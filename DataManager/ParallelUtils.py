@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterable, List, Any
 import time
-import pd
+import pandas as pd
 
 
 def _normalize_fund_data(df):

@@ -23,13 +23,13 @@ from ConfigParser import Config
 from FormatManager.ShareCodeFormatMgr import format_stock_code
 from Distribution import MainCostDataManager
 from DataManager.CalendarManager import  TradingCalendarAnalyzer
-
-
+from LogicAnalyzer.FundMomentumAnalyzer import FundMomentumAnalyzer
 
 class StockAnalyzer:
 
     def __init__(self, config_file: str = "config.ini"):
         self.config_file = config_file
+        self.momentum_analyzer = FundMomentumAnalyzer()
         self.config = Config(config_file=config_file)
         self.calendar_mgr = TradingCalendarAnalyzer()
         self.today_str = self.calendar_mgr.get_last_trading_day()
@@ -704,26 +704,73 @@ class StockAnalyzer:
             final_df.drop(columns=['资金流入净额'], errors='ignore', inplace=True)
 
         f5_col, f10_col, f20_col = '5日资金流入', '10日资金流入', '20日资金流入'
+
+        # 统一资金流入列的单位为万元（原始数据混用亿/万，调用 ParallelUtils 统一处理）
+        if any(col in final_df.columns for col in [f5_col, f10_col, f20_col]):
+            final_df = utils._normalize_fund_data(final_df)
+
+        # 【关键修复】确保所有资金流入列都被标准化为万元
+        fund_columns_to_normalize = [col for col in [f5_col, f10_col, f20_col] if col in final_df.columns]
+        if fund_columns_to_normalize:
+            print(f"  - 正在标准化资金流入数据列: {fund_columns_to_normalize}")
+            for col in fund_columns_to_normalize:
+                # 再次确保每一列的资金数据都以万元为单位
+                def normalize_single_value(val):
+                    if pd.isna(val) or val == 'N/A' or val == '':
+                        return 0.0
+                    val_str = str(val).strip()
+                    try:
+                        if '亿' in val_str:
+                            return float(val_str.replace('亿', '')) * 10000
+                        elif '万' in val_str:
+                            return float(val_str.replace('万', ''))
+                        else:
+                            return float(val_str)
+                    except ValueError:
+                        return 0.0
+                final_df[col] = final_df[col].apply(normalize_single_value)
+
         if all(col in final_df.columns for col in [f5_col, f10_col, f20_col]):
-            def calculate_trend(row):
-                v5 = Parse_Currency.Parse_Currency.parse_money_str(row[f5_col])
-                v10 = Parse_Currency.Parse_Currency.parse_money_str(row[f10_col])
-                v20 = Parse_Currency.Parse_Currency.parse_money_str(row[f20_col])
 
-                if (v5 > v10 or v5 > v20) and v5 > 0:
-                    return "动能增强"
-                elif v5 > 0:
-                    return "流入"
-                else:
-                    return ""
 
-            final_df['资金动能'] = final_df.apply(calculate_trend, axis=1)
+            fund_columns_to_normalize = [col for col in [f5_col, f10_col, f20_col] if col in final_df.columns]
+            if fund_columns_to_normalize:
 
-            cols = list(final_df.columns)
-            if '资金动能' in cols:
-                target_idx = cols.index(f5_col)
-                cols.insert(target_idx + 1, cols.pop(cols.index('资金动能')))
-                final_df = final_df[cols]
+
+
+                try:
+                    # 使用 apply 调用分析器
+                    # result 是一个 Series，每个元素是一个字典 {'资金动能状态': '...', '评分': ...}
+                    result = final_df.apply(lambda row: self.momentum_analyzer.analyze(row), axis=1)
+
+                    momentum_df = pd.json_normalize(result)
+
+
+
+                    if '综合_交易信号' in momentum_df.columns:
+                        final_df['资金动能'] = momentum_df['综合_交易信号']
+                    elif '资金动能状态' in momentum_df.columns:
+                        final_df['资金动能'] = momentum_df['资金动能状态']
+                    else:
+                        # 如果返回的是简单字符串
+                        final_df['资金动能'] = result.astype(str)
+
+
+                    if '综合_动能评分' in momentum_df.columns:
+                        final_df['资金动能评分'] = momentum_df['综合_动能评分']
+                    elif '资金动能评分' in momentum_df.columns:
+                        final_df['资金动能评分'] = momentum_df['资金动能评分']
+
+                    print(" - 资金动能新分析器运行成功。")
+
+                except Exception as e:
+                    self.logger.error(f"运行 FundMomentumAnalyzer 失败: {e}")
+                    # 失败则填充默认值
+                    final_df['资金动能'] = 'N/A'
+            else:
+                final_df['资金动能'] = '无数据'
+
+
 
         if not processed_data['strong_stocks_raw'].empty:
             strong_codes = processed_data['strong_stocks_raw']['股票代码'].tolist()
@@ -855,7 +902,7 @@ class StockAnalyzer:
         else:
             # 添加默认值
             final_df['主力成本'] = 'N/A'
-            final_df['主力成本差价'] = 'N/A'
+            final_df['主力成本差差'] = 'N/A'
             final_df['成本位置'] = 'N/A'
             final_df['主力控盘强度'] = 'N/A'
 
@@ -955,6 +1002,9 @@ class StockAnalyzer:
                         worksheet.set_column(i, i, col_width, currency_format)
                     elif '代码' in col:
                         worksheet.set_column(i, i, 10, code_format)
+                    elif col in ['5日资金流入', '10日资金流入', '20日资金流入']:
+                        # 确保资金流入列使用货币格式
+                        worksheet.set_column(i, i, col_width, currency_format)
                     else:
                         worksheet.set_column(i, i, col_width)
 
