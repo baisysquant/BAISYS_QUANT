@@ -1,7 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterable, List, Any
-import time
-import pandas as pd
 
 
 def _normalize_fund_data(df):
@@ -30,6 +28,7 @@ def _normalize_fund_data(df):
                         return float(val_str)
                 except:
                     return 0.0
+
             df[col] = df[col].apply(convert_to_wan)
     return df
 

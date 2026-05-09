@@ -1,20 +1,11 @@
 from typing import Dict, Any
+
 import numpy as np
 import pandas as pd
 
+
 class FundMomentumAnalyzer:
-    """
-    机构级资金动能分析器 (Quant-Grade Fund Momentum Analyzer).
 
-    设计哲学:
-    1. 消除量纲: 依赖外部标准化, 内部只处理纯数学逻辑.
-    2. 双因子正交:
-       - Factor A (Trend): 关注资金的"持续性" (总量占比).
-       - Factor B (Speed): 关注资金的"爆发力" (日均斜率).
-    3. 动态评分: 基于 Z-Score 或 分位数的标准化打分.
-
-    Input Unit Assumption: 万元 (由 ParallelUtils._normalize_fund_data 保证).
-    """
 
     def __init__(self,
                  trend_weight: float = 0.4,
