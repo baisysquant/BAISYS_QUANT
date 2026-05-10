@@ -67,11 +67,6 @@ class StockSyncEngine:
             f"主力研报盈利预测_完整数据_{self.today}_已处理.csv"
         )
 
-        self.report_filtered_symbols_cache_path = os.path.join(
-            self.base_data_dir,
-            f"report_qualified_pure_symbols_{self.today}.json"
-        )
-
         self.raw_report_cache_path = os.path.join(
             self.base_data_dir,
             f"主力研报盈利预测_经清洗_{self.today}.txt"
@@ -191,17 +186,7 @@ class StockSyncEngine:
         """
         print("\n>>> 正在获取主力研报盈利预测并进行过滤...")
 
-        # 1. 从缓存加载过滤结果
-        if os.path.exists(self.report_filtered_symbols_cache_path):
-            try:
-                with open(self.report_filtered_symbols_cache_path, 'r', encoding='utf-8') as f:
-                    cached = set(json.load(f))
-                print(f"[INFO] 从缓存加载 {len(cached)} 只符合条件的股票。")
-                return cached
-            except Exception as e:
-                print(f"[WARN] 加载缓存失败: {e}")
-
-        # 2. 获取原始数据
+        # 获取原始数据
         report_df = self._safe_ak_fetch(
             fetch_func=ak.stock_profit_forecast_em,
             description="主力研报盈利预测",
@@ -229,14 +214,6 @@ class StockSyncEngine:
 
         result = set(qualified)
         print(f"[INFO] 过滤后剩余 {len(result)} 只符合条件的股票。")
-
-        # 保存缓存
-        try:
-            with open(self.report_filtered_symbols_cache_path, 'w', encoding='utf-8') as f:
-                json.dump(list(result), f, ensure_ascii=False, indent=4)
-            print(f"[INFO] 研报过滤结果已保存至: {self.report_filtered_symbols_cache_path}")
-        except Exception as e:
-            print(f"[ERROR] 保存缓存失败: {e}")
 
         return result
 

@@ -9,10 +9,11 @@ from KDJAnalyzer import AdvancedKDJAnalyzer
 class TASignalProcessor:
     """技术指标信号处理类"""
 
-    def __init__(self, analyzer_instance):
+    def __init__(self, analyzer_instance, config=None):
         self.analyzer      = analyzer_instance
         self.kdj_analyzer  = AdvancedKDJAnalyzer()
         self.macd_analyzer = MACDAnalyzer()
+        self.config        = config
 
     def _classify_cci_level(self, cci_value: float) -> str:
         """根据 CCI 值分类"""
@@ -142,7 +143,10 @@ class TASignalProcessor:
 
             # ── 完全多头综合评分（新增核心能力接入）──────────────────────
             try:
-                bull_result = self.macd_analyzer.analyze_full_bull(df)
+                # 从配置中读取第二周期参数（必填）
+                second_params = self.config.MACD_SECOND_PARAMS
+                
+                bull_result = self.macd_analyzer.analyze_full_bull(df, second_params=second_params)
                 # 不论分数高低都记录，让下游自行筛选
                 detail = bull_result.get('details', {})
                 ta_signals['MACD_FULL_BULL'] = pd.concat([
@@ -167,15 +171,21 @@ class TASignalProcessor:
             try:
                 latest_row = df.iloc[-1]
                 mom_12269  = MACDAnalyzer._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
-                mom_6135   = MACDAnalyzer._calculate_macd_momentum(df, 'DIF_6135',  'DEA_6135')
+                
+                # 根据配置确定第二周期名称（必填）
+                fast, slow, signal = self.config.MACD_SECOND_PARAMS
+                second_period_name = f"{fast}{slow}{signal}"
+                
+                mom_second = MACDAnalyzer._calculate_macd_momentum(df, f'DIF_{second_period_name}', f'DEA_{second_period_name}')
+                
                 ta_signals['MACD_DIF_MOMENTUM'] = pd.concat([
                     ta_signals['MACD_DIF_MOMENTUM'],
                     pd.DataFrame([{
                         '股票代码':        code,
                         'MACD_12269_DIF':  latest_row.get('DIF_12269', 0),
                         'MACD_12269_动能': mom_12269,
-                        'MACD_6135_DIF':   latest_row.get('DIF_6135',  0),
-                        'MACD_6135_动能':  mom_6135,
+                        f'MACD_{second_period_name}_DIF':   latest_row.get(f'DIF_{second_period_name}',  0),
+                        f'MACD_{second_period_name}_动能':  mom_second,
                     }])
                 ], ignore_index=True)
             except Exception as e:

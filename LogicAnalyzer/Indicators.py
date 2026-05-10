@@ -3,12 +3,16 @@ import numpy as np
 from typing import Dict, Tuple, Any
 
 
-def calculate_full_bull_score(df: pd.DataFrame) -> Dict[str, Any]:
+def calculate_full_bull_score(df: pd.DataFrame, thresholds: Dict[str, int] = None) -> Dict[str, Any]:
     """
-    A股多头排列"共振-容错"量化评分系统 (V1.1)
+    A股多头排列“共振-容错”量化评分
 
     Args:
         df: 包含OHLCV及均线数据的DataFrame
+        thresholds: 可选的阈值配置字典，包含以下键：
+            - full_bull: 完全主升阈值（默认85）
+            - trend_acceleration: 趋势加速阈值（默认65）
+            - trend_oscillation: 趋势震荡阈值（默认45）
 
     Returns:
         Dict: 包含评级、因子详情、状态的分析结果
@@ -182,11 +186,19 @@ def calculate_full_bull_score(df: pd.DataFrame) -> Dict[str, Any]:
     total_score = score_trend + score_attack + score_bonus + score_forgive
 
     # --- 4. 信号定级 - 使用描述性词语 ---
-    if total_score >= 85:
+    # 从配置中读取阈值，如果未提供则使用默认值
+    if thresholds is None:
+        thresholds = {}
+    
+    full_bull_threshold = thresholds.get('full_bull', 85)
+    trend_acceleration_threshold = thresholds.get('trend_acceleration', 65)
+    trend_oscillation_threshold = thresholds.get('trend_oscillation', 45)
+
+    if total_score >= full_bull_threshold:
         level = "完全主升"
-    elif total_score >= 65:
+    elif total_score >= trend_acceleration_threshold:
         level = "趋势加速"
-    elif total_score >= 45:
+    elif total_score >= trend_oscillation_threshold:
         level = "趋势震荡"
     else:
         level = "趋势观望"

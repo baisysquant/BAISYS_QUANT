@@ -6,7 +6,7 @@ from scipy.signal import find_peaks
 
 class MACDAnalyzer:
     """
-    双参数 MACD 分析器（标准 12-26-9 + 加速 6-13-5）。
+    双参数 MACD 分析器（标准 12-26-9 + 可配置第二周期）。
 
     功能：
       - 计算两套 MACD，区分零轴上/下金叉死叉
@@ -16,6 +16,10 @@ class MACDAnalyzer:
       - ATR 自适应 find_peaks distance
       - 完全多头综合评分（0~100）
       - 历史信号胜率回测
+    
+    注意：
+      - 标准周期 (12,26,9) 强制保留，不可修改
+      - 第二周期可由用户自定义（默认 6,13,5）
     """
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -173,9 +177,15 @@ class MACDAnalyzer:
     # 3. MACD 计算
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _custom_macd(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _custom_macd(self, df: pd.DataFrame, second_params: Tuple[int, int, int] = (6, 13, 5)) -> pd.DataFrame:
         """
-        同时计算标准 (12, 26, 9) 和加速 (6, 13, 5) 两套 MACD。
+        同时计算标准 (12, 26, 9) 和第二周期两套 MACD。
+        
+        参数：
+          df: 包含 close 列的 DataFrame
+          second_params: 第二周期的 (快线, 慢线, 信号线)，默认 (6, 13, 5)
+                        此参数为必填项，不可为 None 或 (0,0,0)
+        
         新增：
           - MACD_HIST_{name}  柱状值（×2 标准显示）
           - MACD_{name}_CROSS  1=金叉 / -1=死叉 / 0=无
@@ -185,10 +195,16 @@ class MACDAnalyzer:
             return df
 
         close = df['close']
+        
+        # 标准周期（强制保留）
         macd_periods = {
             '12269': (12, 26, 9),
-            '6135':  (6,  13, 5),
         }
+        
+        # 添加第二周期（必填）
+        fast, slow, signal = second_params
+        name = f"{fast}{slow}{signal}"
+        macd_periods[name] = second_params
 
         for name, (fast, slow, signal) in macd_periods.items():
             ema_fast = close.ewm(span=fast,   adjust=False).mean()
@@ -282,9 +298,18 @@ class MACDAnalyzer:
         distance_fast: int = 12,
         recent_window: int = 5,
         decay_half_life: int = 8,
+        second_period_name: str = '6135',  # 第二周期的名称（如 '6135'）
     ) -> Dict:
         """
         检测两套 MACD 的顶/底背离并合并为交易信号。
+
+        参数：
+          df: 包含 DIF_12269, DEA_12269, DIF_{second_period_name}, DEA_{second_period_name} 的 DataFrame
+          distance_slow: 标准周期的 find_peaks distance
+          distance_fast: 第二周期的 find_peaks distance
+          recent_window: 信号有效窗口
+          decay_half_life: 衰减半衰期
+          second_period_name: 第二周期的名称（默认 '6135'）
 
         修复说明：
           原代码每套参数调用两次（分别存为 top/bot），实际两次返回同一结果。
@@ -296,7 +321,7 @@ class MACDAnalyzer:
           idx_12269        信号位置
           strength_12269   背离强度 0~1
           decay_12269      当前衰减系数 0~1
-          div_6135 / idx_6135 / strength_6135 / decay_6135  同上
+          div_{second_period_name} / idx_{second_period_name} / strength_{second_period_name} / decay_{second_period_name}  同上
         """
         current_idx = len(df) - 1
 
@@ -305,48 +330,58 @@ class MACDAnalyzer:
 
         # ── 每套参数只调一次 ──────────────────────────────────────────────
         div_12269, idx_12269, str_12269 = MACDAnalyzer._detect_divergence_single_param(
-            df, df['close'], df['DIF_12269'], distance=distance_slow
+            df, df['close'], df[f'DIF_12269'], distance=distance_slow
         )
-        div_6135, idx_6135, str_6135 = MACDAnalyzer._detect_divergence_single_param(
-            df, df['close'], df['DIF_6135'], distance=distance_fast
-        )
+        
+        dif_col_second = f'DIF_{second_period_name}'
+        if dif_col_second in df.columns:
+            div_second, idx_second, str_second = MACDAnalyzer._detect_divergence_single_param(
+                df, df['close'], df[dif_col_second], distance=distance_fast
+            )
+        else:
+            div_second, idx_second, str_second = None, None, 0.0
 
         # 衰减系数（替代硬截断 is_recent）
         decay_12269 = MACDAnalyzer._signal_with_decay(div_12269, idx_12269, current_idx, decay_half_life)
-        decay_6135  = MACDAnalyzer._signal_with_decay(div_6135,  idx_6135,  current_idx, decay_half_life)
+        decay_second = MACDAnalyzer._signal_with_decay(div_second, idx_second, current_idx, decay_half_life)
 
         # 有效性：衰减后强度 × 背离强度 > 阈值
         eff_12269 = decay_12269 * str_12269
-        eff_6135  = decay_6135  * str_6135
+        eff_second = decay_second * str_second
         THRESHOLD = 0.15  # 综合有效阈值，可调
 
         top_12269  = div_12269 == '顶背离' and eff_12269 >= THRESHOLD
         bot_12269  = div_12269 == '底背离' and eff_12269 >= THRESHOLD
-        top_6135   = div_6135  == '顶背离' and eff_6135  >= THRESHOLD
-        bot_6135   = div_6135  == '底背离' and eff_6135  >= THRESHOLD
+        top_second = div_second == '顶背离' and eff_second >= THRESHOLD
+        bot_second = div_second == '底背离' and eff_second >= THRESHOLD
 
         # 战术层当前状态
-        fast_golden = df['DIF_6135'].iloc[-1]  > df['DEA_6135'].iloc[-1]
-        fast_dead   = df['DIF_6135'].iloc[-1]  < df['DEA_6135'].iloc[-1]
+        if dif_col_second in df.columns:
+            fast_golden = df[dif_col_second].iloc[-1] > df[f'DEA_{second_period_name}'].iloc[-1]
+            fast_dead   = df[dif_col_second].iloc[-1] < df[f'DEA_{second_period_name}'].iloc[-1]
+        else:
+            fast_golden = False
+            fast_dead = False
+        
         slow_above  = df['DIF_12269'].iloc[-1] > 0
 
         # ── 信号优先级（从强到弱）────────────────────────────────────────
-        if bot_12269 and bot_6135 and fast_golden:
-            combined = '战略底背离 + 战术金叉确认 ✅ (精准买入)'
-        elif top_12269 and top_6135 and fast_dead:
-            combined = '战略顶背离 + 战术死叉确认 ❌ (精准卖出)'
-        elif bot_12269 and bot_6135:
-            combined = '双重底背离 (强烈买入关注)'
-        elif top_12269 and top_6135:
-            combined = '双重顶背离 (强烈卖出预警)'
+        if bot_12269 and bot_second and fast_golden:
+            combined = f'战略底背离 + 战术金叉确认 ✅ (精准买入)'
+        elif top_12269 and top_second and fast_dead:
+            combined = f'战略顶背离 + 战术死叉确认 ❌ (精准卖出)'
+        elif bot_12269 and bot_second:
+            combined = f'双重底背离 (强烈买入关注)'
+        elif top_12269 and top_second:
+            combined = f'双重顶背离 (强烈卖出预警)'
         elif bot_12269:
-            combined = '12269 底背离 (战略买入预警)'
+            combined = f'12269 底背离 (战略买入预警)'
         elif top_12269:
-            combined = '12269 顶背离 (战略卖出预警)'
-        elif bot_6135:
-            combined = '6135 底背离 (可考虑买入)' if slow_above else '6135 底背离 (大趋势偏空，谨慎)'
-        elif top_6135:
-            combined = '6135 顶背离 (需结合大趋势)' if slow_above else '6135 顶背离 (可考虑卖出)'
+            combined = f'12269 顶背离 (战略卖出预警)'
+        elif bot_second:
+            combined = f'{second_period_name} 底背离 (可考虑买入)' if slow_above else f'{second_period_name} 底背离 (大趋势偏空，谨慎)'
+        elif top_second:
+            combined = f'{second_period_name} 顶背离 (需结合大趋势)' if slow_above else f'{second_period_name} 顶背离 (可考虑卖出)'
         else:
             combined = ''
 
@@ -357,11 +392,11 @@ class MACDAnalyzer:
             'idx_12269':      idx_12269,
             'strength_12269': str_12269,
             'decay_12269':    decay_12269,
-            # 6135
-            'div_6135':       div_6135 or '',
-            'idx_6135':       idx_6135,
-            'strength_6135':  str_6135,
-            'decay_6135':     decay_6135,
+            # 第二周期
+            f'div_{second_period_name}':       div_second or '',
+            f'idx_{second_period_name}':       idx_second,
+            f'strength_{second_period_name}':  str_second,
+            f'decay_{second_period_name}':     decay_second,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -423,14 +458,21 @@ class MACDAnalyzer:
         df: pd.DataFrame,
         decay_half_life: int = 8,
         slope_window: int = 5,
+        second_params: Tuple[int, int, int] = (6, 13, 5),
     ) -> Dict:
         """
         完全多头信号综合评估，输出 0~100 分和各子项状态。
 
+        参数：
+          df: 包含 OHLCV 数据的 DataFrame
+          decay_half_life: 信号衰减半衰期
+          slope_window: DIF斜率计算窗口
+          second_params: 第二周期参数（必填），默认 (6, 13, 5)
+
         评分维度（满分 100，背离项可扣分）：
           ① 零轴条件        25 分  (12269 DIF>0 且 DEA>0)
           ② 战略线金叉状态  20 分  (12269 MACD 排列)
-          ③ 战术线金叉状态  15 分  (6135  MACD 排列)
+          ③ 战术线金叉状态  15 分  (第二周期 MACD 排列)
           ④ 动能加速        15 分  (红柱加长)
           ⑤ DIF 斜率        10 分  (线性回归趋势)
           ⑥ 背离信号        25 分  (底背离加分，顶背离扣 -10 分)
@@ -442,17 +484,24 @@ class MACDAnalyzer:
           ≥ 40  → 多空拉锯（观望）
           < 40  → 偏空（回避或做空）
         """
-        df = self._custom_macd(df)
+        # 计算MACD指标
+        df = self._custom_macd(df, second_params=second_params)
+        
+        # 确定第二周期名称
+        fast, slow, signal = second_params
+        second_period_name = f"{fast}{slow}{signal}"
 
         # 自适应 distance
         dist_slow = self._adaptive_distance(df, base=10)
         dist_fast = self._adaptive_distance(df, base=5)
 
+        # 检测背离
         div_signals = self.detect_combined_divergence(
             df,
             distance_slow=dist_slow,
             distance_fast=dist_fast,
             decay_half_life=decay_half_life,
+            second_period_name=second_period_name,
         )
 
         current_idx = len(df) - 1
@@ -481,14 +530,18 @@ class MACDAnalyzer:
             scores['战略金叉'] = ('❌ 12269 空头排列', 0)
 
         # ③ 战术线金叉状态 ─────────────────────────────────────────────────
-        fast_detail = df['MACD_6135_SIGNAL_DETAIL'].iloc[-1]
-        fast_bull   = df['DIF_6135'].iloc[-1] > df['DEA_6135'].iloc[-1]
+        fast_detail_col = f'MACD_{second_period_name}_SIGNAL_DETAIL'
+        fast_dif_col = f'DIF_{second_period_name}'
+        fast_dea_col = f'DEA_{second_period_name}'
+        
+        fast_detail = df[fast_detail_col].iloc[-1]
+        fast_bull   = df[fast_dif_col].iloc[-1] > df[fast_dea_col].iloc[-1]
         if fast_detail == '零轴上金叉':
-            scores['战术金叉'] = ('✅ 6135 零轴上金叉', 15)
+            scores['战术金叉'] = (f'✅ {second_period_name} 零轴上金叉', 15)
         elif fast_bull:
-            scores['战术金叉'] = ('✅ 6135 多头持续', 10)
+            scores['战术金叉'] = (f'✅ {second_period_name} 多头持续', 10)
         else:
-            scores['战术金叉'] = ('❌ 6135 空头 / 死叉', 0)
+            scores['战术金叉'] = (f'❌ {second_period_name} 空头 / 死叉', 0)
 
         # ④ 动能状态 ───────────────────────────────────────────────────────
         momentum = self._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
