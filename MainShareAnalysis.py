@@ -314,10 +314,10 @@ class StockAnalyzer:
             # 筛选出需要的股票代码 - 注意保持与数据源的一致性
             # 如果stock_codes已经是不带前缀的6位数字，我们需要匹配数据库中的格式
             formatted_codes = [code.zfill(6) for code in stock_codes]
-            filtered_pool = main_board_pool[main_board_pool['ts_code'].isin(formatted_codes)]
+            filtered_pool = main_board_pool[main_board_pool['股票代码'].isin(formatted_codes)]
 
             # 重命名列以匹配期望的格式
-            industry_df = filtered_pool[['ts_code', 'name', 'industry']].copy()
+            industry_df = filtered_pool[['股票代码', 'name', 'industry']].copy()
             industry_df.columns = ['股票代码', '股票简称', '行业']
 
             print(f"从数据库成功获取 {len(industry_df)} 条行业信息")
