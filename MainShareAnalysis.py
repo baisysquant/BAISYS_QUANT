@@ -375,6 +375,10 @@ class StockAnalyzer:
             main_cost_df = self.cost_manager.get_main_cost_data()
             
             if not main_cost_df.empty:
+                # 标准化列名：将 "代码" 重命名为 "股票代码"
+                if "代码" in main_cost_df.columns and "股票代码" not in main_cost_df.columns:
+                    main_cost_df.rename(columns={"代码": "股票代码"}, inplace=True)
+                
                 # 验证必需列
                 required_cols = ['股票代码', '主力成本']
                 is_valid, missing = self.data_validator.validate_required_columns(
@@ -1259,13 +1263,10 @@ class StockAnalyzer:
         # 步骤2：计算多头排列评分
         final_df = self._calculate_bull_scores(final_df, processed_data)
 
-        # 步骤3：合并资金流数据
+        # 步骤3：合并资金流数据（包含强势股、连涨、量价齐升、持续放量等信号）
         final_df = self._merge_fund_flow_data(final_df, processed_data)
 
-        # 步骤4：合并信号数据（强势股、连涨、量价齐升、持续放量）
-        final_df = self._merge_signal_data(final_df, processed_data)
-
-        # 步骤5：合并技术指标（MACD、KDJ、CCI、RSI、BOLL）
+        # 步骤4：合并技术指标（MACD、KDJ、CCI、RSI、BOLL）
         final_df = self._merge_technical_indicators(final_df, processed_data)
 
         # 步骤6：合并特殊数据（TOP10行业、主力成本、均线突破）
