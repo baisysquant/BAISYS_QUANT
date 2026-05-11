@@ -563,10 +563,17 @@ class MACDAnalyzer:
 
         # ⑥ 背离信号（含强度 × 衰减加权）─────────────────────────────────
         cs          = div_signals['combined_signal']
-        div_type    = div_signals['div_12269'] or div_signals['div_6135']
-        div_idx     = div_signals['idx_12269'] if div_signals['idx_12269'] is not None else div_signals['idx_6135']
-        div_str     = div_signals['strength_12269'] if div_signals['div_12269'] else div_signals['strength_6135']
-        div_decay   = div_signals['decay_12269']    if div_signals['div_12269'] else div_signals['decay_6135']
+        
+        # 动态获取第二周期的键名
+        div_second_key = f'div_{second_period_name}'
+        strength_second_key = f'strength_{second_period_name}'
+        decay_second_key = f'decay_{second_period_name}'
+        idx_second_key = f'idx_{second_period_name}'
+        
+        div_type    = div_signals.get('div_12269') or div_signals.get(div_second_key)
+        div_idx     = div_signals.get('idx_12269') if div_signals.get('idx_12269') is not None else div_signals.get(idx_second_key)
+        div_str     = div_signals.get('strength_12269') if div_signals.get('div_12269') else div_signals.get(strength_second_key, 0.0)
+        div_decay   = div_signals.get('decay_12269')    if div_signals.get('div_12269') else div_signals.get(decay_second_key, 0.0)
         eff         = round(div_str * div_decay, 3)
 
         if '底背离' in cs:

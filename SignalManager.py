@@ -1,22 +1,59 @@
 import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 import pandas_ta as ta  # 勿删
 from MACDAnalyzer import MACDAnalyzer
 from FormatManager.ShareCodeFormatMgr import format_stock_code
 from KDJAnalyzer import AdvancedKDJAnalyzer
+from ConfigParser import Config
 
 
 class TASignalProcessor:
-    """技术指标信号处理类"""
+    """
+    技术指标信号处理类
+    
+    负责计算和处理多种技术指标信号，包括：
+    - MACD（标准周期 + 第二周期）
+    - KDJ、CCI、RSI、BOLL
+    - 背离检测
+    - 完全多头综合评分
+    
+    Attributes:
+        analyzer: 股票分析器实例
+        kdj_analyzer: KDJ 分析器
+        macd_analyzer: MACD 分析器
+        config: 配置管理器实例
+    """
 
-    def __init__(self, analyzer_instance, config=None):
+    def __init__(self, analyzer_instance: Any, config: Optional[Config] = None) -> None:
+        """
+        初始化技术指标信号处理器
+        
+        Args:
+            analyzer_instance: 股票分析器实例
+            config: 配置管理器实例，用于读取MACD第二周期等配置
+        """
         self.analyzer      = analyzer_instance
         self.kdj_analyzer  = AdvancedKDJAnalyzer()
         self.macd_analyzer = MACDAnalyzer()
         self.config        = config
 
     def _classify_cci_level(self, cci_value: float) -> str:
-        """根据 CCI 值分类"""
+        """
+        根据 CCI 值分类
+        
+        CCI (Commodity Channel Index) 商品通道指标分类标准：
+        - > 200: 极度超买
+        - 100 ~ 200: 强势超买
+        - -100 ~ 100: 正常区间（无信号）
+        - -200 ~ -100: 弱势超卖
+        - < -200: 极度超卖
+        
+        Args:
+            cci_value: CCI 指标值
+            
+        Returns:
+            str: CCI 状态描述字符串，如 '极度超买 (250.35)' 或空字符串
+        """
         if pd.isna(cci_value):
             return 'N/A'
         if   cci_value >  200: return f'极度超买 ({cci_value:.2f})'
@@ -31,18 +68,47 @@ class TASignalProcessor:
         hist_df_all: pd.DataFrame,
         spot_df: pd.DataFrame,
     ) -> Dict[str, pd.DataFrame]:
+        """
+        处理所有股票的技术指标信号
+        
+        对给定的股票列表进行批量技术分析，计算多种技术指标并生成信号。
+        
+        Args:
+            all_codes: 股票代码列表（6位纯数字格式）
+            hist_df_all: 历史K线数据DataFrame，包含所有股票的OHLCV数据
+            spot_df: 实时行情数据DataFrame，包含最新价格等信息
+            
+        Returns:
+            Dict[str, pd.DataFrame]: 技术指标信号字典，key为指标名称，value为对应的信号DataFrame
+            包括：
+            - MACD_12269: 标准MACD信号（固定）
+            - MACD_{second_period_name}: 第二周期MACD信号（动态，如 MACD_9186）
+            - MACD_COMBINED_DIVERGENCE: MACD背离信号
+            - KDJ: KDJ信号
+            - CCI: CCI信号
+            - RSI: RSI信号
+            - BOLL: 布林带信号
+            - MACD_DIF_MOMENTUM: MACD动能状态
+        """
 
         print(f"\n正在对 {len(all_codes)} 只股票进行技术分析...")
 
+        # 动态获取第二周期MACD列名
+        if self.config and hasattr(self.config, 'MACD_SECOND_PARAMS'):
+            fast, slow, signal = self.config.MACD_SECOND_PARAMS
+            second_period_name = f"{fast}{slow}{signal}"
+        else:
+            second_period_name = '9186'  # 默认值（与config.ini一致）
+        
         ta_signals = {
             'MACD_12269': pd.DataFrame(columns=['股票代码', 'MACD_12269_Signal']),
-            'MACD_6135':  pd.DataFrame(columns=['股票代码', 'MACD_6135_Signal']),
+            f'MACD_{second_period_name}': pd.DataFrame(columns=['股票代码', f'MACD_{second_period_name}_Signal']),
             # ── 背离：新增强度 / 衰减字段 ──────────────────────────────────
             'MACD_COMBINED_DIVERGENCE': pd.DataFrame(columns=[
                 '股票代码',
                 'Combined_Divergence_Signal',
                 'Div_12269_Type', 'Div_12269_Strength', 'Div_12269_Decay',
-                'Div_6135_Type',  'Div_6135_Strength',  'Div_6135_Decay',
+                f'Div_{second_period_name}_Type', f'Div_{second_period_name}_Strength', f'Div_{second_period_name}_Decay',
             ]),
             'KDJ':  pd.DataFrame(columns=['股票代码', 'KDJ_Signal']),
             'CCI':  pd.DataFrame(columns=['股票代码', 'CCI_Signal']),
@@ -51,7 +117,7 @@ class TASignalProcessor:
             'MACD_DIF_MOMENTUM': pd.DataFrame(columns=[
                 '股票代码',
                 'MACD_12269_DIF', 'MACD_12269_动能',
-                'MACD_6135_DIF',  'MACD_6135_动能',
+                f'MACD_{second_period_name}_DIF', f'MACD_{second_period_name}_动能',
             ]),
             # ── 新增：完全多头综合评分 ─────────────────────────────────────
             'MACD_FULL_BULL': pd.DataFrame(columns=[
@@ -119,6 +185,7 @@ class TASignalProcessor:
                     distance_fast=dist_fast,
                     recent_window=5,
                     decay_half_life=8,
+                    second_period_name=second_period_name,  # 传递动态的第二周期名称
                 )
                 divergence_signal = combined_div.get('combined_signal', '')
 
@@ -133,9 +200,9 @@ class TASignalProcessor:
                             'Div_12269_Type':     combined_div.get('div_12269', ''),
                             'Div_12269_Strength': combined_div.get('strength_12269', 0.0),
                             'Div_12269_Decay':    combined_div.get('decay_12269', 0.0),
-                            'Div_6135_Type':      combined_div.get('div_6135', ''),
-                            'Div_6135_Strength':  combined_div.get('strength_6135', 0.0),
-                            'Div_6135_Decay':     combined_div.get('decay_6135', 0.0),
+                            f'Div_{second_period_name}_Type':      combined_div.get(f'div_{second_period_name}', ''),
+                            f'Div_{second_period_name}_Strength':  combined_div.get(f'strength_{second_period_name}', 0.0),
+                            f'Div_{second_period_name}_Decay':     combined_div.get(f'decay_{second_period_name}', 0.0),
                         }])
                     ], ignore_index=True)
             except Exception as e:
@@ -202,14 +269,14 @@ class TASignalProcessor:
                     }])
                 ], ignore_index=True)
 
-            # ── MACD 6135 金叉 / 死叉信号 ────────────────────────────────
-            detail_col_6135 = 'MACD_6135_SIGNAL_DETAIL'
-            if detail_col_6135 in df.columns and df[detail_col_6135].iloc[-1] != '':
-                ta_signals['MACD_6135'] = pd.concat([
-                    ta_signals['MACD_6135'],
+            # ── MACD 第二周期金叉 / 死叉信号 ────────────────────────────────
+            detail_col_second = f'MACD_{second_period_name}_SIGNAL_DETAIL'
+            if detail_col_second in df.columns and df[detail_col_second].iloc[-1] != '':
+                ta_signals[f'MACD_{second_period_name}'] = pd.concat([
+                    ta_signals[f'MACD_{second_period_name}'],
                     pd.DataFrame([{
                         '股票代码':          code,
-                        'MACD_6135_Signal':  df[detail_col_6135].iloc[-1],
+                        f'MACD_{second_period_name}_Signal':  df[detail_col_second].iloc[-1],
                     }])
                 ], ignore_index=True)
 

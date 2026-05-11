@@ -2,7 +2,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional, Tuple, Set
 import akshare as ak
 import pandas as pd
 import pandas_ta as ta  # 勿删
@@ -23,11 +23,33 @@ from DataManager.CalendarManager import TradingCalendarAnalyzer
 from LogicAnalyzer.FundMomentumAnalyzer import FundMomentumAnalyzer
 from LogicAnalyzer.Indicators import calculate_full_bull_score
 from DataManager.DataFetcher import DataFetcher
+from DataValidator import DataValidator
 
 
 class StockAnalyzer:
+    """
+    股票分析器主类
+    
+    负责整合多个数据源（资金流、强势股、技术指标等），进行综合分析和筛选，
+    生成最终的投资分析报告。
+    
+    Attributes:
+        config: 配置管理器实例
+        calendar_mgr: 交易日历管理器
+        today_str: 当前交易日字符串 (YYYYMMDD格式)
+        data_fetcher: 数据获取器，支持缓存机制
+        cost_manager: 主力成本数据管理器
+        logger: 日志管理器
+        executor: 线程池执行器
+    """
 
-    def __init__(self, config_file: str = "config.ini"):
+    def __init__(self, config_file: str = "config.ini") -> None:
+        """
+        初始化股票分析器
+        
+        Args:
+            config_file: 配置文件路径，默认为 'config.ini'
+        """
 
         self.stock_sync_engine = StockSyncEngine()
         self.config_file = config_file
@@ -56,6 +78,9 @@ class StockAnalyzer:
 
         # 初始化数据获取器
         self.data_fetcher = DataFetcher(self.config, self.calendar_mgr, self.logger)
+        
+        # 初始化数据验证器
+        self.data_validator = DataValidator(self.logger)
 
         # 初始化主力成本数据管理器
         self.cost_manager = MainCostDataManager(
@@ -67,6 +92,26 @@ class StockAnalyzer:
     def _normalize_stock_code(code: str) -> str:
         """
         统一标准化股票代码为6位纯数字格式
+        
+        处理各种格式的股票代码，包括：
+        - SH600000, SZ000001 (带市场前缀)
+        - 600000.SH, 000001.SZ (带市场后缀)
+        - 600000, 000001 (纯数字)
+        - 其他非标准格式
+        
+        Args:
+            code: 原始股票代码字符串
+            
+        Returns:
+            str: 标准化后的6位数字股票代码，失败时返回空字符串
+            
+        Examples:
+            >>> StockAnalyzer._normalize_stock_code('SH600000')
+            '600000'
+            >>> StockAnalyzer._normalize_stock_code('000001.SZ')
+            '000001'
+            >>> StockAnalyzer._normalize_stock_code('600000')
+            '600000'
         """
         if pd.isna(code) or code is None:
             return ""
@@ -108,7 +153,34 @@ class StockAnalyzer:
         return "5日资金流入万元"
 
     def _get_all_raw_data(self) -> Dict[str, pd.DataFrame]:
-        """集中获取所有数据源 (包括主力研报盈利预测)，并支持缓存机制"""
+        """
+        集中获取所有数据源，并支持缓存机制
+        
+        该方法负责从多个 akshare 接口获取原始数据，包括：
+        - 资金流数据（根据配置的周期动态获取）
+        - 强势股池数据
+        - 连续上涨、量价齐升、持续放量等技术指标
+        - 均线突破数据（10日、30日、60日）
+        - 行业板块信息
+        - 主力研报盈利预测
+        
+        所有数据都通过 DataFetcher 获取，支持自动缓存和重试机制。
+        
+        Returns:
+            Dict[str, pd.DataFrame]: 键值对字典，key为数据名称，value为对应的DataFrame
+            包含的键包括：
+            - market_fund_flow_raw[_3/_10/_20]: 市场资金流向数据
+            - strong_stocks_raw: 强势股池数据
+            - consecutive_rise_raw: 连续上涨数据
+            - ljqs_raw: 量价齐升数据
+            - cxfl_raw: 持续放量数据
+            - xstp_10_raw/xstp_30_raw/xstp_60_raw: 均线突破数据
+            - industry_board_df: 行业板块成分股映射
+            - profit_forecast_raw: 主力研报盈利预测数据
+            
+        Raises:
+            Exception: 当数据获取失败时抛出异常
+        """
         print("\n>>> 正在初始化数据获取和缓存检查...")
 
         # 根据配置动态获取资金流数据
@@ -126,37 +198,103 @@ class StockAnalyzer:
         for period in self.config.FUND_FLOW_PERIODS:
             if period in period_to_akshare:
                 desc, symbol, key = period_to_akshare[period]
-                data[key] = self.data_fetcher.fetch(
-                    ak.stock_fund_flow_individual, desc, symbol=symbol
-                )
-                print(f"  - 已获取 {period}日资金流数据")
+                try:
+                    fund_flow_df = self.data_fetcher.fetch(
+                        ak.stock_fund_flow_individual, desc, symbol=symbol
+                    )
+                    
+                    # 验证资金流数据
+                    if not fund_flow_df.empty:
+                        # 检查必需列
+                        required_cols = ['股票代码', '最新价']
+                        is_valid, missing = self.data_validator.validate_required_columns(
+                            fund_flow_df, required_cols, f"{period}日资金流"
+                        )
+                        
+                        if is_valid:
+                            data[key] = fund_flow_df
+                            print(f"  - 已获取 {period}日资金流数据 ({len(fund_flow_df)} 条记录)")
+                        else:
+                            self.logger.warning(
+                                f"  - [WARN] {period}日资金流数据缺少列: {missing}，跳过"
+                            )
+                    else:
+                        self.logger.warning(f"  - [WARN] {period}日资金流数据为空")
+                        
+                except Exception as e:
+                    self.logger.error(f"  - [ERROR] 获取{period}日资金流数据失败: {e}")
             else:
                 self.logger.warning(f"不支持的资金流周期: {period}日（仅支持3,5,10,20）")
         
-        # 获取其他数据源
-        data.update({
-            "strong_stocks_raw": self.data_fetcher.fetch(
-                ak.stock_zt_pool_strong_em,
-                "强势股池",
-                date=self.today_str
-            ),
-            "consecutive_rise_raw": self.data_fetcher.fetch(
-                ak.stock_rank_lxsz_ths, "连续上涨"
-            ),
-            "ljqs_raw": self.data_fetcher.fetch(ak.stock_rank_ljqs_ths, "量价齐升"),
-            "cxfl_raw": self.data_fetcher.fetch(ak.stock_rank_cxfl_ths, "持续放量"),
-        })
+        # 获取其他数据源（带验证）
+        print("\n>>> 正在获取其他技术指标数据...")
+        
+        data_sources = {
+            "strong_stocks_raw": (ak.stock_zt_pool_strong_em, "强势股池", {'date': self.today_str}),
+            "consecutive_rise_raw": (ak.stock_rank_lxsz_ths, "连续上涨", {}),
+            "ljqs_raw": (ak.stock_rank_ljqs_ths, "量价齐升", {}),
+            "cxfl_raw": (ak.stock_rank_cxfl_ths, "持续放量", {}),
+        }
+        
+        for key, (api_func, desc, params) in data_sources.items():
+            try:
+                df = self.data_fetcher.fetch(api_func, desc, **params)
+                
+                if not df.empty:
+                    # 验证必需列
+                    required_cols = ['股票代码']
+                    is_valid, missing = self.data_validator.validate_required_columns(
+                        df, required_cols, desc
+                    )
+                    
+                    if is_valid:
+                        data[key] = df
+                        print(f"  - ✓ {desc}: {len(df)} 条记录")
+                    else:
+                        self.logger.warning(f"  - ⚠ {desc} 缺少列: {missing}")
+                        data[key] = pd.DataFrame()  # 置空
+                else:
+                    self.logger.warning(f"  - ⚠ {desc} 数据为空")
+                    data[key] = pd.DataFrame()
+                    
+            except Exception as e:
+                self.logger.error(f"  - ✗ 获取{desc}失败: {e}")
+                data[key] = pd.DataFrame()
 
         # 均线突破数据 (Akshare接口参数不同，需分开获取)
-        data["xstp_10_raw"] = self.data_fetcher.fetch(
-            ak.stock_rank_xstp_ths, "向上突破10日均线", symbol="10日均线"
-        )
-        data["xstp_30_raw"] = self.data_fetcher.fetch(
-            ak.stock_rank_xstp_ths, "向上突破30日均线", symbol="30日均线"
-        )
-        data["xstp_60_raw"] = self.data_fetcher.fetch(
-            ak.stock_rank_xstp_ths, "向上突破60日均线", symbol="60日均线"
-        )
+        print("\n>>> 正在获取均线突破数据...")
+        
+        xstp_configs = [
+            ("xstp_10_raw", "向上突破10日均线", "10日均线"),
+            ("xstp_30_raw", "向上突破30日均线", "30日均线"),
+            ("xstp_60_raw", "向上突破60日均线", "60日均线"),
+        ]
+        
+        for key, desc, symbol in xstp_configs:
+            try:
+                df = self.data_fetcher.fetch(
+                    ak.stock_rank_xstp_ths, desc, symbol=symbol
+                )
+                
+                if not df.empty:
+                    required_cols = ['股票代码']
+                    is_valid, missing = self.data_validator.validate_required_columns(
+                        df, required_cols, desc
+                    )
+                    
+                    if is_valid:
+                        data[key] = df
+                        print(f"  - ✓ {desc}: {len(df)} 条记录")
+                    else:
+                        self.logger.warning(f"  - ⚠ {desc} 缺少列: {missing}")
+                        data[key] = pd.DataFrame()
+                else:
+                    self.logger.warning(f"  - ⚠ {desc} 数据为空")
+                    data[key] = pd.DataFrame()
+                    
+            except Exception as e:
+                self.logger.error(f"  - ✗ 获取{desc}失败: {e}")
+                data[key] = pd.DataFrame()
 
         # 行业板块数据
         print("\n>>> 正在获取行业板块名称并保存至本地...")
@@ -170,27 +308,61 @@ class StockAnalyzer:
                 industry_board_df = pd.read_csv(
                     industry_info_path, sep="|", encoding="utf-8-sig"
                 )
+                
+                # 验证缓存数据
+                if not industry_board_df.empty:
+                    required_cols = ['板块名称', '板块代码']
+                    is_valid, missing = self.data_validator.validate_required_columns(
+                        industry_board_df, required_cols, "行业板块缓存"
+                    )
+                    
+                    if is_valid:
+                        print(f"  - ✓ 缓存数据有效: {len(industry_board_df)} 个板块")
+                    else:
+                        self.logger.warning(
+                            f"  - ⚠ 缓存数据缺少列: {missing}，将重新获取"
+                        )
+                        industry_board_df = pd.DataFrame()
+                else:
+                    self.logger.warning("  - ⚠ 缓存数据为空，将重新获取")
+                    industry_board_df = pd.DataFrame()
+                    
             except Exception as e:
                 self.logger.warning(
                     f"  - [WARN] 读取本地缓存失败: {e}，将尝试重新获取..."
                 )
+                industry_board_df = pd.DataFrame()
         else:
             print(f"本地无缓存，正在通过接口获取")
             try:
                 industry_board_df = ak.stock_board_industry_name_em()
+                
                 if not industry_board_df.empty:
-                    try:
-                        industry_board_df.to_csv(
-                            industry_info_path,
-                            sep="|",
-                            index=False,
-                            encoding="utf-8-sig",
-                        )
-                        print(f"  - 获取成功并已保存至: {industry_info_filename}")
-                    except Exception as e:
-                        self.logger.error(f"  - [ERROR] 保存文件失败: {e}")
+                    # 验证接口数据
+                    required_cols = ['板块名称', '板块代码']
+                    is_valid, missing = self.data_validator.validate_required_columns(
+                        industry_board_df, required_cols, "行业板块接口"
+                    )
+                    
+                    if is_valid:
+                        try:
+                            industry_board_df.to_csv(
+                                industry_info_path,
+                                sep="|",
+                                index=False,
+                                encoding="utf-8-sig",
+                            )
+                            print(f"  - ✓ 获取成功并已保存: {len(industry_board_df)} 个板块")
+                        except Exception as e:
+                            self.logger.error(f"  - ✗ 保存文件失败: {e}")
+                    else:
+                        self.logger.warning(f"  - ⚠ 接口数据缺少列: {missing}")
+                        industry_board_df = pd.DataFrame()
+                else:
+                    self.logger.warning("  - ⚠ 行业板块接口返回空数据")
+                    
             except Exception as e:
-                self.logger.error(f"  - [ERROR] 调用行业板块接口失败: {e}")
+                self.logger.error(f"  - ✗ 调用行业板块接口失败: {e}")
 
         data["top_industry_cons_df"] = self._get_top_industry_constituents(
             industry_board_df
@@ -199,18 +371,49 @@ class StockAnalyzer:
 
         # 获取主力成本数据（使用新的管理类）
         print("\n>>> 正在获取主力成本数据...")
-        main_cost_df = self.cost_manager.get_main_cost_data()
-        main_cost_df = self.cost_manager.analyze_cost_data(main_cost_df)
-        data["main_cost_data"] = main_cost_df
-
-        # 打印主力成本数据摘要
-        self.cost_manager.print_cost_summary(main_cost_df)
+        try:
+            main_cost_df = self.cost_manager.get_main_cost_data()
+            
+            if not main_cost_df.empty:
+                # 验证必需列
+                required_cols = ['股票代码', '主力成本']
+                is_valid, missing = self.data_validator.validate_required_columns(
+                    main_cost_df, required_cols, "主力成本数据"
+                )
+                
+                if is_valid:
+                    main_cost_df = self.cost_manager.analyze_cost_data(main_cost_df)
+                    data["main_cost_data"] = main_cost_df
+                    print(f"  - ✓ 主力成本数据: {len(main_cost_df)} 条记录")
+                    
+                    # 打印主力成本数据摘要
+                    self.cost_manager.print_cost_summary(main_cost_df)
+                else:
+                    self.logger.warning(f"  - ⚠ 主力成本数据缺少列: {missing}")
+                    data["main_cost_data"] = pd.DataFrame()
+            else:
+                self.logger.warning("  - ⚠ 主力成本数据为空")
+                data["main_cost_data"] = pd.DataFrame()
+                
+        except Exception as e:
+            self.logger.error(f"  - ✗ 获取主力成本数据失败: {e}")
+            data["main_cost_data"] = pd.DataFrame()
 
         return data
 
     def _safe_fetch_constituents(self, symbol: str) -> pd.DataFrame:
         """
-        带重试机制获取单个行业板块的成分股。
+        安全地获取行业板块成分股数据
+        
+        使用异常处理包裹 akshare 接口调用，避免因单个板块数据获取失败
+        而影响整个分析流程。
+        
+        Args:
+            symbol: 行业板块代码或名称
+            
+        Returns:
+            pd.DataFrame: 成分股数据DataFrame，包含股票代码、名称等字段
+                         如果获取失败，返回空的DataFrame
         """
         df = pd.DataFrame()
         for i in range(self.config.DATA_FETCH_RETRIES):
@@ -535,10 +738,20 @@ class StockAnalyzer:
         """
         计算多头排列评分（批量优化版）
         
+        基于K线数据计算每只股票的多头排列得分，评估其趋势强度。
+        使用 groupby 预分组和向量化计算，大幅提升性能。
+        
         性能优化：
         - 预先将所有K线数据按股票代码分组
         - 批量计算每只股票的评分
         - 避免在循环中重复过滤DataFrame
+        
+        Args:
+            final_df: 基础DataFrame，包含股票代码列
+            processed_data: 已处理的原始数据字典，必须包含 'hist_data_all' 或 'kline_data'
+            
+        Returns:
+            pd.DataFrame: 添加了 '多头排列评分' 列的DataFrame，评分范围0-100
         """
         hist_df_all = processed_data.get("hist_data_all")
         if hist_df_all is None:
@@ -673,8 +886,20 @@ class StockAnalyzer:
         """
         合并资金流数据并进行动能分析
         
-        使用配置中的 FUND_FLOW_PERIODS 决定处理哪些周期的数据
-        akshare接口限制：仅支持3、5、10、20日四个周期
+        使用配置中的 FUND_FLOW_PERIODS 决定处理哪些周期的数据。
+        akshare接口限制：仅支持3、5、10、20日四个周期。
+        
+        功能包括：
+        - 根据配置的周期动态获取资金流数据
+        - 计算资金流入/流出动能（加速、减速等）
+        - 合并到最终报告DataFrame
+        
+        Args:
+            final_df: 基础DataFrame，包含股票代码列
+            processed_data: 已处理的原始数据字典，包含各周期的资金流数据
+            
+        Returns:
+            pd.DataFrame: 添加了资金流列和动能列的DataFrame
         """
         # 定义周期映射关系（与akshare接口严格对应）
         period_map = {
@@ -988,9 +1213,28 @@ class StockAnalyzer:
     ) -> pd.DataFrame:
         """
         合并所有数据源和信号，生成最终汇总报告。
+        
         参数 base_stock_codes_pure 是最终报告的基准股票代码列表（纯数字）。
+        
+        Args:
+            processed_data: 已处理的原始数据字典
+            base_stock_codes_pure: 纯数字格式的股票代码列表
+            
+        Returns:
+            pd.DataFrame: 最终汇总报告DataFrame
+            
+        Raises:
+            ValueError: 当关键数据缺失时抛出
         """
         print("\n>>> 正在汇总所有数据和信号 (技术指标作为独立列)...")
+        
+        # 验证输入数据
+        if not base_stock_codes_pure:
+            self.logger.warning("[数据验证] 基准股票代码列表为空")
+            return pd.DataFrame(columns=["股票代码"])
+        
+        if not isinstance(processed_data, dict):
+            raise TypeError(f"processed_data 必须是字典类型，实际为 {type(processed_data)}")
 
         # 初始化最终数据框架
         final_df = pd.DataFrame(base_stock_codes_pure, columns=["股票代码"])
@@ -1015,8 +1259,12 @@ class StockAnalyzer:
         final_df = self._merge_special_data(final_df, processed_data)
 
         # 筛选有信号的股票
+        # 动态获取第二周期MACD列名
+        fast, slow, signal = self.config.MACD_SECOND_PARAMS
+        second_period_name = f"{fast}{slow}{signal}"
+        
         str_cols = [
-            "MACD_12269", "MACD_6135", "MACD_组合背离",
+            "MACD_12269", f"MACD_{second_period_name}", "MACD_组合背离",
             "KDJ_Signal", "CCI_Signal", "RSI_Signal", "BOLL_Signal"
         ]
 
@@ -1100,6 +1348,32 @@ class StockAnalyzer:
                 report_cols.append(period_map[period])
         final_cols = base_cols + signal_cols + report_cols + ["股票链接"]
         final_df = final_df[[col for col in final_cols if col in final_df.columns]]
+        
+        # 最终数据验证
+        if not final_df.empty:
+            # 检查必需列
+            required_report_cols = ["股票代码", "股票简称", "最新价"]
+            is_valid, missing = self.data_validator.validate_required_columns(
+                final_df, required_report_cols, "最终报告"
+            )
+            
+            if not is_valid:
+                self.logger.error(f"[数据验证] 最终报告缺少关键列: {missing}")
+            else:
+                # 验证价格数据
+                price_valid, anomalies = self.data_validator.validate_price_data(
+                    final_df, ['最新价'], "最终报告价格"
+                )
+                
+                if not price_valid:
+                    self.logger.warning(f"[数据验证] 最终报告价格异常: {anomalies}")
+                
+                self.logger.info(
+                    f"[数据验证] 最终报告生成成功: {len(final_df)} 条记录, "
+                    f"{len(final_df.columns)} 个字段"
+                )
+        else:
+            self.logger.warning("[数据验证] 最终报告为空")
 
         return final_df
 
@@ -1542,12 +1816,17 @@ class StockAnalyzer:
                 )
 
                 sync_task = QuantDataPerformer.QuantDBSyncTask(db_manager)
+                
+                # 获取第二周期名称
+                fast, slow, signal = self.config.MACD_SECOND_PARAMS
+                second_period_name = f"{fast}{slow}{signal}"
 
                 sync_task.sync_all(
                     today_str=self.today_str,
                     consolidated_report=consolidated_report,
                     industry_df=industry_analysis_df,
                     raw_data=raw_data,
+                    second_period_name=second_period_name,
                 )
 
                 db_manager.close()

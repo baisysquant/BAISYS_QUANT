@@ -35,8 +35,16 @@ class QuantDBSyncTask:
     def __init__(self, db_manager):
         self.db = db_manager
 
-    def sync_all(self, today_str, consolidated_report, industry_df, raw_data):
-        """执行全量同步主入口"""
+    def sync_all(self, today_str, consolidated_report, industry_df, raw_data, second_period_name='9186'):
+        """执行全量同步主入口
+        
+        Args:
+            today_str: 业务日期字符串
+            consolidated_report: 最终报告DataFrame
+            industry_df: 行业分析DataFrame
+            raw_data: 原始数据字典
+            second_period_name: MACD第二周期名称（如 '9186'）
+        """
         print("\n" + "=" * 50)
         print(f">>> 启动数据库资产化同步任务 业务日期: {today_str}")
         print("=" * 50)
@@ -45,7 +53,7 @@ class QuantDBSyncTask:
             # 1. 同步策略触发归档 (支持一码多策略)
             self._sync_strategy_stocks(today_str, raw_data)
             self._sync_industry_data(today_str, industry_df)
-            self._sync_final_report(today_str, consolidated_report)
+            self._sync_final_report(today_str, consolidated_report, second_period_name)
 
         except Exception as e:
             print(f"!!! [同步中断] 任务运行异常: {e}")
@@ -151,8 +159,14 @@ class QuantDBSyncTask:
 
         self.db.safe_insert_data(df_db, 'ods_ak_industry_analysis', 'archive_date', today)
 
-    def _sync_final_report(self, today, df):
-        """3. 同步决策报告 (APP层) - 完整字段支持版"""
+    def _sync_final_report(self, today, df, second_period_name='9186'):
+        """3. 同步决策报告 (APP层) - 完整字段支持版
+        
+        Args:
+            today: 业务日期
+            df: 最终报告DataFrame
+            second_period_name: MACD第二周期名称（如 '9186'）
+        """
         if df is None or df.empty: return
 
         df_db = df.copy()
@@ -172,12 +186,14 @@ class QuantDBSyncTask:
             '连涨天数': 'consecutive_up_days',
             '放量天数': 'high_vol_days',
             'TOP10行业': 'is_top10_industry',
+            # 标准周期 MACD (固定硬编码)
             'MACD_12269': 'macd_12269_signal',
             'MACD_12269_动能': 'macd_12269_momentum',
             'MACD_12269_DIF': 'macd_12269_dif',
-            'MACD_6135': 'macd_6135_signal',
-            'MACD_6135_动能': 'macd_6135_momentum',
-            'MACD_6135_DIF': 'macd_6135_dif',
+            # 第二周期 MACD (动态映射到通用列)
+            f'MACD_{second_period_name}': 'macd_second_signal',
+            f'MACD_{second_period_name}_动能': 'macd_second_momentum',
+            f'MACD_{second_period_name}_DIF': 'macd_second_dif',
             'KDJ_Signal': 'kdj_signal',
             'CCI_Signal': 'cci_signal',
             'RSI_Signal': 'rsi_signal',
@@ -192,11 +208,14 @@ class QuantDBSyncTask:
         }
 
         df_db.rename(columns=mapping, inplace=True)
+        
+        # 显式添加第二周期名称列
+        df_db['macd_second_period_name'] = second_period_name
 
         text_columns = [
             'stock_code', 'stock_name', 'industry', 'stock_link',
             'macd_12269_signal', 'macd_12269_momentum',
-            'macd_6135_signal', 'macd_6135_momentum',
+            'macd_second_signal', 'macd_second_momentum', 'macd_second_period_name',
             'kdj_signal', 'cci_signal', 'rsi_signal', 'boll_signal',
             'is_strong_stock', 'is_vol_price_rise', 'is_top10_industry', 'is_full_bullish'
         ]

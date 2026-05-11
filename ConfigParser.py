@@ -1,11 +1,54 @@
 # DataManager/Config.py
+"""
+配置管理模块
+
+负责读取和验证 config.ini 配置文件，提供全局配置访问接口。
+支持以下配置分组：
+- DATABASE: 数据库连接配置
+- SYSTEM: 系统运行参数
+- FUND_FLOW: 资金流分析配置
+- TECHNICAL_INDICATORS: 技术指标参数
+- DATA_SYNC: 数据同步配置
+"""
 
 import os
 import configparser
 from pathlib import Path
+from typing import List, Tuple, Optional
 
 class Config:
-    def __init__(self, config_file: str = "config.ini"):
+    """
+    配置管理器类
+    
+    负责加载、解析和验证配置文件，提供统一的配置访问接口。
+    所有配置项在初始化时读取并验证，后续通过属性访问。
+    
+    Attributes:
+        DB_USER: 数据库用户名
+        DB_PASSWORD: 数据库密码
+        DB_HOST: 数据库主机地址
+        DB_PORT: 数据库端口
+        DB_NAME: 数据库名称
+        HOME_DIRECTORY: 主目录路径
+        TEMP_DATA_DIRECTORY: 临时数据目录
+        MAX_WORKERS: 最大线程数
+        FUND_FLOW_PERIODS: 资金流周期列表（必须为3个）
+        MACD_STANDARD_PARAMS: MACD标准周期 (12,26,9)
+        MACD_SECOND_PARAMS: MACD第二周期（必填）
+        ENABLE_MACD_SECOND: 是否启用MACD第二周期（始终为True）
+    """
+    
+    def __init__(self, config_file: str = "config.ini") -> None:
+        """
+        初始化配置管理器
+        
+        Args:
+            config_file: 配置文件路径，默认为 'config.ini'
+            
+        Raises:
+            FileNotFoundError: 配置文件不存在
+            ValueError: 配置参数验证失败
+        """
         self.config_file = config_file
         self._validate_config_file()
         self._load_config()
