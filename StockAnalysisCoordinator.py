@@ -101,7 +101,7 @@ class StockAnalysisCoordinator:
             self.config, self.calendar_mgr, self.logger, self.cache_manager
         )
         self.data_processing = DataProcessingService(
-            self.config, self.logger, FundMomentumAnalyzer()
+            self.config, self.logger, FundMomentumAnalyzer(), self.calendar_mgr
         )
         self.analysis_service = AnalysisService(
             self.config, self.logger, self.db_engine

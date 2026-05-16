@@ -27,7 +27,7 @@ class DataProcessingService:
         momentum_analyzer: 资金流动能分析器
     """
     
-    def __init__(self, config, logger, momentum_analyzer):
+    def __init__(self, config, logger, momentum_analyzer, calendar_mgr=None):
         """
         初始化数据处理服务
         
@@ -35,10 +35,12 @@ class DataProcessingService:
             config: 配置管理器
             logger: 日志管理器
             momentum_analyzer: 资金流动能分析器
+            calendar_mgr: 交易日历管理器（可选）
         """
         self.config = config
         self.logger = logger
         self.momentum_analyzer = momentum_analyzer
+        self.calendar_mgr = calendar_mgr
     
     def consolidate_data(
         self, 

@@ -2,7 +2,7 @@ import os
 import time
 from typing import Callable, Dict, Any, List, Optional
 import pandas as pd
-from LoggerManager import LoggerManager
+from UtilsManager.LoggerManager import LoggerManager
 import os
 
 from ConfigParser import Config
