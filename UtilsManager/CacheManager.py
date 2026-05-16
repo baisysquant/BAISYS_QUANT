@@ -90,11 +90,17 @@ class CacheManager:
             if 'symbol' in df.columns and '股票代码' not in df.columns:
                 df.rename(columns={'symbol': '股票代码'}, inplace=True)
             
-            self.logger.info(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
+            if self.logger:
+                self.logger.info(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
+            else:
+                print(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
             return df
             
         except Exception as e:
-            self.logger.warning(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
+            if self.logger:
+                self.logger.warning(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
+            else:
+                print(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
             return pd.DataFrame()
     
     def save_cache(self, df: pd.DataFrame, base_name: str,
@@ -120,11 +126,17 @@ class CacheManager:
         
         try:
             df.to_csv(file_path, sep=sep, index=False, encoding=encoding)
-            self.logger.info(f"  - 保存数据至缓存: {os.path.basename(file_path)}")
+            if self.logger:
+                self.logger.info(f"  - 保存数据至缓存: {os.path.basename(file_path)}")
+            else:
+                print(f"  - 保存数据至缓存: {os.path.basename(file_path)}")
             return True
             
         except Exception as e:
-            self.logger.error(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
+            if self.logger:
+                self.logger.error(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
+            else:
+                print(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
             return False
     
     def cache_exists(self, base_name: str, cleaned: bool = True) -> bool:

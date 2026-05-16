@@ -296,7 +296,9 @@ class DataProcessingService:
         )
         
         # 标准化K线数据中的股票代码
-        hist_df_all["normalized_code"] = self._normalize_stock_code_in_df(hist_df_all, code_col_in_kline)["normalized_code"]
+        hist_df_all = self._normalize_stock_code_in_df(hist_df_all, code_col_in_kline)
+        # 将标准化后的代码复制到 normalized_code 列
+        hist_df_all["normalized_code"] = hist_df_all[code_col_in_kline]
         
         # 预计算所有均线（向量化操作，比逐行计算快得多）
         for period in self.config.MOVING_AVERAGE_PERIODS:
