@@ -84,11 +84,21 @@ class Config:
         self.DATA_FETCH_RETRIES = system.getint('DATA_FETCH_RETRIES', fallback=3)
         self.DATA_FETCH_DELAY = system.getint('DATA_FETCH_DELAY', fallback=5)
 
-            # 其他配置...
-        self.CODE_ALIASES = {'代码': '股票代码', '证券代码': '股票代码', '股票代码': '股票代码'}
-        self.NAME_ALIASES = {'名称': '股票简称', '股票名称': '股票简称', '股票简称': '股票简称', '简称': '股票简称'}
-        self.PRICE_ALIASES = {'最新价': '最新价', '现价': '最新价', '当前价格': '最新价', '今收盘': '最新价',
-                              '收盘': '最新价', '收盘价': '最新价'}
+        # 读取列名别名配置（从配置文件）
+        col_aliases = config['COLUMN_ALIASES']
+        
+        def parse_aliases(alias_str: str) -> dict:
+            """解析别名字符串为字典，格式：'别名1=目标,别名2=目标'"""
+            aliases = {}
+            for pair in alias_str.split(','):
+                if '=' in pair:
+                    key, value = pair.split('=', 1)
+                    aliases[key.strip()] = value.strip()
+            return aliases
+        
+        self.CODE_ALIASES = parse_aliases(col_aliases.get('code_aliases', '代码=股票代码,证券代码=股票代码,股票代码=股票代码'))
+        self.NAME_ALIASES = parse_aliases(col_aliases.get('name_aliases', '名称=股票简称,股票名称=股票简称,股票简称=股票简称,简称=股票简称'))
+        self.PRICE_ALIASES = parse_aliases(col_aliases.get('price_aliases', '最新价=最新价,现价=最新价,当前价格=最新价,今收盘=最新价,收盘=最新价,收盘价=最新价'))
 
 
         self.TUSHARE_TOKEN = db.get('tushare_token')  # 如果没有配置，默认为 None
@@ -101,33 +111,15 @@ class Config:
 
         # 读取多头排列评分系统配置
         mha = config['MULTI_HEAD_ARRANGEMENT']
-        
-        # 均线周期配置（用于多头排列评分计算）
-        ma_periods_str = mha.get('MOVING_AVERAGE_PERIODS', fallback='5,10,20,30,60,90,120')
-        self.MOVING_AVERAGE_PERIODS = [int(p.strip()) for p in ma_periods_str.split(',')]
-        
-        # 验证均线周期配置
-        if not self.MOVING_AVERAGE_PERIODS:
-            raise ValueError("错误：均线周期列表不能为空")
-        
-        if any(p <= 0 for p in self.MOVING_AVERAGE_PERIODS):
-            raise ValueError(f"错误：均线周期必须为正整数，当前值: {self.MOVING_AVERAGE_PERIODS}")
-        
-        # 建议至少包含短中长期均线
-        recommended_min_periods = {5, 10, 20, 30, 60}
-        missing_recommended = recommended_min_periods - set(self.MOVING_AVERAGE_PERIODS)
-        if missing_recommended:
-            import warnings
-            warnings.warn(
-                f"警告：均线周期缺少推荐的关键周期 {sorted(missing_recommended)}，"
-                f"可能影响多头排列评分的准确性。建议包含: {sorted(recommended_min_periods)}",
-                UserWarning
-            )
-        
         self.FULL_BULL_THRESHOLD = mha.getint('FULL_BULL_THRESHOLD', fallback=85)
         self.TREND_ACCELERATION_THRESHOLD = mha.getint('TREND_ACCELERATION_THRESHOLD', fallback=65)
         self.TREND_OSCILLATION_THRESHOLD = mha.getint('TREND_OSCILLATION_THRESHOLD', fallback=45)
         self.TREND_WATCH_THRESHOLD = mha.getint('TREND_WATCH_THRESHOLD', fallback=45)
+
+        # 读取均线周期配置（用于多头排列评分）
+        # 默认使用 5, 10, 20, 30, 60 日均线
+        ma_periods_str = mha.get('MOVING_AVERAGE_PERIODS', fallback='5,10,20,30,60')
+        self.MOVING_AVERAGE_PERIODS = [int(p.strip()) for p in ma_periods_str.split(',')]
 
         # 读取弱势股过滤规则配置
         fr = config['FILTER_RULES']

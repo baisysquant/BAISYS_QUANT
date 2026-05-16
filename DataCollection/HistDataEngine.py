@@ -374,18 +374,9 @@ class StockSyncEngine:
         filtered_codes = final_codes  # ←  这才是真正的"最终要处理的股票"
         print(f"[INFO]  将获取 {len(filtered_codes)} 只股票的 K 线（基于交集结果）。")
 
-        #  Step 6: 获取最终 Akshare 格式代码
-        akshare_symbols = []
-        for code in filtered_codes:
-            code_str = code.zfill(6)
-            if code_str.startswith('6'):
-                akshare_symbols.append('sh' + code_str)
-            elif code_str.startswith(('0', '3')):
-                akshare_symbols.append('sz' + code_str)
-            elif code_str.startswith(('4', '8', '9')):
-                akshare_symbols.append('bj' + code_str)
-            else:
-                print(f"[WARN] 无法识别代码: {code_str}，跳过。")
+        #  Step 6: 获取最终 Akshare 格式代码（使用统一的格式化函数）
+        from DataManager.ShareCodeFormatMgr import format_stock_code
+        akshare_symbols = [format_stock_code(code) for code in filtered_codes]
 
         #  Step 7: 并发获取 K 线数据（多线程）
         print(f"[INFO] 正在并发获取 {len(akshare_symbols)} 只股票的 K 线数据...")

@@ -8,6 +8,9 @@ from typing import Dict, List
 import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
+from DataManager.ShareCodeFormatMgr import format_stock_code
+from DataManager import ParallelUtils
+from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
 
 
@@ -42,6 +45,40 @@ class DataProcessingService:
         self.momentum_analyzer = momentum_analyzer
         self.calendar_mgr = calendar_mgr
     
+    def _normalize_stock_code_in_df(self, df: pd.DataFrame, code_col: str = "股票代码") -> pd.DataFrame:
+        """
+        统一标准化DataFrame中的股票代码列
+        
+        Args:
+            df: 需要标准化的DataFrame
+            code_col: 股票代码列名，默认"股票代码"
+            
+        Returns:
+            pd.DataFrame: 标准化后的DataFrame（原地修改）
+        """
+        if code_col in df.columns:
+            df[code_col] = CodeNormalizer.normalize_series(df[code_col])
+        return df
+    
+    def _fill_missing_columns(self, df: pd.DataFrame, columns: list, default_value="N/A") -> pd.DataFrame:
+        """
+        批量填充缺失列或缺失值
+        
+        Args:
+            df: DataFrame
+            columns: 需要填充的列名列表
+            default_value: 默认值，默认"N/A"
+            
+        Returns:
+            pd.DataFrame: 填充后的DataFrame（原地修改）
+        """
+        for col in columns:
+            if col not in df.columns:
+                df[col] = default_value
+            else:
+                df[col] = df[col].fillna(default_value)
+        return df
+    
     def consolidate_data(
         self, 
         processed_data: Dict[str, pd.DataFrame],
@@ -71,9 +108,8 @@ class DataProcessingService:
             raise TypeError(f"processed_data 必须是字典类型，实际为 {type(processed_data)}")
         
         # 初始化最终数据框架
-        from UtilsManager.CodeNormalizer import CodeNormalizer
         final_df = pd.DataFrame(base_stock_codes, columns=["股票代码"])
-        final_df["股票代码"] = CodeNormalizer.normalize_series(final_df["股票代码"])
+        final_df["股票代码"] = self._normalize_stock_code_in_df(final_df)["股票代码"]
         
         # 步骤1：合并基础信息（股票名称、实时价格、行业）
         final_df = self.merge_basic_info(final_df, processed_data, base_stock_codes)
@@ -118,7 +154,6 @@ class DataProcessingService:
         Returns:
             pd.DataFrame: 添加了基础信息的DataFrame
         """
-        from UtilsManager.CodeNormalizer import CodeNormalizer
         
         # 从各数据源提取股票名称
         name_dfs = []
@@ -130,7 +165,7 @@ class DataProcessingService:
                 and "股票简称" in df.columns
             ):
                 temp = df[["股票代码", "股票简称"]].copy()
-                temp["股票代码"] = CodeNormalizer.normalize_series(temp["股票代码"])
+                temp = self._normalize_stock_code_in_df(temp)
                 name_dfs.append(temp)
         
         if name_dfs:
@@ -151,7 +186,7 @@ class DataProcessingService:
         # 获取实时数据
         spot_df = processed_data.get("spot_data_all", pd.DataFrame())
         if not spot_df.empty and "股票代码" in spot_df.columns:
-            spot_df["股票代码"] = CodeNormalizer.normalize_series(spot_df["股票代码"])
+            spot_df = self._normalize_stock_code_in_df(spot_df)
             if "最新价" in spot_df.columns:
                 final_df = pd.merge(
                     final_df,
@@ -261,8 +296,7 @@ class DataProcessingService:
         )
         
         # 标准化K线数据中的股票代码
-        from UtilsManager.CodeNormalizer import CodeNormalizer
-        hist_df_all["normalized_code"] = CodeNormalizer.normalize_series(hist_df_all[code_col_in_kline])
+        hist_df_all["normalized_code"] = self._normalize_stock_code_in_df(hist_df_all, code_col_in_kline)["normalized_code"]
         
         # 预计算所有均线（向量化操作，比逐行计算快得多）
         for period in self.config.MOVING_AVERAGE_PERIODS:
@@ -359,7 +393,6 @@ class DataProcessingService:
             pd.DataFrame: 添加了资金流列和动能列的DataFrame
         """
         from DataManager import ParallelUtils as utils
-        from UtilsManager.CodeNormalizer import CodeNormalizer
         
         # 定义周期映射关系（与akshare接口严格对应）
         period_map = {
@@ -384,7 +417,7 @@ class DataProcessingService:
             )
             
             if not fund_flow_df.empty and "股票代码" in fund_flow_df.columns and flow_col:
-                fund_flow_df["股票代码"] = CodeNormalizer.normalize_series(fund_flow_df["股票代码"])
+                fund_flow_df = self._normalize_stock_code_in_df(fund_flow_df)
                 final_df = pd.merge(
                     final_df,
                     fund_flow_df[["股票代码", flow_col]].drop_duplicates(subset=["股票代码"]),
@@ -436,7 +469,7 @@ class DataProcessingService:
         # 处理强势股数据
         strong_df = processed_data.get("strong_stocks_raw", pd.DataFrame())
         if not strong_df.empty and "股票代码" in strong_df.columns:
-            strong_df["股票代码"] = CodeNormalizer.normalize_series(strong_df["股票代码"])
+            strong_df = self._normalize_stock_code_in_df(strong_df)
             strong_codes = set(strong_df["股票代码"].tolist())
             final_df["强势股"] = final_df["股票代码"].apply(
                 lambda x: "是" if x in strong_codes else "否"
@@ -447,7 +480,7 @@ class DataProcessingService:
         # 处理连涨数据
         rise_df = processed_data.get("consecutive_rise_raw", pd.DataFrame())
         if not rise_df.empty and "股票代码" in rise_df.columns:
-            rise_df["股票代码"] = CodeNormalizer.normalize_series(rise_df["股票代码"])
+            rise_df = self._normalize_stock_code_in_df(rise_df)
             rise_df = rise_df[["股票代码", "连涨天数"]].drop_duplicates(subset=["股票代码"])
             final_df = pd.merge(final_df, rise_df, on="股票代码", how="left").fillna(
                 {"连涨天数": 0}
@@ -459,7 +492,7 @@ class DataProcessingService:
         # 处理量价齐升数据
         ljqs_df = processed_data.get("ljqs_raw", pd.DataFrame())
         if not ljqs_df.empty and "股票代码" in ljqs_df.columns:
-            ljqs_df["股票代码"] = CodeNormalizer.normalize_series(ljqs_df["股票代码"])
+            ljqs_df = self._normalize_stock_code_in_df(ljqs_df)
             ljqs_codes = set(ljqs_df["股票代码"].tolist())
             final_df["量价齐升"] = final_df["股票代码"].apply(
                 lambda x: "是" if x in ljqs_codes else "否"
@@ -470,7 +503,7 @@ class DataProcessingService:
         # 处理持续放量数据
         cxfl_df = processed_data.get("cxfl_raw", pd.DataFrame())
         if not cxfl_df.empty and "股票代码" in cxfl_df.columns:
-            cxfl_df["股票代码"] = CodeNormalizer.normalize_series(cxfl_df["股票代码"])
+            cxfl_df = self._normalize_stock_code_in_df(cxfl_df)
             cxfl_df = cxfl_df[["股票代码", "放量天数"]].drop_duplicates(subset=["股票代码"])
             final_df = pd.merge(final_df, cxfl_df, on="股票代码", how="left").fillna(
                 {"放量天数": 0}
@@ -564,30 +597,32 @@ class DataProcessingService:
         momentum_df = processed_data.get("MACD_DIF_MOMENTUM", pd.DataFrame())
         if not momentum_df.empty and "股票代码" in momentum_df.columns:
             final_df = pd.merge(final_df, momentum_df, on="股票代码", how="left")
-            # 动态填充动能列
-            for col in ["MACD_12269_动能"]:
-                if col in final_df.columns:
-                    final_df[col] = final_df[col].fillna("")
+            # 使用辅助方法批量填充动能列
+            macd_momentum_cols = ["MACD_12269_动能"]
             
             # 第二周期动能列（必填）
             fast, slow, signal = self.config.MACD_SECOND_PARAMS
             second_period_name = f"{fast}{slow}{signal}"
             mom_col = f"MACD_{second_period_name}_动能"
-            if mom_col in final_df.columns:
-                final_df[mom_col] = final_df[mom_col].fillna("")
+            macd_momentum_cols.append(mom_col)
+            
+            for col in macd_momentum_cols:
+                if col in final_df.columns:
+                    final_df[col] = final_df[col].fillna("")
         
-        # 填充缺失的技术指标列
+        # 使用辅助方法批量填充缺失的技术指标列
         macd_cols = ["MACD_12269", "MACD_组合背离"]
         # 添加第二周期列名（必填）
         fast, slow, signal = self.config.MACD_SECOND_PARAMS
         second_period_name = f"{fast}{slow}{signal}"
         macd_cols.append(f"MACD_{second_period_name}")
         
-        for col in macd_cols + ["KDJ_Signal", "CCI_Signal", "RSI_Signal", "BOLL_Signal"]:
-            if col in final_df.columns:
-                final_df[col] = final_df[col].fillna("")
-            else:
+        ta_signal_cols = macd_cols + ["KDJ_Signal", "CCI_Signal", "RSI_Signal", "BOLL_Signal"]
+        for col in ta_signal_cols:
+            if col not in final_df.columns:
                 final_df[col] = ""
+            else:
+                final_df[col] = final_df[col].fillna("")
         
         return final_df
     
@@ -606,12 +641,11 @@ class DataProcessingService:
         Returns:
             pd.DataFrame: 添加了特殊数据列的DataFrame
         """
-        from UtilsManager.CodeNormalizer import CodeNormalizer
         
         # 处理行业数据
         top_ind_df = processed_data.get("top_industry_cons_df", pd.DataFrame())
         if not top_ind_df.empty and "股票代码" in top_ind_df.columns:
-            top_ind_df["股票代码"] = CodeNormalizer.normalize_series(top_ind_df["股票代码"])
+            top_ind_df = self._normalize_stock_code_in_df(top_ind_df)
             top_codes = set(top_ind_df["股票代码"].astype(str).unique())
             final_df["TOP10行业"] = final_df["股票代码"].apply(
                 lambda x: "是" if str(x) in top_codes else "否"
@@ -625,7 +659,7 @@ class DataProcessingService:
             if ColumnNames.AKSHARE_CODE_RAW in main_cost_df.columns:
                 main_cost_df.rename(columns={ColumnNames.AKSHARE_CODE_RAW: ColumnNames.STOCK_CODE}, inplace=True)
             if ColumnNames.STOCK_CODE in main_cost_df.columns:
-                main_cost_df[ColumnNames.STOCK_CODE] = CodeNormalizer.normalize_series(main_cost_df[ColumnNames.STOCK_CODE])
+                main_cost_df = self._normalize_stock_code_in_df(main_cost_df, ColumnNames.STOCK_CODE)
                 final_df = pd.merge(
                     final_df,
                     main_cost_df[
@@ -643,15 +677,19 @@ class DataProcessingService:
                     on=ColumnNames.STOCK_CODE,
                     how="left",
                 )
-                final_df["主力成本"] = final_df["主力成本"].fillna("N/A")
-                final_df["主力成本差价"] = final_df["主力成本差价"].fillna("N/A")
-                final_df["成本位置"] = final_df["成本位置"].fillna("N/A")
-                final_df["主力控盘强度"] = final_df["主力控盘强度"].fillna("N/A")
-        else:
-            final_df["主力成本"] = "N/A"
-            final_df["主力成本差价"] = "N/A"
-            final_df["成本位置"] = "N/A"
-            final_df["主力控盘强度"] = "N/A"
+                # 使用辅助方法批量填充主力成本相关列
+                self._fill_missing_columns(
+                    final_df,
+                    ["主力成本", "主力成本差价", "成本位置", "主力控盘强度"],
+                    default_value="N/A"
+                )
+            else:
+                # 使用辅助方法批量设置默认值
+                self._fill_missing_columns(
+                    final_df,
+                    ["主力成本", "主力成本差价", "成本位置", "主力控盘强度"],
+                    default_value="N/A"
+                )
         
         # 均线突破数据
         xstp_df = processed_data.get("processed_xstp_df", pd.DataFrame())
@@ -660,7 +698,7 @@ class DataProcessingService:
             "10日均线价", "30日均线价", "60日均线价"
         ]
         if not xstp_df.empty and "股票代码" in xstp_df.columns:
-            xstp_df["股票代码"] = CodeNormalizer.normalize_series(xstp_df["股票代码"])
+            xstp_df = self._normalize_stock_code_in_df(xstp_df)
             cols_present = [col for col in xstp_cols if col in xstp_df.columns]
             merge_df = xstp_df[cols_present].drop_duplicates(subset=["股票代码"])
             final_df = pd.merge(final_df, merge_df, on="股票代码", how="left")
@@ -735,7 +773,6 @@ class DataProcessingService:
         final_df.reset_index(drop=True, inplace=True)
         
         # 生成股票链接
-        from DataManager.ShareCodeFormatMgr import format_stock_code
         final_df["完整股票代码"] = final_df[ColumnNames.STOCK_CODE].apply(format_stock_code)
         final_df[ColumnNames.STOCK_LINK] = (
             "https://hybrid.gelonghui.com/stock-check/" + final_df["完整股票代码"]
@@ -846,7 +883,6 @@ class DataProcessingService:
             main_board_pool = stock_sync_engine.get_main_board_pool()
             
             # 标准化股票代码
-            from UtilsManager.CodeNormalizer import CodeNormalizer
             formatted_codes = [CodeNormalizer.normalize(code) for code in stock_codes]
             
             # 筛选出需要的股票代码

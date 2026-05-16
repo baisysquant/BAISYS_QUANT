@@ -55,6 +55,30 @@ class DataFetcher:
                     break
             return code_str.zfill(6)
 
+        def find_column_by_candidates(df: pd.DataFrame, candidates: list) -> str:
+            """
+            从候选列名列表中查找第一个存在的列
+            
+            Args:
+                df: DataFrame
+                candidates: 候选列名列表（支持大小写不敏感匹配）
+                
+            Returns:
+                str: 找到的列名，未找到返回 None
+            """
+            # 先尝试精确匹配
+            for col in candidates:
+                if col in df.columns:
+                    return col
+            
+            # 再尝试大小写不敏感匹配
+            df_cols_lower = {col.lower(): col for col in df.columns}
+            for col in candidates:
+                if col.lower() in df_cols_lower:
+                    return df_cols_lower[col.lower()]
+            
+            return None
+
         alias_mappings = [
             (self.config.CODE_ALIASES, '股票代码'),
             (self.config.NAME_ALIASES, '股票简称'),
@@ -72,8 +96,7 @@ class DataFetcher:
             df['股票代码'] = df['股票代码'].astype(str).apply(extract_pure_code)
         else:
             # 尝试从通用列生成
-            code_col = next((col for col in df.columns
-                             if col.lower() in ['code', 'ts_code', 'symbol']), None)
+            code_col = find_column_by_candidates(df, ['code', 'ts_code', 'symbol'])
             if code_col:
                 df['股票代码'] = df[code_col].astype(str).apply(extract_pure_code)
 
@@ -84,7 +107,7 @@ class DataFetcher:
         # --- 3. 处理股票简称 (ST过滤) ---
         if '股票简称' not in df.columns:
             # 尝试从常见列获取
-            name_col = next((col for col in ['name', '简称', 'symbol'] if col in df.columns), None)
+            name_col = find_column_by_candidates(df, ['name', '简称', 'symbol'])
             if name_col:
                 df['股票简称'] = df[name_col]
             else:
@@ -101,7 +124,7 @@ class DataFetcher:
 
         # --- 4. 处理最新价 ---
         if '最新价' not in df.columns:
-            price_col = next((col for col in ['price', 'close'] if col in df.columns), None)
+            price_col = find_column_by_candidates(df, ['price', 'close'])
             if price_col:
                 df['最新价'] = pd.to_numeric(df[price_col], errors='coerce')
                 print(f"[INFO] 已从 '{price_col}' 生成 '最新价' 列。")

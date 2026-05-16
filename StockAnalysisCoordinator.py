@@ -12,7 +12,7 @@ from typing import Dict, List
 import pandas as pd
 from sqlalchemy import text
 
-from DataManager.ConfigParser import Config
+from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataCollection.HistDataEngine import StockSyncEngine
 from UtilsManager.LoggerManager import LoggerManager
