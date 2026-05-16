@@ -12,9 +12,9 @@ from typing import Dict, List
 import pandas as pd
 from sqlalchemy import text
 
-from ConfigParser import Config
-from DataManager.CalendarManager import TradingCalendarAnalyzer
-from DataManager.HistDataEngine import StockSyncEngine
+from DataManager.ConfigParser import Config
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
+from DataCollection.HistDataEngine import StockSyncEngine
 from UtilsManager.LoggerManager import LoggerManager
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager, CacheStrategy
 from LogicAnalyzer.FundMomentumAnalyzer import FundMomentumAnalyzer

@@ -3,11 +3,10 @@ import time
 from typing import Callable, Dict, Any, List, Optional
 import pandas as pd
 from UtilsManager.LoggerManager import LoggerManager
-import os
 
 from ConfigParser import Config
-
-from DataManager.CalendarManager import TradingCalendarAnalyzer
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
+from UtilsManager.CacheManager import CacheManager
 
 
 
@@ -26,36 +25,10 @@ class DataFetcher:
         self.logger = logger
         self.today_str = calendar_mgr.get_last_trading_day()
         self.temp_dir = config.TEMP_DATA_DIRECTORY
-        os.makedirs(self.temp_dir, exist_ok=True)
+        # 初始化缓存管理器
+        self.cache_manager = CacheManager(self.temp_dir, self.today_str, self.logger)
 
-    def _get_file_path(self, base_name: str, cleaned: bool = False) -> str:
-        """
-        生成临时数据文件的完整路径。如果 cleaned=True, 则添加 "_经清洗" 后缀。
-        """
-        suffix = "_经清洗" if cleaned else ""
-        file_name = f"{base_name}{suffix}_{self.today_str}.txt"
-        return os.path.join(self.temp_dir, file_name)
 
-    def _load_data_from_cache(self, file_path: str) -> pd.DataFrame:
-        """从缓存加载数据。"""
-        if os.path.exists(file_path):
-            try:
-                df = pd.read_csv(file_path, sep='|', encoding='utf-8', dtype={'股票代码': str, 'symbol': str})
-                # 统一列名为 '股票代码'
-                if 'symbol' in df.columns and '股票代码' not in df.columns:
-                    df.rename(columns={'symbol': '股票代码'}, inplace=True)
-                print(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
-                return df
-            except Exception as e:
-                self.logger.warning(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
-        return pd.DataFrame()
-
-    def _save_data_to_cache(self, df: pd.DataFrame, file_path: str):
-        """保存数据到缓存。"""
-        try:
-            df.to_csv(file_path, sep='|', index=False, encoding='utf-8')
-        except Exception as e:
-            self.logger.error(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
 
     def _clean_and_standardize(self, df: pd.DataFrame, df_name: str,
                                clean_pipeline: Optional[Callable] = None) -> pd.DataFrame:
@@ -161,8 +134,7 @@ class DataFetcher:
             清洗后的DataFrame
         """
         # 1. 尝试从【清洗后的缓存】加载数据
-        cleaned_file_path = self._get_file_path(file_base_name, cleaned=True)
-        cached_df = self._load_data_from_cache(cleaned_file_path)
+        cached_df = self.cache_manager.load_cache(file_base_name, cleaned=True)
         if not cached_df.empty:
             return cached_df
 
@@ -189,6 +161,6 @@ class DataFetcher:
         # 3. 清洗数据并保存到带有 "_经清洗" 后缀的缓存文件
         cleaned_df = self._clean_and_standardize(df, file_base_name, clean_pipeline)
         if not cleaned_df.empty:
-            self._save_data_to_cache(cleaned_df, cleaned_file_path)
+            self.cache_manager.save_cache(cleaned_df, file_base_name, cleaned=True)
 
         return cleaned_df

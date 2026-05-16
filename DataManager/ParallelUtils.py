@@ -1,22 +1,37 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterable, List, Any
+import pandas as pd
 
 
 def _normalize_fund_data(df):
     """
-    标准化资金数据：将所有资金相关的字符串列（包含'亿'、'万'单位）统一转换为数值型（单位：万元）。
+    标准化资金数据：将所有资金相关的列统一转换为数值型（单位：万元）。
+    
+    处理逻辑：
+    - 字符串类型：识别'亿'、'万'单位并转换
+    - 数值类型：假设单位为'元'，转换为'万元'（除以10000）
     """
     if df is None or df.empty:
         return df
 
+    # 创建副本避免视图问题
+    df = df.copy()
+
     # 定义关键词，自动识别需要转换单位的列
     zijin_keywords = ['资金', '流向', '净流入', '净额', '成交额']
     target_cols = [col for col in df.columns if any(k in col for k in zijin_keywords)]
+    
+    if not target_cols:
+        return df
 
     for col in target_cols:
-        if df[col].dtype == object:  # 仅处理字符串类型
+        # 判断是否为字符串类型（object类型或dtype.kind为'O'）
+        is_string_type = df[col].dtype.kind == 'O' or df[col].dtype == object
+        
+        # 处理字符串类型（包含'亿'、'万'单位）
+        if is_string_type:
             def convert_to_wan(val):
-                if val is None or str(val).strip() in ['', '-']:
+                if val is None or str(val).strip() in ['', '-', 'nan', 'NaN', 'None']:
                     return 0.0
                 val_str = str(val).strip()
                 try:
@@ -26,10 +41,20 @@ def _normalize_fund_data(df):
                         return float(val_str.replace('万', ''))
                     else:
                         return float(val_str)
-                except:
+                except Exception:
                     return 0.0
 
-            df[col] = df[col].apply(convert_to_wan)
+            # 先转换为Series，再赋值，避免pandas string类型的限制
+            converted_series = df[col].apply(convert_to_wan)
+            df[col] = converted_series.astype(float)
+        
+        # 处理数值类型（假设单位为'元'，转换为'万元'）
+        elif pd.api.types.is_numeric_dtype(df[col]):
+            # 检查是否有异常大的值（可能是'元'为单位）
+            max_val = df[col].abs().max()
+            if pd.notna(max_val) and max_val > 1000000:  # 大于100万，很可能是'元'
+                df.loc[:, col] = df[col] / 10000.0  # 转换为万元
+    
     return df
 
 

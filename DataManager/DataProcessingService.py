@@ -313,8 +313,7 @@ class DataProcessingService:
                 # 计算评分
                 result = calculate_full_bull_score(
                     stock_kline, 
-                    thresholds=thresholds,
-                    ma_periods=self.config.MOVING_AVERAGE_PERIODS
+                    thresholds=thresholds
                 )
                 level = result.get("level", "趋势观望")
                 status = result.get("status", "FAILED")
@@ -840,10 +839,32 @@ class DataProcessingService:
             return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
         
         try:
-            # 注意：这里需要从外部注入db_engine或使用其他方法获取
-            # 暂时返回空DataFrame，实际使用时需要修改
-            self.logger.warning("行业信息获取需要数据库引擎，暂时返回空DataFrame")
-            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+            from DataCollection.HistDataEngine import StockSyncEngine
+            
+            # 调用get_main_board_pool方法从数据库获取股票基本信息
+            stock_sync_engine = StockSyncEngine()
+            main_board_pool = stock_sync_engine.get_main_board_pool()
+            
+            # 标准化股票代码
+            from UtilsManager.CodeNormalizer import CodeNormalizer
+            formatted_codes = [CodeNormalizer.normalize(code) for code in stock_codes]
+            
+            # 筛选出需要的股票代码
+            filtered_pool = main_board_pool[
+                main_board_pool["股票代码"].isin(formatted_codes)
+            ]
+            
+            # 检查是否找到了匹配的股票
+            if filtered_pool.empty:
+                self.logger.warning("数据库中未找到匹配的股票信息")
+                return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+            
+            # 重命名列以匹配期望的格式
+            industry_df = filtered_pool[["股票代码", "name", "industry"]].copy()
+            industry_df.columns = ["股票代码", "股票简称", "行业"]
+            
+            self.logger.info(f"从数据库成功获取 {len(industry_df)} 条行业信息")
+            return industry_df
         
         except Exception as e:
             self.logger.warning(f"从数据库获取行业信息失败: {e}，返回空DataFrame")

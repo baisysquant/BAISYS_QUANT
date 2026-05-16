@@ -226,7 +226,7 @@ class AnalysisService:
             return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
         
         try:
-            from DataManager.HistDataEngine import StockSyncEngine
+            from DataCollection.HistDataEngine import StockSyncEngine
             
             # 调用get_main_board_pool方法
             stock_sync_engine = StockSyncEngine()

@@ -4,7 +4,7 @@ import pandas as pd
 import akshare as ak
 import time
 import numpy as np
-from DataManager.CalendarManager import TradingCalendarAnalyzer
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 
 class IndustryFlowAnalyzer:

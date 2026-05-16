@@ -92,7 +92,7 @@ class QuantDBManager:
                     print(f"  - [错误] {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
                     raise
 
-    def _fast_pg_copy(self, df, table_name, batch_size=5000):
+    def _fast_pg_copy(self, df, table_name, batch_size=500):
         """
         内部方法：利用 PostgreSQL 的 COPY 协议实现秒级入库
         支持分批写入，避免大数据量导致连接断开
@@ -100,7 +100,7 @@ class QuantDBManager:
         Args:
             df: DataFrame数据
             table_name: 表名
-            batch_size: 每批写入的记录数，默认5000条
+            batch_size: 每批写入的记录数，默认500条（A股约5000只股票）
         """
         total_rows = len(df)
         print(f"  - [数据库] 开始分批写入 {table_name}，共 {total_rows} 条记录，每批 {batch_size} 条")

@@ -12,7 +12,7 @@ from datetime import timedelta
 import akshare as ak
 from DataManager.DatabaseWriter import QuantDBManager
 from ConfigParser import Config
-from DataManager.CalendarManager import TradingCalendarAnalyzer
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 
 class StockBasicInfoService:

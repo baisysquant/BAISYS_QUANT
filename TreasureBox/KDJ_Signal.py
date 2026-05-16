@@ -8,7 +8,7 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import create_engine
 import warnings
 from ConfigParser import Config  # 确保 Config.py 在同一环境或路径下
-from DataManager.CalendarManager import TradingCalendarAnalyzer
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 if __name__ == "__main__":
     # --- 1. 配置与路径初始化 ---

@@ -111,10 +111,13 @@ class DataAcquisitionService:
             else:
                 self.logger.warning(f"不支持的资金流周期: {period}日（仅支持3,5,10,20）")
         
-        # 定义单个资金流获取的worker函数
-        def fetch_fund_flow_worker(task):
+        # 串行获取所有资金流数据（避免 py_mini_racer 多线程内存冲突）
+        self.logger.info("\n>>> 正在获取资金流数据...")
+        
+        for task in fund_flow_tasks:
             period, desc, symbol, key = task
             try:
+                self.logger.info(f"  - 正在获取: {desc}...")
                 fund_flow_df = self.data_fetcher.fetch(
                     ak.stock_fund_flow_individual, desc, symbol=symbol
                 )
@@ -128,15 +131,13 @@ class DataAcquisitionService:
                     
                     if is_valid:
                         self.logger.info(f"  - ✓ 已获取 {period}日资金流数据 ({len(fund_flow_df)} 条记录)")
-                        return key, fund_flow_df
+                        data[key] = fund_flow_df
                     else:
                         self.logger.warning(
                             f"  - ⚠ {period}日资金流数据缺少列: {missing}，跳过"
                         )
-                        return key, pd.DataFrame()
                 else:
                     self.logger.warning(f"  - ⚠ {period}日资金流数据为空")
-                    return key, pd.DataFrame()
                     
             except Exception as e:
                 handle_exception_with_recovery(
@@ -146,28 +147,6 @@ class DataAcquisitionService:
                     default_value=None,
                     raise_on_critical=False
                 )
-                return key, pd.DataFrame()
-        
-        # 并行获取所有资金流数据
-        self.logger.info("\n>>> 正在并行获取资金流数据...")
-        
-        from concurrent.futures import ThreadPoolExecutor
-        executor = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
-        
-        futures = {
-            executor.submit(fetch_fund_flow_worker, task): task 
-            for task in fund_flow_tasks
-        }
-        
-        for future in as_completed(futures):
-            task = futures[future]
-            period = task[0]
-            try:
-                key, df = future.result()
-                if not df.empty:
-                    data[key] = df
-            except Exception as e:
-                self.logger.error(f"获取{period}日资金流数据时发生异常: {e}")
         
         # 获取其他数据源（带验证，并行优化版）
         self.logger.info("\n>>> 正在并行获取其他技术指标数据...")

@@ -106,6 +106,11 @@ class Config:
         self.TREND_OSCILLATION_THRESHOLD = mha.getint('TREND_OSCILLATION_THRESHOLD', fallback=45)
         self.TREND_WATCH_THRESHOLD = mha.getint('TREND_WATCH_THRESHOLD', fallback=45)
 
+        # 读取均线周期配置（用于多头排列评分）
+        # 默认使用 5, 10, 20, 30, 60 日均线
+        ma_periods_str = mha.get('MOVING_AVERAGE_PERIODS', fallback='5,10,20,30,60')
+        self.MOVING_AVERAGE_PERIODS = [int(p.strip()) for p in ma_periods_str.split(',')]
+
         # 读取弱势股过滤规则配置
         fr = config['FILTER_RULES']
         self.ENABLE_WEAK_STOCK_FILTER = fr.getboolean('ENABLE_WEAK_STOCK_FILTER', fallback=True)

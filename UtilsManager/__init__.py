@@ -9,5 +9,6 @@ from .PriceExtractor import PriceExtractor
 from . import Exceptions
 from .LoggerManager import LoggerManager
 from .UnifiedCacheManager import UnifiedCacheManager
+from .CacheManager import CacheManager
 
-__all__ = ['CodeNormalizer', 'PriceExtractor', 'Exceptions', 'LoggerManager', 'UnifiedCacheManager']
+__all__ = ['CodeNormalizer', 'PriceExtractor', 'Exceptions', 'LoggerManager', 'UnifiedCacheManager', 'CacheManager']

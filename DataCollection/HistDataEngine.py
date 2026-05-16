@@ -3,8 +3,8 @@ import akshare as ak
 import pandas as pd
 import datetime
 import time
-from DataManager.CalendarManager import TradingCalendarAnalyzer
-
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
+from UtilsManager.CacheManager import CacheManager
 import urllib3.util
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
@@ -61,20 +61,22 @@ class StockSyncEngine:
         self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
 
-        # 缓存文件路径
-        self.main_report_cache_path = os.path.join(
-            self.base_data_dir,
-            f"主力研报盈利预测_完整数据_{self.today}_已处理.csv"
+        # 初始化缓存管理器
+        self.cache_manager = CacheManager(
+            temp_dir=self.base_data_dir,
+            today_str=self.today,
+            logger=None  # HistDataEngine 不使用 LoggerManager，直接用 print
         )
 
-        self.raw_report_cache_path = os.path.join(
-            self.base_data_dir,
-            f"主力研报盈利预测_经清洗_{self.today}.txt"
+        # 缓存文件路径（使用 CacheManager 生成）
+        self.main_report_cache_path = self.cache_manager.get_cache_path(
+            "主力研报盈利预测_完整数据", cleaned=True, suffix=".csv"
         )
-
-        self.kline_cache_path = os.path.join(
-            self.base_data_dir,
-            f"股票K线数据_已处理_{self.today}.csv"
+        self.raw_report_cache_path = self.cache_manager.get_cache_path(
+            "主力研报盈利预测", cleaned=True
+        )
+        self.kline_cache_path = self.cache_manager.get_cache_path(
+            "股票K线数据_已处理", cleaned=True, suffix=".csv"
         )
 
     def get_main_board_pool(self) -> pd.DataFrame:
@@ -115,8 +117,8 @@ class StockSyncEngine:
             # 如果数据库查询失败，返回空DataFrame
             return pd.DataFrame(columns=['ts_code', 'name', 'industry', '股票代码'])
 
-    def _safe_ak_fetch(self, fetch_func: callable, description: str, cleaned_file_path: str = None,
-                       **kwargs) -> pd.DataFrame:
+    def _safe_ak_fetch(self, fetch_func: callable, description: str, 
+                       cache_base_name: str = None, **kwargs) -> pd.DataFrame:
         """带重试、缓存、清洗的 Akshare 数据获取。"""
 
         def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -130,23 +132,22 @@ class StockSyncEngine:
             return df
 
         # 1. 尝试加载清洗后的缓存
-        if cleaned_file_path and os.path.exists(cleaned_file_path):
-            try:
-                df = pd.read_csv(
-                    cleaned_file_path,
-                    sep='|',
-                    encoding='utf-8-sig',
-                    dtype={
-                        '股票代码': str, '股票简称': str,
-                        '机构投资评级(近六个月)-买入': float,
-                        '2024预测每股收益': float, '2025预测每股收益': float
-                    }
-                )
-                df = _standardize_columns(df)
-                print(f"  -  从缓存加载: {os.path.basename(cleaned_file_path)}")
-                return df
-            except Exception as e:
-                print(f"[WARN] 加载缓存失败: {e}，将重试获取")
+        if cache_base_name:
+            cached_df = self.cache_manager.load_cache(
+                cache_base_name, 
+                cleaned=True,
+                sep='|',
+                encoding='utf-8-sig',
+                dtype_mapping={
+                    '股票代码': str, '股票简称': str,
+                    '机构投资评级(近六个月)-买入': float,
+                    '2024预测每股收益': float, '2025预测每股收益': float
+                }
+            )
+            if not cached_df.empty:
+                cached_df = _standardize_columns(cached_df)
+                print(f"  -  从缓存加载: {os.path.basename(self.cache_manager.get_cache_path(cache_base_name, cleaned=True))}")
+                return cached_df
 
         df = pd.DataFrame()
         for i in range(self.AKSHARE_RETRIES):
@@ -170,12 +171,14 @@ class StockSyncEngine:
             df['股票代码'] = df['股票代码'].astype(str).str.zfill(6)
             df = df.drop_duplicates(subset=['股票代码'])
 
-        if cleaned_file_path and not df.empty:
-            try:
-                df.to_csv(cleaned_file_path, sep='|', index=False, encoding='utf-8-sig')
-                print(f"  -  保存 {description} 至缓存: {os.path.basename(cleaned_file_path)}")
-            except Exception as e:
-                print(f"[ERROR] 保存缓存失败: {e}")
+        if cache_base_name and not df.empty:
+            self.cache_manager.save_cache(
+                df, 
+                cache_base_name, 
+                cleaned=True,
+                sep='|',
+                encoding='utf-8-sig'
+            )
 
         return df
 
@@ -190,7 +193,7 @@ class StockSyncEngine:
         report_df = self._safe_ak_fetch(
             fetch_func=ak.stock_profit_forecast_em,
             description="主力研报盈利预测",
-            cleaned_file_path=self.raw_report_cache_path
+            cache_base_name="主力研报盈利预测"
         )
 
         if report_df.empty:
