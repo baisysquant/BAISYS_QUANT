@@ -1,9 +1,9 @@
 import pandas as pd
 from typing import List, Dict, Optional, Any
 import pandas_ta as ta  # 勿删
-from MACDAnalyzer import MACDAnalyzer
-from FormatManager.ShareCodeFormatMgr import format_stock_code
-from KDJAnalyzer import AdvancedKDJAnalyzer
+from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
+from DataManager.ShareCodeFormatMgr import format_stock_code
+from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
 from ConfigParser import Config
 
 

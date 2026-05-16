@@ -18,15 +18,31 @@ class QuantDBManager:
         self.engine = create_engine(
             self.conn_str,
             connect_args={
-                'connect_timeout': 10,
-                'client_encoding': 'utf8'
+                'connect_timeout': 30,  # 增加连接超时到30秒
+                'client_encoding': 'utf8',
+                'keepalives': 1,  # 启用TCP keepalive
+                'keepalives_idle': 30,  # 空闲30秒后发送keepalive
+                'keepalives_interval': 10,  # keepalive间隔10秒
+                'keepalives_count': 5  # keepalive重试次数
             },
-            pool_pre_ping=True
+            pool_pre_ping=True,  # 每次使用前检查连接是否有效
+            pool_size=5,  # 连接池大小
+            max_overflow=10,  # 最大溢出连接数
+            pool_timeout=60,  # 获取连接超时时间
+            pool_recycle=3600  # 连接回收时间（秒）
         )
 
-    def safe_insert_data(self, df, table_name, date_column, today_str):
+    def safe_insert_data(self, df, table_name, date_column, today_str, max_retries=3):
         """
         幂等写入：先删除今天的数据，再使用快速 COPY 插入
+        支持自动重试机制
+        
+        Args:
+            df: DataFrame数据
+            table_name: 表名
+            date_column: 日期列名
+            today_str: 业务日期字符串
+            max_retries: 最大重试次数，默认3次
         """
         if df is None or df.empty:
             print(f"  - [数据库] 表 {table_name} 无有效数据，跳过写入。")
@@ -39,30 +55,74 @@ class QuantDBManager:
             # 如果没有，则添加
             df = df.assign(**{date_column: today_str})
 
-        with self.engine.connect() as conn:
-            trans = conn.begin()
+        # 重试逻辑
+        for attempt in range(1, max_retries + 1):
             try:
-                # --- 修改点 2: 使用传入的 today_str 进行删除 ---
-                # 这里的逻辑是正确的，因为我们传入的是交易日
-                delete_query = text(f"DELETE FROM {table_name} WHERE {date_column} = :today")
-                result = conn.execute(delete_query, {"today": today_str})
-                trans.commit()
-                print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
+                with self.engine.connect() as conn:
+                    trans = conn.begin()
+                    try:
+                        # --- 修改点 2: 使用传入的 today_str 进行删除 ---
+                        # 这里的逻辑是正确的，因为我们传入的是交易日
+                        delete_query = text(f"DELETE FROM {table_name} WHERE {date_column} = :today")
+                        result = conn.execute(delete_query, {"today": today_str})
+                        trans.commit()
+                        print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
 
+                    except Exception as e:
+                        trans.rollback()
+                        print(f" - [数据库错误] {table_name} 清理失败: {e}")
+                        raise
+
+                try:
+                    self._fast_pg_copy(df, table_name)
+                    print(f" - [数据库] {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
+                    return  # 成功则返回
+                except Exception as e:
+                    print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
+                    raise
+                    
             except Exception as e:
-                trans.rollback()
-                print(f" - [数据库错误] {table_name} 清理失败: {e}")
-                return
+                if attempt < max_retries:
+                    import time
+                    wait_time = 2 ** attempt  # 指数退避：2s, 4s, 8s
+                    print(f"  - [警告] {table_name} 写入失败 (尝试 {attempt}/{max_retries}): {e}")
+                    print(f"  - [警告] {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  - [错误] {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
+                    raise
 
-            try:
-                self._fast_pg_copy(df, table_name)
-                print(f" - [数据库] {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
-            except Exception as e:
-                print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
-
-    def _fast_pg_copy(self, df, table_name):
+    def _fast_pg_copy(self, df, table_name, batch_size=5000):
         """
         内部方法：利用 PostgreSQL 的 COPY 协议实现秒级入库
+        支持分批写入，避免大数据量导致连接断开
+        
+        Args:
+            df: DataFrame数据
+            table_name: 表名
+            batch_size: 每批写入的记录数，默认5000条
+        """
+        total_rows = len(df)
+        print(f"  - [数据库] 开始分批写入 {table_name}，共 {total_rows} 条记录，每批 {batch_size} 条")
+        
+        # 如果数据量小于batch_size，直接写入
+        if total_rows <= batch_size:
+            self._write_batch(df, table_name)
+            return
+        
+        # 分批写入
+        for i in range(0, total_rows, batch_size):
+            batch_df = df.iloc[i:i+batch_size]
+            try:
+                self._write_batch(batch_df, table_name)
+                print(f"  - [数据库] {table_name} 批次 {i//batch_size + 1}/{(total_rows-1)//batch_size + 1} 写入成功 ({len(batch_df)} 条)")
+            except Exception as e:
+                print(f"  - [数据库错误] {table_name} 批次 {i//batch_size + 1} 写入失败: {e}")
+                raise e
+    
+    def _write_batch(self, df, table_name):
+        """
+        写入单个批次的数据
         """
         output = io.StringIO()
         df.to_csv(output, sep='\t', header=False, index=False, encoding='utf-8')
