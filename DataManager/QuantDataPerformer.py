@@ -230,6 +230,14 @@ class QuantDBSyncTask:
                 df_db[col] = pd.to_numeric(df_db[col], errors='coerce').fillna(0).astype(int)
 
         final_valid_cols = [v for v in mapping.values() if v in df_db.columns]
+        
+        # 【关键修复】在写入前对 stock_code 去重，防止主键冲突
+        if 'stock_code' in df_db.columns:
+            before_count = len(df_db)
+            df_db = df_db.drop_duplicates(subset=['stock_code'], keep='last')
+            after_count = len(df_db)
+            if before_count != after_count:
+                print(f"  - [数据清洗] 发现 {before_count - after_count} 条重复股票代码，已自动去重。")
 
         self.db.safe_insert_data(
             df_db[final_valid_cols],

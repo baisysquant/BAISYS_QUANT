@@ -1,7 +1,11 @@
+import sys
 import os
+# 将项目根目录加入系统路径，支持直接运行此脚本
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import akshare as ak
 import pandas as pd
-import datetime
+from datetime import datetime
 import time
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from UtilsManager.CacheManager import CacheManager
@@ -78,6 +82,12 @@ class StockSyncEngine:
         self.kline_cache_path = self.cache_manager.get_cache_path(
             "股票K线数据_已处理", cleaned=True, suffix=".csv"
         )
+        
+        # 失败股票列表文件路径
+        self.failed_symbols_file = os.path.join(self.base_data_dir, f"failed_symbols_{self.today}.json")
+        
+        # 已成功获取的股票列表文件路径（用于增量更新）
+        self.success_symbols_file = os.path.join(self.base_data_dir, f"success_symbols_{self.today}.json")
 
     def get_main_board_pool(self) -> pd.DataFrame:
         """
@@ -182,81 +192,93 @@ class StockSyncEngine:
 
         return df
 
-    def _get_research_report_filtered_symbols(self) -> Set[str]:
+    def _get_research_report_data(self) -> pd.DataFrame:
         """
-        获取研报"机构投资评级(近六个月)-买入" > 1 的股票代码集合。
-        返回纯数字代码（如 '000001'）。
+        获取研报数据（不过滤），返回包含股票代码和买入评级的DataFrame。
+        用于后续作为特征列添加到报告中。
         """
-        print("\n>>> 正在获取主力研报盈利预测并进行过滤...")
-
+        print("\n>>> 正在获取主力研报盈利预测数据...")
+    
         # 获取原始数据
         report_df = self._safe_ak_fetch(
             fetch_func=ak.stock_profit_forecast_em,
             description="主力研报盈利预测",
             cache_base_name="主力研报盈利预测"
         )
-
+    
         if report_df.empty:
-            print("[WARNING] 未获取到研报数据，返回空集合")
-            return set()
-
+            print("[WARNING] 未获取到研报数据，返回空DataFrame")
+            return pd.DataFrame()
+    
         # 标准化列名
         if '股票代码' not in report_df.columns:
             report_df.rename(columns={'代码': '股票代码'}, inplace=True)
         if '机构投资评级(近六个月)-买入' not in report_df.columns:
             report_df.rename(columns={'买入 (次)': '机构投资评级(近六个月)-买入'}, inplace=True)
-
+    
         # 清洗
         report_df = report_df.drop_duplicates(subset=['股票代码'])
         report_df['股票代码'] = report_df['股票代码'].astype(str).str.zfill(6)
-
-        # 过滤
-        report_df['机构投资评级(近六个月)-买入'] = pd.to_numeric(report_df['机构投资评级(近六个月)-买入'],
-                                                                 errors='coerce').fillna(0)
-        qualified = report_df[report_df['机构投资评级(近六个月)-买入'] > 0]['股票代码'].unique()
-
-        result = set(qualified)
-        print(f"[INFO] 过滤后剩余 {len(result)} 只符合条件的股票。")
-
-        return result
+    
+        # 转换为数值型
+        report_df['机构投资评级(近六个月)-买入'] = pd.to_numeric(
+            report_df['机构投资评级(近六个月)-买入'], errors='coerce'
+        ).fillna(0).astype(int)
+    
+        print(f"[INFO] 获取到 {len(report_df)} 只股票的研报数据。")
+        return report_df[['股票代码', '机构投资评级(近六个月)-买入']]
 
     def _fetch_kline_for_symbol(self, symbol: str) -> pd.DataFrame:
         """获取单个股票的前复权 + 不复权数据，合并输出"""
         try:
+            # 尝试获取前复权数据
             df_qfq = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self.global_start, end_date=self.today,
                                            adjust="qfq")
             time.sleep(0.05)
-            if df_qfq.empty:
+            
+            if df_qfq is None or df_qfq.empty:
                 return None
 
             expected_cols = ['date', 'open', 'close', 'high', 'low', 'amount']
             missing = [c for c in expected_cols if c not in df_qfq.columns]
             if missing:
-                print(f"[ERROR] QFQ 数据缺失列: {missing}")
+                # 北交所股票可能返回不同结构的数，记录并跳过
+                print(f"[WARN] {symbol} QFQ 数据缺失列: {missing}，跳过。")
                 return None
 
+            # 尝试获取不复权数据
             df_norm = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self.global_start, end_date=self.today, adjust="")
             time.sleep(0.05)
-            if df_norm.empty:
+            
+            if df_norm is None or df_norm.empty:
+                return None
+            
+            if 'close' not in df_norm.columns or 'amount' not in df_norm.columns:
+                print(f"[WARN] {symbol} 不复权数据缺失必要列，跳过。")
                 return None
 
             df_norm = df_norm[['date', 'close', 'amount']].rename(
                 columns={'close': 'close_normal', 'amount': 'volume_normal'})
+            
+            # 合并数据
             df = pd.merge(df_qfq, df_norm, on='date', how='inner')
             if df.empty:
                 return None
 
-            df['close'] = pd.to_numeric(df['close'])
-            df['close_normal'] = pd.to_numeric(df['close_normal'])
+            # 数值转换与计算
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df['close_normal'] = pd.to_numeric(df['close_normal'], errors='coerce')
             df['adj_ratio'] = df['close'] / df['close_normal'].replace(0, pd.NA)
 
-            # 计算复权成交量
-            df['amount'] = pd.to_numeric(df['amount'])
-            df['volume_normal'] = pd.to_numeric(df['volume_normal'])
+            df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+            df['volume_normal'] = pd.to_numeric(df['volume_normal'], errors='coerce')
             df['volume_adj_ratio'] = df['amount'] / df['volume_normal'].replace(0, pd.NA)
             df['volume'] = df['volume_normal'] * df['volume_adj_ratio']
 
-            df.dropna(subset=['adj_ratio'], inplace=True)
+            df.dropna(subset=['adj_ratio', 'volume'], inplace=True)
+            
+            if df.empty:
+                return None
 
             df['symbol'] = format_stock_code(symbol)
             df['date'] = pd.to_datetime(df['date'])
@@ -267,9 +289,261 @@ class StockSyncEngine:
                 'close_normal', 'volume', 'adj_ratio'
             ]
             return df[final_cols]
+        except KeyError as e:
+            # 专门捕获键错误（如 'day'），这通常意味着接口返回结构异常
+            print(f"[ERROR] 获取 {symbol} 数据结构异常 (KeyError: {e})，可能是接口不支持该股票。")
+            return None
         except Exception as e:
             print(f"[ERROR] 获取 {symbol} 数据失败: {e}")
             return None
+
+    def _fetch_kline_with_delay(self, symbol: str, delay_seconds: float = 0) -> pd.DataFrame:
+        """
+        带错峰延迟的 K 线获取方法
+        
+        Args:
+            symbol: 股票代码
+            delay_seconds: 请求前的延迟时间（秒）
+        """
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        return self._fetch_kline_for_symbol(symbol)
+
+    def _load_failed_symbols(self) -> List[str]:
+        """加载上次失败的股票列表"""
+        if not os.path.exists(self.failed_symbols_file):
+            return []
+        
+        try:
+            with open(self.failed_symbols_file, 'r', encoding='utf-8') as f:
+                failed_list = json.load(f)
+            print(f"[断点续传] 加载失败列表: {len(failed_list)} 只股票")
+            return failed_list
+        except Exception as e:
+            print(f"[WARN] 加载失败列表失败: {e}")
+            return []
+
+    def _save_failed_symbols(self, failed_symbols: List[str]):
+        """保存失败的股票列表到本地"""
+        try:
+            with open(self.failed_symbols_file, 'w', encoding='utf-8') as f:
+                json.dump(failed_symbols, f, ensure_ascii=False, indent=2)
+            print(f"[断点续传] 已保存 {len(failed_symbols)} 只失败股票至: {os.path.basename(self.failed_symbols_file)}")
+        except Exception as e:
+            print(f"[ERROR] 保存失败列表失败: {e}")
+
+    def _clear_failed_symbols(self):
+        """清除失败股票列表文件（全部成功时调用）"""
+        if os.path.exists(self.failed_symbols_file):
+            try:
+                os.remove(self.failed_symbols_file)
+                print(f"[断点续传] 已清除失败列表文件")
+            except Exception as e:
+                print(f"[WARN] 清除失败列表文件失败: {e}")
+
+    def _load_success_symbols(self) -> Set[str]:
+        """加载已成功获取的股票列表（用于增量更新）"""
+        if not os.path.exists(self.success_symbols_file):
+            return set()
+        
+        try:
+            with open(self.success_symbols_file, 'r', encoding='utf-8') as f:
+                success_set = set(json.load(f))
+            print(f"[增量更新] 发现今日已成功获取 {len(success_set)} 只股票，将跳过重复获取")
+            return success_set
+        except Exception as e:
+            print(f"[WARN] 加载成功列表失败: {e}")
+            return set()
+
+    def _save_success_symbols(self, success_symbols: List[str], append: bool = True):
+        """
+        保存已成功获取的股票列表
+        
+        Args:
+            success_symbols: 新成功的股票列表
+            append: 是否追加到已有列表（True=追加，False=覆盖）
+        """
+        try:
+            existing = set()
+            if append and os.path.exists(self.success_symbols_file):
+                with open(self.success_symbols_file, 'r', encoding='utf-8') as f:
+                    existing = set(json.load(f))
+            
+            # 合并新旧成功列表
+            all_success = existing | set(success_symbols)
+            
+            with open(self.success_symbols_file, 'w', encoding='utf-8') as f:
+                json.dump(list(all_success), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[ERROR] 保存成功列表失败: {e}")
+
+    def _clear_success_symbols(self):
+        """清除成功股票列表文件"""
+        if os.path.exists(self.success_symbols_file):
+            try:
+                os.remove(self.success_symbols_file)
+                print(f"[增量更新] 已清除成功列表文件")
+            except Exception as e:
+                print(f"[WARN] 清除成功列表文件失败: {e}")
+
+    def _has_today_batch_files(self, kline_cache_dir: str) -> bool:
+        """
+        检查是否有当前业务交易日的批次文件
+        
+        Args:
+            kline_cache_dir: 批次缓存目录路径
+            
+        Returns:
+            bool: 如果有当前交易日的批次文件返回True，否则返回False
+        """
+        if not os.path.exists(kline_cache_dir):
+            return False
+        
+        try:
+            # 获取最后一个交易日（YYYY-MM-DD），并转换为 YYYYMMDD
+            last_trading_day = TradingCalendarAnalyzer().get_last_trading_day()
+            trading_date_prefix = last_trading_day.replace('-', '')
+            
+            for filename in os.listdir(kline_cache_dir):
+                if filename.startswith('kline_batch_') and filename.endswith('.csv'):
+                    # 提取时间戳部分（格式：kline_batch_YYYYMMDDHHMMSS.csv）
+                    parts = filename.replace('.csv', '').split('_')
+                    if len(parts) == 3:
+                        file_timestamp = parts[2]
+                        file_date = file_timestamp[:8]
+                        # 如果找到当前交易日的批次文件，立即返回True
+                        if file_date == trading_date_prefix:
+                            return True
+            
+            return False
+        except Exception as e:
+            print(f"[WARN] 检查批次文件失败: {e}")
+            return False
+
+    def _cleanup_old_batch_files(self, kline_cache_dir: str):
+        """清理旧的批次文件，只保留当前业务交易日的批次（通过时间戳判断）"""
+        if not os.path.exists(kline_cache_dir):
+            return
+        
+        try:
+            # 获取最后一个交易日（YYYY-MM-DD），并转换为 YYYYMMDD
+            last_trading_day = TradingCalendarAnalyzer().get_last_trading_day()
+            trading_date_prefix = last_trading_day.replace('-', '')
+            cleaned_count = 0
+            
+            for filename in os.listdir(kline_cache_dir):
+                if filename.startswith('kline_batch_') and filename.endswith('.csv'):
+                    # 从文件名中提取时间戳部分（格式：kline_batch_YYYYMMDDHHMMSS.csv）
+                    parts = filename.replace('.csv', '').split('_')
+                    if len(parts) == 3:
+                        file_timestamp = parts[2]  # 第3部分是时间戳（YYYYMMDDHHMMSS）
+                        file_date = file_timestamp[:8]  # 提取前8位作为日期（YYYYMMDD）
+                        
+                        # 如果不是当前交易日的批次文件，则删除
+                        if file_date != trading_date_prefix:
+                            file_path = os.path.join(kline_cache_dir, filename)
+                            os.remove(file_path)
+                            print(f"[清理] 已删除旧批次文件: {filename} (数据日期: {file_date})")
+                            cleaned_count += 1
+                    else:
+                        # 兼容旧格式（带批次序号或无时间戳），直接删除
+                        file_path = os.path.join(kline_cache_dir, filename)
+                        os.remove(file_path)
+                        print(f"[清理] 已删除旧批次文件: {filename} (旧格式)")
+                        cleaned_count += 1
+            
+            if cleaned_count > 0:
+                print(f"[清理] 共清理 {cleaned_count} 个旧批次文件")
+        except Exception as e:
+            print(f"[WARN] 清理旧批次文件失败: {e}")
+
+    def _load_and_merge_cached_data(self, kline_cache_dir: str):
+        """
+        加载并合并今日已缓存的批次数据，直接写入数据库
+        
+        Args:
+            kline_cache_dir: 批次缓存目录路径
+        """
+        if not os.path.exists(kline_cache_dir):
+            print("[WARN] 批次缓存目录不存在")
+            return
+        
+        # 查找所有批次文件（只加载当前交易日的）
+        last_trading_day = TradingCalendarAnalyzer().get_last_trading_day()
+        trading_date_prefix = last_trading_day.replace('-', '')
+        batch_files = []
+        
+        for f in os.listdir(kline_cache_dir):
+            if f.startswith('kline_batch_') and f.endswith('.csv'):
+                # 提取时间戳部分（格式：kline_batch_YYYYMMDDHHMMSS.csv）
+                parts = f.replace('.csv', '').split('_')
+                if len(parts) == 3:
+                    file_timestamp = parts[2]  # 第3部分是时间戳
+                    file_date = file_timestamp[:8]
+                    # 只保留当前交易日的批次文件
+                    if file_date == trading_date_prefix:
+                        batch_files.append(f)
+                else:
+                    # 兼容旧格式（带批次序号或无时间戳），也加载
+                    batch_files.append(f)
+        
+        # 按文件名排序（保证批次顺序）
+        batch_files = sorted(batch_files)
+        
+        if not batch_files:
+            print("[WARN] 未找到任何批次缓存文件")
+            return
+        
+        print(f"[INFO] 发现 {len(batch_files)} 个批次缓存文件，开始合并...")
+        
+        # 加载并合并所有批次
+        all_dfs = []
+        total_records = 0
+        
+        for batch_file in batch_files:
+            try:
+                file_path = os.path.join(kline_cache_dir, batch_file)
+                df = pd.read_csv(file_path, sep='|', encoding='utf-8-sig')
+                all_dfs.append(df)
+                total_records += len(df)
+                print(f"  - 加载 {batch_file}: {len(df)} 条记录")
+            except Exception as e:
+                print(f"[ERROR] 加载 {batch_file} 失败: {e}")
+        
+        if not all_dfs:
+            print("[WARNING] 所有批次文件加载失败")
+            return
+        
+        # 合并所有批次
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        print(f"[INFO] 成功合并 {total_records} 条 K 线记录。")
+        
+        # 保存到完整缓存文件
+        try:
+            combined_df.to_csv(
+                self.kline_cache_path,
+                sep='|',
+                index=False,
+                encoding='utf-8-sig'
+            )
+            print(f"[INFO] K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
+        except Exception as e:
+            print(f"[ERROR] 保存 K线数据缓存失败: {e}")
+        
+        # 写入数据库
+        try:
+            combined_df.to_sql(
+                name='stock_daily_kline',
+                con=self.db,
+                if_exists='replace',
+                index=False,
+                method='multi',
+                chunksize=5000
+            )
+            print(f"[INFO] 成功将 {len(combined_df)} 条记录写入 'stock_daily_kline' 表。")
+        except Exception as e:
+            print(f"[ERROR] 写入数据库失败: {e}")
+            raise
 
     def _clear_stock_daily_kline_table(self):
         """清空 stock_daily_kline 表"""
@@ -305,22 +579,71 @@ class StockSyncEngine:
         if tushare_df.empty or '股票代码' not in tushare_df.columns:
             print("[CRITICAL] 基础股票池无效")
             return
+        
+        # Step 1.5: 过滤ST股票
+        if 'name' in tushare_df.columns:
+            st_pattern = r'(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])'
+            before_count = len(tushare_df)
+            tushare_df = tushare_df[~tushare_df['name'].astype(str).str.contains(st_pattern, na=False)].copy()
+            after_count = len(tushare_df)
+            filtered_count = before_count - after_count
+            if filtered_count > 0:
+                print(f"[FILTER] 已过滤 {filtered_count} 只ST股票，剩余 {after_count} 只正常股票。")
+            else:
+                print(f"[INFO] 无ST股票需要过滤。")
+        
         tushare_pure_codes = set(tushare_df['股票代码'].unique().tolist())
-        print(f"[INFO] 从数据库获取 {len(tushare_pure_codes)} 只股票。")
+        print(f"[INFO] 从数据库获取 {len(tushare_pure_codes)} 只股票（已剔除ST）。")
 
-        # Step 2: 获取研报符合条件的股票
-        report_codes = self._get_research_report_filtered_symbols()
-        if not report_codes:
-            print("[WARNING] 研报过滤后无股票，数据库将清空")
-            self._clear_stock_daily_kline_table()
-            return
+        # Step 2: 获取研报数据（作为特征，不过滤）
+        report_df = self._get_research_report_data()
+        
+        # 将研报数据保存到processed_data，供后续合并使用
+        if not report_df.empty:
+            # 保存到缓存文件，供 DataProcessingService 读取
+            report_cache_path = self.cache_manager.get_cache_path("研报买入次数", cleaned=True)
+            try:
+                report_df.to_csv(report_cache_path, sep='|', index=False, encoding='utf-8-sig')
+                print(f"[INFO] 研报数据已保存至缓存: {os.path.basename(report_cache_path)}")
+            except Exception as e:
+                print(f"[ERROR] 保存研报数据失败: {e}")
 
-        # Step 3: 交集
-        final_codes = tushare_pure_codes.intersection(report_codes)
-        if not final_codes:
-            print("[CRITICAL] 无共同股票，停止任务")
-            return
-        print(f"[INFO] 双重过滤后保留 {len(final_codes)} 只股票。")
+        #  Step 3: 根据配置决定是否只保留主板股票
+        if self.config.MAIN_BOARD_ONLY:
+            final_codes = {code for code in tushare_pure_codes if code.startswith(('60', '00'))}
+            print(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
+        else:
+            final_codes = tushare_pure_codes
+            print(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
+                
+        # 【新增】Step 3.5: 如果启用了研报过滤，则进行二次过滤
+        if self.config.ENABLE_RESEARCH_REPORT_FILTER and not report_df.empty:
+            print(f"\n[研报过滤] 启用研报二次过滤，阈值: {self.config.RESEARCH_REPORT_MIN_COUNT} 次买入评级")
+            
+            # 筛选出研报买入次数大于阈值的股票
+            filtered_report_df = report_df[report_df['机构投资评级(近六个月)-买入'] > self.config.RESEARCH_REPORT_MIN_COUNT]
+            report_filtered_codes = set(filtered_report_df['股票代码'].unique().tolist())
+            
+            # 与final_codes取交集
+            before_count = len(final_codes)
+            final_codes = final_codes.intersection(report_filtered_codes)
+            after_count = len(final_codes)
+            filtered_count = before_count - after_count
+            
+            print(f"[研报过滤] 原始股票数: {before_count}, 研报过滤后: {after_count}, 过滤掉: {filtered_count}")
+            
+            if after_count == 0:
+                print("[警告] 研报过滤后无股票剩余，请检查阈值设置或研报数据")
+                return
+        elif self.config.ENABLE_RESEARCH_REPORT_FILTER:
+            print(f"[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
+        
+        # 【测试模式】如果环境变量设置了 TEST_MODE，只取前10只股票测试
+        import os as _os
+        if _os.getenv('TEST_MODE', '').lower() == 'true':
+            test_count = int(_os.getenv('TEST_COUNT', '10'))
+            final_codes = sorted(list(final_codes))[:test_count]
+            print(f"[测试模式] 仅获取前 {test_count} 只股票进行流程验证")
 
         #  Step 4: 缓存检查 → 决定是否重取
 
@@ -378,26 +701,159 @@ class StockSyncEngine:
         from DataManager.ShareCodeFormatMgr import format_stock_code
         akshare_symbols = [format_stock_code(code) for code in filtered_codes]
 
-        #  Step 7: 并发获取 K 线数据（多线程）
-        print(f"[INFO] 正在并发获取 {len(akshare_symbols)} 只股票的 K 线数据...")
-        kline_dfs = []
-        with ThreadPoolExecutor(max_workers=12) as executor:
-            futures = {executor.submit(self._fetch_kline_for_symbol, sym): sym for sym in akshare_symbols}
-            for future in as_completed(futures):
-                result = future.result()
-                symbol = futures[future]
-                if result is not None and not result.empty:
-                    kline_dfs.append(result)
-                else:
-                    print(f"[WARN] 获取 {symbol} 的 K 线失败，跳过。")
-
-        #  Step 8: 合并所有 K 线数据
-        if not kline_dfs:
+        #  Step 7: 多线程并发获取 K 线数据（带错峰延迟 + 断点续传 + 增量更新）
+        print(f"[INFO] 正在获取 {len(akshare_symbols)} 只股票的 K 线数据（多线程并发模式）...")
+        
+        # 7.0 检查是否有今天的批次文件（判断是否需要全量获取）
+        kline_cache_dir = os.path.join(self.base_data_dir, "kline_batches")
+        os.makedirs(kline_cache_dir, exist_ok=True)
+        has_today_batches = self._has_today_batch_files(kline_cache_dir)
+        
+        # 7.1 检查今日已成功获取的股票（增量更新）
+        success_symbols = self._load_success_symbols()
+        
+        # 如果没有今天的批次文件，说明是历史数据，需要清空成功列表，从头开始
+        if success_symbols and not has_today_batches:
+            print(f"[警告] 检测到成功列表，但未找到今天的批次文件（可能是历史数据）")
+            print(f"[清理] 清空成功列表和失败列表，将从头开始全量获取...")
+            self._clear_success_symbols()
+            self._clear_failed_symbols()
+            success_symbols = set()  # 重置为空
+        
+        if success_symbols:
+            # 过滤掉已成功的股票
+            original_count = len(akshare_symbols)
+            akshare_symbols = [s for s in akshare_symbols if s not in success_symbols]
+            skipped_count = original_count - len(akshare_symbols)
+            print(f"[增量更新] 跳过 {skipped_count} 只已成功的股票，本次需获取 {len(akshare_symbols)} 只")
+            
+            # 如果全部已成功，直接加载缓存并写入数据库
+            if not akshare_symbols:
+                print(f"[INFO] 今日所有股票 K 线数据已成功获取，无需重复调用接口！")
+                self._load_and_merge_cached_data(kline_cache_dir)
+                return
+        
+        # 7.2 检查是否有上次失败的任务需要重试
+        failed_symbols = self._load_failed_symbols()
+        if failed_symbols:
+            print(f"[断点续传] 发现上次失败的 {len(failed_symbols)} 只股票，优先重试...")
+            # 将失败的股票移到最前面优先处理
+            akshare_symbols = failed_symbols + [s for s in akshare_symbols if s not in failed_symbols]
+        
+        # 7.2 分批并发获取（每500只股票为一批，每批内8线程并发+错峰请求）
+        batch_size = 500  # 每批处理的股票数量
+        max_workers = 8   # 每批内的并发线程数
+        # kline_cache_dir 已在 7.0 步定义
+        
+        total_new_batches = (len(akshare_symbols) + batch_size - 1) // batch_size
+        all_success_dfs = []
+        all_failed_symbols = []
+        total_success = 0
+        total_failed = 0
+        
+        for batch_idx in range(total_new_batches):
+            # 为每个批次生成独立的时间戳（业务交易日 + 当前时分秒）
+            last_trading_day = TradingCalendarAnalyzer().get_last_trading_day()
+            # 将 YYYY-MM-DD 转换为 YYYYMMDD
+            trading_date_str = last_trading_day.replace('-', '')
+            current_time_str = datetime.now().strftime("%H%M%S")
+            batch_timestamp = f"{trading_date_str}{current_time_str}"
+            
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(akshare_symbols))
+            batch_symbols = akshare_symbols[start_idx:end_idx]
+            
+            print(f"\n[批次 {batch_idx + 1}/{total_new_batches}] 处理 {len(batch_symbols)} 只股票...")
+            
+            # 使用线程池并发获取，但每个线程请求后错峰延迟
+            batch_success_dfs = []
+            batch_failed = []
+            batch_current_success = 0  # 当前批次已成功数量
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # 提交任务（无错峰延迟，直接并发）
+                futures = {}
+                for symbol in batch_symbols:
+                    # 直接提交任务，不添加延迟
+                    future = executor.submit(self._fetch_kline_for_symbol, symbol)
+                    futures[future] = symbol
+                
+                # 收集结果
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        result = future.result()
+                        if result is not None and not result.empty:
+                            batch_success_dfs.append(result)
+                            total_success += 1
+                            batch_current_success += 1
+                            # 每50只股票显示一次进度
+                            if batch_current_success % 50 == 0 or batch_current_success == len(batch_symbols):
+                                print(f"  [进度] 批次 {batch_idx + 1} 已成功: {batch_current_success}/{len(batch_symbols)}")
+                        else:
+                            batch_failed.append(symbol)
+                            total_failed += 1
+                    except Exception as e:
+                        batch_failed.append(symbol)
+                        total_failed += 1
+                        print(f"[ERROR] {symbol} 获取异常: {e}")
+            
+            # 7.3 保存本批成功的数据到本地缓存
+            if batch_success_dfs:
+                batch_df = pd.concat(batch_success_dfs, ignore_index=True)
+                # 使用批次独立时间戳作为唯一标识，格式：kline_batch_YYYYMMDDHHMMSS.csv
+                batch_file = os.path.join(kline_cache_dir, f"kline_batch_{batch_timestamp}.csv")
+                batch_df.to_csv(batch_file, sep='|', index=False, encoding='utf-8-sig')
+                print(f"[缓存] 批次 {batch_idx + 1}/{total_new_batches} 已保存: {len(batch_df)} 条记录 -> {os.path.basename(batch_file)}")
+                all_success_dfs.append(batch_df)
+                
+                # 【关键】保存本批成功的股票列表（增量更新）
+                batch_success_codes = [df['symbol'].iloc[0] for df in batch_success_dfs if not df.empty]
+                self._save_success_symbols(batch_success_codes, append=True)
+            else:
+                print(f"[警告] 批次 {batch_idx + 1}/{total_new_batches} 无成功数据")
+            
+            all_failed_symbols.extend(batch_failed)
+            
+            # 显示本批统计
+            batch_success_count = len(batch_success_dfs)
+            batch_fail_count = len(batch_failed)
+            print(f"[批次 {batch_idx + 1} 完成] 成功: {batch_success_count}, 失败: {batch_fail_count}, "
+                  f"累计成功: {total_success}, 累计失败: {total_failed}")
+            
+            # 批次间休息20秒，给接口充分恢复时间
+            if batch_idx < total_new_batches - 1:
+                print(f"[休息] 批次间等待20秒...")
+                time.sleep(20)
+        
+        # 7.4 保存失败列表到本地（供下次重试）
+        if all_failed_symbols:
+            self._save_failed_symbols(all_failed_symbols)
+            print(f"\n{'='*60}")
+            print(f"[统计] 总股票数: {len(akshare_symbols)}")
+            print(f"[统计] 成功获取: {total_success} ({total_success/len(akshare_symbols)*100:.1f}%)")
+            print(f"[统计] 获取失败: {total_failed} ({total_failed/len(akshare_symbols)*100:.1f}%)")
+            print(f"[警告] 共有 {len(all_failed_symbols)} 只股票获取失败，已保存至失败列表。")
+            print(f"[提示] 下次运行时将优先重试这些股票。")
+            print(f"{'='*60}")
+        else:
+            # 如果全部成功，删除失败列表文件、成功列表文件和旧的批次文件
+            self._clear_failed_symbols()
+            self._clear_success_symbols()  # 【新增】清除成功列表（第二天需要重新获取）
+            self._cleanup_old_batch_files(kline_cache_dir)
+            print(f"\n{'='*60}")
+            print(f"[成功] 所有股票 K 线数据获取完成！")
+            print(f"[统计] 总股票数: {len(akshare_symbols)}")
+            print(f"[统计] 成功获取: {total_success} (100%)")
+            print(f"{'='*60}")
+        
+        # 7.5 合并所有批次的数据
+        if not all_success_dfs:
             print("[WARNING] 所有股票 K 线获取失败，数据库将清空。")
             self._clear_stock_daily_kline_table()
             return
 
-        combined_kline_df = pd.concat(kline_dfs, ignore_index=True)
+        combined_kline_df = pd.concat(all_success_dfs, ignore_index=True)
         print(f"[INFO] 成功合并 {len(combined_kline_df)} 条 K 线记录。")
         try:
             # 保存为 CSV，不包含 index

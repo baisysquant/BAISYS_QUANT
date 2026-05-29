@@ -86,6 +86,12 @@ class StockAnalysisCoordinator:
         try:
             self.stock_sync_engine = StockSyncEngine()
             self.db_engine = self.stock_sync_engine.db
+            
+            # 【新增】启动时执行股票基本信息同步（物理日期锁机制）
+            from DataCollection.GetStockBasicinfo import StockBasicInfoService
+            basic_info_service = StockBasicInfoService(self.config)
+            basic_info_service.sync_all_stock_basic_info()
+            
         except Exception as e:
             raise DatabaseConnectionError(f"初始化数据库引擎失败: {e}")
         
@@ -233,8 +239,35 @@ class StockAnalysisCoordinator:
     def _sync_historical_data(self) -> None:
         """同步历史数据到数据库"""
         self.logger.info(">>> 正在同步历史数据到数据库...")
-        self.stock_sync_engine.run_engine()
         self.stock_sync_engine.run_engine(target_date=self.today_str)
+    
+    def _load_research_report_data(self) -> pd.DataFrame:
+        """
+        加载研报数据（从缓存文件）
+        
+        Returns:
+            pd.DataFrame: 包含股票代码和研报买入次数的DataFrame
+        """
+        try:
+            report_cache_path = self.stock_sync_engine.cache_manager.get_cache_path(
+                "研报买入次数", cleaned=True
+            )
+            
+            if os.path.exists(report_cache_path):
+                report_df = pd.read_csv(
+                    report_cache_path,
+                    sep='|',
+                    encoding='utf-8-sig',
+                    dtype={'股票代码': str}
+                )
+                self.logger.info(f"  - 已加载研报数据: {len(report_df)} 条记录")
+                return report_df
+            else:
+                self.logger.warning("  - 研报数据缓存文件不存在")
+                return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"  - 加载研报数据失败: {e}")
+            return pd.DataFrame()
     
     def _get_stock_codes_from_db(self) -> tuple[List[str], List[str]]:
         """
@@ -437,6 +470,11 @@ class StockAnalysisCoordinator:
             "hist_data_all": hist_df,
             "spot_data_all": spot_data,
         }
+        
+        # 加载研报数据（作为加分因子）
+        report_df = self._load_research_report_data()
+        if not report_df.empty:
+            processed_data["research_report_data"] = report_df
         
         return processed_data
     

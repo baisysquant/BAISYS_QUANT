@@ -157,6 +157,9 @@ class ColumnNames:
         
         return cols
     
+    # 研报相关
+    RESEARCH_REPORT_COUNT = "研报买入次数"  # 机构研报买入评级次数（加分因子）
+    
     @classmethod
     def get_report_columns(cls, fund_flow_periods: list = None) -> list:
         """
@@ -171,6 +174,7 @@ class ColumnNames:
         cols = [
             cls.BULL_TREND,
             cls.FUND_MOMENTUM,
+            cls.RESEARCH_REPORT_COUNT,  # 添加研报列
         ]
         
         if fund_flow_periods:

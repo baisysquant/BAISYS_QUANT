@@ -104,6 +104,9 @@ class Config:
         self.TUSHARE_TOKEN = db.get('tushare_token')  # 如果没有配置，默认为 None
         if not self.TUSHARE_TOKEN:
             raise ValueError("配置文件中缺少 'tushare_token'，请在 [DATABASE] 节点下添加。")
+        
+        # 读取主板过滤配置
+        self.MAIN_BOARD_ONLY = db.getboolean('main_board_only', fallback=False)
 
         log = config['LOGGING']
         self.LOG_LEVEL = log.get('LOG_LEVEL', 'INFO')
@@ -217,6 +220,16 @@ class Config:
         
         # 第二周期始终启用
         self.ENABLE_MACD_SECOND = True
+
+        # 读取研报过滤配置
+        try:
+            rrf = config['RESEARCH_REPORT_FILTER']
+            self.ENABLE_RESEARCH_REPORT_FILTER = rrf.getboolean('ENABLE_RESEARCH_REPORT_FILTER', fallback=False)
+            self.RESEARCH_REPORT_MIN_COUNT = rrf.getint('RESEARCH_REPORT_MIN_COUNT', fallback=1)
+        except KeyError:
+            # 如果配置节不存在，使用默认值
+            self.ENABLE_RESEARCH_REPORT_FILTER = False
+            self.RESEARCH_REPORT_MIN_COUNT = 1
 
         for key, val in self.__dict__.items():
             if val is None:

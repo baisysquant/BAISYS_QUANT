@@ -60,7 +60,7 @@ class TradingCalendarAnalyzer:
                         data = json.load(f)
                         # 将列表转为集合
                         dates = set(data.get('dates', []))
-                        print(f"[Calendar] 成功从本地缓存加载数据 (文件未过期)。")
+                        print(f"[Calendar] 交易日历已从本地缓存加载 (文件未过期)。")
                         return dates
                 else:
                     print(f"[Calendar] 本地缓存文件已过期，将尝试更新。")

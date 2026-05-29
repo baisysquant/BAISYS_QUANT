@@ -1,5 +1,8 @@
 import os
 import sys
+# 将项目根目录加入系统路径，支持直接运行此脚本
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
 from datetime import datetime, timedelta
 from openpyxl import Workbook

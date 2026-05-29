@@ -58,15 +58,15 @@ class QuantDBManager:
         # 重试逻辑
         for attempt in range(1, max_retries + 1):
             try:
+                # 确保每次写入前都执行清理操作，防止主键冲突
                 with self.engine.connect() as conn:
                     trans = conn.begin()
                     try:
                         # --- 修改点 2: 使用传入的 today_str 进行删除 ---
-                        # 这里的逻辑是正确的，因为我们传入的是交易日
                         delete_query = text(f"DELETE FROM {table_name} WHERE {date_column} = :today")
                         result = conn.execute(delete_query, {"today": today_str})
-                        trans.commit()
                         print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
+                        trans.commit()
 
                     except Exception as e:
                         trans.rollback()
@@ -79,6 +79,11 @@ class QuantDBManager:
                     return  # 成功则返回
                 except Exception as e:
                     print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
+                    # 如果写入失败，在重试前再次尝试清理，以防是部分写入导致的残留
+                    if attempt < max_retries:
+                        with self.engine.connect() as conn:
+                            conn.execute(text(f"DELETE FROM {table_name} WHERE {date_column} = :today"), {"today": today_str})
+                            conn.commit()
                     raise
                     
             except Exception as e:
@@ -91,6 +96,35 @@ class QuantDBManager:
                 else:
                     print(f"  - [错误] {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
                     raise
+
+    def truncate_and_insert(self, df, table_name):
+        """
+        清表覆盖写入模式：先清空全表，再写入新数据
+        适用于基础信息表等只需要保留一份最新数据的场景
+        
+        Args:
+            df: DataFrame数据
+            table_name: 表名
+        """
+        if df is None or df.empty:
+            print(f"  - [数据库] 表 {table_name} 无有效数据，跳过写入。")
+            return
+        
+        # 步骤1: 清空全表
+        with self.engine.connect() as conn:
+            trans = conn.begin()
+            try:
+                conn.execute(text(f"DELETE FROM {table_name}"))
+                trans.commit()
+                print(f"  - [数据库] {table_name} 表已清空。")
+            except Exception as e:
+                trans.rollback()
+                print(f"  - [数据库错误] {table_name} 清空失败: {e}")
+                raise
+        
+        # 步骤2: 使用 COPY 协议快速写入
+        self._fast_pg_copy(df, table_name)
+        print(f"  - [数据库] {table_name} 成功插入新数据: {len(df)} 条。")
 
     def _fast_pg_copy(self, df, table_name, batch_size=500):
         """

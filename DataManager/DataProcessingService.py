@@ -710,6 +710,28 @@ class DataProcessingService:
         else:
             final_df["完全多头排列"] = final_df["完全多头排列"].fillna("否")
         
+        # 合并研报数据（作为加分因子）
+        report_df = processed_data.get("research_report_data", pd.DataFrame())
+        if not report_df.empty and "股票代码" in report_df.columns:
+            report_df = self._normalize_stock_code_in_df(report_df)
+            # 重命名列
+            if "机构投资评级(近六个月)-买入" in report_df.columns:
+                report_df = report_df.rename(
+                    columns={"机构投资评级(近六个月)-买入": "研报买入次数"}
+                )
+            if "研报买入次数" in report_df.columns:
+                final_df = pd.merge(
+                    final_df,
+                    report_df[["股票代码", "研报买入次数"]].drop_duplicates(subset=["股票代码"]),
+                    on="股票代码",
+                    how="left"
+                )
+                final_df["研报买入次数"] = final_df["研报买入次数"].fillna(0).astype(int)
+            else:
+                final_df["研报买入次数"] = 0
+        else:
+            final_df["研报买入次数"] = 0
+        
         return final_df
     
     def filter_signal_stocks(self, final_df: pd.DataFrame) -> pd.DataFrame:
