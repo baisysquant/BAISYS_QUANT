@@ -19,7 +19,7 @@ class DataValidator:
     提供多种数据质量检查方法，确保数据的完整性和准确性。
     """
 
-    def __init__(self):
+    def __init__(self, logger=None):
         """
         初始化数据验证器
         """

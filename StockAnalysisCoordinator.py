@@ -139,8 +139,19 @@ class StockAnalysisCoordinator:
             hist_df, spot_data = self._get_kline_and_prices(stock_codes_prefixed)
 
             # 步骤5：处理技术指标信号
+       
             ta_signals = self.analysis_service.process_technical_signals(stock_codes_prefixed, hist_df, spot_data)
             self.report_service.save_ta_signals_to_txt(ta_signals, self.today_str)
+
+ 
+            print("\n=== 技术指标数据检查 ===")
+            for key, df in ta_signals.items():
+                  if isinstance(df, pd.DataFrame) and not df.empty:
+                     print(f"{key}: {len(df)} 条数据，列名: {list(df.columns)}")
+                     print(f"  样本数据:\n{df.head(2)}")
+                  else:
+                      print(f"{key}: 空DataFrame")
+
 
             # 步骤6：运行行业分析
             industry_df = self.analysis_service.run_industry_analysis()
