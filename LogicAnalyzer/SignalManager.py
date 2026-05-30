@@ -11,16 +11,16 @@ from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 pd.set_option('mode.chained_assignment', None)
 
 
-def _classify_cci_level(cci_value: float) -&gt; str:
+def _classify_cci_level(cci_value: float) -> str:
     if pd.isna(cci_value):
         return "N/A"
-    if cci_value &gt; 200:
+    if cci_value > 200:
         return f"极度超买 ({cci_value:.2f})"
-    elif cci_value &gt;= 100:
+    elif cci_value >= 100:
         return f"强势超买 ({cci_value:.2f})"
-    elif cci_value &gt; -100:
+    elif cci_value > -100:
         return ""
-    elif cci_value &gt;= -200:
+    elif cci_value >= -200:
         return f"弱势超卖 ({cci_value:.2f})"
     else:
         return f"极度超卖 ({cci_value:.2f})"
@@ -31,7 +31,7 @@ def _process_single_stock(
     hist_df_subset: pd.DataFrame,
     second_period_name: str,
     config: Config
-) -&gt; dict:
+) -> dict:
     """处理单个股票的技术指标（独立函数，用于多进程）"""
     result = {
         "code": code,
@@ -47,7 +47,7 @@ def _process_single_stock(
     }
 
     df = hist_df_subset.copy()
-    if df.empty or len(df) &lt; 30:
+    if df.empty or len(df) < 30:
         return result
 
     for col in ["close", "open", "high", "low"]:
@@ -161,8 +161,8 @@ def _process_single_stock(
                 curr_low = df["low"].iloc[-1]
                 min_low_window = df["low"].iloc[-window:-1].min()
                 min_rsi_window = df[rsi_col].iloc[-window:-1].min()
-                is_price_low = curr_low &lt;= (min_low_window * 1.02)
-                is_divergence = is_price_low and (curr_rsi &gt; min_rsi_window * 1.05) and (curr_rsi &lt; 50)
+                is_price_low = curr_low <= (min_low_window * 1.02)
+                is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
                 rsi_msg = f"RSI底背离! ({curr_rsi:.1f})" if is_divergence else f"RSI={curr_rsi:.1f}"
                 result["rsi"] = {"RSI_Signal": rsi_msg}
     except Exception:
@@ -177,7 +177,7 @@ def _process_single_stock(
             boll_upper_cols = [col for col in df.columns if col.startswith("BBU_")]
             if boll_lower_cols and boll_upper_cols:
                 df["BOLL_BANDWIDTH"] = (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df["close"]
-                is_narrow = df["BOLL_BANDWIDTH"].iloc[-5:].mean() &lt; df["BOLL_BANDWIDTH"].mean()
+                is_narrow = df["BOLL_BANDWIDTH"].iloc[-5:].mean() < df["BOLL_BANDWIDTH"].mean()
                 result["boll"] = {"BOLL_Signal": "低波/缩口" if is_narrow else "常态/张口"}
     except Exception:
         pass
@@ -186,7 +186,7 @@ def _process_single_stock(
 
 
 class TASignalProcessor:
-    def __init__(self, analyzer_instance: Any, config: Config | None = None) -&gt; None:
+    def __init__(self, analyzer_instance: Any, config: Config | None = None) -> None:
         self.analyzer = analyzer_instance
         self.kdj_analyzer = AdvancedKDJAnalyzer()
         self.macd_analyzer = MACDAnalyzer()
@@ -197,7 +197,7 @@ class TASignalProcessor:
         all_codes: list[str],
         hist_df_all: pd.DataFrame,
         spot_df: pd.DataFrame,
-    ) -&gt; dict[str, pd.DataFrame]:
+    ) -> dict[str, pd.DataFrame]:
         print(f"\n正在对 {len(all_codes)} 只股票进行技术分析...")
 
         if self.config and hasattr(self.config, "MACD_SECOND_PARAMS"):
@@ -286,7 +286,7 @@ class TASignalProcessor:
             if pure_code in code_to_hist:
                 tasks.append((code, pure_code))
 
-        if num_processes &gt; 1 and len(tasks) &gt; 10:
+        if num_processes > 1 and len(tasks) > 10:
             with ProcessPoolExecutor(max_workers=num_processes) as executor:
                 futures = []
                 for code, pure_code in tasks:
@@ -393,4 +393,3 @@ class TASignalProcessor:
             ta_signals["MACD_FULL_BULL"] = pd.concat(
                 [ta_signals["MACD_FULL_BULL"], pd.DataFrame([data])], ignore_index=True
             )
-
