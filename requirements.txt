@@ -49,5 +49,11 @@ virtualenv==21.2.0
 webencodings==0.5.1
 websocket-client==1.9.0
 xlrd==2.0.2
-
 scipy
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+loguru>=0.7.0
+# 代码质量工具
+ruff>=0.3.0
+mypy>=1.8.0
+pandera>=0.19.0

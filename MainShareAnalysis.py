@@ -1,37 +1,11 @@
-"""
-股票分析主程序（新架构入口）
-
-这是BAISYS_QUANT系统的主入口文件，使用新的分层架构。
-
-新架构特点：
-- 模块化设计：数据获取、处理、分析、报告生成分离
-- 依赖注入：通过构造函数注入依赖，便于测试
-- 高内聚低耦合：每个服务类职责单一
-- 易于扩展：添加新功能只需新增服务类
-
-旧版本（2005行）已迁移到以下模块：
-- LogicAnalyzer/DataAcquisitionService.py - 数据获取
-- DataManager/DataProcessingService.py - 数据处理
-- LogicAnalyzer/AnalysisService.py - 业务分析
-- DataManager/ReportService.py - 报告生成
-- StockAnalysisCoordinator.py - 主协调器（根目录）
-- UtilsManager/CodeNormalizer.py - 代码标准化
-- UtilsManager/PriceExtractor.py - 价格提取
-
-使用方法：
-    python MainShareAnalysis.py
-
-或者直接使用协调器：
-    python StockAnalysisCoordinator.py
-"""
-
-from StockAnalysisCoordinator import StockAnalysisCoordinator
+from StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+from UtilsManager.LoggerManager import get_logger
 
 
 def main():
     """
     主函数 - 执行完整的股票分析流程
-    
+
     流程步骤：
     1. 同步历史数据到数据库
     2. 获取待分析股票代码列表
@@ -45,7 +19,7 @@ def main():
     10. 剔除弱势且加速下跌的个股
     11. 生成Excel审计报告
     12. 同步结果到数据库
-    
+
     Raises:
         DatabaseConnectionError: 数据库连接失败
         ReportGenerationError: 报告生成失败
@@ -53,47 +27,42 @@ def main():
     """
     import sys
     import io
-    # 强制在 Windows 终端下支持 UTF-8 编码，防止特殊 Unicode/Emoji 字符导致 UnicodeEncodeError
-    if sys.platform.startswith('win'):
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-    print("=" * 80)
-    print("BAISYS_QUANT - A股量化复盘分析系统")
-    print("新架构版本 v2.0")
-    print("=" * 80)
-    print()
-    
+    # 强制在 Windows 终端下支持 UTF-8 编码，防止特殊 Unicode/Emoji 字符导致 UnicodeEncodeError
+    if sys.platform.startswith("win"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
+
+    logger = get_logger()
+
+    logger.info("=" * 80)
+    logger.info("BAISYS_QUANT - A股量化复盘分析系统")
+    logger.info("=" * 80)
+    logger.info("")
+
     try:
-        # 创建协调器实例（自动初始化所有服务）
-        coordinator = StockAnalysisCoordinator(config_file="config.ini")
-        
+        # 使用工厂类创建协调器实例（完全依赖注入）
+        coordinator = StockAnalysisCoordinatorFactory.create(config_file="config.ini")
+
         # 执行完整的分析流程
         coordinator.run()
-        
-        print()
-        print("=" * 80)
-        print("✅ 分析流程完成！")
-        print("=" * 80)
-        print()
-        print("📊 查看报告:")
-        print("   - Excel报告: temp_data/审计报告_YYYYMMDD.xlsx")
-        print("   - 日志文件: logs/Corenews_Main_YYYYMMDD.log")
-        print("   - 技术指标: temp_data/*_Signals_YYYYMMDD.txt")
-        print()
-        
+
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("✅ 分析流程完成！")
+        logger.info("=" * 80)
+        logger.info("")
+        logger.info("   - Excel报告: temp_data/审计报告_YYYYMMDD.xlsx")
+        logger.info("   - 日志文件: logs/Corenews_Main_YYYYMMDD.log")
+        logger.info("")
+
     except Exception as e:
-        print()
-        print("=" * 80)
-        print(f"❌ 分析流程失败: {type(e).__name__}")
-        print(f"   错误信息: {e}")
-        print("=" * 80)
-        print()
-        print("💡 建议:")
-        print("   1. 检查配置文件 config.ini")
-        print("   2. 查看日志文件获取详细信息")
-        print("   3. 确保数据库连接正常")
-        print()
+        logger.error("")
+        logger.error("=" * 80)
+        logger.error(f"❌ 分析流程失败: {type(e).__name__}")
+        logger.error(f"   错误信息: {e}")
+        logger.error("=" * 80)
+        logger.error("")
         raise
 
 

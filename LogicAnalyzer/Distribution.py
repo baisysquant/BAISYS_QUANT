@@ -1,9 +1,8 @@
+import os
+from typing import Any
+
 import akshare as ak
 import pandas as pd
-import numpy as np
-from typing import Optional, Dict, Any
-import time
-import os
 
 
 class MainCostDataManager:
@@ -32,8 +31,11 @@ class MainCostDataManager:
         Returns:
             DataFrame: 包含代码、主力成本、机构参与度等字段的数据
         """
-        cache_file = os.path.join(self.cache_dir,
-                                  f"main_cost_data_{pd.Timestamp.now().date()}.csv") if self.cache_enabled else None
+        cache_file = (
+            os.path.join(self.cache_dir, f"main_cost_data_{pd.Timestamp.now().date()}.csv")
+            if self.cache_enabled
+            else None
+        )
 
         # 检查缓存
         if self.cache_enabled and cache_file and os.path.exists(cache_file):
@@ -75,58 +77,60 @@ class MainCostDataManager:
         result_df = df.copy()
 
         # 检查必要的列是否存在
-        if '主力成本' in result_df.columns and '最新价' in result_df.columns:
+        if "主力成本" in result_df.columns and "最新价" in result_df.columns:
             # 计算主力成本与当前价格的差价
-            result_df['主力成本差价'] = result_df['最新价'] - result_df['主力成本']
+            result_df["主力成本差价"] = result_df["最新价"] - result_df["主力成本"]
 
             # 计算主力成本与当前价格的百分比差异
-            result_df['主力成本差价百分比'] = ((result_df['最新价'] - result_df['主力成本']) / result_df[
-                '主力成本']) * 100
+            result_df["主力成本差价百分比"] = (
+                (result_df["最新价"] - result_df["主力成本"]) / result_df["主力成本"]
+            ) * 100
 
             # 判断当前价格相对于主力成本的位置
             def cost_position(row):
-                if row['最新价'] > row['主力成本']:
-                    if row['主力成本差价百分比'] > 10:
-                        return '大幅高于成本'
+                if row["最新价"] > row["主力成本"]:
+                    if row["主力成本差价百分比"] > 10:
+                        return "大幅高于成本"
                     else:
-                        return '略高于成本'
-                elif row['最新价'] < row['主力成本']:
-                    if row['主力成本差价百分比'] < -10:
-                        return '大幅低于成本'
+                        return "略高于成本"
+                elif row["最新价"] < row["主力成本"]:
+                    if row["主力成本差价百分比"] < -10:
+                        return "大幅低于成本"
                     else:
-                        return '略低于成本'
+                        return "略低于成本"
                 else:
-                    return '等于成本'
+                    return "等于成本"
 
-            result_df['成本位置'] = result_df.apply(cost_position, axis=1)
+            result_df["成本位置"] = result_df.apply(cost_position, axis=1)
 
         # 分析机构参与度
-        if '机构参与度' in result_df.columns:
+        if "机构参与度" in result_df.columns:
             # 创建机构参与度等级
-            result_df['机构参与度等级'] = pd.cut(
-                result_df['机构参与度'],
+            result_df["机构参与度等级"] = pd.cut(
+                result_df["机构参与度"],
                 bins=[-1, 20, 50, 80, 101],
-                labels=['低', '中低', '中高', '高'],
-                include_lowest=True
+                labels=["低", "中低", "中高", "高"],
+                include_lowest=True,
             ).astype(str)
 
         # 添加主力控盘强度评估
-        if '主力成本' in result_df.columns and '机构参与度' in result_df.columns:
-            def control_strength(row):
-                if row['机构参与度'] >= 80 and abs(row['主力成本差价百分比']) <= 10:
-                    return '高度控盘'
-                elif row['机构参与度'] >= 50 and abs(row['主力成本差价百分比']) <= 15:
-                    return '中度控盘'
-                elif row['机构参与度'] >= 20:
-                    return '轻度控盘'
-                else:
-                    return '低度控盘'
+        if "主力成本" in result_df.columns and "机构参与度" in result_df.columns:
 
-            result_df['主力控盘强度'] = result_df.apply(control_strength, axis=1)
+            def control_strength(row):
+                if row["机构参与度"] >= 80 and abs(row["主力成本差价百分比"]) <= 10:
+                    return "高度控盘"
+                elif row["机构参与度"] >= 50 and abs(row["主力成本差价百分比"]) <= 15:
+                    return "中度控盘"
+                elif row["机构参与度"] >= 20:
+                    return "轻度控盘"
+                else:
+                    return "低度控盘"
+
+            result_df["主力控盘强度"] = result_df.apply(control_strength, axis=1)
 
         return result_df
 
-    def get_stock_cost_info(self, stock_code: str) -> Optional[Dict[str, Any]]:
+    def get_stock_cost_info(self, stock_code: str) -> dict[str, Any] | None:
         """
         获取指定股票的主力成本信息
 
@@ -142,7 +146,7 @@ class MainCostDataManager:
 
         # 格式化股票代码进行匹配
         formatted_code = str(stock_code).zfill(6)
-        stock_data = df[df['代码'].astype(str).str.zfill(6) == formatted_code]
+        stock_data = df[df["代码"].astype(str).str.zfill(6) == formatted_code]
 
         if stock_data.empty:
             return None
@@ -151,22 +155,25 @@ class MainCostDataManager:
         record = stock_data.iloc[0].to_dict()
 
         return {
-            '代码': record.get('代码'),
-            '名称': record.get('名称'),
-            '最新价': record.get('最新价'),
-            '主力成本': record.get('主力成本'),
-            '机构参与度': record.get('机构参与度'),
-            '主力成本差价': record.get('主力成本差价') if '主力成本差价' in record else None,
-            '主力成本差价百分比': record.get('主力成本差价百分比') if '主力成本差价百分比' in record else None,
-            '成本位置': record.get('成本位置') if '成本位置' in record else None,
-            '机构参与度等级': record.get('机构参与度等级') if '机构参与度等级' in record else None,
-            '主力控盘强度': record.get('主力控盘强度') if '主力控盘强度' in record else None
+            "代码": record.get("代码"),
+            "名称": record.get("名称"),
+            "最新价": record.get("最新价"),
+            "主力成本": record.get("主力成本"),
+            "机构参与度": record.get("机构参与度"),
+            "主力成本差价": record.get("主力成本差价") if "主力成本差价" in record else None,
+            "主力成本差价百分比": record.get("主力成本差价百分比") if "主力成本差价百分比" in record else None,
+            "成本位置": record.get("成本位置") if "成本位置" in record else None,
+            "机构参与度等级": record.get("机构参与度等级") if "机构参与度等级" in record else None,
+            "主力控盘强度": record.get("主力控盘强度") if "主力控盘强度" in record else None,
         }
 
-    def filter_by_cost_criteria(self, df: pd.DataFrame,
-                                cost_diff_threshold: float = 0.0,
-                                participation_threshold: float = 0.0,
-                                cost_position: Optional[str] = None) -> pd.DataFrame:
+    def filter_by_cost_criteria(
+        self,
+        df: pd.DataFrame,
+        cost_diff_threshold: float = 0.0,
+        participation_threshold: float = 0.0,
+        cost_position: str | None = None,
+    ) -> pd.DataFrame:
         """
         根据主力成本相关条件筛选股票
 
@@ -185,16 +192,16 @@ class MainCostDataManager:
         result_df = df.copy()
 
         # 按成本差价筛选
-        if '主力成本差价百分比' in result_df.columns:
-            result_df = result_df[result_df['主力成本差价百分比'] >= cost_diff_threshold]
+        if "主力成本差价百分比" in result_df.columns:
+            result_df = result_df[result_df["主力成本差价百分比"] >= cost_diff_threshold]
 
         # 按机构参与度筛选
-        if '机构参与度' in result_df.columns:
-            result_df = result_df[result_df['机构参与度'] >= participation_threshold]
+        if "机构参与度" in result_df.columns:
+            result_df = result_df[result_df["机构参与度"] >= participation_threshold]
 
         # 按成本位置筛选
-        if cost_position and '成本位置' in result_df.columns:
-            result_df = result_df[result_df['成本位置'] == cost_position]
+        if cost_position and "成本位置" in result_df.columns:
+            result_df = result_df[result_df["成本位置"] == cost_position]
 
         return result_df
 
@@ -209,39 +216,35 @@ class MainCostDataManager:
             print("主力成本数据为空")
             return
 
-
         print("主力成本数据分析摘要")
-
 
         # 基础统计
         print(f"总股票数量: {len(df)}")
 
-        if '主力成本' in df.columns:
+        if "主力成本" in df.columns:
             print(f"主力成本有效数量: {df['主力成本'].notna().sum()}")
             print(f"主力成本平均值: {df['主力成本'].mean():.2f}")
             print(f"主力成本中位数: {df['主力成本'].median():.2f}")
             print(f"主力成本最高值: {df['主力成本'].max():.2f}")
             print(f"主力成本最低值: {df['主力成本'].min():.2f}")
 
-
-
         # 成本位置分布
-        if '成本位置' in df.columns:
+        if "成本位置" in df.columns:
             print("\n成本位置分布:")
-            position_counts = df['成本位置'].value_counts()
+            position_counts = df["成本位置"].value_counts()
             for pos, count in position_counts.items():
                 print(f"  {pos}: {count} 只 ({count / len(df) * 100:.1f}%)")
 
         # 机构参与度等级分布
-        if '机构参与度等级' in df.columns:
+        if "机构参与度等级" in df.columns:
             print("\n机构参与度等级分布:")
-            level_counts = df['机构参与度等级'].value_counts()
+            level_counts = df["机构参与度等级"].value_counts()
             for level, count in level_counts.items():
                 print(f"  {level}: {count} 只 ({count / len(df) * 100:.1f}%)")
 
         # 主力控盘强度分布
-        if '主力控盘强度' in df.columns:
+        if "主力控盘强度" in df.columns:
             print("\n主力控盘强度分布:")
-            strength_counts = df['主力控盘强度'].value_counts()
+            strength_counts = df["主力控盘强度"].value_counts()
             for strength, count in strength_counts.items():
                 print(f"  {strength}: {count} 只 ({count / len(df) * 100:.1f}%)")

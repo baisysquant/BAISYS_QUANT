@@ -1,0 +1,94 @@
+[project]
+name = "BAISYS_QUANT"
+version = "2.0.0"
+description = "A股量化复盘分析系统"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle 错误
+    "F",    # pyflakes
+    "I",    # isort 导入排序
+    "W",    # pycodestyle 警告
+    "UP",   # pyupgrade (代码现代化)
+    "SIM",  # 简化代码
+    "PERF", # 性能提示
+]
+ignore = [
+    "E501",  # 行过长（由 line-length 控制）
+    "N999",  # 模块命名不规范（保留现有模块名）
+    "RUF001",  # 全角字符（中文项目常见）
+    "RUF002",  # 全角标点（中文项目常见）
+    "RUF003",  # 全角注释标点（中文项目常见）
+    "W291",   # 行尾空格（放宽）
+    "W293",   # 空白行有空格（放宽）
+    "W292",   # 无文件结尾换行（放宽）
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["UtilsManager", "DataManager", "LogicAnalyzer", "DataCollection"]
+known-third-party = ["akshare", "pandas", "numpy", "sqlalchemy", "loguru"]
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+no_implicit_optional = true
+warn_redundant_casts = false
+warn_unused_ignores = true
+warn_no_return = true
+show_error_codes = true
+pretty = true
+color_output = true
+ignore_errors = false
+
+# 模块配置 - 放宽对第三方库的检查
+[[tool.mypy.overrides]]
+module = [
+    "akshare.*",
+    "pandas.*",
+    "numpy.*",
+    "sqlalchemy.*",
+    "loguru.*",
+    "tushare.*",
+    "scipy.*",
+    "pydantic.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "UtilsManager.*"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "DataManager.*"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "LogicAnalyzer.*"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "DataCollection.*"
+ignore_errors = false
+
+[[tool.mypy.overrides]]
+module = "TreasureBox.*"
+ignore_errors = false

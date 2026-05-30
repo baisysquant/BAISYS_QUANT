@@ -1,18 +1,14 @@
-import tushare as ts
-import pandas as pd
-from typing import List, Dict, Optional
-import time
 import logging
+import time
 from datetime import datetime
+
+import pandas as pd
 import requests
-import pytz
-import json
-import os
-from datetime import timedelta
-import akshare as ak
-from DataManager.DatabaseWriter import QuantDBManager
+import tushare as ts
+
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
+from DataManager.DatabaseWriter import QuantDBManager
 
 
 class StockBasicInfoService:
@@ -37,9 +33,9 @@ class StockBasicInfoService:
     def _get_system_config_from_attributes(self, config_parser) -> dict:
         """从Config对象的属性构建系统配置字典"""
         return {
-            'max_workers': config_parser.MAX_WORKERS,
-            'data_fetch_retries': config_parser.DATA_FETCH_RETRIES,
-            'data_fetch_delay': config_parser.DATA_FETCH_DELAY
+            "max_workers": config_parser.MAX_WORKERS,
+            "data_fetch_retries": config_parser.DATA_FETCH_RETRIES,
+            "data_fetch_delay": config_parser.DATA_FETCH_DELAY,
         }
 
     def _setup_logger(self) -> logging.Logger:
@@ -49,9 +45,7 @@ class StockBasicInfoService:
 
         if not logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            )
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
             handler.setFormatter(formatter)
             logger.addHandler(handler)
 
@@ -60,18 +54,14 @@ class StockBasicInfoService:
     def _initialize_database(self):
         """初始化数据库连接"""
         db_config = {
-            'user': self.config_parser.DB_USER,
-            'password': self.config_parser.DB_PASSWORD,
-            'host': self.config_parser.DB_HOST,
-            'port': self.config_parser.DB_PORT,
-            'database': self.config_parser.DB_NAME
+            "user": self.config_parser.DB_USER,
+            "password": self.config_parser.DB_PASSWORD,
+            "host": self.config_parser.DB_HOST,
+            "port": self.config_parser.DB_PORT,
+            "database": self.config_parser.DB_NAME,
         }
         self.db_manager = QuantDBManager(
-            db_config['user'],
-            db_config['password'],
-            db_config['host'],
-            db_config['port'],
-            db_config['database']
+            db_config["user"], db_config["password"], db_config["host"], db_config["port"], db_config["database"]
         )
 
     def _get_latest_data_date(self) -> str:
@@ -81,35 +71,36 @@ class StockBasicInfoService:
 
         try:
             # 使用QuantDBManager新增的get_latest_record_date方法
-            return self.db_manager.get_latest_record_date('stock_basic_info', 'create_time')
+            return self.db_manager.get_latest_record_date("stock_basic_info", "create_time")
 
         except Exception as e:
-            self.logger.error(f"获取最新数据日期失败: {str(e)}")
+            self.logger.error(f"获取最新数据日期失败: {e!s}")
             return ""
 
     def _is_physical_date_up_to_date(self) -> bool:
         """检查物理日期是否已同步（每日只同步一次）"""
-        today_str = datetime.now().strftime('%Y-%m-%d')
+        today_str = datetime.now().strftime("%Y-%m-%d")
         latest_date = self._get_latest_data_date()
-        
+
         if not latest_date:
             self.logger.info("[DB Sync] 表中无数据，准备执行全量同步")
             return False
-        
+
         # 比较物理日期
-        if latest_date == today_str.replace('-', ''):
+        if latest_date == today_str.replace("-", ""):
             self.logger.info(f"[DB Sync] 物理日期锁命中 ({today_str})，今日已同步，跳过更新")
             return True
         else:
-            self.logger.info(f"[DB Sync] 数据库最新日期 {latest_date} != 今日 {today_str.replace('-', '')}，触发全量刷新")
+            self.logger.info(
+                f"[DB Sync] 数据库最新日期 {latest_date} != 今日 {today_str.replace('-', '')}，触发全量刷新"
+            )
             return False
 
     def _is_current_trading_day_data_up_to_date(self) -> bool:
         """检查当前交易日的数据是否已经是最新的（保留作为备用）"""
         return self._is_physical_date_up_to_date()
 
-    def fetch_stock_basic_info(self, exchange: str = '',
-                               list_status: str = 'L') -> pd.DataFrame:
+    def fetch_stock_basic_info(self, exchange: str = "", list_status: str = "L") -> pd.DataFrame:
         """
         获取股票基本信息（仅包含四个字段）
 
@@ -117,42 +108,38 @@ class StockBasicInfoService:
         - exchange: 交易所 SSE上交所 SZSE深交所 BSE北交所
         - list_status: 上市状态 L上市 D退市 P暂停上市
         """
-        max_retries = self.system_config['data_fetch_retries']
-        delay = self.system_config['data_fetch_delay']
+        max_retries = self.system_config["data_fetch_retries"]
+        delay = self.system_config["data_fetch_delay"]
 
         # 只获取需要的字段
-        fields = 'ts_code,symbol,name,industry,market'
+        fields = "ts_code,symbol,name,industry,market"
 
         for attempt in range(max_retries):
             try:
-                df = self.pro.stock_basic(
-                    exchange=exchange,
-                    list_status=list_status,
-                    fields=fields
-                )
+                df = self.pro.stock_basic(exchange=exchange, list_status=list_status, fields=fields)
 
                 self.logger.info(f"成功获取 {len(df)} 条股票基本信息")
 
                 # 根据配置文件决定是否只保留主板股票
                 if self.config_parser.MAIN_BOARD_ONLY:
-                    df = df[df['ts_code'].str.match(r'^(60|00)\d{4}\.(SH|SZ)$')]
+                    df = df[df["ts_code"].str.match(r"^(60|00)\d{4}\.(SH|SZ)$")]
                     self.logger.info(f"已开启主板过滤，剩余 {len(df)} 只主板股票 (60/00开头)")
 
                 # 添加create_time列，使用最新交易日作为数据归属日期
                 latest_trading_day = self.trading_calendar.get_last_trading_day()
-                df['create_time'] = latest_trading_day
+                df["create_time"] = latest_trading_day
 
                 return df
 
             except requests.exceptions.RequestException as e:
-                self.logger.warning(f"第 {attempt + 1} 次请求失败: {str(e)}")
+                self.logger.warning(f"第 {attempt + 1} 次请求失败: {e!s}")
                 if attempt < max_retries - 1:
                     time.sleep(delay)
                     continue
                 else:
                     raise
             except Exception as e:
-                self.logger.error(f"获取股票基本信息失败: {str(e)}")
+                self.logger.error(f"获取股票基本信息失败: {e!s}")
                 raise
 
     def sync_all_stock_basic_info(self) -> bool:
@@ -174,28 +161,28 @@ class StockBasicInfoService:
                 return False
 
             # 使用当前物理日期作为锁标记
-            physical_today = datetime.now().strftime('%Y-%m-%d')
+            physical_today = datetime.now().strftime("%Y-%m-%d")
             self.logger.info(f"[DB Sync] 开始全量刷新，归属日期: {physical_today}")
 
             # 【关键修改】清表覆盖写入模式
             # 步骤1: 添加 create_time 列
-            df['create_time'] = physical_today
-            
+            df["create_time"] = physical_today
+
             # 步骤2: 使用 truncate_and_insert 方法清空全表并写入
-            self.db_manager.truncate_and_insert(df, 'stock_basic_info')
+            self.db_manager.truncate_and_insert(df, "stock_basic_info")
             self.logger.info(f"[DB Sync] 成功写入 {len(df)} 条股票基本信息。")
 
             # 显示统计信息
-            industries = df['industry'].value_counts().head(10)
+            industries = df["industry"].value_counts().head(10)
             self.logger.info(f"主要行业分布:\n{industries}")
 
-            markets = df['market'].value_counts()
+            markets = df["market"].value_counts()
             self.logger.info(f"市场分布:\n{markets}")
 
             return True
 
         except Exception as e:
-            self.logger.error(f"同步股票基本信息失败: {str(e)}")
+            self.logger.error(f"同步股票基本信息失败: {e!s}")
             return False
 
     def get_stock_count(self) -> int:
@@ -204,9 +191,9 @@ class StockBasicInfoService:
             self._initialize_database()
 
         try:
-            return self.db_manager.get_table_count('stock_basic_info')
+            return self.db_manager.get_table_count("stock_basic_info")
         except Exception as e:
-            self.logger.error(f"获取股票总数失败: {str(e)}")
+            self.logger.error(f"获取股票总数失败: {e!s}")
             return 0
 
 

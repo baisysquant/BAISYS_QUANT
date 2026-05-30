@@ -1,90 +1,119 @@
-# LoggerManager.py
 
-import logging
+# LoggerManager.py
+"""
+专业日志管理器（基于 Loguru）
+支持控制台 + 文件双输出，多级别控制，线程/进程安全，日志自动轮转
+"""
+
 import os
 import sys
 from datetime import datetime
-from typing import Optional
+
+from loguru import logger
 
 
-class LoggerManager:
+def setup_logger(log_dir=None, log_filename=None, level="INFO"):
     """
-    专业日志管理器，支持控制台 + 文件双输出，多级别控制，线程安全。
-    专为量化分析系统设计，提供统一、清晰、可配置的日志输出。
+    配置并初始化 Loguru 日志系统
+
+    Args:
+        log_dir: 日志目录
+        log_filename: 日志文件名
+        level: 日志级别 (DEBUG/INFO/WARNING/ERROR/CRITICAL)
+
+    Returns:
+        logger: Loguru logger 实例
     """
+    # 配置参数
+    log_dir = log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
+    log_filename = log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log"
+    log_path = os.path.join(log_dir, log_filename)
 
-    _instance = None  # 单例模式，避免重复初始化
+    # 确保日志目录存在
+    os.makedirs(log_dir, exist_ok=True)
 
-    def __new__(cls, log_dir: str = None, log_filename: str = None, level: str = "INFO"):
-        if cls._instance is None:
-            cls._instance = super(LoggerManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+    # 日志级别
+    log_level = level.upper()
 
-    def __init__(self, log_dir: str = None, log_filename: str = None, level: str = "INFO"):
-        if self._initialized:
-            return
+    # 先移除默认的 handler
+    logger.remove()
 
-        # 配置参数
-        self.log_dir = log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
-        self.log_filename = log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log"
-        self.log_path = os.path.join(self.log_dir, self.log_filename)
+    # 定义格式函数 - 根据级别显示不同的信息
+    def format_console(record):
+        if record["level"].name in ["ERROR", "CRITICAL"]:
+            return (
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level}</level> | "
+                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+                "<level>{message}</level>\n"
+            )
+        else:
+            return (
+                "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+                "<level>{level}</level> | "
+                "<level>{message}</level>\n"
+            )
 
-        # 确保日志目录存在
-        os.makedirs(self.log_dir, exist_ok=True)
+    def format_file(record):
+        if record["level"].name in ["ERROR", "CRITICAL"]:
+            return "{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}\n"
+        else:
+            return "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}\n"
 
-        # 设置日志级别映射
-        level_map = {
-            "DEBUG": logging.DEBUG,
-            "INFO": logging.INFO,
-            "WARNING": logging.WARNING,
-            "ERROR": logging.ERROR,
-            "CRITICAL": logging.CRITICAL
-        }
-        self.level = level_map.get(level.upper(), logging.INFO)
+    # 添加控制台 handler
+    logger.add(
+        sys.stdout,
+        format=format_console,
+        level=log_level,
+        colorize=True,
+        enqueue=True,
+    )
 
-        # 创建 logger
-        self.logger = logging.getLogger("Corenews_Main")
-        self.logger.setLevel(self.level)
-        self.logger.propagate = False  # 防止重复输出到 root logger
+    # 添加文件 handler（支持自动轮转）
+    logger.add(
+        log_path,
+        format=format_file,
+        level="DEBUG",
+        rotation="00:00",
+        retention="30 days",
+        compression="zip",
+        encoding="utf-8",
+        enqueue=True,
+    )
 
-        # 清除已有处理器（避免重复）
-        self.logger.handlers.clear()
+    return logger
 
-        # 创建格式化器
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)-8s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
+
+# 全局 logger 实例（单例模式）
+_global_logger = None
+_global_log_path = None
+
+
+def get_logger(log_dir=None, log_filename=None, level="INFO"):
+    """
+    获取全局 logger 实例（单例模式）
+
+    Args:
+        log_dir: 日志目录
+        log_filename: 日志文件名
+        level: 日志级别
+
+    Returns:
+        logger: Loguru logger 实例
+    """
+    global _global_logger
+    global _global_log_path
+    if _global_logger is None:
+        _global_logger = setup_logger(log_dir, log_filename, level)
+        _global_log_path = os.path.join(
+            log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs"),
+            log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log",
         )
+    return _global_logger
 
-        # 控制台处理器（INFO及以上）
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(self.level)
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
 
-        # 文件处理器（所有级别）
-        file_handler = logging.FileHandler(self.log_path, encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)  # 文件记录所有级别
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
+def get_log_path():
+    """获取当前日志文件路径"""
+    global _global_log_path
+    return _global_log_path or ""
 
-        self._initialized = True
-
-    def info(self, message: str):
-        self.logger.info(message)
-
-    def warning(self, message: str):
-        self.logger.warning(message)
-
-    def error(self, message: str):
-        self.logger.error(message)
-
-    def critical(self, message: str):
-        self.logger.critical(message)
-
-    def debug(self, message: str):
-        self.logger.debug(message)
-
-    def get_log_path(self) -> str:
-        return self.log_path

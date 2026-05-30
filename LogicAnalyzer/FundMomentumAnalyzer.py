@@ -1,16 +1,11 @@
-from typing import Dict, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 
 class FundMomentumAnalyzer:
-
-
-    def __init__(self,
-                 trend_weight: float = 0.4,
-                 speed_weight: float = 0.6,
-                 z_score_threshold: float = 1.0):
+    def __init__(self, trend_weight: float = 0.4, speed_weight: float = 0.6, z_score_threshold: float = 1.0):
         """
         初始化.
 
@@ -23,7 +18,7 @@ class FundMomentumAnalyzer:
         self.speed_weight = speed_weight
         self.z_score_threshold = z_score_threshold
 
-    def analyze(self, row: pd.Series) -> Dict[str, Any]:
+    def analyze(self, row: pd.Series) -> dict[str, Any]:
         """
         对单只股票/单行数据进行分析.
 
@@ -35,9 +30,9 @@ class FundMomentumAnalyzer:
         """
 
         # 提取标准化后的数值 (单位: 万元)
-        T5 = self._safe_float(row.get('5日资金流入万元', row.get('5日资金流入', 0)))
-        T10 = self._safe_float(row.get('10日资金流入万元', row.get('10日资金流入', 0)))
-        T20 = self._safe_float(row.get('20日资金流入万元', row.get('20日资金流入', 0)))
+        T5 = self._safe_float(row.get("5日资金流入万元", row.get("5日资金流入", 0)))
+        T10 = self._safe_float(row.get("10日资金流入万元", row.get("10日资金流入", 0)))
+        T20 = self._safe_float(row.get("20日资金流入万元", row.get("20日资金流入", 0)))
 
         # 趋势因子 如果5日占了10日的80%，说明近期资金主导了中期趋势.
         participation_10 = T5 / T10 if T10 > 0 else 0
@@ -72,13 +67,13 @@ class FundMomentumAnalyzer:
         signal = self._classify_signal(factor_trend, factor_speed, T5)
 
         return {
-            '输入_5日总额(万元)': T5,
-            '输入_10日总额(万元)': T10,
-            '输入_20日总额(万元)': T20,
-            '因子_趋势因子': factor_trend,
-            '因子_强度因子': factor_speed,
-            '综合_动能评分': momentum_score,
-            '综合_交易信号': signal
+            "输入_5日总额(万元)": T5,
+            "输入_10日总额(万元)": T10,
+            "输入_20日总额(万元)": T20,
+            "因子_趋势因子": factor_trend,
+            "因子_强度因子": factor_speed,
+            "综合_动能评分": momentum_score,
+            "综合_交易信号": signal,
         }
 
     def _classify_signal(self, trend: float, speed: float, t5: float) -> str:

@@ -1,5 +1,4 @@
 import pandas as pd
-import re
 
 
 class Parse_Currency:
@@ -13,7 +12,7 @@ class Parse_Currency:
         统一处理含有 '亿'、'万'、'%' 或非法字符的金融数据
         """
         # 1. 处理空值
-        if pd.isna(val) or val == '' or val == '--' or val == '-':
+        if pd.isna(val) or val == "" or val == "--" or val == "-":
             return 0.0
 
         # 2. 转换为字符串并去除首尾空格
@@ -21,17 +20,17 @@ class Parse_Currency:
 
         try:
             # 3. 处理百分比 (如果是 5.2% 这种格式)
-            if '%' in s:
-                return float(s.replace('%', '')) / 100.0
+            if "%" in s:
+                return float(s.replace("%", "")) / 100.0
 
             # 4. 处理单位换算
             multiplier = 1.0
-            if '亿' in s:
+            if "亿" in s:
                 multiplier = 100000000.0
-                s = s.replace('亿', '')
-            elif '万' in s:
+                s = s.replace("亿", "")
+            elif "万" in s:
                 multiplier = 10000.0
-                s = s.replace('万', '')
+                s = s.replace("万", "")
 
             # 5. 最终转换
             return float(s) * multiplier
