@@ -51,6 +51,13 @@ def main():
         ReportGenerationError: 报告生成失败
         Exception: 其他未预期的错误
     """
+    import sys
+    import io
+    # 强制在 Windows 终端下支持 UTF-8 编码，防止特殊 Unicode/Emoji 字符导致 UnicodeEncodeError
+    if sys.platform.startswith('win'):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
     print("=" * 80)
     print("BAISYS_QUANT - A股量化复盘分析系统")
     print("新架构版本 v2.0")

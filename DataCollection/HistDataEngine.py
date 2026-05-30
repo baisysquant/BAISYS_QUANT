@@ -192,10 +192,15 @@ class StockSyncEngine:
                 if df is not None and not df.empty:
                     df = _standardize_columns(df)
                     break
-                time.sleep(self.AKSHARE_DELAY)
+                
+                # 使用指数级退避递增重试延时
+                wait_time = self.AKSHARE_DELAY * (2 ** i)
+                print(f"[WARN] 获取 {description} 返回空或无效，将在 {wait_time} 秒后重试")
+                time.sleep(wait_time)
             except Exception as e:
-                print(f"[ERROR] 获取 {description} 失败: {e}，将在 {self.AKSHARE_DELAY} 秒后重试")
-                time.sleep(self.AKSHARE_DELAY)
+                wait_time = self.AKSHARE_DELAY * (2 ** i)
+                print(f"[ERROR] 获取 {description} 失败: {e}，将在 {wait_time} 秒后重试")
+                time.sleep(wait_time)
 
         if df.empty:
             print(f"[CRITICAL] 所有重试失败，未能获取 {description}")

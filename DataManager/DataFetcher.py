@@ -170,12 +170,16 @@ class DataFetcher:
                 if df is not None and not df.empty:
                     break
                 else:
-                    self.logger.warning(f"[WARN] 数据返回为空或无效: {file_base_name}，重试中。")
-                    time.sleep(self.config.DATA_FETCH_DELAY)
+                    # 使用指数级退避递增重试延时
+                    wait_time = self.config.DATA_FETCH_DELAY * (2 ** i)
+                    self.logger.warning(f"[WARN] 数据返回为空或无效: {file_base_name}，将在 {wait_time} 秒后重试。")
+                    time.sleep(wait_time)
             except Exception as e:
+                # 使用指数级退避递增重试延时
+                wait_time = self.config.DATA_FETCH_DELAY * (2 ** i)
                 self.logger.error(
-                    f"[ERROR] 获取 {file_base_name} 时出错: {e}，将在 {self.config.DATA_FETCH_DELAY} 秒后重试。")
-                time.sleep(self.config.DATA_FETCH_DELAY)
+                    f"[ERROR] 获取 {file_base_name} 时出错: {e}，将在 {wait_time} 秒后重试。")
+                time.sleep(wait_time)
 
         if df.empty:
             self.logger.critical(f"[FATAL] 所有重试均失败，返回空 DataFrame: {file_base_name}")
