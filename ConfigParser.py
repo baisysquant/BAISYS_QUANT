@@ -231,6 +231,24 @@ class Config:
             self.ENABLE_RESEARCH_REPORT_FILTER = False
             self.RESEARCH_REPORT_MIN_COUNT = 1
 
+        # 读取K线数据获取配置
+        try:
+            kd = config['KLINE_DATA']
+            self.KLINE_HISTORY_DAYS = kd.getint('KLINE_HISTORY_DAYS', fallback=200)
+            
+            # 验证天数范围
+            if self.KLINE_HISTORY_DAYS < 1:
+                raise ValueError(f"KLINE_HISTORY_DAYS 必须大于0，当前值: {self.KLINE_HISTORY_DAYS}")
+            if self.KLINE_HISTORY_DAYS > 1000:
+                import warnings
+                warnings.warn(
+                    f"警告：KLINE_HISTORY_DAYS 设置为 {self.KLINE_HISTORY_DAYS} 天，数值较大可能导致获取数据时间过长。",
+                    UserWarning
+                )
+        except KeyError:
+            # 如果配置节不存在，使用默认值
+            self.KLINE_HISTORY_DAYS = 200
+
         for key, val in self.__dict__.items():
             if val is None:
                 raise ValueError(f"配置项 '{key}' 未设置，请在 {self.config_file} 中检查。")

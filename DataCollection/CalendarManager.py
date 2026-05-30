@@ -159,6 +159,45 @@ class TradingCalendarAnalyzer:
         # 理论上不会走到这里，除非日历数据为空
         return current_str
 
+    def get_trading_day_offset(self, offset_days: int, base_date: str = None) -> str:
+        """
+        获取相对于基准日期的偏移交易日
+        
+        Args:
+            offset_days: 偏移天数（负数表示往前，正数表示往后）
+            base_date: 基准日期（YYYY-MM-DD格式），默认为最后交易日
+            
+        Returns:
+            str: 偏移后的交易日期（YYYY-MM-DD格式）
+        """
+        # 获取官方日历数据
+        official_dates = self.get_official_trading_dates()
+        
+        # 确定基准日期
+        if base_date is None:
+            base_date = self.get_last_trading_day()
+        
+        # 将官方日期转换为排序列表
+        sorted_dates = sorted(list(official_dates))
+        
+        # 找到基准日期在列表中的位置
+        try:
+            base_index = sorted_dates.index(base_date)
+        except ValueError:
+            print(f"[Calendar WARN] 基准日期 {base_date} 不在交易日列表中，使用最后交易日")
+            base_index = len(sorted_dates) - 1
+        
+        # 计算目标索引
+        target_index = base_index + offset_days
+        
+        # 边界检查
+        if target_index < 0:
+            target_index = 0
+        elif target_index >= len(sorted_dates):
+            target_index = len(sorted_dates) - 1
+        
+        return sorted_dates[target_index]
+
 # --- 实例化供外部调用 ---
 # 假设你的缓存目录配置在 Config 中，或者直接用默认的
 # trading_calendar = TradingCalendarAnalyzer()

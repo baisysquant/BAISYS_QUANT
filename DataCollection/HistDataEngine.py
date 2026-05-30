@@ -57,11 +57,15 @@ class StockSyncEngine:
         except Exception as e:
             raise RuntimeError("数据库引擎初始化失败") from e
 
-        self.global_start = "20250301"
         # 使用业务交易日而非物理时间
         calendar_mgr = TradingCalendarAnalyzer()
         self.today = calendar_mgr.get_last_trading_day()
         self.today_dt = pd.to_datetime(self.today).normalize()
+        
+        # 根据配置的天数动态计算起始日期
+        self.global_start = self._calculate_start_date(calendar_mgr, self.config.KLINE_HISTORY_DAYS)
+        print(f"[INFO] K线数据获取范围: {self.global_start} 至 {self.today} (共{self.config.KLINE_HISTORY_DAYS}天)")
+        
         self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
 
@@ -88,6 +92,27 @@ class StockSyncEngine:
         
         # 已成功获取的股票列表文件路径（用于增量更新）
         self.success_symbols_file = os.path.join(self.base_data_dir, f"success_symbols_{self.today}.json")
+
+    def _calculate_start_date(self, calendar_mgr, history_days: int) -> str:
+        """
+        根据配置的天数动态计算K线数据的起始日期
+        
+        Args:
+            calendar_mgr: 交易日历管理器实例
+            history_days: 历史天数（交易日）
+            
+        Returns:
+            str: 格式为YYYYMMDD的起始日期字符串
+        """
+        try:
+            # 获取当前交易日往前推history_days天的交易日
+            start_date = calendar_mgr.get_trading_day_offset(-history_days)
+            # 转换为YYYYMMDD格式
+            start_date_str = start_date.replace('-', '')
+            return start_date_str
+        except Exception as e:
+            print(f"[WARNING] 计算起始日期失败: {e}，使用默认值20250301")
+            return "20250301"
 
     def get_main_board_pool(self) -> pd.DataFrame:
         """
@@ -884,7 +909,6 @@ class StockSyncEngine:
 
         print(f"  - 今日日期: {self.today}")
         print(f"  - 筛选股票数: {len(filtered_codes)}")
-        print(f"  - 成功获取 K 线股票: {len(kline_dfs)}")
 
         #  可选：保存最终过滤列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
