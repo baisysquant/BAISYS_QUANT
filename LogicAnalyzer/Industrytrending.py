@@ -6,20 +6,20 @@ import time
 import datetime
 import warnings
 import re
+from ConfigParser import Config
 warnings.filterwarnings('ignore')
-
-# 配置缓存目录
-CACHE_DIR = "./sw_data_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 class SWIndustryDataPipeline:
     """模块一：数据管道（负责拉取、清洗与本地缓存）"""
     
-    def __init__(self):
+    def __init__(self, config=None):
+        self.config = config or Config()
         self.today_str = datetime.datetime.now().strftime("%Y%m%d")
-        self.cache_file = os.path.join(CACHE_DIR, f"sw_hist_250d_{self.today_str}.parquet")
-        self.cache_csv_file = os.path.join(CACHE_DIR, f"sw_hist_250d_{self.today_str}.csv")  # 添加CSV备选缓存
-        self.valuation_file = os.path.join(CACHE_DIR, f"sw_valuation_{self.today_str}.csv")
+        self.cache_dir = os.path.join(self.config.HOME_DIRECTORY, "sw_data_cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.parquet")
+        self.cache_csv_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.csv")
+        self.valuation_file = os.path.join(self.cache_dir, f"sw_valuation_{self.today_str}.csv")
 
     def _map_hist_columns(self, df_hist):
         """
@@ -50,15 +50,30 @@ class SWIndustryDataPipeline:
 
     def fetch_and_cache_all(self, force_update=False):
         """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
-        # 历史数据缓存和估值缓存同时存在时，才直接复用本地缓存
         hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
         valuation_cache_exists = os.path.exists(self.valuation_file)
+        
         if hist_cache_exists and valuation_cache_exists and not force_update:
-            print(f"[*] 发现已缓存数据，跳过网络拉取。")
+            # 先读取缓存，检查其完整性
             try:
-                return pd.read_parquet(self.cache_file)
-            except ImportError:
-                return pd.read_csv(self.cache_csv_file, parse_dates=['date'])
+                cached_hist = pd.read_parquet(self.cache_file)
+            except:
+                cached_hist = pd.read_csv(self.cache_csv_file, parse_dates=['date'])
+            
+            cached_val = pd.read_csv(self.valuation_file)
+            cached_industry_count = len(cached_val)
+            
+            # 🔑 关键：获取当前接口的行业总数
+            df_info = ak.sw_index_second_info()
+            current_total_industries = len(df_info)
+            
+            # ✅ 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
+            if cached_industry_count == current_total_industries:
+                print(f"[*] 缓存完整({cached_industry_count}个行业)，使用缓存数据")
+                return cached_hist
+            else:
+                print(f"[!] 缓存不完整({cached_industry_count}个 vs {current_total_industries}个)，重新拉取...")
+
 
         print("[1/3] 获取申万二级行业列表及估值数据...")
         try:
@@ -247,7 +262,7 @@ class IndustryFlowAnalyzer:
 
     def __init__(self, config=None):
         self.config = config
-        self.pipeline = SWIndustryDataPipeline()
+        self.pipeline = SWIndustryDataPipeline(config=config)
         self.model = SWMultiFactorModel(self.pipeline)
 
     @staticmethod

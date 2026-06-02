@@ -83,7 +83,7 @@ class TASignalProcessor:
             包括：
             - MACD_12269: 标准MACD信号（固定）
             - MACD_{second_period_name}: 第二周期MACD信号（动态，如 MACD_9186）
-            - MACD_COMBINED_DIVERGENCE: MACD背离信号
+            - MACD_FULL_BULL: MACD完全多头综合评分信号
             - KDJ: KDJ信号
             - CCI: CCI信号
             - RSI: RSI信号
@@ -101,13 +101,6 @@ class TASignalProcessor:
         ta_signals = {
             'MACD_12269': pd.DataFrame(columns=['股票代码', 'MACD_12269_Signal']),
             f'MACD_{second_period_name}': pd.DataFrame(columns=['股票代码', f'MACD_{second_period_name}_Signal']),
-            # ── 背离：新增强度 / 衰减字段 ──────────────────────────────────
-            'MACD_COMBINED_DIVERGENCE': pd.DataFrame(columns=[
-                '股票代码',
-                'Combined_Divergence_Signal',
-                'Div_12269_Type', 'Div_12269_Strength', 'Div_12269_Decay',
-                f'Div_{second_period_name}_Type', f'Div_{second_period_name}_Strength', f'Div_{second_period_name}_Decay',
-            ]),
             'KDJ':  pd.DataFrame(columns=['股票代码', 'KDJ_Signal']),
             'CCI':  pd.DataFrame(columns=['股票代码', 'CCI_Signal']),
             'RSI':  pd.DataFrame(columns=['股票代码', 'RSI_Signal']),
@@ -218,46 +211,6 @@ class TASignalProcessor:
                 df = self.macd_analyzer._custom_macd(df, second_params=self.config.MACD_SECOND_PARAMS if self.config and hasattr(self.config, 'MACD_SECOND_PARAMS') else (6, 13, 5))
             except Exception:
                 continue
-
-            # ── 自适应 distance（利用 ATR，替代固定值）────────────────────
-            try:
-                dist_slow = MACDAnalyzer._adaptive_distance(df, base=10)
-                dist_fast = MACDAnalyzer._adaptive_distance(df, base=5)
-            except Exception:
-                dist_slow = 10
-                dist_fast = 5
-
-            # ── 背离检测（修复：每套参数只调一次，含强度 / 衰减）──────────
-            try:
-                combined_div = MACDAnalyzer.detect_combined_divergence(
-                    df,
-                    distance_slow=dist_slow,
-                    distance_fast=dist_fast,
-                    recent_window=5,
-                    decay_half_life=8,
-                    second_period_name=second_period_name,  # 传递动态的第二周期名称
-                )
-                divergence_signal = combined_div.get('combined_signal', '')
-
-                # 只有存在信号时才写入（保持原逻辑）
-                if divergence_signal:
-                    new_row = pd.DataFrame([{
-                        '股票代码':                  code,
-                        'Combined_Divergence_Signal': divergence_signal,
-                        # ── 新增：完整背离元数据，方便下游过滤 ──
-                        'Div_12269_Type':     combined_div.get('div_12269', ''),
-                        'Div_12269_Strength': combined_div.get('strength_12269', 0.0),
-                        'Div_12269_Decay':    combined_div.get('decay_12269', 0.0),
-                        f'Div_{second_period_name}_Type':      combined_div.get(f'div_{second_period_name}', ''),
-                        f'Div_{second_period_name}_Strength':  combined_div.get(f'strength_{second_period_name}', 0.0),
-                        f'Div_{second_period_name}_Decay':     combined_div.get(f'decay_{second_period_name}', 0.0),
-                    }])
-                    ta_signals['MACD_COMBINED_DIVERGENCE'] = pd.concat([
-                        ta_signals['MACD_COMBINED_DIVERGENCE'],
-                        new_row
-                    ], ignore_index=True)
-            except Exception:
-                pass
 
             # ── 完全多头综合评分（新增核心能力接入）──────────────────────
             try:

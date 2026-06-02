@@ -35,8 +35,8 @@ class ColumnNames:
     MACD_12269 = "MACD_12269"
     MACD_12269_DIF = "MACD_12269_DIF"
     MACD_12269_MOMENTUM = "MACD_12269_动能"
-
-    MACD_COMBINED_DIVERGENCE = "MACD_组合背离"
+    MACD_FULL_BULL_SIGNAL = "MACD_FULL_BULL_Signals"
+    FULL_BULL_SCORE = "FullBull_Score"
 
     # MACD第二周期（动态生成，这里提供模板）
     # 格式: f"MACD_{fast}{slow}{signal}"
@@ -87,7 +87,6 @@ class ColumnNames:
 
     # ==================== 趋势评分列 ====================
     BULL_TREND = "多头排列趋势"
-    FULL_BULL_SCORE = "FullBull_Score"  # 内部使用，可能不在最终报告中
 
     # ==================== akshare原始列名映射 ====================
     # akshare接口返回的原始列名（用于数据提取阶段）
@@ -138,6 +137,8 @@ class ColumnNames:
             cls.MACD_12269,
             cls.MACD_12269_MOMENTUM,
             cls.MACD_12269_DIF,
+            cls.MACD_FULL_BULL_SIGNAL,
+            cls.FULL_BULL_SCORE,
         ]
 
         if second_period_name:
@@ -151,7 +152,6 @@ class ColumnNames:
 
         cols.extend(
             [
-                cls.MACD_COMBINED_DIVERGENCE,
                 cls.KDJ_SIGNAL,
                 cls.CCI_SIGNAL,
                 cls.RSI_SIGNAL,
@@ -207,7 +207,6 @@ class ColumnNames:
         """
         cols = [
             cls.MACD_12269,
-            cls.MACD_COMBINED_DIVERGENCE,
             cls.KDJ_SIGNAL,
             cls.CCI_SIGNAL,
             cls.RSI_SIGNAL,

@@ -487,12 +487,12 @@ class DataProcessingService:
             signal_col = f"{macd_key}_Signal"
             ta_dfs_to_merge.append(macd_df_second[["股票代码", signal_col]].rename(columns={signal_col: macd_key}))
 
-        # MACD 组合背离
-        macd_div_df = processed_data.get("MACD_COMBINED_DIVERGENCE", pd.DataFrame())
-        if not macd_div_df.empty and "股票代码" in macd_div_df.columns:
+        # MACD 完全多头综合评分
+        macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
+        if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
             ta_dfs_to_merge.append(
-                macd_div_df[["股票代码", "Combined_Divergence_Signal"]].rename(
-                    columns={"Combined_Divergence_Signal": "MACD_组合背离"}
+                macd_full_bull_df[["股票代码", "FullBull_Score", "FullBull_Conclusion"]].rename(
+                    columns={"FullBull_Conclusion": "MACD_FULL_BULL_Signals"}
                 )
             )
 
@@ -545,7 +545,7 @@ class DataProcessingService:
                     final_df[col] = final_df[col].fillna("")
 
         # 使用辅助方法批量填充缺失的技术指标列
-        macd_cols = ["MACD_12269", "MACD_组合背离"]
+        macd_cols = ["MACD_12269", "MACD_FULL_BULL_Signals"]
         # 添加第二周期列名（必填）
         fast, slow, signal = self.config.MACD_SECOND_PARAMS
         second_period_name = f"{fast}{slow}{signal}"
@@ -557,6 +557,11 @@ class DataProcessingService:
                 final_df[col] = ""
             else:
                 final_df[col] = final_df[col].fillna("")
+
+        if "FullBull_Score" not in final_df.columns:
+            final_df["FullBull_Score"] = 0
+        else:
+            final_df["FullBull_Score"] = pd.to_numeric(final_df["FullBull_Score"], errors="coerce").fillna(0)
 
         return final_df
 

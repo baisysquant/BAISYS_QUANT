@@ -42,7 +42,7 @@ class DatabaseConfig(BaseModel):
     host: str
     port: str
     db_name: str
-    tushare_token: str
+    tushare_token: str = Field(default="")
     main_board_only: bool = Field(default=False)
 
 
@@ -307,7 +307,7 @@ class Config:
             host=db.get("host"),
             port=db.get("port"),
             db_name=db.get("db_name"),
-            tushare_token=db.get("tushare_token"),
+            tushare_token=(db.get("tushare_token", fallback="") or "").strip(),
             main_board_only=db.getboolean("main_board_only", fallback=False),
         )
 
