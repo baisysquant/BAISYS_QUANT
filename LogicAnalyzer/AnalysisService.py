@@ -169,9 +169,23 @@ class AnalysisService:
             stock_df["所属行业信号"] = ""
             return stock_df
 
+        required_cols = {"行业名称", "行业信号"}
+        if not required_cols.issubset(industry_df.columns):
+            self.logger.warning(f"行业分析结果缺少必要列: {required_cols - set(industry_df.columns)}")
+            stock_df["所属行业信号"] = ""
+            return stock_df
+
         self.logger.info("  - 正在将行业信号映射至个股...")
-        signal_map = industry_df.set_index("行业名称")["行业信号"].to_dict()
-        stock_df["所属行业信号"] = stock_df["行业"].map(signal_map).fillna("")
+
+        industry_signal_df = industry_df[["行业名称", "行业信号"]].copy()
+        industry_signal_df["行业名称"] = industry_signal_df["行业名称"].fillna("").astype(str).str.strip()
+        industry_signal_df["行业信号"] = industry_signal_df["行业信号"].fillna("").astype(str).str.strip()
+        industry_signal_df = industry_signal_df.drop_duplicates(subset=["行业名称"], keep="first")
+
+        signal_map = industry_signal_df.set_index("行业名称")["行业信号"].to_dict()
+        stock_df["所属行业信号"] = (
+            stock_df["行业"].fillna("").astype(str).str.strip().map(signal_map).fillna("")
+        )
 
         return stock_df
 

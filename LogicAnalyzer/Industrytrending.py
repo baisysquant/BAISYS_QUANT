@@ -1,162 +1,319 @@
+import akshare as ak
+import pandas as pd
+import numpy as np
 import os
 import time
+import datetime
+import warnings
+import re
+warnings.filterwarnings('ignore')
 
-import akshare as ak
-import numpy as np
-import pandas as pd
+# 配置缓存目录
+CACHE_DIR = "./sw_data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-from DataCollection.CalendarManager import TradingCalendarAnalyzer
+class SWIndustryDataPipeline:
+    """模块一：数据管道（负责拉取、清洗与本地缓存）"""
+    
+    def __init__(self):
+        self.today_str = datetime.datetime.now().strftime("%Y%m%d")
+        self.cache_file = os.path.join(CACHE_DIR, f"sw_hist_250d_{self.today_str}.parquet")
+        self.cache_csv_file = os.path.join(CACHE_DIR, f"sw_hist_250d_{self.today_str}.csv")  # 添加CSV备选缓存
+        self.valuation_file = os.path.join(CACHE_DIR, f"sw_valuation_{self.today_str}.csv")
+
+    def _map_hist_columns(self, df_hist):
+        """
+        【核心防御机制】为历史数据接口动态映射列名
+        """
+        if df_hist.empty:
+            return df_hist
+
+        mapping = {
+            'code': ['代码'], # 新增映射，处理历史数据的代码列
+            'date': ['日期', 'date', 'trade_date'],
+            'open': ['开盘', 'open', 'O'],
+            'high': ['最高', 'high', 'H'],
+            'low': ['最低', 'low', 'L'],
+            'close': ['收盘', 'close', 'C'],
+            'volume': ['成交量', 'volume', 'vol', 'V'],
+            'amount': ['成交额', 'amount', 'amt', 'A']
+        }
+        
+        rename_dict = {}
+        for col in df_hist.columns:
+            for standard_name, candidates in mapping.items():
+                if any(cand.lower() in str(col).lower() for cand in candidates):
+                    rename_dict[col] = standard_name
+                    break
+        
+        return df_hist.rename(columns=rename_dict)
+
+    def fetch_and_cache_all(self, force_update=False, test_mode=False):
+        """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
+        # 历史数据缓存和估值缓存同时存在时，才直接复用本地缓存
+        hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
+        valuation_cache_exists = os.path.exists(self.valuation_file)
+        if hist_cache_exists and valuation_cache_exists and not force_update:
+            print(f"[*] 发现已缓存数据，跳过网络拉取。")
+            try:
+                return pd.read_parquet(self.cache_file)
+            except ImportError:
+                return pd.read_csv(self.cache_csv_file, parse_dates=['date'])
+
+        print("[1/3] 获取申万二级行业列表及估值数据...")
+        try:
+            df_info = ak.sw_index_second_info()
+        except Exception as e:
+            print(f"获取行业列表失败: {e}")
+            return None
+
+        valuation_cols_map = {
+            '行业代码': 'code',
+            '行业名称': 'name',
+            '静态市盈率': 'pe_static',
+            'TTM(滚动)市盈率': 'pe_ttm',
+            '市净率': 'pb',
+            '静态股息率': 'div_yield'
+        }
+        
+        missing_valuation_cols = [k for k in valuation_cols_map.keys() if k not in df_info.columns]
+        if missing_valuation_cols:
+            print(f"[!] 警告: 估值接口缺少预期列 {missing_valuation_cols}。")
+        
+        available_valuation_cols = {k: v for k, v in valuation_cols_map.items() if k in df_info.columns}
+        df_val = df_info[list(available_valuation_cols.keys())].copy()
+        df_val.columns = list(available_valuation_cols.values())
+        # --- 智能提取纯数字代码 ---
+        # 使用正则表达式，提取字符串开头的连续数字部分
+        df_val['code'] = df_val['code'].astype(str).apply(lambda x: re.match(r'^(\d+)', x).group(1) if re.match(r'^(\d+)', x) else x)
+        df_val.to_csv(self.valuation_file, index=False, encoding='utf-8-sig')
+
+        codes = df_val['code'].astype(str).tolist()
+        names = df_val['name'].astype(str).tolist()
+        
+        # 测试模式只取前10个行业
+        if test_mode:
+            codes = codes[:30]
+            names = names[:30]
+            print(f"[!] 测试模式：仅处理前10个行业")
+        
+        print(f"[2/3] 开始遍历拉取 {len(codes)} 个行业的250天历史量价数据...")
+        all_hist_data = []
+        
+        for i, code in enumerate(codes):
+            try:
+                # 此时 code 是纯数字，可以直接传入 symbol 参数
+                df_hist = ak.index_hist_sw(symbol=code, period="day")
+                
+                if df_hist is not None and not df_hist.empty:
+                    df_hist_mapped = self._map_hist_columns(df_hist)
+                    
+                    required_core_cols = ['date', 'close', 'volume', 'amount']
+                    if not all(c in df_hist_mapped.columns for c in required_core_cols):
+                        print(f"   [!] 警告: {code} 历史数据映射后缺少核心字段，跳过。")
+                        continue
+
+                    core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
+                    df_sub = df_hist_mapped[core_cols].copy()
+                    df_sub['date'] = pd.to_datetime(df_sub['date'])
+                    df_sub = df_sub.sort_values('date').tail(250).reset_index(drop=True)
+                    
+                    df_sub['code'] = code
+                    df_sub['name'] = names[i]  # 添加行业名称
+                    all_hist_data.append(df_sub)
+                    
+                if (i + 1) % 5 == 0:
+                    print(f"   -> 进度: {i+1}/{len(codes)}")
+                time.sleep(0.2) 
+                
+            except Exception as e:
+                print(f"   [!] 警告: 获取 {code} ({names[i]}) 失败 -> {e}")
+                time.sleep(1) 
+
+        if not all_hist_data:
+            print("[!] 错误: 未能获取任何历史数据。")
+            return None
+
+        print("[3/3] 数据合并与本地缓存...")
+        df_all = pd.concat(all_hist_data, ignore_index=True)
+        
+        # 尝试保存为Parquet，如果失败则保存为CSV
+        try:
+            df_all.to_parquet(self.cache_file, index=False)
+            print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
+        except ImportError:
+            # 如果pyarrow或fastparquet不可用，则保存为CSV
+            df_all.to_csv(self.cache_csv_file, index=False, encoding='utf-8-sig')
+            print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
+            
+        return df_all
+
+
+class SWMultiFactorModel:
+    """模块二：多因子计算引擎（纯本地向量化计算，极速）"""
+    
+    def __init__(self, pipeline: SWIndustryDataPipeline):
+        self.pipeline = pipeline
+        self.ma_periods = [10, 20, 30, 60, 90]
+
+    def _calculate_vectorized_factors(self, df_hist):
+        """利用 GroupBy 进行向量化计算"""
+        df = df_hist.sort_values(['code', 'date']).copy()
+        
+        for p in self.ma_periods:
+            df[f'ma_{p}'] = df.groupby('code')['close'].transform(lambda x: x.rolling(p).mean())
+            
+        df['vol_ma_20'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(20).mean())
+        df['amt_ma_60'] = df.groupby('code')['amount'].transform(lambda x: x.rolling(60).mean())
+        
+        df_latest = df.groupby('code').tail(1).set_index('code')
+        
+        bull_score = pd.Series(0, index=df_latest.index)
+        mas = [df_latest[f'ma_{p}'] for p in self.ma_periods]
+        for i in range(len(mas)-1):
+            bull_score += (mas[i] > mas[i+1]).astype(int)
+        df_latest['bull_align_score'] = bull_score
+        
+        df_latest['dev_20'] = (df_latest['close'] - df_latest['ma_20']) / df_latest['ma_20'] * 100
+        df_latest['dev_60'] = (df_latest['close'] - df_latest['ma_60']) / df_latest['ma_60'] * 100
+        
+        df_latest['vol_ratio'] = df_latest['volume'] / df_latest['vol_ma_20']
+        df_latest['amt_ratio'] = df_latest['amount'] / df_latest['amt_ma_60']
+        
+        # 只保留因子计算相关的列，避免与估值数据中的name列冲突
+        return df_latest[['name', 'close', 'bull_align_score', 'dev_20', 'dev_60', 'vol_ratio', 'amt_ratio']]
+
+    def run_scoring(self):
+        """执行完整的打分流程"""
+        # 尝试读取Parquet，如果失败则读取CSV
+        try:
+            df_hist = pd.read_parquet(self.pipeline.cache_file)
+        except ImportError:
+            df_hist = pd.read_csv(self.pipeline.cache_csv_file, parse_dates=['date'])
+        
+        df_val = pd.read_csv(self.pipeline.valuation_file)
+        
+        print(">>> 正在执行向量化因子计算...")
+        df_factors = self._calculate_vectorized_factors(df_hist)
+        
+        # 解决列名冲突：重命名因子数据中的name列为factor_name
+        df_factors_renamed = df_factors.copy()
+        df_factors_renamed = df_factors_renamed.rename(columns={'name': 'factor_name'})
+        
+        # 合并数据时指定suffixes来避免重复列名
+        df = df_factors_renamed.join(df_val.set_index('code'), how='left', rsuffix='_val')
+        
+        # 使用估值数据中的name列覆盖因子数据中的name列
+        df['name'] = df['name']
+        
+        # 数据清洗
+        for col in ['pe_ttm', 'pb']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df.loc[df[col] <= 0, col] = np.nan
+        df['div_yield'] = pd.to_numeric(df['div_yield'], errors='coerce').fillna(0)
+        
+        # 截面标准化打分 (0-100)
+        df['score_pe'] = 100 - (df['pe_ttm'].rank(pct=True) * 100)
+        df['score_pb'] = 100 - (df['pb'].rank(pct=True) * 100)
+        df['score_div'] = df['div_yield'].rank(pct=True) * 100
+        df['factor_value'] = df['score_pe']*0.4 + df['score_pb']*0.3 + df['score_div']*0.3
+        
+        df['score_bull'] = (df['bull_align_score'] / 4) * 100
+        df['score_mom'] = df['dev_60'].rank(pct=True) * 100 
+        df['factor_trend'] = df['score_bull']*0.5 + df['score_mom']*0.5
+        
+        df['score_vol'] = df['vol_ratio'].rank(pct=True) * 100
+        df['score_amt'] = df['amt_ratio'].rank(pct=True) * 100
+        df['factor_volume'] = df['score_vol']*0.5 + df['score_amt']*0.5
+        
+        df['total_score'] = (
+            df['factor_value'].fillna(50) * 0.35 +  # 估值缺失给中性分50
+            df['factor_trend'] * 0.40 + 
+            df['factor_volume'] * 0.25
+        ).round(2)
+        
+        def get_signal(row):
+            if row['total_score'] > 75 and row['factor_value'] > 70:
+                return "★ 核心配置 (低估值+强趋势)"
+            elif row['total_score'] > 70 and row['factor_trend'] > 80:
+                return "▲ 动量追击 (高景气+资金涌入)"
+            elif row['factor_value'] > 85 and row['factor_trend'] < 40:
+                return "▼ 左侧潜伏 (极度低估+等待拐点)"
+            elif row['factor_trend'] > 80 and row['factor_value'] < 30:
+                return "⚠ 情绪过热 (高估+趋势透支)"
+            else:
+                return "- 均衡/观望"
+                
+        df['signal'] = df.apply(get_signal, axis=1)
+        return df.sort_values('total_score', ascending=False)
 
 
 class IndustryFlowAnalyzer:
-    def __init__(self, config):
+    """兼容主程序调用链的行业分析适配器。"""
+
+    def __init__(self, config=None):
         self.config = config
-        # 使用业务交易日而非物理时间
-        calendar_mgr = TradingCalendarAnalyzer()
-        self.today_str = calendar_mgr.get_last_trading_day()
-        self.cache_filename = f"行业权重趋势_{self.today_str}.txt"
-        self.cache_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, self.cache_filename)
+        self.pipeline = SWIndustryDataPipeline()
+        self.model = SWMultiFactorModel(self.pipeline)
 
-    def _normalize_amount(self, val):
-        if pd.isna(val):
-            return 0.0
-        s = str(val).strip()
-        try:
-            if "亿" in s:
-                return float(s.replace("亿", ""))
-            elif "万" in s:
-                return float(s.replace("万", "")) / 10000.0
-            else:
-                return float(s)
-        except:
-            return 0.0
+    @staticmethod
+    def _output_columns():
+        return [
+            '行业代码', '行业名称', '行业信号', '综合得分', '趋势得分', '估值得分', '量能得分',
+            'PE_TTM', 'PB', '股息率', '多头排列分', '20日偏离率', '60日偏离率', '量比', '额比'
+        ]
 
-    def _clean_pct_string(self, val):
-        if pd.isna(val):
-            return 0.0
-        if isinstance(val, (int, float)):
-            return float(val)
-        try:
-            return float(str(val).replace("%", "").strip())
-        except:
-            return 0.0
+    def _format_main_output(self, result_df):
+        if result_df is None or result_df.empty:
+            return pd.DataFrame(columns=self._output_columns())
 
-    def _fetch_and_clean(self, period_name):
-        """抓取同花顺行业资金流接口"""
-        try:
-            df = ak.stock_fund_flow_industry(symbol=period_name)
-            if df is None or df.empty:
-                return pd.DataFrame()
-            df = df.rename(columns={"行业": "行业名称"})
-            # 清洗百分比和金额
-            pct_cols = ["行业-涨跌幅", "阶段涨跌幅", "领涨股-涨跌幅"]
-            for col in pct_cols:
-                if col in df.columns:
-                    df[col] = df[col].apply(self._clean_pct_string)
-            money_cols = ["流入资金", "流出资金", "净额"]
-            for col in money_cols:
-                if col in df.columns:
-                    if df[col].dtype == "object":
-                        df[col] = df[col].apply(self._normalize_amount)
-                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-            return df
-        except Exception as e:
-            print(f"[WARN] 周期 {period_name} 数据抓取失败: {e}")
-            return pd.DataFrame()
+        df = result_df.reset_index().copy()
+        df = df.rename(columns={
+            'code': '行业代码',
+            'name': '行业名称',
+            'signal': '行业信号',
+            'total_score': '综合得分',
+            'factor_trend': '趋势得分',
+            'factor_value': '估值得分',
+            'factor_volume': '量能得分',
+            'pe_ttm': 'PE_TTM',
+            'pb': 'PB',
+            'div_yield': '股息率',
+            'bull_align_score': '多头排列分',
+            'dev_20': '20日偏离率',
+            'dev_60': '60日偏离率',
+            'vol_ratio': '量比',
+            'amt_ratio': '额比',
+        })
 
-    def _fetch_market_turnover(self):
-        """抓取东方财富行业接口以补全【换手率】"""
-        try:
-            df = ak.stock_board_industry_name_em()
-            # 统一列名以备 merge
-            df = df[["板块名称", "换手率"]]
-            df.columns = ["行业名称", "换手率"]
-            return df
-        except Exception as e:
-            print(f"[WARN] 补全换手率数据失败: {e}")
-            return pd.DataFrame()
+        for col in self._output_columns():
+            if col not in df.columns:
+                df[col] = '' if col in ['行业代码', '行业名称', '行业信号'] else np.nan
 
-    def _fetch_big_deal_logic(self):
-        """抓取大单追踪以增强潜入识别"""
-        try:
-            df = ak.stock_fund_flow_big_deal()
-            if df.empty:
-                return set()
-            # 只统计买入的大单
-            buy_stocks = set(df[df["大单性质"].str.contains("买入", na=False)]["股票简称"].tolist())
-            return buy_stocks
-        except:
-            return set()
+        df['行业名称'] = df['行业名称'].fillna('').astype(str).str.strip()
+        df['行业信号'] = df['行业信号'].fillna('').astype(str).str.strip()
+        return df[self._output_columns()]
 
-    def run_analysis(self) -> pd.DataFrame:
-        if os.path.exists(self.cache_path):
-            print(f">>> 发现本地缓存：{self.cache_filename}，正在加载...")
-            try:
-                return pd.read_csv(self.cache_path, sep="|", encoding="utf-8")
-            except Exception as e:
-                print(f"[WARN] 缓存加载失败: {e}")
+    def run_analysis(self, force_update=False, test_mode=False):
+        df_hist = self.pipeline.fetch_and_cache_all(force_update=force_update, test_mode=test_mode)
+        if df_hist is None or df_hist.empty:
+            return pd.DataFrame(columns=self._output_columns())
 
-        print("\n>>> 获取行业趋势")
-        period_map = {"即时": "now", "3日排行": "3d", "5日排行": "5d", "10日排行": "10d", "20日排行": "20d"}
-        dfs = {}
-        for p_name, p_key in period_map.items():
-            df = self._fetch_and_clean(p_name)
-            if not df.empty:
-                dfs[p_key] = df
-            time.sleep(1.0)
+        result_df = self.model.run_scoring()
+        return self._format_main_output(result_df)
 
-        if "now" not in dfs:
-            return pd.DataFrame()
-
-        # 1. 基础资金数据对齐
-        main = dfs["now"][["行业名称", "行业指数", "行业-涨跌幅", "净额", "流入资金", "领涨股", "领涨股-涨跌幅"]].copy()
-        main.rename(columns={"净额": "净额_now", "行业-涨跌幅": "涨幅_now"}, inplace=True)
-
-        for p in ["3d", "5d", "10d", "20d"]:
-            if p in dfs:
-                tmp = dfs[p][["行业名称", "净额", "阶段涨跌幅"]]
-                tmp.columns = ["行业名称", f"净额_{p}", f"涨幅_{p}"]
-                main = pd.merge(main, tmp, on="行业名称", how="left")
-
-        # 2. 补全缺失的【换手率】和【大单】维度
-        turnover_df = self._fetch_market_turnover()
-        if not turnover_df.empty:
-            main = pd.merge(main, turnover_df, on="行业名称", how="left")
-        else:
-            main["换手率"] = 0.0  # 兜底逻辑
-
-        big_deal_stocks = self._fetch_big_deal_logic()
-        main["大单印证"] = main["领涨股"].apply(lambda x: "确认" if x in big_deal_stocks else "无")
-
-        # 3. 核心计算 (处理缺失值)
-        money_rank_cols = ["净额_3d", "净额_5d", "净额_10d", "净额_20d"]
-        for col in money_rank_cols:
-            main[col] = main[col].fillna(0.0)
-
-        main["资金分"] = (
-            main["净额_3d"] * 0.4 + main["净额_5d"] * 0.3 + main["净额_10d"] * 0.2 + main["净额_20d"] * 0.1
-        ).rank(pct=True) * 100
-        main["价格分"] = main["涨幅_now"].rank(pct=True) * 100  # 以即时强度为主
-        main["换手分"] = main["换手率"].rank(pct=True, ascending=False) * 100  # 换手越低（缩量）得分越高
-        main["趋势得分"] = (main["资金分"] * 0.5 + main["价格分"] * 0.5).round(2)
-
-        # 4. 潜入识别信号逻辑
-        # 黄金坑：钱在进（资金分>75），价没起（价格分<50），散户没动（换手分>60, 即低换手率）
-        is_submerged = (main["资金分"] > 75) & (main["价格分"] < 50) & (main["换手分"] > 60)
-        # 异动点：价格开始抬头，且有大单背书
-        is_shaking = (main["趋势得分"].between(50, 80)) & (main["大单印证"] == "确认")
-
-        conds = [(main["趋势得分"] > 85), (main["趋势得分"] < 25), (is_submerged), (is_shaking)]
-        main["行业信号"] = np.select(conds, ["资金主攻", "退潮预警", "黄金坑潜入", "低位强异动"], default="观望区间")
-
-        result = main.sort_values("趋势得分", ascending=False)
-
-        try:
-            if not os.path.exists(self.config.TEMP_DATA_DIRECTORY):
-                os.makedirs(self.config.TEMP_DATA_DIRECTORY)
-            result.to_csv(self.cache_path, sep="|", index=False, encoding="utf-8")
-            print(f">>> 深度分析完成，结果存至: {self.cache_filename}")
-        except Exception as e:
-            print(f"[WARN] 保存失败: {e}")
-
-        return result
+# ================= 运行入口 =================
+if __name__ == "__main__":
+    pipeline = SWIndustryDataPipeline()
+    # 测试模式：只获取前10个行业数据
+    pipeline.fetch_and_cache_all(force_update=True, test_mode=True) 
+    
+    model = SWMultiFactorModel(pipeline)
+    result = model.run_scoring()
+    
+    cols = ['name', 'pe_ttm', 'pb', 'div_yield', 'bull_align_score', 'dev_60', 'vol_ratio', 'factor_value', 'factor_trend', 'total_score', 'signal']
+    print("\n================ 申万二级行业多因子综合排名 (Top 10) ================")
+    print(result[cols].head(30).to_string())
+    
+    result[cols].to_excel("SW_Industry_Factor_Report_Test.xlsx")
+    print("\n[*] 测试报告已导出至 SW_Industry_Factor_Report_Test.xlsx")

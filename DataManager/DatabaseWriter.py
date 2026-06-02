@@ -257,6 +257,28 @@ class QuantDBManager:
         """
         result = self.execute_query(query, {"table_name": table_name})
         return result[0][0] if result else False
+    
+    def get_distinct_count(self, table_name: str, column_name: str) -> int:
+        """
+        获取指定表中某列的去重记录数
+        用于缓存校验时比对数据维度是否发生变化
+        
+        Args:
+            table_name: 表名
+            column_name: 需要去重统计的列名
+            
+        Returns:
+            int: 去重后的记录数量，如果查询失败或无数据则返回0
+        """
+        # 使用参数化查询防止SQL注入，但表名和列名无法直接参数化
+        # 这里假设传入的table_name和column_name是受信任的内部变量
+        query = f"SELECT COUNT(DISTINCT {column_name}) FROM {table_name}"
+        try:
+            result = self.execute_query(query)
+            return result[0][0] if result and result[0][0] is not None else 0
+        except Exception as e:
+            print(f"  - [数据库错误] 获取 {table_name}.{column_name} 去重计数失败: {e}")
+            return 0
 
     def get_table_columns(self, table_name: str) -> list:
         """获取表的所有列名"""

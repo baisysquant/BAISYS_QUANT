@@ -108,12 +108,12 @@ class StockSyncEngine:
             # 直接从数据库查询股票基本信息
             query = """
             SELECT 
-                ts_code,
-                symbol as 股票代码,
-                name,
-                industry
-            FROM stock_basic_info
-            ORDER BY symbol
+               stock_code as  ts_code,
+                stock_code as 股票代码,
+                stock_name as name,
+                industry_name as industry
+            FROM stock_basic_info_sw
+            ORDER BY stock_code
             """
 
             with self.db.connect() as conn:
