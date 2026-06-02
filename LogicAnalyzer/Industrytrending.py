@@ -48,7 +48,7 @@ class SWIndustryDataPipeline:
         
         return df_hist.rename(columns=rename_dict)
 
-    def fetch_and_cache_all(self, force_update=False, test_mode=False):
+    def fetch_and_cache_all(self, force_update=False):
         """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
         # 历史数据缓存和估值缓存同时存在时，才直接复用本地缓存
         hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
@@ -90,12 +90,6 @@ class SWIndustryDataPipeline:
 
         codes = df_val['code'].astype(str).tolist()
         names = df_val['name'].astype(str).tolist()
-        
-        # 测试模式只取前10个行业
-        if test_mode:
-            codes = codes[:30]
-            names = names[:30]
-            print(f"[!] 测试模式：仅处理前10个行业")
         
         print(f"[2/3] 开始遍历拉取 {len(codes)} 个行业的250天历史量价数据...")
         all_hist_data = []
@@ -234,15 +228,15 @@ class SWMultiFactorModel:
         
         def get_signal(row):
             if row['total_score'] > 75 and row['factor_value'] > 70:
-                return "★ 核心配置 (低估值+强趋势)"
+                return "核心配置 (低估值+强趋势)"
             elif row['total_score'] > 70 and row['factor_trend'] > 80:
-                return "▲ 动量追击 (高景气+资金涌入)"
+                return "动量追击 (高景气+资金涌入)"
             elif row['factor_value'] > 85 and row['factor_trend'] < 40:
-                return "▼ 左侧潜伏 (极度低估+等待拐点)"
+                return "左侧潜伏 (极度低估+等待拐点)"
             elif row['factor_trend'] > 80 and row['factor_value'] < 30:
-                return "⚠ 情绪过热 (高估+趋势透支)"
+                return "情绪过热 (高估+趋势透支)"
             else:
-                return "- 均衡/观望"
+                return "均衡/观望"
                 
         df['signal'] = df.apply(get_signal, axis=1)
         return df.sort_values('total_score', ascending=False)
@@ -294,26 +288,11 @@ class IndustryFlowAnalyzer:
         df['行业信号'] = df['行业信号'].fillna('').astype(str).str.strip()
         return df[self._output_columns()]
 
-    def run_analysis(self, force_update=False, test_mode=False):
-        df_hist = self.pipeline.fetch_and_cache_all(force_update=force_update, test_mode=test_mode)
+    def run_analysis(self, force_update=False):
+        df_hist = self.pipeline.fetch_and_cache_all(force_update=force_update)
         if df_hist is None or df_hist.empty:
             return pd.DataFrame(columns=self._output_columns())
 
         result_df = self.model.run_scoring()
         return self._format_main_output(result_df)
-
-# ================= 运行入口 =================
-if __name__ == "__main__":
-    pipeline = SWIndustryDataPipeline()
-    # 测试模式：只获取前10个行业数据
-    pipeline.fetch_and_cache_all(force_update=True, test_mode=True) 
-    
-    model = SWMultiFactorModel(pipeline)
-    result = model.run_scoring()
-    
-    cols = ['name', 'pe_ttm', 'pb', 'div_yield', 'bull_align_score', 'dev_60', 'vol_ratio', 'factor_value', 'factor_trend', 'total_score', 'signal']
-    print("\n================ 申万二级行业多因子综合排名 (Top 10) ================")
-    print(result[cols].head(30).to_string())
-    
-    result[cols].to_excel("SW_Industry_Factor_Report_Test.xlsx")
-    print("\n[*] 测试报告已导出至 SW_Industry_Factor_Report_Test.xlsx")
+ 
