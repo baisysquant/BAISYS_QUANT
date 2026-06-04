@@ -16,6 +16,7 @@
 import sys
 import os
 import time
+import random
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,8 +30,8 @@ if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
         pass
 
 import pandas as pd
+import traceback
 import akshare as ak
-import pandas_ta as ta  # noqa: F401  SignalManager / _process_single_stock 内部依赖
 
 
 # ── 从项目现有模块导入 ─────────────────────────────────────────────────────
@@ -69,66 +70,73 @@ def print_field(label: str, value: Any):
         print(f"    {label:<26} : {value}")
 
 
-# ── 数据获取（带自动重试）─────────────────────────────────────────────────
+# ── 数据获取（复用 StockSyncEngine._fetch_kline_for_symbol 模式）─────────
 def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
-    """从 akshare 获取个股日 K 线数据，失败时自动重试"""
+    """
+    获取个股前复权 + 不复权数据，合并输出。
+    完全复用 StockSyncEngine._fetch_kline_for_symbol 的 akshare API 调用模式。
+    """
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
 
-    last_error = None
     for attempt in range(3):
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq",
+            # 1) 前复权数据（价格）
+            df_qfq = ak.stock_zh_a_hist_tx(
+                symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq"
             )
-            if df is not None and not df.empty:
-                return _prepare_kline_df(df)
+            if df_qfq is None or df_qfq.empty:
+                raise ValueError("空数据")
+
+            expected = ["date", "open", "close", "high", "low", "amount"]
+            if any(c not in df_qfq.columns for c in expected):
+                raise ValueError(f"前复权数据缺失列: {df_qfq.columns.tolist()}")
+
+            time.sleep(0.05)
+
+            # 2) 不复权数据（成交量）
+            df_norm = ak.stock_zh_a_hist_tx(
+                symbol=symbol, start_date=start_date, end_date=end_date, adjust=""
+            )
+            if df_norm is None or df_norm.empty:
+                raise ValueError("空数据")
+
+            df_norm = df_norm[["date", "close", "amount"]].rename(
+                columns={"close": "close_normal", "amount": "volume_normal"}
+            )
+
+            # 3) 合并
+            df = pd.merge(df_qfq, df_norm, on="date", how="inner")
+            if df.empty:
+                raise ValueError("合并后无数据")
+
+            # 4) 数值转换 & 计算调整后成交量
+            for col in ["close", "close_normal", "amount", "volume_normal"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            df["adj_ratio"] = df["close"] / df["close_normal"].replace(0, pd.NA)
+            df["volume"] = df["volume_normal"] * (df["amount"] / df["volume_normal"].replace(0, pd.NA))
+            df.dropna(subset=["adj_ratio", "volume"], inplace=True)
+
+            # 5) 标准化
+            df["date"] = pd.to_datetime(df["date"])
+            df.sort_values("date", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            df.rename(columns={"amount": "amount_adj"}, inplace=True)
+
+            return df
+
         except Exception as e:
-            last_error = e
             if attempt < 2:
                 wait = 2 ** attempt
                 print(f"  [RETRY] 第 {attempt + 1} 次失败，{wait} 秒后重试...")
+                print(f"       {type(e).__name__}: {e}")
                 time.sleep(wait)
-
-    print(f"  [ERROR] 下载数据失败: {last_error}")
+            else:
+                print(f"  [ERROR] 下载数据失败: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                return None
     return None
-
-
-def _prepare_kline_df(df: pd.DataFrame) -> pd.DataFrame:
-    """标准化 K 线 DataFrame 列名，同时保留额外行情字段供展示"""
-    extra_cols = {}
-    for cn in ("振幅", "涨跌幅", "涨跌额", "换手率"):
-        if cn in df.columns:
-            extra_cols[cn] = df[cn].iloc[-1]
-
-    df = df.rename(
-        columns={
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "成交额": "amount",
-        }
-    )
-
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-        df.sort_values("date", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-    for col in ["open", "close", "high", "low", "volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # 将额外字段挂在 df.attrs 上，与主数据分离
-    df.attrs["extra"] = extra_cols
-    return df
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────
@@ -166,7 +174,7 @@ def main():
     # 尝试获取股票名称
     stock_name = pure_code
     try:
-        info_df = ak.stock_individual_info_em(symbol=symbol)
+        info_df = ak.stock_individual_info_em(symbol=pure_code)
         if info_df is not None and not info_df.empty and len(info_df.columns) >= 2:
             first_col = info_df.columns[0]
             name_row = info_df[info_df[first_col].astype(str).str.contains("股票名称")]
@@ -179,14 +187,6 @@ def main():
     latest_price = df["close"].iloc[-1]
     print_field("最新价", f"{latest_price:.2f}")
     print_field("数据条数", len(df))
-
-    # 展示额外行情字段（振幅 / 涨跌幅 / 涨跌额 / 换手率）
-    extra = df.attrs.get("extra", {})
-    for k in ("振幅", "涨跌幅", "涨跌额", "换手率"):
-        v = extra.get(k)
-        if v is not None and pd.notna(v):
-            unit = "%" if k in ("振幅", "涨跌幅", "换手率") else ""
-            print_field(k, f"{v:.2f}{unit}")
 
     # 4. 复用 TASignalProcessor 计算全部技术信号 ──────────────────────
     config = Config()
