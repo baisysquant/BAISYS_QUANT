@@ -318,6 +318,48 @@ class MACDAnalyzer:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _score_kline_pattern(df: pd.DataFrame, max_score: int = 10) -> tuple[str, int]:
+        """
+        根据 K 线形态检测结果给出评分（0~max_score）。
+
+        优先从 df.attrs 读取 SignalManager 传入的复合评分，
+        若无则基于最近 20 根 K 线做简易反转特征评分。
+        """
+        attrs_score = df.attrs.get('kline_pattern_score', None)
+        if attrs_score is not None:
+            raw = attrs_score
+        else:
+            close = df['close'].astype(float)
+            high = df['high'].astype(float)
+            low = df['low'].astype(float)
+            open_ = df['open'].astype(float)
+            recent = df.tail(20)
+            raw = 0.0
+            for i in range(len(recent) - 1, max(len(recent) - 6, -1), -1):
+                body = abs(recent['close'].iloc[i] - recent['open'].iloc[i])
+                lower = min(recent['open'].iloc[i], recent['close'].iloc[i]) - recent['low'].iloc[i]
+                upper = recent['high'].iloc[i] - max(recent['open'].iloc[i], recent['close'].iloc[i])
+                if body > 0 and lower > body * 2 and upper < body * 0.5:
+                    raw += 1 if recent['close'].iloc[i] > recent['open'].iloc[i] else -1
+                if body > 0 and upper > body * 2 and lower < body * 0.5:
+                    raw += 1 if recent['close'].iloc[i] > recent['open'].iloc[i] else -1
+            for i in range(len(recent) - 2):
+                if all(recent['close'].iloc[i + j] > recent['open'].iloc[i + j] for j in range(3)):
+                    raw += 1
+                if all(recent['close'].iloc[i + j] < recent['open'].iloc[i + j] for j in range(3)):
+                    raw -= 1
+
+        raw_norm = max(-1.0, min(1.0, raw / 10.0))
+        score = int((raw_norm + 1.0) / 2.0 * max_score)
+        if raw_norm > 0.3:
+            desc = f"偏多形态 (score={raw:.1f})"
+        elif raw_norm < -0.3:
+            desc = f"偏空形态 (score={raw:.1f})"
+        else:
+            desc = f"中性形态 (score={raw:.1f})"
+        return desc, score
+
+    @staticmethod
     def _volume_price_trend_score(df: pd.DataFrame, lookback: int = 5, max_bonus: int = 10) -> tuple[str, int]:
         if len(df) < lookback + 1 or "volume" not in df.columns:
             return "数据不足", 0
@@ -661,6 +703,13 @@ class MACDAnalyzer:
             vol_desc = f"顶背离压制，跳过量价奖励"
         scores["量价配合"] = (vol_desc, vol_bonus)
 
+        # ⑧ K线形态评分 ────────────────────────────────────────────────────
+        w_kp = weights.get("K线形态", 10)
+        kp_result = self._score_kline_pattern(df, max_score=w_kp)
+        if has_top_div:
+            kp_result = (kp_result[0], max(0, kp_result[1]))
+        scores["K线形态"] = kp_result
+
         # ── 历史胜率（仅参考，不计入评分）────────────────────────────────
         winrate = self.backtest_signal_winrate(df, "MACD_12269_SIGNAL_DETAIL", "零轴上金叉", forward_bars=5)
         winrate_str = (
@@ -678,7 +727,7 @@ class MACDAnalyzer:
         if has_top_div:
             total_base = min(total_base, w_div * 4)
 
-        total_max_base = w_zero + w_strat + w_tact + w_mom + w_slope + w_div
+        total_max_base = w_zero + w_strat + w_tact + w_mom + w_slope + w_div + w_kp
         total_base = max(0, min(total_max_base, total_base))
         total = max(0, min(total_max_base + w_vol, total_base + bonus))
 

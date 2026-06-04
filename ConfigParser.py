@@ -21,6 +21,10 @@ import os
 import warnings
 
 from pydantic import BaseModel, Field, field_validator
+
+
+def _default_signal_workers() -> int:
+    return max(os.cpu_count() or 4, 2)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,7 +57,7 @@ class SystemConfig(BaseModel):
     MAX_WORKERS: int = Field(default=15, ge=1)
     DATA_FETCH_RETRIES: int = Field(default=3, ge=1)
     DATA_FETCH_DELAY: int = Field(default=5, ge=1)
-    SIGNAL_PROCESSING_PROCESSES: int = Field(default=2, ge=1)
+    SIGNAL_PROCESSING_PROCESSES: int = Field(default_factory=_default_signal_workers, ge=1)
 
     @field_validator("HOME_DIRECTORY")
     @classmethod
@@ -222,12 +226,13 @@ class FullBullScoringConfig(BaseModel):
     """MACD 完全多头评分维度权重"""
 
     WEIGHT_ZERO_AXIS: int = Field(default=20, ge=0, le=100)
-    WEIGHT_STRATEGY_GOLDEN: int = Field(default=20, ge=0, le=100)
-    WEIGHT_TACTICAL_GOLDEN: int = Field(default=15, ge=0, le=100)
-    WEIGHT_MOMENTUM: int = Field(default=20, ge=0, le=100)
-    WEIGHT_DIF_SLOPE: int = Field(default=15, ge=0, le=100)
+    WEIGHT_STRATEGY_GOLDEN: int = Field(default=15, ge=0, le=100)
+    WEIGHT_TACTICAL_GOLDEN: int = Field(default=10, ge=0, le=100)
+    WEIGHT_MOMENTUM: int = Field(default=15, ge=0, le=100)
+    WEIGHT_DIF_SLOPE: int = Field(default=10, ge=0, le=100)
     WEIGHT_DIVERGENCE: int = Field(default=10, ge=0, le=100)
     WEIGHT_VOLUME_PRICE: int = Field(default=10, ge=0, le=100)
+    WEIGHT_KLINE_PATTERN: int = Field(default=10, ge=0, le=100)
     CONCLUSION_FULL_BULL: int = Field(default=80, ge=0, le=100)
     CONCLUSION_BULLISH: int = Field(default=60, ge=0, le=100)
     CONCLUSION_OSCILLATE: int = Field(default=40, ge=0, le=100)
@@ -347,7 +352,7 @@ class Config:
             MAX_WORKERS=system.getint("MAX_WORKERS", fallback=15),
             DATA_FETCH_RETRIES=system.getint("DATA_FETCH_RETRIES", fallback=3),
             DATA_FETCH_DELAY=system.getint("DATA_FETCH_DELAY", fallback=5),
-            SIGNAL_PROCESSING_PROCESSES=system.getint("signal_processing_processes", fallback=2),
+            SIGNAL_PROCESSING_PROCESSES=system.getint("signal_processing_processes", fallback=_default_signal_workers()),
         )
 
         # 读取 LOGGING 配置
@@ -409,12 +414,13 @@ class Config:
             fbs = config["FULL_BULL_SCORING"]
             fbs_config = FullBullScoringConfig(
                 WEIGHT_ZERO_AXIS=fbs.getint("WEIGHT_ZERO_AXIS", fallback=20),
-                WEIGHT_STRATEGY_GOLDEN=fbs.getint("WEIGHT_STRATEGY_GOLDEN", fallback=20),
-                WEIGHT_TACTICAL_GOLDEN=fbs.getint("WEIGHT_TACTICAL_GOLDEN", fallback=15),
-                WEIGHT_MOMENTUM=fbs.getint("WEIGHT_MOMENTUM", fallback=20),
-                WEIGHT_DIF_SLOPE=fbs.getint("WEIGHT_DIF_SLOPE", fallback=15),
+                WEIGHT_STRATEGY_GOLDEN=fbs.getint("WEIGHT_STRATEGY_GOLDEN", fallback=15),
+                WEIGHT_TACTICAL_GOLDEN=fbs.getint("WEIGHT_TACTICAL_GOLDEN", fallback=10),
+                WEIGHT_MOMENTUM=fbs.getint("WEIGHT_MOMENTUM", fallback=15),
+                WEIGHT_DIF_SLOPE=fbs.getint("WEIGHT_DIF_SLOPE", fallback=10),
                 WEIGHT_DIVERGENCE=fbs.getint("WEIGHT_DIVERGENCE", fallback=10),
                 WEIGHT_VOLUME_PRICE=fbs.getint("WEIGHT_VOLUME_PRICE", fallback=10),
+                WEIGHT_KLINE_PATTERN=fbs.getint("WEIGHT_KLINE_PATTERN", fallback=10),
                 CONCLUSION_FULL_BULL=fbs.getint("CONCLUSION_FULL_BULL", fallback=80),
                 CONCLUSION_BULLISH=fbs.getint("CONCLUSION_BULLISH", fallback=60),
                 CONCLUSION_OSCILLATE=fbs.getint("CONCLUSION_OSCILLATE", fallback=40),
@@ -502,6 +508,7 @@ class Config:
             "DIF斜率": fbs_config.WEIGHT_DIF_SLOPE,
             "背离信号": fbs_config.WEIGHT_DIVERGENCE,
             "量价配合": fbs_config.WEIGHT_VOLUME_PRICE,
+            "K线形态": fbs_config.WEIGHT_KLINE_PATTERN,
         }
         self.FULL_BULL_THRESHOLDS = {
             "fully_bull": fbs_config.CONCLUSION_FULL_BULL,

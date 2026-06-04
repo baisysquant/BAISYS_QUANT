@@ -119,14 +119,17 @@ class StockAnalysisCoordinator:
         self.logger.info(f"[INFO] 最后一个交易日为: {self.today_str}")
 
         try:
-            # 步骤1：同步历史数据
-            self._sync_historical_data()
-
-            # 步骤2：获取股票代码列表
-            stock_codes_prefixed, stock_codes_pure = self._get_stock_codes_from_db()
-            if not stock_codes_prefixed:
-                self.logger.critical("未获取到股票代码，流程终止")
+            # 步骤1：同步历史数据（内部已完成研报过滤，返回过滤后的纯代码集合）
+            filtered_pure_codes = self._sync_historical_data()
+            if not filtered_pure_codes:
+                self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return
+
+            from DataManager.ShareCodeFormatMgr import format_stock_code
+
+            # 步骤2：将过滤后的代码转为带前缀格式
+            stock_codes_prefixed = [format_stock_code(code) for code in sorted(filtered_pure_codes)]
+            stock_codes_pure = sorted(filtered_pure_codes)
 
             self.logger.info(
                 f">>> HistDataWatchDog 成功同步 {len(stock_codes_prefixed)} 只股票数据到数据库，并作为分析基础。"
@@ -208,10 +211,10 @@ class StockAnalysisCoordinator:
         finally:
             self.executor.shutdown(wait=True)
 
-    def _sync_historical_data(self) -> None:
-        """同步历史数据到数据库"""
+    def _sync_historical_data(self) -> set:
+        """同步历史数据到数据库，返回研报过滤后的股票代码集合"""
         self.logger.info(">>> 正在同步历史数据到数据库...")
-        self.stock_sync_engine.run_engine(target_date=self.today_str)
+        return self.stock_sync_engine.run_engine(target_date=self.today_str)
 
     def _load_research_report_data(self) -> pd.DataFrame:
         """
@@ -517,6 +520,14 @@ class StockAnalysisCoordinatorFactory:
 
         # 1. 初始化配置和基础设施
         config = Config(config_file=config_file)
+
+        # 1a. 配置完整性校验与自动修复
+        try:
+            from UtilsManager.ConfigValidator import validate_and_repair
+            validate_and_repair(config_file)
+        except Exception:
+            pass
+
         calendar_mgr = TradingCalendarAnalyzer()
         today_str = calendar_mgr.get_last_trading_day()
 

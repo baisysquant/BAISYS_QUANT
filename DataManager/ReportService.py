@@ -96,6 +96,7 @@ class ReportService:
             ColumnNames.CCI_SIGNAL,
             ColumnNames.RSI_SIGNAL,
             ColumnNames.BOLL_SIGNAL,
+            ColumnNames.KLINE_PATTERN_SIGNAL,
         ])
         return cols
 
@@ -192,11 +193,13 @@ class ReportService:
                     if stock_code_col in df.columns:
                         # Create a temporary column for sorting: 1 if in user focus, 0 otherwise
                         df_tmp = df.copy()
-                        df_tmp['_user_focus'] = df_tmp[stock_code_col].isin(user_focus_stocks).astype(int)
-                        # Sort by user focus descending (so 1 comes first), then by the original index to maintain order within groups
-                        df_tmp = df_tmp.sort_values(by=['_user_focus', df_tmp.index], ascending=[False, True])
-                        # Drop the temporary column
-                        df_sorted = df_tmp.drop(columns=['_user_focus'])
+                        mask = df_tmp[stock_code_col].isin(user_focus_stocks)
+                        # Move user focus stocks to top while preserving original order within each group
+                        df_user = df_tmp[mask]
+                        df_normal = df_tmp[~mask]
+                        df_user = df_user.reset_index(drop=True)
+                        df_normal = df_normal.reset_index(drop=True)
+                        df_sorted = pd.concat([df_user, df_normal], ignore_index=True)
                     else:
                         # If stock code column not found, use original df
                         df_sorted = df

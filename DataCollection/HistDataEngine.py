@@ -595,7 +595,7 @@ class StockSyncEngine:
         stock_pool_df = self.get_stock_pool_from_db()
         if stock_pool_df.empty or "股票代码" not in stock_pool_df.columns:
             print("[CRITICAL] 基础股票池无效")
-            return
+            return set()
 
         # Step 1.5: 过滤ST股票
         if "name" in stock_pool_df.columns:
@@ -653,7 +653,7 @@ class StockSyncEngine:
 
             if after_count == 0:
                 print("[警告] 研报过滤后无股票剩余，请检查阈值设置或研报数据")
-                return
+                return set()
         elif self.config.ENABLE_RESEARCH_REPORT_FILTER:
             print("[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
 
@@ -719,7 +719,7 @@ class StockSyncEngine:
                     print(f"  - 今日日期: {self.today}")
                     print(f"  - 筛选股票数: {len(final_codes)}")
 
-                    return
+                    return final_codes
 
             except Exception as e:
                 print(f"[WARN] 缓存加载失败: {e}")
@@ -926,3 +926,6 @@ class StockSyncEngine:
             print(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
         except Exception as e:
             print(f"[ERROR] 保存最终代码列表失败: {e}")
+
+        return filtered_codes
+

@@ -103,6 +103,16 @@ class TASignalProcessor:
 
         result: dict[str, Any] = {'code': code, 'pure_code': pure_code}
 
+        # K线形态检测（在 FullBull 评分之前执行，评分结果存入 df.attrs 供后续使用）
+        try:
+            kp = self._detect_kline_patterns(df, scan_window=60)
+            if kp:
+                result['kline_pattern'] = kp['signal']
+                result['kline_pattern_score'] = kp['score']
+                df.attrs['kline_pattern_score'] = kp['score']
+        except Exception:
+            pass
+
         try:
             weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
             thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
@@ -186,6 +196,149 @@ class TASignalProcessor:
             pass
 
         return result
+
+    # ── K线形态检测 ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _detect_kline_patterns(df: pd.DataFrame, scan_window: int = 60) -> dict | None:
+        """
+        检测最近 scan_window 根 K 线的经典组合形态。
+
+        使用 TA-Lib CDL 模式识别 + pandas_ta.cdl_pattern()。
+        返回综合信号文本和评分（-10 ~ +10），供 FullBull 评分使用。
+        """
+        import pandas_ta as ta
+
+        required = ['open', 'high', 'low', 'close']
+        if not all(c in df.columns for c in required):
+            return None
+
+        df_window = df.tail(scan_window).copy()
+        if len(df_window) < 30:
+            return None
+
+        open_s = df_window['open'].astype(float)
+        high_s = df_window['high'].astype(float)
+        low_s = df_window['low'].astype(float)
+        close_s = df_window['close'].astype(float)
+
+        result = ta.cdl_pattern(open_s, high_s, low_s, close_s, name='all')
+        if result is None or result.empty:
+            return None
+
+        # TA-Lib 列名格式: CDL_ENGULFING, CDL_DOJI_10_0.1 等
+        def _norm_name(col: str) -> str:
+            for suffix in ('_10_0.1', '_0.1', '_10'):
+                if suffix in col:
+                    return col.split(suffix)[0]
+            return col
+
+        # 形态级别映射
+        STRONG = {'CDL_ENGULFING', 'CDL_HIKKAKE', 'CDL_MORNINGSTAR', 'CDL_MORNINGDOJISTAR',
+                  'CDL_EVENINGSTAR', 'CDL_EVENINGDOJISTAR', 'CDL_ABANDONEDBABY'}
+        MEDIUM = {'CDL_DARKCLOUDCOVER', 'CDL_PIERCING', 'CDL_3WHITESOLDIERS', 'CDL_3BLACKCROWS',
+                  'CDL_HARAMI', 'CDL_HARAMICROSS', 'CDL_BREAKAWAY', 'CDL_KICKING'}
+        WEAK = {'CDL_DOJI', 'CDL_HAMMER', 'CDL_HANGINGMAN', 'CDL_SHOOTINGSTAR',
+                'CDL_INVERTEDHAMMER', 'CDL_DRAGONFLYDOJI', 'CDL_GRAVESTONEDOJI',
+                'CDL_LONGLEGGEDDOJI', 'CDL_SPINNINGTOP', 'CDL_TAKURI'}
+        CONTINUOUS = {'CDL_RISEFALL3METHODS', 'CDL_GAPSIDESIDEWHITE', 'CDL_XSIDEGAP3METHODS', 'CDL_MATHOLD'}
+
+        LABELS = {
+            'CDL_ENGULFING': '吞没形态', 'CDL_HIKKAKE': '对策(类岛形反转)',
+            'CDL_MORNINGSTAR': '早晨之星', 'CDL_MORNINGDOJISTAR': '早晨十字星',
+            'CDL_EVENINGSTAR': '黄昏之星', 'CDL_EVENINGDOJISTAR': '黄昏十字星',
+            'CDL_ABANDONEDBABY': '弃婴(岛形反转)',
+            'CDL_DARKCLOUDCOVER': '乌云盖顶', 'CDL_PIERCING': '刺透形态',
+            'CDL_3WHITESOLDIERS': '红三兵', 'CDL_3BLACKCROWS': '三只乌鸦',
+            'CDL_HARAMI': '孕线', 'CDL_HARAMICROSS': '十字孕线',
+            'CDL_BREAKAWAY': '脱离(类旗形)', 'CDL_KICKING': '踢形态',
+            'CDL_DOJI': '十字星', 'CDL_HAMMER': '锤子线',
+            'CDL_HANGINGMAN': '上吊线', 'CDL_SHOOTINGSTAR': '射击之星',
+            'CDL_INVERTEDHAMMER': '倒锤子线',
+            'CDL_DRAGONFLYDOJI': '蜻蜓十字', 'CDL_GRAVESTONEDOJI': '墓碑十字',
+            'CDL_LONGLEGGEDDOJI': '长脚十字', 'CDL_SPINNINGTOP': '纺锤线',
+            'CDL_TAKURI': '托里(类锤子)',
+            'CDL_RISEFALL3METHODS': '上升/下降三法',
+            'CDL_GAPSIDESIDEWHITE': '跳空并列阳线',
+            'CDL_XSIDEGAP3METHODS': '侧跳空三法', 'CDL_MATHOLD': '待变(类旗形)',
+        }
+
+        LEVEL_ORDER = {'强反转': 0, '中反转': 1, '弱信号': 2, '持续': 3}
+        LEVEL_MAP = {}
+        for p in STRONG: LEVEL_MAP[p] = '强反转'
+        for p in MEDIUM: LEVEL_MAP[p] = '中反转'
+        for p in WEAK: LEVEL_MAP[p] = '弱信号'
+        for p in CONTINUOUS: LEVEL_MAP[p] = '持续'
+
+        # 扫描窗口内所有非零模式
+        detected = []
+        for col in result.columns:
+            base = _norm_name(col)
+            series = result[col]
+            nonzero = series[series != 0]
+            if nonzero.empty:
+                continue
+            last_row_idx = nonzero.index[-1]
+            last_val = nonzero.iloc[-1]
+            bars_ago = len(series) - 1 - series.index.get_loc(last_row_idx)
+            is_bullish = last_val > 0
+
+            level = LEVEL_MAP.get(base)
+            if level is None:
+                continue
+
+            detected.append({
+                'base': base,
+                'label': LABELS.get(base, base),
+                'level': level,
+                'direction': '看涨' if is_bullish else '看跌',
+                'bars_ago': bars_ago,
+                'confirmed': bars_ago > 0,
+                'score_val': last_val,
+            })
+
+        if not detected:
+            return None
+
+        # 按级别 + 时间排序，优先展示强反转且最新的
+        detected.sort(key=lambda x: (LEVEL_ORDER.get(x['level'], 9), x['bars_ago']))
+
+        # 生成综合信号文本
+        strongest = detected[0]
+        parts = []
+        status_mark = '' if strongest['confirmed'] else ' [待确认]'
+        parts.append(f"[{strongest['level']}] {strongest['label']} ({strongest['direction']}){status_mark}")
+
+        # 统计多空
+        bull_count = sum(1 for d in detected if d['direction'] == '看涨')
+        bear_count = sum(1 for d in detected if d['direction'] == '看跌')
+        if bull_count > bear_count * 1.5:
+            parts.append('整体偏多')
+        elif bear_count > bull_count * 1.5:
+            parts.append('整体偏空')
+
+        # 形态数量
+        parts.append(f'形态{len(detected)}种')
+        signal_text = ' | '.join(parts)
+
+        # 评分（-10 ~ +10）
+        score_raw = 0
+        for d in detected:
+            weight = 1.0
+            if d['level'] == '强反转':
+                weight = 3.0
+            elif d['level'] == '中反转':
+                weight = 2.0
+            elif d['level'] == '弱信号':
+                weight = 0.5
+            else:
+                weight = 0.3
+            if not d['confirmed']:
+                weight *= 0.5
+            score_raw += weight if d['direction'] == '看涨' else -weight
+
+        score = max(-10, min(10, int(score_raw)))
+
+        return {'signal': signal_text, 'score': score, 'details': detected}
 
     def process_signals(
         self,
@@ -315,6 +468,7 @@ class TASignalProcessor:
         cci_rows: list[dict] = []
         rsi_rows: list[dict] = []
         boll_rows: list[dict] = []
+        kline_rows: list[dict] = []
 
         for r in results:
             code = r['code']
@@ -339,6 +493,7 @@ class TASignalProcessor:
                     'DIF斜率': detail.get('DIF斜率', {}).get('desc', ''),
                     '背离信号': detail.get('背离信号', {}).get('desc', ''),
                     '量价配合': detail.get('量价配合', {}).get('desc', ''),
+                    'K线形态': detail.get('K线形态', {}).get('desc', ''),
                 })
 
             if 'mom_12269' in r:
@@ -362,6 +517,9 @@ class TASignalProcessor:
             if 'boll_signal' in r:
                 boll_rows.append({'股票代码': code, 'BOLL_Signal': r['boll_signal']})
 
+            if 'kline_pattern' in r:
+                kline_rows.append({'股票代码': code, 'K线形态信号': r['kline_pattern']})
+
         ta_signals['MACD_12269'] = pd.DataFrame(macd_12269_rows)
         ta_signals[f'MACD_{second_period_name}'] = pd.DataFrame(macd_second_rows)
         ta_signals['MACD_FULL_BULL'] = pd.DataFrame(bull_rows)
@@ -370,6 +528,7 @@ class TASignalProcessor:
         ta_signals['CCI'] = pd.DataFrame(cci_rows)
         ta_signals['RSI'] = pd.DataFrame(rsi_rows)
         ta_signals['BOLL'] = pd.DataFrame(boll_rows)
+        ta_signals['KLINE_PATTERN'] = pd.DataFrame(kline_rows)
 
         # ── 统一清洗股票代码格式 ──────────────────────────────────────────
         for key in ta_signals:

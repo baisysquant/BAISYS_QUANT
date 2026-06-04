@@ -52,6 +52,7 @@ class ColumnNames:
     CCI_SIGNAL = "CCI_Signal"
     RSI_SIGNAL = "RSI_Signal"
     BOLL_SIGNAL = "BOLL_Signal"
+    KLINE_PATTERN_SIGNAL = "K线形态信号"
 
     # ==================== 资金流列 ====================
     # 注意：单位统一为"万元"
