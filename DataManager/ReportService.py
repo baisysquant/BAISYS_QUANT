@@ -29,13 +29,32 @@ class ReportService:
     def __init__(self, config, logger):
         """
         初始化报告生成服务
-
+        
         Args:
             config: 配置管理器
             logger: 日志管理器
         """
         self.config = config
         self.logger = logger
+
+    def _get_user_focus_stocks(self) -> set[str]:
+        """
+        从配置中获取用户关注的股票列表
+        
+        Returns:
+            set[str]: 用户关注的股票代码集合（不含SZ/SH前缀）
+        """
+        try:
+            user_focus_str = self.config.USER_FOCUS_STOCKS
+            if not user_focus_str or user_focus_str.strip() == "":
+                return set()
+            
+            # Split by | and clean up whitespace
+            stocks = {stock.strip() for stock in user_focus_str.split("|") if stock.strip()}
+            return stocks
+        except AttributeError:
+            # If USER_FOCUS_STOCKS config doesn't exist, return empty set
+            return set()
 
     @staticmethod
     def get_base_columns():
@@ -139,6 +158,11 @@ class ReportService:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{timestamp}.xlsx")
 
+        # Get user focus stocks once for all sheets
+        user_focus_stocks = self._get_user_focus_stocks()
+        if user_focus_stocks:
+            self.logger.info(f"  - 用户关注股池: {', '.join(sorted(user_focus_stocks))}")
+
         try:
             writer = pd.ExcelWriter(report_path, engine="xlsxwriter")
             workbook = writer.book
@@ -154,18 +178,38 @@ class ReportService:
             )
             currency_format = workbook.add_format({"num_format": "#,##0.00"})
             code_format = workbook.add_format({"num_format": "@"})
+            # Format for user focus stocks: light red background
+            user_focus_format = workbook.add_format({"bg_color": "#FFC7CE"})  # Light red
 
             for sheet_name, df in sheets_data.items():
                 if df is None or df.empty:
                     self.logger.debug(f"工作表 '{sheet_name}' 数据为空，跳过创建。")
                     continue
 
-                df.to_excel(writer, sheet_name=sheet_name, startrow=1, header=False, index=False)
+                # If we have user focus stocks and the stock code column exists, sort and prepare for highlighting
+                if user_focus_stocks:
+                    stock_code_col = ColumnNames.STOCK_CODE
+                    if stock_code_col in df.columns:
+                        # Create a temporary column for sorting: 1 if in user focus, 0 otherwise
+                        df_tmp = df.copy()
+                        df_tmp['_user_focus'] = df_tmp[stock_code_col].isin(user_focus_stocks).astype(int)
+                        # Sort by user focus descending (so 1 comes first), then by the original index to maintain order within groups
+                        df_tmp = df_tmp.sort_values(by=['_user_focus', df_tmp.index], ascending=[False, True])
+                        # Drop the temporary column
+                        df_sorted = df_tmp.drop(columns=['_user_focus'])
+                    else:
+                        # If stock code column not found, use original df
+                        df_sorted = df
+                else:
+                    df_sorted = df
+
+                df_sorted.to_excel(writer, sheet_name=sheet_name, startrow=1, header=False, index=False)
                 worksheet = writer.sheets[sheet_name]
 
                 for col_num, value in enumerate(df.columns.values):
                     worksheet.write(0, col_num, value, header_format)
 
+                # Apply formatting for columns and user focus rows
                 for i, col in enumerate(df.columns):
                     max_len = max(df[col].astype(str).str.len().max(), len(col))
                     col_width = min(max_len + 2, 30)
@@ -184,6 +228,17 @@ class ReportService:
                         worksheet.set_column(i, i, col_width, currency_format)
                     else:
                         worksheet.set_column(i, i, col_width)
+
+                # Apply user focus highlighting if applicable
+                if user_focus_stocks and stock_code_col in df.columns:
+                    # We need to apply the format to the rows where stock code is in user_focus_stocks
+                    # We have already sorted the df_sorted, so we can iterate over the rows and apply the format
+                    for row_idx, (_, row) in enumerate(df_sorted.iterrows(), start=2):  # start=2 because header is at row 1 (0-indexed in excel, but we start at row 2 in excel because of header)
+                        stock_code = row[stock_code_col]
+                        if stock_code in user_focus_stocks:
+                            # Apply the user focus format to the entire row
+                            for col_idx in range(len(df.columns)):
+                                worksheet.write(row_idx, col_idx, row[df.columns[col_idx]], user_focus_format)
 
             writer.close()
             self.logger.info(f"  - 报告已成功生成并保存到: {report_path}")

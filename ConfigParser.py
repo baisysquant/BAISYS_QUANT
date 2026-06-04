@@ -246,6 +246,12 @@ class KlineDataConfig(BaseModel):
         return v
 
 
+class UserFocusStocksConfig(BaseModel):
+    """用户关注股池配置"""
+
+    USER_FOCUS_STOCKS: str = Field(default="")
+
+
 class AppConfig(BaseSettings):
     """应用配置主模型"""
 
@@ -263,6 +269,7 @@ class AppConfig(BaseSettings):
     column_aliases: ColumnAliasesConfig
     research_report_filter: ResearchReportFilterConfig
     full_bull_scoring: FullBullScoringConfig
+    user_focus_stocks: UserFocusStocksConfig
     kline_data: KlineDataConfig
 
 
@@ -422,6 +429,13 @@ class Config:
         except KeyError:
             kd_config = KlineDataConfig()
 
+        # 读取用户关注股池配置
+        try:
+            ufs = config["USER_FOCUS_STOCKS"]
+            ufc = UserFocusStocksConfig(USER_FOCUS_STOCKS=ufs.get("user_focus_stocks", fallback=""))
+        except KeyError:
+            ufc = UserFocusStocksConfig()
+
         # 创建主配置对象
         self.app_config = AppConfig(
             database=database_config,
@@ -434,6 +448,7 @@ class Config:
             column_aliases=col_config,
             research_report_filter=rrf_config,
             full_bull_scoring=fbs_config,
+            user_focus_stocks=ufc,
             kline_data=kd_config,
         )
 
@@ -476,6 +491,8 @@ class Config:
 
         self.ENABLE_RESEARCH_REPORT_FILTER = rrf_config.ENABLE_RESEARCH_REPORT_FILTER
         self.RESEARCH_REPORT_MIN_COUNT = rrf_config.RESEARCH_REPORT_MIN_COUNT
+
+        self.USER_FOCUS_STOCKS = ufc.USER_FOCUS_STOCKS
 
         self.FULL_BULL_WEIGHTS = {
             "零轴条件": fbs_config.WEIGHT_ZERO_AXIS,
