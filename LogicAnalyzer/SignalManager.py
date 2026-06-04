@@ -1,6 +1,6 @@
 import re
 import pandas as pd
-from typing import Any
+from typing import Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas_ta as ta  # 勿删
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
