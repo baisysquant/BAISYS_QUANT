@@ -7,22 +7,21 @@
 输出 Excel 报告中所有的技术指标因子结论。
 
 用法：
-    python TreasureBox/SingleStockAnalyzer.py
-    或从项目根目录：
-    python -m TreasureBox.SingleStockAnalyzer
+    python TreasureBox/SingleStockAnalyzer.py          # 交互模式
+    python TreasureBox/SingleStockAnalyzer.py 000001   # 命令行参数模式
 
-依赖：
-    pip install akshare pandas pandas-ta
+依赖：akshare, pandas, pandas-ta
 """
 
 import sys
 import os
+import time
 from datetime import datetime, timedelta
+from typing import Any
 
-# 确保能找到项目根目录的模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 处理 Windows 控制台编码问题
+# Windows 控制台 UTF-8 输出
 if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
@@ -31,67 +30,80 @@ if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
 
 import pandas as pd
 import akshare as ak
-import pandas_ta as ta
+import pandas_ta as ta  # noqa: F401  SignalManager / _process_single_stock 内部依赖
 
 
-def _classify_cci_level(cci_value: float) -> str:
-    if pd.isna(cci_value):
-        return "N/A"
-    if cci_value > 200:
-        return f"极度超买 ({cci_value:.2f})"
-    elif cci_value >= 100:
-        return f"强势超买 ({cci_value:.2f})"
-    elif cci_value > -100:
-        return ""
-    elif cci_value >= -200:
-        return f"弱势超卖 ({cci_value:.2f})"
-    else:
-        return f"极度超卖 ({cci_value:.2f})"
-
-
-def format_stock_code(code: str) -> str:
-    code_str = str(code)
-    if code_str.startswith(("sh", "sz", "bj")):
-        return code_str
-    code_str = code_str.zfill(6)
-    if code_str.startswith("6"):
-        return "sh" + code_str
-    elif code_str.startswith(("0", "3")):
-        return "sz" + code_str
-    elif code_str.startswith(("4", "8", "9")):
-        return "bj" + code_str
-    return code_str
+# ── 从项目现有模块导入 ─────────────────────────────────────────────────────
+from DataManager.ShareCodeFormatMgr import format_stock_code
+from ConfigParser import Config
 
 
 def extract_pure_code(code: str) -> str:
     code_str = str(code).lower()
-    if code_str.startswith(("sh", "sz", "bj")):
-        code_str = code_str[2:]
-    import re
-    match = re.search(r"(\d{6})", code_str)
-    return match.group(1) if match else code_str.zfill(6)
+    for prefix in ("sh", "sz", "bj"):
+        if code_str.startswith(prefix):
+            return code_str[len(prefix) :]
+    return code_str.zfill(6)
 
 
+# ── 打印辅助函数 ───────────────────────────────────────────────────────────
+WIDTH = 68
+
+
+def print_header():
+    print()
+    print("=" * WIDTH)
+    print("  单只股票技术指标分析工具")
+    print("=" * WIDTH)
+
+
+def print_section(title: str):
+    print()
+    print("-" * WIDTH)
+    print(f"  {title}")
+    print("-" * WIDTH)
+
+
+def print_field(label: str, value: Any):
+    if value is not None and str(value).strip():
+        print(f"    {label:<26} : {value}")
+
+
+# ── 数据获取（带自动重试）─────────────────────────────────────────────────
 def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
-    """从 akshare 获取个股日 K 线数据（复用 StockSyncEngine 的获取模式）"""
+    """从 akshare 获取个股日 K 线数据，失败时自动重试"""
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
 
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-    except Exception as e:
-        print(f"  [ERROR] 下载数据失败: {e}")
-        return None
+    last_error = None
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="qfq",
+            )
+            if df is not None and not df.empty:
+                return _prepare_kline_df(df)
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                wait = 2 ** attempt
+                print(f"  [RETRY] 第 {attempt + 1} 次失败，{wait} 秒后重试...")
+                time.sleep(wait)
 
-    if df is None or df.empty:
-        print("  [WARN] 未获取到数据")
-        return None
+    print(f"  [ERROR] 下载数据失败: {last_error}")
+    return None
+
+
+def _prepare_kline_df(df: pd.DataFrame) -> pd.DataFrame:
+    """标准化 K 线 DataFrame 列名，同时保留额外行情字段供展示"""
+    extra_cols = {}
+    for cn in ("振幅", "涨跌幅", "涨跌额", "换手率"):
+        if cn in df.columns:
+            extra_cols[cn] = df[cn].iloc[-1]
 
     df = df.rename(
         columns={
@@ -104,6 +116,7 @@ def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
             "成交额": "amount",
         }
     )
+
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
         df.sort_values("date", inplace=True)
@@ -113,37 +126,20 @@ def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # 将额外字段挂在 df.attrs 上，与主数据分离
+    df.attrs["extra"] = extra_cols
     return df
 
 
-def print_analysis_header():
-    width = 68
-    print()
-    print("=" * width)
-    print("  单只股票技术指标分析工具")
-    print("=" * width)
-
-
-def print_section(title: str, width: int = 68):
-    print()
-    print("-" * width)
-    print(f"  {title}")
-    print("-" * width)
-
-
-def print_field(label: str, value, width: int = 68):
-    if value is not None and str(value).strip():
-        print(f"    {label:<26} : {value}")
-
-
+# ── 主流程 ────────────────────────────────────────────────────────────────
 def main():
-    print_analysis_header()
+    print_header()
 
-    # ── 1. 用户输入（支持命令行参数和交互式输入）────────────────────────
+    # 1. 用户输入 ──────────────────────────────────────────────────────
     if len(sys.argv) > 1:
         raw_code = sys.argv[1]
     else:
-        raw_code = input("\n  请输入股票代码 (6位数字，如 000001): ").strip()
+        raw_code = input(f"\n  请输入股票代码 (6位数字，如 000001): ").strip()
 
     if not raw_code:
         print("  [ERROR] 未输入股票代码")
@@ -153,7 +149,7 @@ def main():
     symbol = format_stock_code(raw_code)
     print(f"\n  [-] 股票代码: {pure_code}  ({symbol})")
 
-    # ── 2. 获取 K 线数据 ────────────────────────────────────────────────
+    # 2. 获取 K 线数据 ────────────────────────────────────────────────
     print(f"\n  >>> 正在从 akshare 下载数据 ({pure_code})...")
     df = fetch_kline_data(symbol, days=200)
     if df is None or df.empty or len(df) < 30:
@@ -163,110 +159,65 @@ def main():
     print(f"  [OK] 获取到 {len(df)} 条日 K 线数据")
     print(f"      日期范围: {df['date'].iloc[0].strftime('%Y-%m-%d')} ~ {df['date'].iloc[-1].strftime('%Y-%m-%d')}")
 
-    # ── 2a. 获取股票名称 ──────────────────────────────────────────────
-    stock_name = pure_code
-    try:
-        # 使用 akshare 获取个股简况（含股票名称）
-        info_df = ak.stock_individual_info_em(symbol=symbol)
-        # 兼容处理不同 akshare 版本的返回格式
-        if info_df is not None and not info_df.empty:
-            if "item" in info_df.columns and "value" in info_df.columns:
-                name_row = info_df[info_df["item"].astype(str).str.contains("股票名称")]
-                if not name_row.empty:
-                    stock_name = name_row.iloc[0]["value"]
-            elif len(info_df.columns) >= 2:
-                first_col = info_df.columns[0]
-                second_col = info_df.columns[1]
-                name_row = info_df[info_df[first_col].astype(str).str.contains("股票名称")]
-                if not name_row.empty:
-                    stock_name = name_row.iloc[0].iloc[1]
-    except Exception:
-        pass
-
-    latest_price = df["close"].iloc[-1] if "close" in df.columns else None
-
-    # ── 3. 基础信息 ──────────────────────────────────────────────────────
+    # 3. 基础信息 ──────────────────────────────────────────────────────
     print_section("基础信息")
     print_field("股票代码", pure_code)
+
+    # 尝试获取股票名称
+    stock_name = pure_code
+    try:
+        info_df = ak.stock_individual_info_em(symbol=symbol)
+        if info_df is not None and not info_df.empty and len(info_df.columns) >= 2:
+            first_col = info_df.columns[0]
+            name_row = info_df[info_df[first_col].astype(str).str.contains("股票名称")]
+            if not name_row.empty:
+                stock_name = name_row.iloc[0].iloc[1]
+    except Exception:
+        pass
     print_field("股票名称", stock_name)
-    print_field("最新价", f"{latest_price:.2f}" if latest_price else "N/A")
+
+    latest_price = df["close"].iloc[-1]
+    print_field("最新价", f"{latest_price:.2f}")
     print_field("数据条数", len(df))
 
-    # ── 4. MACD 分析 ──────────────────────────────────────────────────
-    from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
-    from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
+    # 展示额外行情字段（振幅 / 涨跌幅 / 涨跌额 / 换手率）
+    extra = df.attrs.get("extra", {})
+    for k in ("振幅", "涨跌幅", "涨跌额", "换手率"):
+        v = extra.get(k)
+        if v is not None and pd.notna(v):
+            unit = "%" if k in ("振幅", "涨跌幅", "换手率") else ""
+            print_field(k, f"{v:.2f}{unit}")
 
-    macd_analyzer = MACDAnalyzer()
-    kdj_analyzer = AdvancedKDJAnalyzer()
-
-    # 第二周期参数
-    second_params = (6, 13, 5)
+    # 4. 复用 TASignalProcessor 计算全部技术信号 ──────────────────────
+    config = Config()
+    second_params = getattr(config, "MACD_SECOND_PARAMS", (6, 13, 5))
     second_period_name = f"{second_params[0]}{second_params[1]}{second_params[2]}"
 
-    # 计算 MACD
-    try:
-        df = macd_analyzer._custom_macd(df, second_params=second_params)
-    except Exception as e:
-        print(f"  [ERROR] MACD 计算失败: {e}")
+    # 准备 TASignalProcessor 要求的 hist_df 格式
+    hist_df = df.copy()
+    hist_df["股票代码"] = pure_code
+
+    from LogicAnalyzer.SignalManager import TASignalProcessor
+
+    processor = TASignalProcessor(None, config=config)
+    result = processor._process_single_stock(symbol, hist_df, second_params, second_period_name)
+
+    if result is None:
+        print("  [ERROR] 技术指标分析失败")
         return
 
+    # 5. MACD 指标 ────────────────────────────────────────────────────
     print_section("MACD 指标")
+    print_field("MACD_12269", result.get("macd_12269_signal", ""))
+    print_field(f"MACD_{second_period_name}", result.get("macd_second_signal", ""))
+    print_field("MACD_12269_DIF", f"{result.get('dif_12269', 0):.4f}")
+    print_field(f"MACD_{second_period_name}_DIF", f"{result.get('dif_second', 0):.4f}")
+    print_field("MACD_12269_动能", result.get("mom_12269", ""))
+    print_field(f"MACD_{second_period_name}_动能", result.get("mom_second", ""))
 
-    # ① MACD 12269 信号
-    detail_col_12269 = "MACD_12269_SIGNAL_DETAIL"
-    if detail_col_12269 in df.columns:
-        val = df[detail_col_12269].iloc[-1]
-        if pd.notna(val) and str(val).strip():
-            print_field("MACD_12269", val)
-
-    # ② MACD 第二周期信号
-    detail_col_second = f"MACD_{second_period_name}_SIGNAL_DETAIL"
-    if detail_col_second in df.columns:
-        val = df[detail_col_second].iloc[-1]
-        if pd.notna(val) and str(val).strip():
-            print_field(f"MACD_{second_period_name}", val)
-
-    # ③ DIF 值
-    if "DIF_12269" in df.columns:
-        print_field("MACD_12269_DIF", f"{df['DIF_12269'].iloc[-1]:.4f}")
-    if f"DIF_{second_period_name}" in df.columns:
-        print_field(f"MACD_{second_period_name}_DIF", f"{df[f'DIF_{second_period_name}'].iloc[-1]:.4f}")
-
-    # ④ MACD 动能
-    try:
-        mom_12269 = MACDAnalyzer._calculate_macd_momentum(df, "DIF_12269", "DEA_12269")
-        print_field("MACD_12269_动能", mom_12269)
-    except Exception:
-        pass
-    try:
-        mom_second = MACDAnalyzer._calculate_macd_momentum(
-            df, f"DIF_{second_period_name}", f"DEA_{second_period_name}"
-        )
-        print_field(f"MACD_{second_period_name}_动能", mom_second)
-    except Exception:
-        pass
-
-    # ── 5. 完全多头综合评分 ──────────────────────────────────────────────
+    # 6. 完全多头评分 ────────────────────────────────────────────────
     print_section("MACD 完全多头评分")
-
-    from ConfigParser import Config
-
-    config = Config()
-    weights = getattr(config, "FULL_BULL_WEIGHTS", None)
-    thresholds = getattr(config, "FULL_BULL_THRESHOLDS", None)
-
-    bull_result = None
-    try:
-        bull_result = macd_analyzer.analyze_full_bull(
-            df,
-            second_params=second_params,
-            recalc_macd=False,
-            weights=weights,
-            thresholds=thresholds,
-        )
-    except Exception as e:
-        print(f"  [ERROR] 完全多头评分失败: {e}")
-
+    bull_result = result.get("bull")
     if bull_result:
         print_field("FullBull_Score", bull_result.get("score", "N/A"))
         print_field("FullBull_Score_Base", bull_result.get("score_base", "N/A"))
@@ -275,85 +226,30 @@ def main():
         details = bull_result.get("details", {})
         if details:
             print()
-            print("  ─ 各维度得分 ─")
+            print("  " + "\u2500" * 18)
             for dim_key, dim_val in details.items():
                 desc = dim_val.get("desc", "")
                 score = dim_val.get("score", 0)
                 print(f"    {dim_key:<20} : {score:>3}  ({desc})")
 
-    # ── 6. KDJ 信号 ────────────────────────────────────────────────────
+    # 7. KDJ / CCI / RSI / BOLL ──────────────────────────────────────
     print_section("KDJ 指标")
-    try:
-        kdj_signal = kdj_analyzer.calculate_kdj_signal_from_df(df)
-        if kdj_signal:
-            print_field("KDJ_Signal", kdj_signal)
-        else:
-            print_field("KDJ_Signal", "无信号")
-    except Exception as e:
-        print_field("KDJ_Signal", f"计算失败: {e}")
+    print_field("KDJ_Signal", result.get("kdj_signal", "无信号"))
 
-    # ── 7. CCI 指标 ────────────────────────────────────────────────────
     print_section("CCI 指标")
-    try:
-        df.ta.cci(append=True, close="close", high="high", low="low")
-        cci_cols = [col for col in df.columns if col.startswith("CCI_")]
-        if cci_cols:
-            current_cci = df[cci_cols[0]].iloc[-1]
-            cci_signal = _classify_cci_level(current_cci)
-            print_field("CCI_Signal", cci_signal or f"常态波动 ({current_cci:.2f})")
-    except Exception:
-        print_field("CCI_Signal", "计算失败")
+    print_field("CCI_Signal", result.get("cci_signal", "无信号"))
 
-    # ── 8. RSI 指标 ────────────────────────────────────────────────────
     print_section("RSI 指标")
-    try:
-        df.ta.rsi(append=True, close="close", length=14)
-        rsi_cols = [col for col in df.columns if col.startswith("RSI_")]
-        if rsi_cols:
-            rsi_col = rsi_cols[0]
-            curr_rsi = df[rsi_col].iloc[-1]
-            window = 10
-            if len(df) >= window + 1:
-                curr_low = df["low"].iloc[-1]
-                min_low_window = df["low"].iloc[-window:-1].min()
-                min_rsi_window = df[rsi_col].iloc[-window:-1].min()
-                is_price_low = curr_low <= (min_low_window * 1.02)
-                is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
-                rsi_signal = (
-                    f"RSI底背离! ({curr_rsi:.1f})"
-                    if is_divergence
-                    else f"RSI={curr_rsi:.1f}"
-                )
-                print_field("RSI_Signal", rsi_signal)
-            else:
-                print_field("RSI_Signal", f"RSI={curr_rsi:.1f}")
-    except Exception:
-        print_field("RSI_Signal", "计算失败")
+    print_field("RSI_Signal", result.get("rsi_signal", "无信号"))
 
-    # ── 9. BOLL 指标 ──────────────────────────────────────────────────
     print_section("BOLL 指标")
-    try:
-        df.ta.bbands(append=True, length=20, std=2, close="close")
-        boll_lower_cols = [col for col in df.columns if col.startswith("BBL_")]
-        boll_upper_cols = [col for col in df.columns if col.startswith("BBU_")]
-        if boll_lower_cols and boll_upper_cols:
-            df["BOLL_BANDWIDTH"] = (
-                (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df["close"]
-            )
-            is_narrow = (
-                df["BOLL_BANDWIDTH"].iloc[-5:].mean() < df["BOLL_BANDWIDTH"].mean()
-            )
-            boll_signal = "低波/缩口" if is_narrow else "常态/张口"
-            print_field("BOLL_Signal", boll_signal)
-    except Exception:
-        print_field("BOLL_Signal", "计算失败")
+    print_field("BOLL_Signal", result.get("boll_signal", "无信号"))
 
-    # ── 10. 汇总 ──────────────────────────────────────────────────────
+    # 8. 汇总 ────────────────────────────────────────────────────────
     print()
-    print("=" * 68)
+    print("=" * WIDTH)
     if bull_result:
         score = bull_result.get("score", 0)
-        conclusion = bull_result.get("conclusion", "N/A")
         if score >= 80:
             rating = "[强烈买入]"
         elif score >= 60:
@@ -363,8 +259,8 @@ def main():
         else:
             rating = "[回避/做空]"
         print(f"  综合评分: {score}  {rating}")
-        print(f"  综合结论: {conclusion}")
-    print("=" * 68)
+        print(f"  综合结论: {bull_result.get('conclusion', 'N/A')}")
+    print("=" * WIDTH)
     print()
 
 
