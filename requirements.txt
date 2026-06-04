@@ -1,6 +1,5 @@
 akshare==1.18.53
 beautifulsoup4==4.14.3
-bs4==0.0.2
 certifi==2026.2.25
 cffi==2.0.0
 charset-normalizer==3.4.7
@@ -24,9 +23,7 @@ numpy==2.2.6
 openpyxl==3.1.5
 pandas==3.0.2
 pandas-ta==0.4.71b0
-pd==0.0.4
 platformdirs==4.9.4
-psycopg2==2.9.11
 psycopg2-binary==2.9.11
 pycparser==3.0
 Pygments==2.20.0
@@ -53,7 +50,4 @@ cryptography>=41.0.0
 pydantic>=2.0.0
 pydantic-settings>=2.0.0
 loguru>=0.7.0
-# 代码质量工具
-ruff>=0.3.0
-mypy>=1.8.0
 pandera>=0.19.0

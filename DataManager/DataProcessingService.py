@@ -12,6 +12,49 @@ from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
 
 
+def get_stock_industry_mapping(
+    stock_codes: list[str],
+    logger=None,
+) -> pd.DataFrame:
+    """Standalone: 从数据库获取股票的行业信息。
+
+    Args:
+        stock_codes: 股票代码列表
+        logger: 可选的日志器实例
+
+    Returns:
+        pd.DataFrame: 包含股票代码、名称、行业的DataFrame
+    """
+    if not stock_codes:
+        return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+
+    try:
+        from DataCollection.HistDataEngine import StockSyncEngine
+
+        engine = StockSyncEngine()
+        pool = engine.get_stock_pool_from_db()
+
+        formatted = [CodeNormalizer.normalize(c) for c in stock_codes]
+        filtered = pool[pool["股票代码"].isin(formatted)]
+
+        if filtered.empty:
+            if logger:
+                logger.warning("数据库中未找到匹配的股票信息")
+            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+
+        result = filtered[["股票代码", "name", "industry"]].copy()
+        result.columns = ["股票代码", "股票简称", "行业"]
+
+        if logger:
+            logger.info(f"从数据库成功获取 {len(result)} 条行业信息")
+        return result
+
+    except Exception as e:
+        if logger:
+            logger.warning(f"从数据库获取行业信息失败: {e}，返回空DataFrame")
+        return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+
+
 class DataProcessingService:
     """
     数据处理服务
@@ -685,7 +728,8 @@ class DataProcessingService:
         second_period_name = f"{fast}{slow}{signal}"
 
         # 使用常量类获取所有技术指标信号列
-        str_cols = ColumnNames.get_all_technical_signal_columns(second_period_name)
+        from DataManager.ReportService import ReportService
+        str_cols = ReportService.get_all_technical_signal_columns(second_period_name)
 
         mask = (
             (final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] == "是")
@@ -751,7 +795,8 @@ class DataProcessingService:
         second_period_name = f"{fast}{slow}{signal}"
 
         # 使用常量类获取最终列顺序
-        final_cols = ColumnNames.get_final_column_order(
+        from DataManager.ReportService import ReportService
+        final_cols = ReportService.get_final_column_order(
             second_period_name=second_period_name, fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )
 
@@ -799,44 +844,4 @@ class DataProcessingService:
         return True
 
     def _get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
-        """
-        从数据库获取股票的行业信息
-
-        Args:
-            stock_codes: 股票代码列表
-
-        Returns:
-            pd.DataFrame: 包含股票代码、名称、行业的DataFrame
-        """
-        self.logger.info("正在从数据库获取个股行业信息...")
-
-        if not stock_codes:
-            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
-
-        try:
-            from DataCollection.HistDataEngine import StockSyncEngine
-
-            stock_sync_engine = StockSyncEngine()
-            main_board_pool = stock_sync_engine.get_stock_pool_from_db()
-
-            # 标准化股票代码
-            formatted_codes = [CodeNormalizer.normalize(code) for code in stock_codes]
-
-            # 筛选出需要的股票代码
-            filtered_pool = main_board_pool[main_board_pool["股票代码"].isin(formatted_codes)]
-
-            # 检查是否找到了匹配的股票
-            if filtered_pool.empty:
-                self.logger.warning("数据库中未找到匹配的股票信息")
-                return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
-
-            # 重命名列以匹配期望的格式
-            industry_df = filtered_pool[["股票代码", "name", "industry"]].copy()
-            industry_df.columns = ["股票代码", "股票简称", "行业"]
-
-            self.logger.info(f"从数据库成功获取 {len(industry_df)} 条行业信息")
-            return industry_df
-
-        except Exception as e:
-            self.logger.warning(f"从数据库获取行业信息失败: {e}，返回空DataFrame")
-            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+        return get_stock_industry_mapping(stock_codes, self.logger)

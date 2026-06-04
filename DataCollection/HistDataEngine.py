@@ -599,7 +599,7 @@ class StockSyncEngine:
 
         # Step 1.5: 过滤ST股票
         if "name" in stock_pool_df.columns:
-            st_pattern = r"(?:\s*(?:\*|*|※|•|·))?(?:[Ss][Tt])"
+            st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
             before_count = len(stock_pool_df)
             stock_pool_df = stock_pool_df[~stock_pool_df["name"].astype(str).str.contains(st_pattern, na=False)].copy()
             after_count = len(stock_pool_df)

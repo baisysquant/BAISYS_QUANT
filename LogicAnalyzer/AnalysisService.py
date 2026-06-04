@@ -190,42 +190,8 @@ class AnalysisService:
         return stock_df
 
     def get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
-        """
-        从数据库获取股票的行业信息
-
-        Args:
-            stock_codes: 股票代码列表
-
-        Returns:
-            pd.DataFrame: 包含股票代码、名称、行业的DataFrame
-        """
-        self.logger.info("正在从数据库获取个股行业信息...")
-
-        if not stock_codes:
-            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
-
-        try:
-            from DataCollection.HistDataEngine import StockSyncEngine
-
-            stock_sync_engine = StockSyncEngine()
-            main_board_pool = stock_sync_engine.get_stock_pool_from_db()
-
-            # 筛选出需要的股票代码
-            from UtilsManager.CodeNormalizer import CodeNormalizer
-
-            formatted_codes = [CodeNormalizer.normalize(code) for code in stock_codes]
-            filtered_pool = main_board_pool[main_board_pool["股票代码"].isin(formatted_codes)]
-
-            # 重命名列以匹配期望的格式
-            industry_df = filtered_pool[["股票代码", "name", "industry"]].copy()
-            industry_df.columns = ["股票代码", "股票简称", "行业"]
-
-            self.logger.info(f"从数据库成功获取 {len(industry_df)} 条行业信息")
-            return industry_df
-
-        except Exception as e:
-            self.logger.warning(f"从数据库获取行业信息失败: {e}，返回空DataFrame")
-            return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
+        from DataManager.DataProcessingService import get_stock_industry_mapping as _get_mapping
+        return _get_mapping(stock_codes, self.logger)
 
     def process_xstp_and_filter(self, raw_data: dict[str, pd.DataFrame], spot_df: pd.DataFrame) -> pd.DataFrame:
         """

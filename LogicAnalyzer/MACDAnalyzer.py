@@ -257,7 +257,7 @@ class MACDAnalyzer:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _calculate_momentum_score(df: pd.DataFrame, dif_col: str, dea_col: str, window: int = 5) -> tuple[str, int]:
+    def _calculate_momentum_score(df: pd.DataFrame, dif_col: str, dea_col: str, window: int = 5, max_score: int = 20) -> tuple[str, int]:
         if len(df) < window + 2:
             return "数据不足", 0
 
@@ -273,14 +273,13 @@ class MACDAnalyzer:
         is_bull = cur_hist > 0
 
         if is_bull:
-            # 红柱区域：norm_change > 0 加速上涨，< 0 减速上涨
             ratio = norm_change / (norm_change + 1) if norm_change >= 0 else norm_change / (norm_change - 1)
-            score = min(20, max(0, int(20 * (0.5 + 0.5 * ratio))))
+            score = min(max_score, max(0, int(max_score * (0.5 + 0.5 * ratio))))
             desc = f"加速上涨 (红柱加长, z={norm_change:.2f})" if norm_change > 0 else f"减速上涨 (红柱缩短, z={norm_change:.2f})"
         else:
-            # 绿柱区域：最高给 8 分（空头区域不应高分）
+            max_bear = max(8, max_score * 2 // 5)
             ratio = abs(norm_change) / (abs(norm_change) + 1)
-            score = min(8, max(0, int(8 * ratio)))
+            score = min(max_bear, max(0, int(max_bear * ratio)))
             desc = f"加速下跌 (绿柱加长, z={norm_change:.2f})" if norm_change < 0 else f"减速下跌 (绿柱缩短, z={norm_change:.2f})"
 
         return desc, score
@@ -319,7 +318,7 @@ class MACDAnalyzer:
     # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _volume_price_trend_score(df: pd.DataFrame, lookback: int = 5) -> tuple[str, int]:
+    def _volume_price_trend_score(df: pd.DataFrame, lookback: int = 5, max_bonus: int = 10) -> tuple[str, int]:
         if len(df) < lookback + 1 or "volume" not in df.columns:
             return "数据不足", 0
 
@@ -330,12 +329,13 @@ class MACDAnalyzer:
         vol_early = volumes[:2].mean()
         vol_trend = (volumes[-1] - vol_early) / (vol_early + 1e-9)
 
+        half = max_bonus // 2
         if pct_change > 0.02 and vol_trend > 0.1:
-            return f"量价齐升 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", 10
+            return f"量价齐升 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", max_bonus
         elif pct_change > 0.02:
-            return f"价涨量缩 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", 5
+            return f"价涨量缩 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", half
         elif pct_change < -0.02 and vol_trend > 0.1:
-            return f"放量下跌 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", -5
+            return f"放量下跌 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", -half
         elif pct_change < -0.02:
             return f"缩量下跌 (价格{pct_change:+.2%}, 量{vol_trend:+.2%})", 0
         else:
@@ -520,6 +520,8 @@ class MACDAnalyzer:
         slope_window: int = 5,
         second_params: tuple[int, int, int] = (6, 13, 5),
         recalc_macd: bool = True,
+        weights: dict[str, int] | None = None,
+        thresholds: dict[str, int] | None = None,
     ) -> dict:
         """
         完全多头信号综合评估，输出 0~100/110 分和各子项状态。
@@ -530,22 +532,13 @@ class MACDAnalyzer:
           slope_window: DIF斜率计算窗口
           second_params: 第二周期参数（必填），默认 (6, 13, 5)
           recalc_macd: 是否重新计算 MACD（若已在外部计算，可设为 False）
-
-        评分维度（基础满分 100，量价配合为独立奖励 10 分）：
-          ① 零轴条件        20 分  (12269 DIF>0 且 DEA>0)
-          ② 战略线金叉状态  20 分  (12269 MACD 排列)
-          ③ 战术线金叉状态  15 分  (第二周期 MACD 排列)
-          ④ 动能加速        20 分  (连续标准化分数，替代三档分类)
-          ⑤ DIF 斜率        15 分  (线性回归趋势，增加权重)
-          ⑥ 背离信号        10 分  (底背离加权，顶背离一票否决 cap=40)
-          ⑦ 量价配合        10 分  (独立奖励，不依赖背离锚点)
-
-        综合结论（基于基础分）：
-          ≥ 80  → 完全多头（强烈买入）
-          ≥ 60  → 偏多（逢低布局）
-          ≥ 40  → 多空拉锯（观望）
-          < 40  → 偏空（回避或做空）
+          weights: 各维度权重，默认 零轴20 / 战略金叉20 / 战术金叉15 / 动能20 / DIF斜率15 / 背离10 / 量价10
+          thresholds: 结论阈值 {fully_bull, bullish, oscillate}
         """
+        if weights is None:
+            weights = {"零轴条件": 20, "战略金叉": 20, "战术金叉": 15, "动能": 20, "DIF斜率": 15, "背离信号": 10, "量价配合": 10}
+        if thresholds is None:
+            thresholds = {"fully_bull": 80, "bullish": 60, "oscillate": 40}
         # 计算MACD指标（若外部已计算可跳过，避免重复）
         if recalc_macd:
             df = self._custom_macd(df, second_params=second_params)
@@ -574,13 +567,21 @@ class MACDAnalyzer:
         current_idx = len(df) - 1
         scores: dict[str, tuple[str, int]] = {}
 
+        w_zero = weights["零轴条件"]
+        w_strat = weights["战略金叉"]
+        w_tact = weights["战术金叉"]
+        w_mom = weights["动能"]
+        w_slope = weights["DIF斜率"]
+        w_div = weights["背离信号"]
+        w_vol = weights["量价配合"]
+
         # ① 零轴条件 ──────────────────────────────────────────────────────
         dif_above = df["DIF_12269"].iloc[-1] > 0
         dea_above = df["DEA_12269"].iloc[-1] > 0
         if dif_above and dea_above:
-            scores["零轴条件"] = ("DIF/DEA 均在零轴上", 20)
+            scores["零轴条件"] = ("DIF/DEA 均在零轴上", w_zero)
         elif dif_above:
-            scores["零轴条件"] = ("DIF 在零轴上，DEA 仍在下方（金叉进行中）", 10)
+            scores["零轴条件"] = ("DIF 在零轴上，DEA 仍在下方（金叉进行中）", w_zero // 2)
         else:
             scores["零轴条件"] = ("DIF 在零轴下", 0)
 
@@ -588,11 +589,11 @@ class MACDAnalyzer:
         slow_detail = df["MACD_12269_SIGNAL_DETAIL"].iloc[-1]
         slow_bull = df["DIF_12269"].iloc[-1] > df["DEA_12269"].iloc[-1]
         if slow_detail == "零轴上金叉":
-            scores["战略金叉"] = ("12269 零轴上金叉（最强信号）", 20)
+            scores["战略金叉"] = ("12269 零轴上金叉（最强信号）", w_strat)
         elif slow_detail == "零轴下金叉":
-            scores["战略金叉"] = ("12269 零轴下金叉（注意假突破）", 10)
+            scores["战略金叉"] = ("12269 零轴下金叉（注意假突破）", w_strat // 2)
         elif slow_bull:
-            scores["战略金叉"] = ("12269 多头持续（DIF > DEA）", 15)
+            scores["战略金叉"] = ("12269 多头持续（DIF > DEA）", int(w_strat * 0.75))
         else:
             scores["战略金叉"] = ("12269 空头排列", 0)
 
@@ -604,30 +605,29 @@ class MACDAnalyzer:
         fast_detail = df[fast_detail_col].iloc[-1]
         fast_bull = df[fast_dif_col].iloc[-1] > df[fast_dea_col].iloc[-1]
         if fast_detail == "零轴上金叉":
-            scores["战术金叉"] = (f"{second_period_name} 零轴上金叉", 15)
+            scores["战术金叉"] = (f"{second_period_name} 零轴上金叉", w_tact)
         elif fast_bull:
-            scores["战术金叉"] = (f"{second_period_name} 多头持续", 10)
+            scores["战术金叉"] = (f"{second_period_name} 多头持续", int(w_tact * 0.65))
         else:
             scores["战术金叉"] = (f"{second_period_name} 空头/死叉", 0)
 
-        # ④ 动能评分（连续标准化分数 0~20）───────────────────────────────
-        mom_desc, mom_score = self._calculate_momentum_score(df, "DIF_12269", "DEA_12269")
-        prefix = "强势" if mom_score >= 10 else ("关注" if mom_score >= 5 else "弱势")
+        # ④ 动能评分（连续标准化分数）─────────────────────────────────────
+        mom_desc, mom_score = self._calculate_momentum_score(df, "DIF_12269", "DEA_12269", max_score=w_mom)
+        prefix = "强势" if mom_score >= w_mom // 2 else ("关注" if mom_score >= w_mom // 4 else "弱势")
         scores["动能"] = (f"{prefix}: {mom_desc}", mom_score)
 
-        # ⑤ DIF 斜率（权重提升至 15 分）───────────────────────────────────
+        # ⑤ DIF 斜率 ─────────────────────────────────────────────────────
         slope_info = self._slope_analysis(df["DIF_12269"], window=slope_window)
         if slope_info["trend"] == "明确上行":
-            scores["DIF斜率"] = (f"确认 {slope_info['trend']} (R²={slope_info['r2']})", 15)
+            scores["DIF斜率"] = (f"确认 {slope_info['trend']} (R²={slope_info['r2']})", w_slope)
         elif "上行" in slope_info["trend"]:
-            scores["DIF斜率"] = (f"关注 {slope_info['trend']} (R²={slope_info['r2']})", 8)
+            scores["DIF斜率"] = (f"关注 {slope_info['trend']} (R²={slope_info['r2']})", int(w_slope * 0.55))
         else:
             scores["DIF斜率"] = (f"弱势 {slope_info['trend']} (R²={slope_info['r2']})", 0)
 
-        # ⑥ 背离信号（权重降至 10 分，顶背离一票否决）────────────────────
+        # ⑥ 背离信号 ─────────────────────────────────────────────────────
         cs = div_signals["combined_signal"]
 
-        # 动态获取第二周期的键名
         div_second_key = f"div_{second_period_name}"
         strength_second_key = f"strength_{second_period_name}"
         decay_second_key = f"decay_{second_period_name}"
@@ -647,17 +647,17 @@ class MACDAnalyzer:
         has_top_div = "顶背离" in cs or "卖出" in cs
 
         if "底背离" in cs:
-            div_score = int(10 * (0.5 + 0.5 * eff))
+            div_score = int(w_div * (0.5 + 0.5 * eff))
             scores["背离信号"] = (f"确认 {cs} (强度={div_str}, 衰减={div_decay}, 有效={eff})", div_score)
         elif has_top_div:
             scores["背离信号"] = (f"否定 {cs}（一票否决）", 0)
         else:
             scores["背离信号"] = ("中性: 无背离信号", 0)
 
-        # ⑦ 量价配合（独立奖励，不依赖背离锚点）───────────────────────────
-        vol_desc, vol_bonus = self._volume_price_trend_score(df)
+        # ⑦ 量价配合（独立奖励）─────────────────────────────────────────────
+        vol_desc, vol_bonus = self._volume_price_trend_score(df, max_bonus=w_vol)
         if has_top_div:
-            vol_bonus = 0  # 顶背离时无视量价奖励
+            vol_bonus = 0
             vol_desc = f"顶背离压制，跳过量价奖励"
         scores["量价配合"] = (vol_desc, vol_bonus)
 
@@ -674,18 +674,23 @@ class MACDAnalyzer:
         total_base = sum(scores[k][1] for k in base_keys)
         bonus = scores["量价配合"][1]
 
-        # 顶背离一票否决：基础分最高 40
+        # 顶背离一票否决：基础分最高为 背离权重 × 4
         if has_top_div:
-            total_base = min(total_base, 40)
+            total_base = min(total_base, w_div * 4)
 
-        total_base = max(0, min(100, total_base))
-        total = max(0, min(110, total_base + bonus))
+        total_max_base = w_zero + w_strat + w_tact + w_mom + w_slope + w_div
+        total_base = max(0, min(total_max_base, total_base))
+        total = max(0, min(total_max_base + w_vol, total_base + bonus))
 
-        if total_base >= 80:
+        full_bull = thresholds["fully_bull"]
+        bullish = thresholds["bullish"]
+        oscillate = thresholds["oscillate"]
+
+        if total_base >= full_bull:
             conclusion = "完全多头 (强烈买入)"
-        elif total_base >= 60:
+        elif total_base >= bullish:
             conclusion = "偏多 (可逢低布局)"
-        elif total_base >= 40:
+        elif total_base >= oscillate:
             conclusion = "多空拉锯 (观望为主)"
         else:
             conclusion = "偏空 (回避或做空)"

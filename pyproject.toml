@@ -4,6 +4,9 @@ version = "2.0.0"
 description = "A股量化复盘分析系统"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+dev = ["ruff>=0.3.0", "mypy>=1.8.0"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"

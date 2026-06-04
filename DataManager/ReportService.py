@@ -5,8 +5,11 @@
 """
 
 import os
+import datetime
 
 import pandas as pd
+
+from DataManager.ColumnNames import ColumnNames
 
 
 class ReportService:
@@ -34,6 +37,88 @@ class ReportService:
         self.config = config
         self.logger = logger
 
+    @staticmethod
+    def get_base_columns():
+        return [
+            ColumnNames.STOCK_CODE,
+            ColumnNames.STOCK_NAME,
+            ColumnNames.INDUSTRY,
+            ColumnNames.INDUSTRY_SIGNAL,
+            ColumnNames.LATEST_PRICE,
+            ColumnNames.MAIN_COST,
+            ColumnNames.MAIN_COST_DIFF,
+            ColumnNames.COST_POSITION,
+            ColumnNames.MAIN_CONTROL_STRENGTH,
+        ]
+
+    @staticmethod
+    def get_signal_columns(second_period_name: str = None) -> list:
+        cols = [
+            ColumnNames.STRONG_STOCK,
+            ColumnNames.PRICE_VOLUME_RISE,
+            ColumnNames.CONSECUTIVE_RISE_DAYS,
+            ColumnNames.VOLUME_INCREASE_DAYS,
+            ColumnNames.TOP10_INDUSTRY,
+            ColumnNames.MACD_12269,
+            ColumnNames.MACD_12269_MOMENTUM,
+            ColumnNames.MACD_12269_DIF,
+            ColumnNames.MACD_FULL_BULL_LABEL,
+            ColumnNames.FULL_BULL_SCORE,
+            ColumnNames.FULL_BULL_SCORE_BASE,
+        ]
+        if second_period_name:
+            cols.extend([
+                ColumnNames.MACD_SECOND_TEMPLATE.format(second_period_name),
+                ColumnNames.MACD_SECOND_MOMENTUM_TEMPLATE.format(second_period_name),
+                ColumnNames.MACD_SECOND_DIF_TEMPLATE.format(second_period_name),
+            ])
+        cols.extend([
+            ColumnNames.KDJ_SIGNAL,
+            ColumnNames.CCI_SIGNAL,
+            ColumnNames.RSI_SIGNAL,
+            ColumnNames.BOLL_SIGNAL,
+        ])
+        return cols
+
+    @staticmethod
+    def get_report_columns(fund_flow_periods: list = None) -> list:
+        cols = [
+            ColumnNames.BULL_TREND,
+            ColumnNames.FUND_MOMENTUM,
+            ColumnNames.RESEARCH_REPORT_COUNT,
+        ]
+        if fund_flow_periods:
+            period_map = {
+                3: ColumnNames.FUND_FLOW_3D,
+                5: ColumnNames.FUND_FLOW_5D,
+                10: ColumnNames.FUND_FLOW_10D,
+                20: ColumnNames.FUND_FLOW_20D,
+            }
+            for period in fund_flow_periods:
+                if period in period_map:
+                    cols.append(period_map[period])
+        return cols
+
+    @staticmethod
+    def get_all_technical_signal_columns(second_period_name: str = None) -> list:
+        cols = [
+            ColumnNames.MACD_12269,
+            ColumnNames.KDJ_SIGNAL,
+            ColumnNames.CCI_SIGNAL,
+            ColumnNames.RSI_SIGNAL,
+            ColumnNames.BOLL_SIGNAL,
+        ]
+        if second_period_name:
+            cols.append(ColumnNames.MACD_SECOND_TEMPLATE.format(second_period_name))
+        return cols
+
+    @staticmethod
+    def get_final_column_order(second_period_name: str = None, fund_flow_periods: list = None) -> list:
+        base_cols = ReportService.get_base_columns()
+        signal_cols = ReportService.get_signal_columns(second_period_name)
+        report_cols = ReportService.get_report_columns(fund_flow_periods)
+        return base_cols + signal_cols + report_cols + [ColumnNames.STOCK_LINK]
+
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
         """
         生成Excel审计报告
@@ -51,7 +136,8 @@ class ReportService:
         from UtilsManager.Exceptions import ReportGenerationError
 
         self.logger.info("\n>>> 正在生成 Excel 报告...")
-        report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{today_str}.xlsx")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{timestamp}.xlsx")
 
         try:
             writer = pd.ExcelWriter(report_path, engine="xlsxwriter")

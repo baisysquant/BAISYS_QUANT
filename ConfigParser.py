@@ -218,6 +218,21 @@ class ResearchReportFilterConfig(BaseModel):
     RESEARCH_REPORT_MIN_COUNT: int = Field(default=1, ge=1)
 
 
+class FullBullScoringConfig(BaseModel):
+    """MACD 完全多头评分维度权重"""
+
+    WEIGHT_ZERO_AXIS: int = Field(default=20, ge=0, le=100)
+    WEIGHT_STRATEGY_GOLDEN: int = Field(default=20, ge=0, le=100)
+    WEIGHT_TACTICAL_GOLDEN: int = Field(default=15, ge=0, le=100)
+    WEIGHT_MOMENTUM: int = Field(default=20, ge=0, le=100)
+    WEIGHT_DIF_SLOPE: int = Field(default=15, ge=0, le=100)
+    WEIGHT_DIVERGENCE: int = Field(default=10, ge=0, le=100)
+    WEIGHT_VOLUME_PRICE: int = Field(default=10, ge=0, le=100)
+    CONCLUSION_FULL_BULL: int = Field(default=80, ge=0, le=100)
+    CONCLUSION_BULLISH: int = Field(default=60, ge=0, le=100)
+    CONCLUSION_OSCILLATE: int = Field(default=40, ge=0, le=100)
+
+
 class KlineDataConfig(BaseModel):
     """K线数据获取配置"""
 
@@ -247,6 +262,7 @@ class AppConfig(BaseSettings):
     technical_indicators: TechnicalIndicatorsConfig
     column_aliases: ColumnAliasesConfig
     research_report_filter: ResearchReportFilterConfig
+    full_bull_scoring: FullBullScoringConfig
     kline_data: KlineDataConfig
 
 
@@ -381,6 +397,24 @@ class Config:
         except KeyError:
             rrf_config = ResearchReportFilterConfig()
 
+        # 读取 MACD 完全多头评分配置
+        try:
+            fbs = config["FULL_BULL_SCORING"]
+            fbs_config = FullBullScoringConfig(
+                WEIGHT_ZERO_AXIS=fbs.getint("WEIGHT_ZERO_AXIS", fallback=20),
+                WEIGHT_STRATEGY_GOLDEN=fbs.getint("WEIGHT_STRATEGY_GOLDEN", fallback=20),
+                WEIGHT_TACTICAL_GOLDEN=fbs.getint("WEIGHT_TACTICAL_GOLDEN", fallback=15),
+                WEIGHT_MOMENTUM=fbs.getint("WEIGHT_MOMENTUM", fallback=20),
+                WEIGHT_DIF_SLOPE=fbs.getint("WEIGHT_DIF_SLOPE", fallback=15),
+                WEIGHT_DIVERGENCE=fbs.getint("WEIGHT_DIVERGENCE", fallback=10),
+                WEIGHT_VOLUME_PRICE=fbs.getint("WEIGHT_VOLUME_PRICE", fallback=10),
+                CONCLUSION_FULL_BULL=fbs.getint("CONCLUSION_FULL_BULL", fallback=80),
+                CONCLUSION_BULLISH=fbs.getint("CONCLUSION_BULLISH", fallback=60),
+                CONCLUSION_OSCILLATE=fbs.getint("CONCLUSION_OSCILLATE", fallback=40),
+            )
+        except KeyError:
+            fbs_config = FullBullScoringConfig()
+
         # 读取K线数据获取配置
         try:
             kd = config["KLINE_DATA"]
@@ -399,6 +433,7 @@ class Config:
             technical_indicators=ti_config,
             column_aliases=col_config,
             research_report_filter=rrf_config,
+            full_bull_scoring=fbs_config,
             kline_data=kd_config,
         )
 
@@ -441,6 +476,21 @@ class Config:
 
         self.ENABLE_RESEARCH_REPORT_FILTER = rrf_config.ENABLE_RESEARCH_REPORT_FILTER
         self.RESEARCH_REPORT_MIN_COUNT = rrf_config.RESEARCH_REPORT_MIN_COUNT
+
+        self.FULL_BULL_WEIGHTS = {
+            "零轴条件": fbs_config.WEIGHT_ZERO_AXIS,
+            "战略金叉": fbs_config.WEIGHT_STRATEGY_GOLDEN,
+            "战术金叉": fbs_config.WEIGHT_TACTICAL_GOLDEN,
+            "动能": fbs_config.WEIGHT_MOMENTUM,
+            "DIF斜率": fbs_config.WEIGHT_DIF_SLOPE,
+            "背离信号": fbs_config.WEIGHT_DIVERGENCE,
+            "量价配合": fbs_config.WEIGHT_VOLUME_PRICE,
+        }
+        self.FULL_BULL_THRESHOLDS = {
+            "fully_bull": fbs_config.CONCLUSION_FULL_BULL,
+            "bullish": fbs_config.CONCLUSION_BULLISH,
+            "oscillate": fbs_config.CONCLUSION_OSCILLATE,
+        }
 
         self.KLINE_HISTORY_DAYS = kd_config.KLINE_HISTORY_DAYS
 

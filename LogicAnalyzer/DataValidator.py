@@ -19,11 +19,8 @@ class DataValidator:
     提供多种数据质量检查方法，确保数据的完整性和准确性。
     """
 
-    def __init__(self, logger=None):
-        """
-        初始化数据验证器
-        """
-        pass
+    def __init__(self, logger_instance=None):
+        self.logger = logger_instance if logger_instance is not None else logger
 
     def validate_dataframe_not_empty(self, df: pd.DataFrame, data_name: str = "数据") -> bool:
         """

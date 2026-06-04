@@ -1,10 +1,9 @@
 import re
 import pandas as pd
-from typing import List, Dict, Optional, Any
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas_ta as ta  # 勿删
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
-from DataManager.ShareCodeFormatMgr import format_stock_code
 from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
 from ConfigParser import Config
 
@@ -70,7 +69,7 @@ class TASignalProcessor:
         valid_hist_df: pd.DataFrame,
         second_params: tuple,
         second_period_name: str,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         code_str = str(code).lower()
         if code_str.startswith(('sh', 'sz', 'bj')):
             code_str = code_str[2:]
@@ -102,11 +101,14 @@ class TASignalProcessor:
         except Exception:
             return None
 
-        result: Dict[str, Any] = {'code': code, 'pure_code': pure_code}
+        result: dict[str, Any] = {'code': code, 'pure_code': pure_code}
 
         try:
+            weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
+            thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
             bull_result = self.macd_analyzer.analyze_full_bull(
                 df, second_params=second_params, recalc_macd=False,
+                weights=weights, thresholds=thresholds,
             )
             result['bull'] = bull_result
         except Exception:
@@ -187,10 +189,10 @@ class TASignalProcessor:
 
     def process_signals(
         self,
-        all_codes: List[str],
+        all_codes: list[str],
         hist_df_all: pd.DataFrame,
         spot_df: pd.DataFrame,
-    ) -> Dict[str, pd.DataFrame]:
+    ) -> dict[str, pd.DataFrame]:
         """
         处理所有股票的技术指标信号
         
@@ -202,7 +204,7 @@ class TASignalProcessor:
             spot_df: 实时行情数据DataFrame，包含最新价格等信息
             
         Returns:
-            Dict[str, pd.DataFrame]: 技术指标信号字典，key为指标名称，value为对应的信号DataFrame
+            dict[str, pd.DataFrame]: 技术指标信号字典，key为指标名称，value为对应的信号DataFrame
             包括：
             - MACD_12269: 标准MACD信号（固定）
             - MACD_{second_period_name}: 第二周期MACD信号（动态，如 MACD_9186）
@@ -288,7 +290,7 @@ class TASignalProcessor:
         second_params = getattr(self.config, 'MACD_SECOND_PARAMS', (6, 13, 5))
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -305,14 +307,14 @@ class TASignalProcessor:
                     continue
 
         # ── 从结果列表构建信号 DataFrame（避免逐行 O(n²) concat）─────────
-        macd_12269_rows: List[Dict] = []
-        macd_second_rows: List[Dict] = []
-        bull_rows: List[Dict] = []
-        mom_rows: List[Dict] = []
-        kdj_rows: List[Dict] = []
-        cci_rows: List[Dict] = []
-        rsi_rows: List[Dict] = []
-        boll_rows: List[Dict] = []
+        macd_12269_rows: list[dict] = []
+        macd_second_rows: list[dict] = []
+        bull_rows: list[dict] = []
+        mom_rows: list[dict] = []
+        kdj_rows: list[dict] = []
+        cci_rows: list[dict] = []
+        rsi_rows: list[dict] = []
+        boll_rows: list[dict] = []
 
         for r in results:
             code = r['code']

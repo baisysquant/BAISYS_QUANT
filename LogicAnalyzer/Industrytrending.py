@@ -6,6 +6,7 @@ import time
 import datetime
 import warnings
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ConfigParser import Config
 warnings.filterwarnings('ignore')
 
@@ -106,38 +107,39 @@ class SWIndustryDataPipeline:
         codes = df_val['code'].astype(str).tolist()
         names = df_val['name'].astype(str).tolist()
         
-        print(f"[2/3] 开始遍历拉取 {len(codes)} 个行业的250天历史量价数据...")
+        print(f"[2/3] 开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
         all_hist_data = []
-        
-        for i, code in enumerate(codes):
+
+        def fetch_one(code, name):
             try:
-                # 此时 code 是纯数字，可以直接传入 symbol 参数
                 df_hist = ak.index_hist_sw(symbol=code, period="day")
-                
                 if df_hist is not None and not df_hist.empty:
                     df_hist_mapped = self._map_hist_columns(df_hist)
-                    
                     required_core_cols = ['date', 'close', 'volume', 'amount']
                     if not all(c in df_hist_mapped.columns for c in required_core_cols):
                         print(f"   [!] 警告: {code} 历史数据映射后缺少核心字段，跳过。")
-                        continue
-
+                        return None
                     core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
                     df_sub = df_hist_mapped[core_cols].copy()
                     df_sub['date'] = pd.to_datetime(df_sub['date'])
                     df_sub = df_sub.sort_values('date').tail(250).reset_index(drop=True)
-                    
                     df_sub['code'] = code
-                    df_sub['name'] = names[i]  # 添加行业名称
-                    all_hist_data.append(df_sub)
-                    
-                if (i + 1) % 5 == 0:
-                    print(f"   -> 进度: {i+1}/{len(codes)}")
-                time.sleep(0.2) 
-                
+                    df_sub['name'] = name
+                    return df_sub
             except Exception as e:
-                print(f"   [!] 警告: 获取 {code} ({names[i]}) 失败 -> {e}")
-                time.sleep(1) 
+                print(f"   [!] 警告: 获取 {code} ({name}) 失败 -> {e}")
+            return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(fetch_one, codes[i], names[i]): i for i in range(len(codes))}
+            for future in as_completed(futures):
+                idx = futures[future]
+                result = future.result()
+                if result is not None:
+                    all_hist_data.append(result)
+                if (idx + 1) % 5 == 0 or idx == len(codes) - 1:
+                    print(f"   -> 进度: {len(all_hist_data)}/{len(codes)}")
+                time.sleep(0.1)
 
         if not all_hist_data:
             print("[!] 错误: 未能获取任何历史数据。")
