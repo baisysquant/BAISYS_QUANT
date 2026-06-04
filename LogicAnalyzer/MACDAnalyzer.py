@@ -552,7 +552,422 @@ class MACDAnalyzer:
         }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 8. 完全多头综合评分（核心入口）
+    # 8. 市场情景识别（Market Regime Detection）
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def detect_market_regime(df: pd.DataFrame, boll_col: str | None = None) -> str:
+        """
+        识别人市场状态（Gate 0 前置判断）。
+
+        返回情景标签:
+          STRONG_TREND, WEAK_TREND, BOTTOM_REVERSAL, TOP_RISK, OSCILLATION, UNCLEAR
+        """
+        close = df['close'].astype(float)
+
+        # ── 计算均线（若无则现场计算） ─────────────────────────────────
+        ma5 = df['close'].rolling(5).mean().iloc[-1] if 'close' in df.columns else 0
+        ma10 = df['close'].rolling(10).mean().iloc[-1]
+        ma20 = df['close'].rolling(20).mean().iloc[-1]
+        ma30 = df['close'].rolling(30).mean().iloc[-1]
+        ma60 = df['close'].rolling(60).mean().iloc[-1]
+
+        # 均线方向
+        ma_bullish = ma5 > ma10 > ma20 > ma30 > ma60
+        ma_bearish = ma5 < ma10 < ma20 < ma30 < ma60
+
+        # ── MACD 状态 ─────────────────────────────────────────────────────
+        dif = df['DIF_12269'].iloc[-1] if 'DIF_12269' in df.columns else 0
+        dea = df['DEA_12269'].iloc[-1] if 'DEA_12269' in df.columns else 0
+        hist = df['DIF_12269'] - df['DEA_12269'] if 'DIF_12269' in df.columns and 'DEA_12269' in df.columns else None
+        momentum_positive = hist.iloc[-1] > 0 if hist is not None else False
+
+        # DIF 斜率
+        slope_info = MACDAnalyzer._slope_analysis(df['DIF_12269'] if 'DIF_12269' in df.columns else df['close'])
+        slope_positive = slope_info['slope'] > 0
+
+        # ── 布林带宽（震荡判断） ─────────────────────────────────────────
+        is_narrow_boll = False
+        if boll_col and boll_col in df.columns:
+            recent_bw = df[boll_col].iloc[-5:].mean()
+            hist_bw = df[boll_col].mean()
+            is_narrow_boll = recent_bw < hist_bw * 0.8
+
+        # ── 背离与 K 线（仅在调用方传入 attrs 时可用） ───────────────────
+        # 依赖 df.attrs 中的 kline_pattern_score 和 divergence 数据
+
+        # ── 判定 ─────────────────────────────────────────────────────────
+        if ma_bullish and slope_positive and momentum_positive:
+            return 'STRONG_TREND'
+        if ma_bearish and dif < 0 and not momentum_positive:
+            return 'WEAK_TREND'
+        if is_narrow_boll and abs(hist.iloc[-1]) < 0.1 * close.std() if hist is not None and len(df) > 30 else False:
+            return 'OSCILLATION'
+
+        # 需要外部数据的特殊情景通过 attrs 传入
+        regime_from_attrs = df.attrs.get('_regime_hint', None)
+        if regime_from_attrs:
+            return regime_from_attrs
+
+        return 'UNCLEAR'
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8b. 级联流水线分析（替代 analyze_full_bull）
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def pipeline_analysis(
+        self,
+        df: pd.DataFrame,
+        second_params: tuple[int, int, int] = (6, 13, 5),
+        weights: dict[str, int] | None = None,
+        thresholds: dict[str, int] | None = None,
+    ) -> dict:
+        """
+        级联流水线综合分析。
+
+        Gate 0: 情景识别
+        Gate 1: 信号确认（规则引擎 R03/R04/R08）
+        Gate 2: 风险评估（规则引擎 R01/R05）
+        Gate 3: 综合裁定（规则引擎 R02/R06/R07 + 情景权重矩阵）
+
+        返回:
+          score, level, conclusion, regime, risk_level, triggered_rules, details, ...
+        """
+        from LogicAnalyzer.ScoringRules import execute_rules
+
+        if weights is None:
+            weights = {"零轴条件": 20, "战略金叉": 15, "战术金叉": 10, "动能": 15,
+                       "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10}
+        if thresholds is None:
+            thresholds = {"fully_bull": 80, "bullish": 60, "oscillate": 40}
+
+        fast, slow, signal = second_params
+        second_period_name = f"{fast}{slow}{signal}"
+
+        # ── 前置指标计算（若不足则补充） ──────────────────────────────────
+        if 'MA_5' not in df.columns:
+            for p in [5, 10, 20, 30, 60]:
+                df[f'MA_{p}'] = df['close'].rolling(p).mean()
+
+        # 布林带宽
+        boll_bw_col = None
+        boll_upper_cols = [c for c in df.columns if c.startswith('BBU_')]
+        boll_lower_cols = [c for c in df.columns if c.startswith('BBL_')]
+        if boll_upper_cols and boll_lower_cols:
+            bw_col = 'BOLL_BANDWIDTH'
+            if bw_col not in df.columns:
+                df[bw_col] = (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df['close']
+            boll_bw_col = bw_col
+
+        # ── 计算各因子数据 ──────────────────────────────────────────────────
+        # 背离检测
+        dist_slow = self._adaptive_distance(df, base=10)
+        dist_fast = self._adaptive_distance(df, base=5)
+        div_signals = self.detect_combined_divergence(
+            df, distance_slow=dist_slow, distance_fast=dist_fast,
+            second_period_name=second_period_name,
+        )
+
+        # 动能
+        mom_desc, mom_score = self._calculate_momentum_score(df, 'DIF_12269', 'DEA_12269', max_score=20)
+
+        # DIF 斜率
+        slope_info = self._slope_analysis(df['DIF_12269'], window=5)
+
+        # 量价趋势
+        vol_desc, vol_score = self._volume_price_trend_score(df, max_bonus=10)
+
+        # K 线形态评分
+        kp_result = self._score_kline_pattern(df, max_score=10)
+
+        # ── 构建 state ──────────────────────────────────────────────────────
+        state = {
+            'df': df,
+            'regime': None,
+            'signal_list': [],
+            'risk_level': 'NONE',
+            'risk_desc': '',
+            'conclusion': '',
+            'level': 'C',
+            'score': 0,
+            'triggered_rules': [],
+            '_notes': [],
+            'divergence': div_signals,
+            'kline_data': df.attrs.get('_kline_pattern_details', None),
+            'volume_trend': (vol_desc, vol_score),
+            'momentum': {'desc': mom_desc, 'score': mom_score},
+            'slope': slope_info,
+            'chip_data': df.attrs.get('chip_data', None),
+        }
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Gate 0: 情景识别
+        # ═══════════════════════════════════════════════════════════════════
+        boll_col_name = boll_bw_col if boll_bw_col else None
+        regime = MACDAnalyzer.detect_market_regime(df, boll_col=boll_col_name)
+        state['regime'] = regime
+
+        # 弱势趋势 → 直接终止
+        if regime == 'WEAK_TREND':
+            state['level'] = 'C'
+            state['conclusion'] = 'C: 弱势趋势，环境不配合'
+            state['score'] = 0
+            return _pipeline_output(state)
+
+        # 顶部风险 → 进入 R01 检查
+        # （R01 在 Gate 2 规则引擎中处理）
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Gate 1: 信号确认
+        # ═══════════════════════════════════════════════════════════════════
+        signal_list = []
+
+        # MACD 金叉信号
+        detail_12269 = df['MACD_12269_SIGNAL_DETAIL'].iloc[-1] if 'MACD_12269_SIGNAL_DETAIL' in df.columns else ''
+        if '金叉' in str(detail_12269):
+            if '零轴上' in str(detail_12269):
+                signal_list.append({'type': 'MACD_金叉', 'confidence': 'high', 'desc': '零轴上金叉'})
+            else:
+                signal_list.append({'type': 'MACD_金叉', 'confidence': 'medium', 'desc': '零轴下金叉'})
+
+        # 底背离信号
+        cs = div_signals.get('combined_signal', '')
+        if '底背离' in cs:
+            strength = div_signals.get('strength_12269', 0) or div_signals.get(f'strength_{second_period_name}', 0)
+            confidence = 'high' if strength > 0.6 else 'medium'
+            signal_list.append({'type': '底背离', 'confidence': confidence, 'desc': cs})
+
+        # K 线反转信号
+        kd = state.get('kline_data')
+        if kd and kd.get('details'):
+            for d in kd['details']:
+                if d['direction'] == '看涨' and d['level'] in ('强反转', '中反转'):
+                    confidence = 'high' if d['level'] == '强反转' else 'medium'
+                    signal_list.append({'type': 'K线反转', 'confidence': confidence, 'desc': d['label']})
+                    break
+
+        state['signal_list'] = signal_list
+
+        # 规则引擎 Gate 1
+        execute_rules(state, gate=1)
+
+        # 无信号 → 终止
+        if not signal_list:
+            state['level'] = 'C'
+            state['conclusion'] = 'C: 无明确入场信号'
+            return _pipeline_output(state)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Gate 2: 风险评估
+        # ═══════════════════════════════════════════════════════════════════
+        execute_rules(state, gate=2)
+
+        if state['risk_level'] == 'HIGH':
+            return _pipeline_output(state)
+
+        # 手动风险兜底
+        has_top_div = '顶背离' in cs or '卖出' in cs
+        if has_top_div and 'R01' not in state['triggered_rules']:
+            state['risk_level'] = 'MEDIUM'
+            state['risk_desc'] = '顶背离(未达R01阈值)'
+
+        # 筹码分布风险评估
+        chip = state.get('chip_data')
+        if chip:
+            winner_rate = chip.get('winner_rate', 0)
+            close = df['close'].iloc[-1]
+            cost_95pct = chip.get('cost_95pct', 0)
+            cost_5pct = chip.get('cost_5pct', 0)
+
+            # 高位获利盘风险
+            if winner_rate > 80 and state['regime'] in ('WEAK_TREND', 'TOP_RISK', 'UNCLEAR'):
+                if state['risk_level'] in ('NONE', 'LOW'):
+                    state['risk_level'] = 'MEDIUM'
+                    state['risk_desc'] += ' 筹码高位获利[>80%]'
+
+            # 接近成本上沿阻力
+            if cost_95pct > 0 and close >= cost_95pct * 0.95 and winner_rate > 70:
+                if state['risk_level'] in ('NONE', 'LOW'):
+                    state['risk_level'] = 'MEDIUM'
+                    state['risk_desc'] += ' 筹码阻力位'
+
+            # 筹码极度集中（集中度高 = 窄区间）
+            if cost_95pct > 0 and cost_5pct > 0:
+                chip_range = (cost_95pct - cost_5pct) / max(cost_5pct, 0.01)
+                if chip_range < 0.15:
+                    # 筹码高度集中，根据位置判断
+                    cost_50pct = chip.get('cost_50pct', 0)
+                    if close > cost_50pct and winner_rate > 70:
+                        if state['risk_level'] not in ('HIGH',):
+                            state['risk_level'] = 'HIGH' if state['regime'] in ('WEAK_TREND', 'TOP_RISK') else 'MEDIUM'
+                            state['risk_desc'] += ' 筹码密集区高位'
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Gate 3: 综合裁定
+        # ═══════════════════════════════════════════════════════════════════
+        execute_rules(state, gate=3)
+
+        # ── 情景权重矩阵 ──────────────────────────────────────────────────
+        regime_mult = {
+            'STRONG_TREND':   {'zero': 1.2, 'strat': 1.0, 'tact': 1.0, 'mom': 1.5, 'slope': 1.5, 'div': 1.0, 'vol': 1.0, 'kp': 0.3},
+            'BOTTOM_REVERSAL':{'zero': 0.5, 'strat': 1.0, 'tact': 1.0, 'mom': 0.8, 'slope': 0.8, 'div': 2.0, 'vol': 1.5, 'kp': 1.5},
+            'TOP_RISK':       {'zero': 0.3, 'strat': 0.5, 'tact': 0.5, 'mom': 0.5, 'slope': 0.5, 'div': 2.0, 'vol': 1.5, 'kp': 2.0},
+            'OSCILLATION':    {'zero': 0.5, 'strat': 0.5, 'tact': 0.5, 'mom': 0.3, 'slope': 0.3, 'div': 1.5, 'vol': 0.5, 'kp': 1.2},
+            'UNCLEAR':        {'zero': 1.0, 'strat': 1.0, 'tact': 1.0, 'mom': 1.0, 'slope': 1.0, 'div': 1.0, 'vol': 1.0, 'kp': 1.0},
+        }
+        mult = regime_mult.get(regime, regime_mult['UNCLEAR'])
+
+        # 各维度计算（使用权重矩阵修正）
+        w_zero = int(weights['零轴条件'] * mult['zero'])
+        w_strat = int(weights['战略金叉'] * mult['strat'])
+        w_tact = int(weights['战术金叉'] * mult['tact'])
+        w_mom = int(weights['动能'] * mult['mom'])
+        w_slope = int(weights['DIF斜率'] * mult['slope'])
+        w_div = int(weights['背离信号'] * mult['div'])
+        w_vol = int(weights['量价配合'] * mult['vol'])
+        w_kp = int(weights['K线形态'] * mult['kp'])
+
+        scores = {}
+
+        # 零轴条件
+        dif_above = df['DIF_12269'].iloc[-1] > 0
+        dea_above = df['DEA_12269'].iloc[-1] > 0
+        if dif_above and dea_above:
+            scores['零轴条件'] = ('DIF/DEA 均在零轴上', w_zero)
+        elif dif_above:
+            scores['零轴条件'] = ('DIF 在零轴上，DEA 仍在下方', w_zero // 2)
+        else:
+            scores['零轴条件'] = ('DIF 在零轴下', 0)
+
+        # 战略金叉
+        slow_detail = df['MACD_12269_SIGNAL_DETAIL'].iloc[-1] if 'MACD_12269_SIGNAL_DETAIL' in df.columns else ''
+        slow_bull = df['DIF_12269'].iloc[-1] > df['DEA_12269'].iloc[-1]
+        if '零轴上金叉' in str(slow_detail):
+            scores['战略金叉'] = ('12269 零轴上金叉', w_strat)
+        elif '零轴下金叉' in str(slow_detail):
+            scores['战略金叉'] = ('12269 零轴下金叉', w_strat // 2)
+        elif slow_bull:
+            scores['战略金叉'] = ('12269 多头持续', int(w_strat * 0.75))
+        else:
+            scores['战略金叉'] = ('12269 空头排列', 0)
+
+        # 战术金叉
+        fast_detail_col = f'MACD_{second_period_name}_SIGNAL_DETAIL'
+        fast_dif_col = f'DIF_{second_period_name}'
+        fast_dea_col = f'DEA_{second_period_name}'
+        if fast_detail_col in df.columns:
+            fast_detail = df[fast_detail_col].iloc[-1]
+            fast_bull = df[fast_dif_col].iloc[-1] > df[fast_dea_col].iloc[-1]
+            if '零轴上金叉' in str(fast_detail):
+                scores['战术金叉'] = (f'{second_period_name} 零轴上金叉', w_tact)
+            elif fast_bull:
+                scores['战术金叉'] = (f'{second_period_name} 多头持续', int(w_tact * 0.65))
+            else:
+                scores['战术金叉'] = (f'{second_period_name} 空头/死叉', 0)
+
+        # 动能
+        prefix = '强势' if mom_score >= w_mom // 2 else ('关注' if mom_score >= w_mom // 4 else '弱势')
+        scores['动能'] = (f'{prefix}: {mom_desc}', min(mom_score, w_mom))
+
+        # DIF 斜率
+        if slope_info['trend'] == '明确上行':
+            scores['DIF斜率'] = (f"确认 {slope_info['trend']} (R²={slope_info['r2']})", w_slope)
+        elif '上行' in slope_info['trend']:
+            scores['DIF斜率'] = (f"关注 {slope_info['trend']} (R²={slope_info['r2']})", int(w_slope * 0.55))
+        else:
+            scores['DIF斜率'] = (f"弱势 {slope_info['trend']} (R²={slope_info['r2']})", 0)
+
+        # 背离信号
+        div_type = div_signals.get('div_12269') or div_signals.get(f'div_{second_period_name}')
+        div_str = div_signals.get('strength_12269') or div_signals.get(f'strength_{second_period_name}', 0.0)
+        div_decay = div_signals.get('decay_12269') or div_signals.get(f'decay_{second_period_name}', 0.0)
+        eff = round(div_str * div_decay, 3)
+        if '底背离' in cs:
+            div_score = int(w_div * (0.5 + 0.5 * eff))
+            scores['背离信号'] = (f'确认 {cs} (强度={div_str}, 衰减={div_decay}, 有效={eff})', div_score)
+        elif '顶背离' in cs or '卖出' in cs:
+            scores['背离信号'] = (f'否定 {cs}（一票否决）', 0)
+        else:
+            scores['背离信号'] = ('中性: 无背离信号', 0)
+
+        # 量价
+        has_top_div = '顶背离' in cs or '卖出' in cs
+        vol_bonus = 0 if has_top_div else vol_score
+        scores['量价配合'] = (vol_desc, min(vol_bonus, w_vol))
+
+        # K线形态
+        scores['K线形态'] = kp_result
+
+        # ── 汇总 ──────────────────────────────────────────────────────────
+        base_keys = [k for k in scores if k != '量价配合']
+        total_base = sum(scores[k][1] for k in base_keys)
+        bonus = scores['量价配合'][1]
+
+        total_max_base = w_zero + w_strat + w_tact + w_mom + w_slope + w_div + w_kp
+        total_base = max(0, min(total_max_base, total_base))
+        total = max(0, min(total_max_base + w_vol, total_base + bonus))
+
+        # ── 级别判定 ──────────────────────────────────────────────────────
+        notes = state.get('_notes', [])
+        notes_str = '+'.join(notes) if notes else ''
+
+        is_high_risk = state['risk_level'] == 'HIGH' or has_top_div
+
+        if is_high_risk:
+            state['level'] = 'D'
+            conclusion_parts = ['D: 顶部风险']
+        elif total_base >= thresholds['fully_bull'] and not notes_str:
+            state['level'] = 'A'
+            conclusion_parts = ['A: 综合多头']
+        elif total_base >= thresholds['fully_bull']:
+            state['level'] = 'A'
+            conclusion_parts = ['A: 综合多头']
+        elif total_base >= thresholds['bullish'] and has_top_div:
+            state['level'] = 'B'
+            conclusion_parts = ['B: 偏多(注意顶部风险)']
+        elif total_base >= thresholds['bullish']:
+            state['level'] = 'B'
+            conclusion_parts = ['B: 偏多']
+        elif total_base >= thresholds['oscillate']:
+            state['level'] = 'C'
+            conclusion_parts = ['C: 多空拉锯']
+        else:
+            state['level'] = 'C'
+            conclusion_parts = ['C: 偏空']
+
+        # 情景描述
+        regime_labels = {
+            'STRONG_TREND': '强势趋势', 'WEAK_TREND': '弱势趋势',
+            'BOTTOM_REVERSAL': '底部反转', 'TOP_RISK': '顶部风险',
+            'OSCILLATION': '震荡', 'UNCLEAR': '方向不明',
+        }
+        regime_label = regime_labels.get(regime, '方向不明')
+
+        # 信号描述
+        signal_desc = '+'.join(s['desc'] for s in signal_list[:2]) if signal_list else ''
+
+        # 备注
+        if notes_str:
+            conclusion_parts.append(notes_str)
+        if regime_label != '方向不明':
+            conclusion_parts.insert(1, regime_label)
+        if signal_desc:
+            conclusion_parts.insert(2, signal_desc)
+
+        state['conclusion'] = ' | '.join(filter(None, conclusion_parts))
+        state['score'] = total
+        state['risk_desc'] = state.get('risk_desc', '')
+
+        # ── 写入 df.attrs 供外部使用 ─────────────────────────────────────
+        df.attrs['pipeline_level'] = state['level']
+        df.attrs['pipeline_conclusion'] = state['conclusion']
+        df.attrs['pipeline_regime'] = state['regime']
+
+        state['_scores'] = scores
+        return _pipeline_output(state)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 9. 完全多头综合评分（核心入口，待弃用）
     # ─────────────────────────────────────────────────────────────────────────
 
     def analyze_full_bull(
@@ -754,3 +1169,37 @@ class MACDAnalyzer:
             "slope": slope_info,
             "winrate_ref": winrate_str,
         }
+
+
+# ── 级联流水线输出构建（在 pipeline_analysis 末尾调用） ──────────────────
+
+
+def _pipeline_output(state: dict) -> dict:
+    """
+    从 pipeline state 构建统一返回 dict。
+
+    保持与 analyze_full_bull 相同的顶层 key，以便 SignalManager 兼容处理。
+    """
+    notes = state.get('_notes', [])
+    details = {}
+    # 如果 state 中有 scores 则包含（取自 Gate 3 计算）
+    if '_scores' in state:
+        details = {k: {'desc': v[0], 'score': v[1]} for k, v in state['_scores'].items()}
+
+    return {
+        "score": state.get('score', 0),
+        "score_base": state.get('score', 0),
+        "conclusion": state.get('conclusion', ''),
+        "level": state.get('level', 'C'),
+        "regime": state.get('regime', 'UNCLEAR'),
+        "risk_level": state.get('risk_level', 'NONE'),
+        "risk_desc": state.get('risk_desc', ''),
+        "triggered_rules": state.get('triggered_rules', []),
+        "notes": notes,
+        "signal_count": len(state.get('signal_list', [])),
+        "details": details if details else {},
+        "divergence": state.get('divergence', {}),
+        "momentum": state.get('momentum', {}).get('desc', ''),
+        "slope": state.get('slope', {}),
+        "winrate_ref": '参考 pipeline',
+    }

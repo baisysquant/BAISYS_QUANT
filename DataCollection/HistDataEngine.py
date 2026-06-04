@@ -732,7 +732,9 @@ class StockSyncEngine:
 
         akshare_symbols = [format_stock_code(code) for code in filtered_codes]
 
-        #  Step 7: 多线程并发获取 K 线数据（带错峰延迟 + 断点续传 + 增量更新）
+        #  Step 7: 多线程并发获取 K 线数据（带断点续传 + 增量更新 + 进度条）
+        from tqdm import tqdm
+
         print(f"[INFO] 正在获取 {len(akshare_symbols)} 只股票的 K 线数据（多线程并发模式）...")
 
         # 7.0 检查是否有今天的批次文件（判断是否需要全量获取）
@@ -749,16 +751,14 @@ class StockSyncEngine:
             print("[清理] 清空成功列表和失败列表，将从头开始全量获取...")
             self._clear_success_symbols()
             self._clear_failed_symbols()
-            success_symbols = set()  # 重置为空
+            success_symbols = set()
 
         if success_symbols:
-            # 过滤掉已成功的股票
             original_count = len(akshare_symbols)
             akshare_symbols = [s for s in akshare_symbols if s not in success_symbols]
             skipped_count = original_count - len(akshare_symbols)
             print(f"[增量更新] 跳过 {skipped_count} 只已成功的股票，本次需获取 {len(akshare_symbols)} 只")
 
-            # 如果全部已成功，直接加载缓存并写入数据库
             if not akshare_symbols:
                 print("[INFO] 今日所有股票 K 线数据已成功获取，无需重复调用接口！")
                 self._load_and_merge_cached_data(kline_cache_dir)
@@ -768,13 +768,11 @@ class StockSyncEngine:
         failed_symbols = self._load_failed_symbols()
         if failed_symbols:
             print(f"[断点续传] 发现上次失败的 {len(failed_symbols)} 只股票，优先重试...")
-            # 将失败的股票移到最前面优先处理
             akshare_symbols = failed_symbols + [s for s in akshare_symbols if s not in failed_symbols]
 
-        # 7.2 分批并发获取（每500只股票为一批，每批内8线程并发+错峰请求）
-        batch_size = 500  # 每批处理的股票数量
-        max_workers = 8  # 每批内的并发线程数
-        # kline_cache_dir 已在 7.0 步定义
+        # 分批并发获取（每500只股票为一批，每批内多线程并发）
+        batch_size = 500
+        max_workers = min(len(akshare_symbols), 15)
 
         total_new_batches = (len(akshare_symbols) + batch_size - 1) // batch_size
         all_success_dfs = []
@@ -783,9 +781,7 @@ class StockSyncEngine:
         total_failed = 0
 
         for batch_idx in range(total_new_batches):
-            # 为每个批次生成独立的时间戳（业务交易日 + 当前时分秒）
             last_trading_day = TradingCalendarAnalyzer().get_last_trading_day()
-            # 将 YYYY-MM-DD 转换为 YYYYMMDD
             trading_date_str = last_trading_day.replace("-", "")
             current_time_str = datetime.now().strftime("%H%M%S")
             batch_timestamp = f"{trading_date_str}{current_time_str}"
@@ -794,95 +790,53 @@ class StockSyncEngine:
             end_idx = min(start_idx + batch_size, len(akshare_symbols))
             batch_symbols = akshare_symbols[start_idx:end_idx]
 
-            print(f"\n[批次 {batch_idx + 1}/{total_new_batches}] 处理 {len(batch_symbols)} 只股票...")
-
-            # 使用线程池并发获取，但每个线程请求后错峰延迟
             batch_success_dfs = []
             batch_failed = []
-            batch_current_success = 0  # 当前批次已成功数量
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交任务（无错峰延迟，直接并发）
-                futures = {}
-                for symbol in batch_symbols:
-                    # 直接提交任务，不添加延迟
-                    future = executor.submit(self._fetch_kline_for_symbol, symbol)
-                    futures[future] = symbol
-
-                # 收集结果
-                for future in as_completed(futures):
-                    symbol = futures[future]
-                    try:
-                        result = future.result()
-                        if result is not None and not result.empty:
-                            batch_success_dfs.append(result)
-                            total_success += 1
-                            batch_current_success += 1
-                            # 每50只股票显示一次进度
-                            if batch_current_success % 50 == 0 or batch_current_success == len(batch_symbols):
-                                print(
-                                    f"  [进度] 批次 {batch_idx + 1} 已成功: {batch_current_success}/{len(batch_symbols)}"
-                                )
-                        else:
+            batch_desc = f"批次{batch_idx + 1}/{total_new_batches}"
+            with tqdm(total=len(batch_symbols), desc=batch_desc, unit="只", ncols=80, leave=False) as pbar:
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(self._fetch_kline_for_symbol, s): s for s in batch_symbols}
+                    for future in as_completed(futures):
+                        symbol = futures[future]
+                        try:
+                            result = future.result()
+                            if result is not None and not result.empty:
+                                batch_success_dfs.append(result)
+                                total_success += 1
+                            else:
+                                batch_failed.append(symbol)
+                                total_failed += 1
+                        except Exception:
                             batch_failed.append(symbol)
                             total_failed += 1
-                    except Exception as e:
-                        batch_failed.append(symbol)
-                        total_failed += 1
-                        print(f"[ERROR] {symbol} 获取异常: {e}")
+                        pbar.update(1)
+                        pbar.set_postfix_str(f"成{total_success} 败{total_failed}")
 
-            # 7.3 保存本批成功的数据到本地缓存
-            if batch_success_dfs:
-                batch_df = pd.concat(batch_success_dfs, ignore_index=True)
-                # 使用批次独立时间戳作为唯一标识，格式：kline_batch_YYYYMMDDHHMMSS.csv
-                batch_file = os.path.join(kline_cache_dir, f"kline_batch_{batch_timestamp}.csv")
-                batch_df.to_csv(batch_file, sep="|", index=False, encoding="utf-8-sig")
-                print(
-                    f"[缓存] 批次 {batch_idx + 1}/{total_new_batches} 已保存: {len(batch_df)} 条记录 -> {os.path.basename(batch_file)}"
-                )
-                all_success_dfs.append(batch_df)
-
-                # 【关键】保存本批成功的股票列表（增量更新）
-                batch_success_codes = [df["symbol"].iloc[0] for df in batch_success_dfs if not df.empty]
-                self._save_success_symbols(batch_success_codes, append=True)
-            else:
-                print(f"[警告] 批次 {batch_idx + 1}/{total_new_batches} 无成功数据")
+                # 7.3 保存本批成功的数据到本地缓存
+                if batch_success_dfs:
+                    batch_df = pd.concat(batch_success_dfs, ignore_index=True)
+                    batch_file = os.path.join(kline_cache_dir, f"kline_batch_{batch_timestamp}.csv")
+                    batch_df.to_csv(batch_file, sep="|", index=False, encoding="utf-8-sig")
+                    all_success_dfs.append(batch_df)
+                    batch_success_codes = [df["symbol"].iloc[0] for df in batch_success_dfs if not df.empty]
+                    self._save_success_symbols(batch_success_codes, append=True)
 
             all_failed_symbols.extend(batch_failed)
 
-            # 显示本批统计
-            batch_success_count = len(batch_success_dfs)
-            batch_fail_count = len(batch_failed)
-            print(
-                f"[批次 {batch_idx + 1} 完成] 成功: {batch_success_count}, 失败: {batch_fail_count}, "
-                f"累计成功: {total_success}, 累计失败: {total_failed}"
-            )
-
-            # 批次间休息20秒，给接口充分恢复时间
+            # 批次间休息10秒
             if batch_idx < total_new_batches - 1:
-                print("[休息] 批次间等待20秒...")
-                time.sleep(20)
+                time.sleep(10)
 
-        # 7.4 保存失败列表到本地（供下次重试）
+        # 7.4 统计输出
         if all_failed_symbols:
             self._save_failed_symbols(all_failed_symbols)
-            print(f"\n{'=' * 60}")
-            print(f"[统计] 总股票数: {len(akshare_symbols)}")
-            print(f"[统计] 成功获取: {total_success} ({total_success / len(akshare_symbols) * 100:.1f}%)")
-            print(f"[统计] 获取失败: {total_failed} ({total_failed / len(akshare_symbols) * 100:.1f}%)")
-            print(f"[警告] 共有 {len(all_failed_symbols)} 只股票获取失败，已保存至失败列表。")
-            print("[提示] 下次运行时将优先重试这些股票。")
-            print(f"{'=' * 60}")
+            print(f"\n[统计] 总{len(akshare_symbols)}只 | 成功{total_success} | 失败{total_failed}")
         else:
-            # 如果全部成功，删除失败列表文件、成功列表文件和旧的批次文件
             self._clear_failed_symbols()
-            self._clear_success_symbols()  # 【新增】清除成功列表（第二天需要重新获取）
+            self._clear_success_symbols()
             self._cleanup_old_batch_files(kline_cache_dir)
-            print(f"\n{'=' * 60}")
-            print("[成功] 所有股票 K 线数据获取完成！")
-            print(f"[统计] 总股票数: {len(akshare_symbols)}")
-            print(f"[统计] 成功获取: {total_success} (100%)")
-            print(f"{'=' * 60}")
+            print(f"\n[统计] 总{len(akshare_symbols)}只 | 全部成功 ✓")
 
         # 7.5 合并所有批次的数据
         if not all_success_dfs:
@@ -898,6 +852,21 @@ class StockSyncEngine:
             print(f"[INFO]  K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
         except Exception as e:
             print(f"[ERROR] 保存 K线数据缓存失败: {e}")
+
+        #  Step 8: 获取筹码分布数据（仅当启用时）
+        if self.config.ENABLE_CHIP_DISTRIBUTION:
+            from DataCollection.ChipDistributionFetcher import ChipDistributionFetcher
+
+            chip_fetcher = ChipDistributionFetcher(self.config)
+            chip_df = chip_fetcher.fetch_chip_data(akshare_symbols)
+            if not chip_df.empty:
+                chip_cache_path = os.path.join(self.base_data_dir, f"chip_distribution_{self.today}.csv")
+                chip_df.to_csv(chip_cache_path, index=False, encoding="utf-8-sig")
+                print(f"[ChipDist] 筹码分布数据已保存: {os.path.basename(chip_cache_path)}")
+            else:
+                print("[ChipDist] 未获取到筹码分布数据。")
+        else:
+            print("[ChipDist] 筹码分布获取未启用（config.ini 中 enable_chip_distribution = false）")
 
         #  Step 9: 写入数据库
         try:

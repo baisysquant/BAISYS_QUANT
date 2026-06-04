@@ -97,6 +97,12 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "conclusion_bullish = 60",
         "conclusion_oscillate = 40",
     ],
+    "ASHAREHUB": [
+        "[ASHAREHUB]",
+        "api_key = (请设置 AShareHub API 密钥)",
+        "enable_chip_distribution = false",
+        "chip_history_days = 90",
+    ],
 }
 
 
@@ -344,6 +350,11 @@ SECTION_RULES: list[SectionRule] = [
     ]),
     SectionRule(name="USER_FOCUS_STOCKS", description="用户关注股池配置", optional=True, fields=[
         FieldRule("user_focus_stocks", "str", required=False, default=""),
+    ]),
+    SectionRule(name="ASHAREHUB", description="AShareHub筹码分布数据配置", optional=True, fields=[
+        FieldRule("api_key", "str"),
+        FieldRule("enable_chip_distribution", "bool", required=False, default="false"),
+        FieldRule("chip_history_days", "int", required=False, default="90", min_value=1, max_value=200),
     ]),
     SectionRule(name="FULL_BULL_SCORING", description="MACD完全多头评分配置", optional=True, fields=[
         FieldRule("weight_zero_axis", "int", required=False, default="20", min_value=0, max_value=100),

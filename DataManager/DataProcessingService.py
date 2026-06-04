@@ -530,12 +530,15 @@ class DataProcessingService:
             signal_col = f"{macd_key}_Signal"
             ta_dfs_to_merge.append(macd_df_second[["股票代码", signal_col]].rename(columns={signal_col: macd_key}))
 
-        # MACD 完全多头综合评分
+        # MACD 完全多头综合评分 + 级联流水线输出
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
             cols = ["股票代码", "FullBull_Score", "MACD_FULL_BULL_Label"]
             if "FullBull_Score_Base" in macd_full_bull_df.columns:
                 cols.append("FullBull_Score_Base")
+            for pipe_col in ["综合分析结论", "综合分析评分", "综合级别", "风险等级"]:
+                if pipe_col in macd_full_bull_df.columns:
+                    cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])
 
         # KDJ

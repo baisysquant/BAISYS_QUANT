@@ -1,4 +1,7 @@
+import os
 import re
+from datetime import datetime
+
 import pandas as pd
 from typing import Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -121,6 +124,25 @@ class TASignalProcessor:
                 weights=weights, thresholds=thresholds,
             )
             result['bull'] = bull_result
+        except Exception:
+            pass
+
+        # 附加筹码分布数据
+        code_str = str(code).lower()
+        if code_str.startswith(('sh', 'sz', 'bj')):
+            code_str = code_str[:2] + code_str[2:].zfill(6)
+        else:
+            code_str = code_str.zfill(6)
+        if code_str in getattr(self, 'chip_lookup', {}):
+            df.attrs['chip_data'] = self.chip_lookup[code_str]
+
+        # 级联流水线分析（验证期：与旧逻辑并行输出）
+        try:
+            pipeline_result = self.macd_analyzer.pipeline_analysis(
+                df, second_params=second_params,
+                weights=weights, thresholds=thresholds,
+            )
+            result['pipeline'] = pipeline_result
         except Exception:
             pass
 
@@ -392,8 +414,24 @@ class TASignalProcessor:
             'MACD_FULL_BULL': pd.DataFrame(columns=[
                 '股票代码', 'FullBull_Score', 'FullBull_Score_Base', 'MACD_FULL_BULL_Label',
                 '零轴条件', '战略金叉', '战术金叉', '动能', 'DIF斜率', '背离信号', '量价配合',
+                '综合分析结论', '综合分析评分', '综合级别', '风险等级',
             ]),
         }
+
+        # ── 加载筹码分布数据 ───────────────────────────────────────────────
+        self.chip_lookup = {}
+        today_str = datetime.now().strftime('%Y%m%d')
+        chip_path = os.path.join(getattr(self.config, 'HOME_DIRECTORY', '~/Downloads/CoreNews_Reports'), f"chip_distribution_{today_str}.csv")
+        chip_path = os.path.expanduser(chip_path)
+        if os.path.exists(chip_path):
+            try:
+                chip_df = pd.read_csv(chip_path)
+                for _, row in chip_df.iterrows():
+                    pure = row['symbol']
+                    self.chip_lookup[pure] = row.to_dict()
+                print(f"[ChipDist] 已加载 {len(self.chip_lookup)} 条筹码数据")
+            except Exception as e:
+                print(f"[ChipDist] 加载筹码数据失败: {e}")
 
         if hist_df_all.empty:
             return ta_signals
@@ -481,6 +519,7 @@ class TASignalProcessor:
 
             if 'bull' in r:
                 detail = r['bull'].get('details', {})
+                pipeline = r.get('pipeline', {})
                 bull_rows.append({
                     '股票代码': code,
                     'FullBull_Score': r['bull'].get('score', 0),
@@ -494,6 +533,11 @@ class TASignalProcessor:
                     '背离信号': detail.get('背离信号', {}).get('desc', ''),
                     '量价配合': detail.get('量价配合', {}).get('desc', ''),
                     'K线形态': detail.get('K线形态', {}).get('desc', ''),
+                    # 级联流水线新增列
+                    '综合分析结论': pipeline.get('conclusion', ''),
+                    '综合分析评分': pipeline.get('score', 0),
+                    '综合级别': pipeline.get('level', ''),
+                    '风险等级': pipeline.get('risk_level', ''),
                 })
 
             if 'mom_12269' in r:

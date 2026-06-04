@@ -84,6 +84,11 @@ class ReportService:
             ColumnNames.MACD_FULL_BULL_LABEL,
             ColumnNames.FULL_BULL_SCORE,
             ColumnNames.FULL_BULL_SCORE_BASE,
+            # 级联流水线新列
+            ColumnNames.COMPREHENSIVE_ANALYSIS,
+            ColumnNames.COMPREHENSIVE_SCORE,
+            ColumnNames.COMPREHENSIVE_LEVEL,
+            ColumnNames.RISK_LEVEL,
         ]
         if second_period_name:
             cols.extend([

@@ -104,5 +104,11 @@ class ColumnNames:
         AKSHARE_MAIN_NET_FLOW,
     ]
 
+    # ==================== 综合分析列 ====================
+    COMPREHENSIVE_ANALYSIS = "综合分析结论"
+    COMPREHENSIVE_SCORE = "综合分析评分"
+    COMPREHENSIVE_LEVEL = "综合级别"
+    RISK_LEVEL = "风险等级"
+
     # 研报相关
     RESEARCH_REPORT_COUNT = "研报买入次数"

@@ -257,6 +257,14 @@ class UserFocusStocksConfig(BaseModel):
     USER_FOCUS_STOCKS: str = Field(default="")
 
 
+class AShareHubConfig(BaseModel):
+    """AShareHub 筹码分布数据配置"""
+
+    API_KEY: str = Field(default="")
+    ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
+    CHIP_HISTORY_DAYS: int = Field(default=90, ge=1, le=200)
+
+
 class AppConfig(BaseSettings):
     """应用配置主模型"""
 
@@ -276,6 +284,7 @@ class AppConfig(BaseSettings):
     full_bull_scoring: FullBullScoringConfig
     user_focus_stocks: UserFocusStocksConfig
     kline_data: KlineDataConfig
+    asharehub: AShareHubConfig
 
 
 class Config:
@@ -442,6 +451,17 @@ class Config:
         except KeyError:
             ufc = UserFocusStocksConfig()
 
+        # 读取 AShareHub 筹码分布配置
+        try:
+            ah = config["ASHAREHUB"]
+            ah_config = AShareHubConfig(
+                API_KEY=ConfigCipher.maybe_decrypt(ah.get("api_key", "")),
+                ENABLE_CHIP_DISTRIBUTION=ah.getboolean("enable_chip_distribution", fallback=False),
+                CHIP_HISTORY_DAYS=ah.getint("chip_history_days", fallback=90),
+            )
+        except KeyError:
+            ah_config = AShareHubConfig()
+
         # 创建主配置对象
         self.app_config = AppConfig(
             database=database_config,
@@ -456,6 +476,7 @@ class Config:
             full_bull_scoring=fbs_config,
             user_focus_stocks=ufc,
             kline_data=kd_config,
+            asharehub=ah_config,
         )
 
         # 设置向后兼容的属性
@@ -499,6 +520,10 @@ class Config:
         self.RESEARCH_REPORT_MIN_COUNT = rrf_config.RESEARCH_REPORT_MIN_COUNT
 
         self.USER_FOCUS_STOCKS = ufc.USER_FOCUS_STOCKS
+
+        self.ASHAREHUB_API_KEY = ah_config.API_KEY
+        self.ENABLE_CHIP_DISTRIBUTION = ah_config.ENABLE_CHIP_DISTRIBUTION
+        self.CHIP_HISTORY_DAYS = ah_config.CHIP_HISTORY_DAYS
 
         self.FULL_BULL_WEIGHTS = {
             "零轴条件": fbs_config.WEIGHT_ZERO_AXIS,
