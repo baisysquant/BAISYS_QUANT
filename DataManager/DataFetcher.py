@@ -112,7 +112,7 @@ class DataFetcher:
                 print(f"[WARN] {df_name} 无简称列，使用占位符。")
 
         # ST股过滤 (统一正则)
-        st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
+        st_pattern = r"(?:\s*(?:\*|*|※|•|·))?(?:[Ss][Tt])"
         if df["股票简称"].dtype == "object" and df["股票简称"].astype(str).str.contains(st_pattern, na=False).any():
             st_count = df["股票简称"].astype(str).str.contains(st_pattern, na=False).sum()
             df = df[~df["股票简称"].astype(str).str.contains(st_pattern, na=False)].copy()

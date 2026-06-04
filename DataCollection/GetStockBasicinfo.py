@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import time
 from datetime import datetime
 
@@ -140,10 +140,10 @@ class StockBasicInfoService:
             self.logger.info(f"[缓存校验] 接口行业数量: {api_industry_count} | 数据库行业数量: {db_industry_count}")
             
             if api_industry_count == db_industry_count:
-                self.logger.info("[缓存校验] ✅ 行业数量一致，数据无需更新，直接使用本地缓存！")
+                self.logger.info("[缓存校验] [OK] 行业数量一致，数据无需更新，直接使用本地缓存！")
                 return True
             else:
-                self.logger.info("[缓存校验] ⚠️ 行业数量发生变化，触发全量刷新")
+                self.logger.info("[缓存校验] [WARN] 行业数量发生变化，触发全量刷新")
                 return False
                 
         except AttributeError as e:

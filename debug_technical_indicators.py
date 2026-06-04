@@ -17,7 +17,7 @@ def debug_technical_indicators():
     # 配置初始化
     config_path = "config.ini"
     config = Config(config_path)
-    DB_URI = f"postgresql://{config.DB_USER}:{config.DB_PASSWORD}@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
+    DB_URI = config.get_db_connection_string()
     
     print("=" * 80)
     print("【技术指标诊断工具】")
@@ -30,9 +30,9 @@ def debug_technical_indicators():
         with engine.connect() as conn:
             result = conn.execute(text("SELECT COUNT(*) FROM stock_daily_kline"))
             count = result.scalar()
-            print(f"✅ 数据库连接成功，K线表数据量: {count}")
+            print(f"[确认] 数据库连接成功，K线表数据量: {count}")
     except Exception as e:
-        print(f"❌ 数据库连接失败: {e}")
+        print(f"[失败] 数据库连接失败: {e}")
         return
     
     # 2. 获取最新交易日期的股票代码
@@ -41,7 +41,7 @@ def debug_technical_indicators():
         with engine.connect() as conn:
             query = text("SELECT MAX(trade_date) FROM stock_daily_kline")
             latest_date = conn.execute(query).scalar()
-            print(f"✅ 最新交易日期: {latest_date}")
+            print(f"[确认] 最新交易日期: {latest_date}")
             
             # 获取该日期的股票代码
             query = text(f"""
@@ -51,9 +51,9 @@ def debug_technical_indicators():
                 LIMIT 5
             """)
             symbols = conn.execute(query).fetchall()
-            print(f"✅ 该日期有 {len(symbols)} 只股票，样本: {[s[0] for s in symbols]}")
+            print(f"[确认] 该日期有 {len(symbols)} 只股票，样本: {[s[0] for s in symbols]}")
     except Exception as e:
-        print(f"❌ 查询失败: {e}")
+        print(f"[失败] 查询失败: {e}")
         return
     
     # 3. 检查历史数据
@@ -72,7 +72,7 @@ def debug_technical_indicators():
                     LIMIT 10
                 """)
                 df = pd.read_sql(query, conn)
-                print(f"✅ 查询到 {len(df)} 条历史数据")
+                print(f"[确认] 查询到 {len(df)} 条历史数据")
                 print(f"  列名: {list(df.columns)}")
                 print(f"  数据类型:\n{df.dtypes}")
                 print(f"  最近数据:\n{df.head(3)}")
@@ -85,7 +85,7 @@ def debug_technical_indicators():
                 print(f"    - low 非空率: {df['low'].notna().sum() / len(df) * 100:.1f}%")
                 
         except Exception as e:
-            print(f"❌ 查询失败: {e}")
+            print(f"[失败] 查询失败: {e}")
     
     # 4. 测试技术指标计算
     print("\n[步骤4] 测试技术指标计算...")
@@ -100,15 +100,15 @@ def debug_technical_indicators():
             result = _process_single_stock(test_symbol, df, "9186", config)
             
             print(f"\n技术指标计算结果:")
-            print(f"  - MACD_12269: {'✅ 有数据' if result['macd_12269'] else '❌ 无数据'}")
-            print(f"  - MACD_9186: {'✅ 有数据' if result['macd_9186'] else '❌ 无数据'}")
-            print(f"  - MACD_COMBINED_DIVERGENCE: {'✅ 有数据' if result['macd_divergence'] else '❌ 无数据'}")
-            print(f"  - KDJ: {'✅ 有数据' if result['kdj'] else '❌ 无数据'}")
-            print(f"  - CCI: {'✅ 有数据' if result['cci'] else '❌ 无数据'}")
-            print(f"  - RSI: {'✅ 有数据' if result['rsi'] else '❌ 无数据'}")
-            print(f"  - BOLL: {'✅ 有数据' if result['boll'] else '❌ 无数据'}")
-            print(f"  - MACD_momentum: {'✅ 有数据' if result['macd_momentum'] else '❌ 无数据'}")
-            print(f"  - MACD_full_bull: {'✅ 有数据' if result['macd_full_bull'] else '❌ 无数据'}")
+            print(f"  - MACD_12269: {'[有数据]' if result['macd_12269'] else '[无数据]'}")
+            print(f"  - MACD_9186: {'[有数据]' if result['macd_9186'] else '[无数据]'}")
+            print(f"  - MACD_COMBINED_DIVERGENCE: {'[有数据]' if result['macd_divergence'] else '[无数据]'}")
+            print(f"  - KDJ: {'[有数据]' if result['kdj'] else '[无数据]'}")
+            print(f"  - CCI: {'[有数据]' if result['cci'] else '[无数据]'}")
+            print(f"  - RSI: {'[有数据]' if result['rsi'] else '[无数据]'}")
+            print(f"  - BOLL: {'[有数据]' if result['boll'] else '[无数据]'}")
+            print(f"  - MACD_momentum: {'[有数据]' if result['macd_momentum'] else '[无数据]'}")
+            print(f"  - MACD_full_bull: {'[有数据]' if result['macd_full_bull'] else '[无数据]'}")
             
             # 打印详细结果
             print(f"\n详细结果:")
@@ -117,7 +117,7 @@ def debug_technical_indicators():
                     print(f"  {key}: {val}")
                     
         except Exception as e:
-            print(f"❌ 技术指标计算失败: {e}")
+            print(f"[失败] 技术指标计算失败: {e}")
             import traceback
             traceback.print_exc()
     
@@ -164,7 +164,7 @@ def debug_technical_indicators():
                 print(f"  {key}: {type(df)}")
                 
     except Exception as e:
-        print(f"❌ 完整流程测试失败: {e}")
+        print(f"[失败] 完整流程测试失败: {e}")
         import traceback
         traceback.print_exc()
     

@@ -490,11 +490,10 @@ class DataProcessingService:
         # MACD 完全多头综合评分
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
-            ta_dfs_to_merge.append(
-                macd_full_bull_df[["股票代码", "FullBull_Score", "FullBull_Conclusion"]].rename(
-                    columns={"FullBull_Conclusion": "MACD_FULL_BULL_Signals"}
-                )
-            )
+            cols = ["股票代码", "FullBull_Score", "MACD_FULL_BULL_Label"]
+            if "FullBull_Score_Base" in macd_full_bull_df.columns:
+                cols.append("FullBull_Score_Base")
+            ta_dfs_to_merge.append(macd_full_bull_df[cols])
 
         # KDJ
         kdj_df = processed_data.get("KDJ", pd.DataFrame())
@@ -545,7 +544,7 @@ class DataProcessingService:
                     final_df[col] = final_df[col].fillna("")
 
         # 使用辅助方法批量填充缺失的技术指标列
-        macd_cols = ["MACD_12269", "MACD_FULL_BULL_Signals"]
+        macd_cols = ["MACD_12269", "MACD_FULL_BULL_Label"]
         # 添加第二周期列名（必填）
         fast, slow, signal = self.config.MACD_SECOND_PARAMS
         second_period_name = f"{fast}{slow}{signal}"
@@ -562,6 +561,11 @@ class DataProcessingService:
             final_df["FullBull_Score"] = 0
         else:
             final_df["FullBull_Score"] = pd.to_numeric(final_df["FullBull_Score"], errors="coerce").fillna(0)
+
+        if "FullBull_Score_Base" not in final_df.columns:
+            final_df["FullBull_Score_Base"] = 0
+        else:
+            final_df["FullBull_Score_Base"] = pd.to_numeric(final_df["FullBull_Score_Base"], errors="coerce").fillna(0)
 
         return final_df
 
@@ -812,9 +816,8 @@ class DataProcessingService:
         try:
             from DataCollection.HistDataEngine import StockSyncEngine
 
-            # 调用get_main_board_pool方法从数据库获取股票基本信息
             stock_sync_engine = StockSyncEngine()
-            main_board_pool = stock_sync_engine.get_main_board_pool()
+            main_board_pool = stock_sync_engine.get_stock_pool_from_db()
 
             # 标准化股票代码
             formatted_codes = [CodeNormalizer.normalize(code) for code in stock_codes]

@@ -1,5 +1,7 @@
+import re
 import pandas as pd
 from typing import List, Dict, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas_ta as ta  # 勿删
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from DataManager.ShareCodeFormatMgr import format_stock_code
@@ -62,6 +64,127 @@ class TASignalProcessor:
         elif cci_value >= -200: return f'弱势超卖 ({cci_value:.2f})'
         else:                   return f'极度超卖 ({cci_value:.2f})'
 
+    def _process_single_stock(
+        self,
+        code: str,
+        valid_hist_df: pd.DataFrame,
+        second_params: tuple,
+        second_period_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        code_str = str(code).lower()
+        if code_str.startswith(('sh', 'sz', 'bj')):
+            code_str = code_str[2:]
+        match = re.search(r'(\d{6})', code_str)
+        if not match:
+            return None
+        pure_code = match.group(1)
+
+        df = valid_hist_df[valid_hist_df['股票代码'] == pure_code].copy()
+        if df.empty or len(df) < 30:
+            return None
+
+        for col in ['close', 'open', 'high', 'low', 'volume']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        df.dropna(subset=['close', 'open', 'high', 'low'], inplace=True)
+        if df.empty:
+            return None
+        required_cols = ['close', 'open', 'high', 'low']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            return None
+        if 'date' in df.columns:
+            df.sort_values('date', inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+        try:
+            df = self.macd_analyzer._custom_macd(df, second_params=second_params)
+        except Exception:
+            return None
+
+        result: Dict[str, Any] = {'code': code, 'pure_code': pure_code}
+
+        try:
+            bull_result = self.macd_analyzer.analyze_full_bull(
+                df, second_params=second_params, recalc_macd=False,
+            )
+            result['bull'] = bull_result
+        except Exception:
+            pass
+
+        try:
+            latest_row = df.iloc[-1]
+            result['mom_12269'] = MACDAnalyzer._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
+            result['mom_second'] = MACDAnalyzer._calculate_macd_momentum(
+                df, f'DIF_{second_period_name}', f'DEA_{second_period_name}',
+            )
+            result['dif_12269'] = latest_row.get('DIF_12269', 0)
+            result['dif_second'] = latest_row.get(f'DIF_{second_period_name}', 0)
+        except Exception:
+            pass
+
+        detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
+        if detail_col_12269 in df.columns:
+            val = df[detail_col_12269].iloc[-1]
+            if pd.notna(val) and val != '':
+                result['macd_12269_signal'] = val
+
+        detail_col_second = f'MACD_{second_period_name}_SIGNAL_DETAIL'
+        if detail_col_second in df.columns:
+            val = df[detail_col_second].iloc[-1]
+            if pd.notna(val) and val != '':
+                result['macd_second_signal'] = val
+
+        try:
+            kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
+            if kdj_signal:
+                result['kdj_signal'] = kdj_signal
+        except Exception:
+            pass
+
+        try:
+            df.ta.cci(append=True, close='close', high='high', low='low')
+            cci_cols = [col for col in df.columns if col.startswith('CCI_')]
+            if cci_cols:
+                current_cci = df[cci_cols[0]].iloc[-1]
+                result['cci_signal'] = self._classify_cci_level(current_cci) or f'常态波动 ({current_cci:.2f})'
+        except Exception:
+            pass
+
+        try:
+            df.ta.rsi(append=True, close='close', length=14)
+            rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
+            if rsi_cols:
+                rsi_col = rsi_cols[0]
+                curr_rsi = df[rsi_col].iloc[-1]
+                window = 10
+                if len(df) >= window + 1:
+                    curr_low = df['low'].iloc[-1]
+                    min_low_window = df['low'].iloc[-window:-1].min()
+                    min_rsi_window = df[rsi_col].iloc[-window:-1].min()
+                    is_price_low = curr_low <= (min_low_window * 1.02)
+                    is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
+                    result['rsi_signal'] = f'RSI底背离! ({curr_rsi:.1f})' if is_divergence else f'RSI={curr_rsi:.1f}'
+        except Exception:
+            pass
+
+        try:
+            df.ta.bbands(append=True, length=20, std=2, close='close')
+            boll_lower_cols = [col for col in df.columns if col.startswith('BBL_')]
+            boll_upper_cols = [col for col in df.columns if col.startswith('BBU_')]
+            if boll_lower_cols and boll_upper_cols:
+                df['BOLL_BANDWIDTH'] = (
+                    (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df['close']
+                )
+                is_narrow = (
+                    df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
+                )
+                result['boll_signal'] = '低波/缩口' if is_narrow else '常态/张口'
+        except Exception:
+            pass
+
+        return result
+
     def process_signals(
         self,
         all_codes: List[str],
@@ -112,7 +235,7 @@ class TASignalProcessor:
             ]),
             # ── 新增：完全多头综合评分 ─────────────────────────────────────
             'MACD_FULL_BULL': pd.DataFrame(columns=[
-                '股票代码', 'FullBull_Score', 'FullBull_Conclusion',
+                '股票代码', 'FullBull_Score', 'FullBull_Score_Base', 'MACD_FULL_BULL_Label',
                 '零轴条件', '战略金叉', '战术金叉', '动能', 'DIF斜率', '背离信号', '量价配合',
             ]),
         }
@@ -129,12 +252,9 @@ class TASignalProcessor:
         
         # 提取股票代码，支持多种格式（sh600000, sz000001, 600000, 000001等）
         def extract_code(symbol):
-            # 移除前缀并提取6位数字
             clean_symbol = str(symbol).lower()
             if clean_symbol.startswith(('sh', 'sz', 'bj')):
                 clean_symbol = clean_symbol[2:]
-            # 提取6位数字
-            import re
             match = re.search(r'(\d{6})', clean_symbol)
             return match.group(1) if match else 'N/A'
         
@@ -153,8 +273,6 @@ class TASignalProcessor:
             code_str = str(c).lower()
             if code_str.startswith(('sh', 'sz', 'bj')):
                 code_str = code_str[2:]
-            # 再次提取6位数字
-            import re
             match = re.search(r'(\d{6})', code_str)
             if match:
                 pure_codes_list.append(match.group(1).zfill(6))
@@ -166,213 +284,95 @@ class TASignalProcessor:
         # 过滤出有效的股票数据
         valid_hist_df = hist_df_all[hist_df_all['股票代码'].isin(code_set) & (hist_df_all['股票代码'] != 'N/A')].copy()
 
-        # ── 逐只股票处理 ─────────────────────────────────────────────────
-        for code in all_codes:
-            # 提取标准6位股票代码
-            code_str = str(code).lower()
-            if code_str.startswith(('sh', 'sz', 'bj')):
-                code_str = code_str[2:]
-            import re
-            match = re.search(r'(\d{6})', code_str)
-            if not match:
-                continue
-            pure_code = match.group(1)
-            
-            # 获取该股票的历史数据
-            df = valid_hist_df[valid_hist_df['股票代码'] == pure_code].copy()
+        # ── 并行处理所有股票 ──────────────────────────────────────────────
+        second_params = getattr(self.config, 'MACD_SECOND_PARAMS', (6, 13, 5))
+        max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
 
-            if df.empty or len(df) < 30:
-                continue
+        results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_single_stock, code, valid_hist_df, second_params, second_period_name
+                ): code
+                for code in all_codes
+            }
+            for future in as_completed(futures):
+                try:
+                    r = future.result()
+                    if r:
+                        results.append(r)
+                except Exception:
+                    continue
 
-            # 数据类型转换和清理
-            for col in ['close', 'open', 'high', 'low', 'volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # 删除关键列中存在NaN的行
-            df.dropna(subset=['close', 'open', 'high', 'low'], inplace=True)
+        # ── 从结果列表构建信号 DataFrame（避免逐行 O(n²) concat）─────────
+        macd_12269_rows: List[Dict] = []
+        macd_second_rows: List[Dict] = []
+        bull_rows: List[Dict] = []
+        mom_rows: List[Dict] = []
+        kdj_rows: List[Dict] = []
+        cci_rows: List[Dict] = []
+        rsi_rows: List[Dict] = []
+        boll_rows: List[Dict] = []
 
-            if df.empty:
-                continue
-            
-            # 检查必要列是否存在
-            required_cols = ['close', 'open', 'high', 'low']
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if missing_cols:
-                continue
+        for r in results:
+            code = r['code']
 
-            # 确保数据按日期排序
-            if 'date' in df.columns:
-                df.sort_values('date', inplace=True)
-                df.reset_index(drop=True, inplace=True)
+            if 'macd_12269_signal' in r:
+                macd_12269_rows.append({'股票代码': code, 'MACD_12269_Signal': r['macd_12269_signal']})
 
-            # ── MACD 计算（一次调用，后续共用结果）────────────────────────
-            try:
-                df = self.macd_analyzer._custom_macd(df, second_params=self.config.MACD_SECOND_PARAMS if self.config and hasattr(self.config, 'MACD_SECOND_PARAMS') else (6, 13, 5))
-            except Exception:
-                continue
+            if 'macd_second_signal' in r:
+                macd_second_rows.append({'股票代码': code, f'MACD_{second_period_name}_Signal': r['macd_second_signal']})
 
-            # ── 完全多头综合评分（新增核心能力接入）──────────────────────
-            try:
-                # 从配置中读取第二周期参数（必填）
-                second_params = getattr(self.config, 'MACD_SECOND_PARAMS', (6, 13, 5))
-                
-                bull_result = self.macd_analyzer.analyze_full_bull(df, second_params=second_params)
-                # 不论分数高低都记录，让下游自行筛选
-                detail = bull_result.get('details', {})
-                new_row = pd.DataFrame([{
-                    '股票代码':           code,
-                    'FullBull_Score':      bull_result.get('score', 0),
-                    'FullBull_Conclusion': bull_result.get('conclusion', ''),
+            if 'bull' in r:
+                detail = r['bull'].get('details', {})
+                bull_rows.append({
+                    '股票代码': code,
+                    'FullBull_Score': r['bull'].get('score', 0),
+                    'FullBull_Score_Base': r['bull'].get('score_base', 0),
+                    'MACD_FULL_BULL_Label': r['bull'].get('conclusion', ''),
                     '零轴条件': detail.get('零轴条件', {}).get('desc', ''),
                     '战略金叉': detail.get('战略金叉', {}).get('desc', ''),
                     '战术金叉': detail.get('战术金叉', {}).get('desc', ''),
-                    '动能':     detail.get('动能',     {}).get('desc', ''),
-                    'DIF斜率':  detail.get('DIF斜率',  {}).get('desc', ''),
+                    '动能': detail.get('动能', {}).get('desc', ''),
+                    'DIF斜率': detail.get('DIF斜率', {}).get('desc', ''),
                     '背离信号': detail.get('背离信号', {}).get('desc', ''),
                     '量价配合': detail.get('量价配合', {}).get('desc', ''),
-                }])
-                ta_signals['MACD_FULL_BULL'] = pd.concat([
-                    ta_signals['MACD_FULL_BULL'],
-                    new_row
-                ], ignore_index=True)
-            except Exception:
-                pass
+                })
 
-            # ── 动能状态 ──────────────────────────────────────────────────
-            try:
-                latest_row = df.iloc[-1]
-                mom_12269  = MACDAnalyzer._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
-                
-                # 根据配置确定第二周期名称（必填）
-                if self.config and hasattr(self.config, 'MACD_SECOND_PARAMS'):
-                    fast, slow, signal = self.config.MACD_SECOND_PARAMS
-                    second_period_name = f"{fast}{slow}{signal}"
-                else:
-                    second_period_name = '6135'
-                
-                mom_second = MACDAnalyzer._calculate_macd_momentum(df, f'DIF_{second_period_name}', f'DEA_{second_period_name}')
-                
-                new_row = pd.DataFrame([{
-                    '股票代码':        code,
-                    'MACD_12269_DIF':  latest_row.get('DIF_12269', 0),
-                    'MACD_12269_动能': mom_12269,
-                    f'MACD_{second_period_name}_DIF':   latest_row.get(f'DIF_{second_period_name}',  0),
-                    f'MACD_{second_period_name}_动能':  mom_second,
-                }])
-                ta_signals['MACD_DIF_MOMENTUM'] = pd.concat([
-                    ta_signals['MACD_DIF_MOMENTUM'],
-                    new_row
-                ], ignore_index=True)
-            except Exception:
-                pass
+            if 'mom_12269' in r:
+                mom_rows.append({
+                    '股票代码': code,
+                    'MACD_12269_DIF': r['dif_12269'],
+                    'MACD_12269_动能': r['mom_12269'],
+                    f'MACD_{second_period_name}_DIF': r.get('dif_second', 0),
+                    f'MACD_{second_period_name}_动能': r.get('mom_second', ''),
+                })
 
-            # ── MACD 12269 金叉 / 死叉信号 ───────────────────────────────
-            detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
-            if detail_col_12269 in df.columns:
-                signal_val = df[detail_col_12269].iloc[-1]
-                if pd.notna(signal_val) and signal_val != '':
-                    new_row = pd.DataFrame([{
-                        '股票代码':           code,
-                        'MACD_12269_Signal':  signal_val,
-                    }])
-                    ta_signals['MACD_12269'] = pd.concat([
-                        ta_signals['MACD_12269'],
-                        new_row
-                    ], ignore_index=True)
+            if 'kdj_signal' in r:
+                kdj_rows.append({'股票代码': code, 'KDJ_Signal': r['kdj_signal']})
 
-            # ── MACD 第二周期金叉 / 死叉信号 ────────────────────────────────
-            detail_col_second = f'MACD_{second_period_name}_SIGNAL_DETAIL'
-            if detail_col_second in df.columns:
-                signal_val = df[detail_col_second].iloc[-1]
-                if pd.notna(signal_val) and signal_val != '':
-                    new_row = pd.DataFrame([{
-                        '股票代码':          code,
-                        f'MACD_{second_period_name}_Signal':  signal_val,
-                    }])
-                    ta_signals[f'MACD_{second_period_name}'] = pd.concat([
-                        ta_signals[f'MACD_{second_period_name}'],
-                        new_row
-                    ], ignore_index=True)
+            if 'cci_signal' in r:
+                cci_rows.append({'股票代码': code, 'CCI_Signal': r['cci_signal']})
 
-            # ── KDJ ───────────────────────────────────────────────────────
-            try:
-                kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
-                if kdj_signal:
-                    new_row = pd.DataFrame([{'股票代码': code, 'KDJ_Signal': kdj_signal}])
-                    ta_signals['KDJ'] = pd.concat([
-                        ta_signals['KDJ'],
-                        new_row
-                    ], ignore_index=True)
-            except Exception:
-                pass
+            if 'rsi_signal' in r:
+                rsi_rows.append({'股票代码': code, 'RSI_Signal': r['rsi_signal']})
 
-            # ── CCI ───────────────────────────────────────────────────────
-            try:
-                df.ta.cci(append=True, close='close', high='high', low='low')
-                cci_cols = [col for col in df.columns if col.startswith('CCI_')]
-                if cci_cols:
-                    current_cci = df[cci_cols[0]].iloc[-1]
-                    cci_signal  = self._classify_cci_level(current_cci) or f'常态波动 ({current_cci:.2f})'
-                    new_row = pd.DataFrame([{'股票代码': code, 'CCI_Signal': cci_signal}])
-                    ta_signals['CCI'] = pd.concat([
-                        ta_signals['CCI'],
-                        new_row
-                    ], ignore_index=True)
-            except Exception:
-                pass
+            if 'boll_signal' in r:
+                boll_rows.append({'股票代码': code, 'BOLL_Signal': r['boll_signal']})
 
-            # ── RSI ───────────────────────────────────────────────────────
-            try:
-                df.ta.rsi(append=True, close='close', length=14)
-                rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
-                if rsi_cols:
-                    rsi_col        = rsi_cols[0]
-                    curr_rsi       = df[rsi_col].iloc[-1]
-                    window         = 10
-                    if len(df) >= window + 1:  # 确保有足够的数据
-                        curr_low       = df['low'].iloc[-1]
-                        min_low_window = df['low'].iloc[-window:-1].min()
-                        min_rsi_window = df[rsi_col].iloc[-window:-1].min()
-                        is_price_low   = curr_low <= (min_low_window * 1.02)
-                        is_divergence  = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
-                        rsi_msg        = f'RSI底背离! ({curr_rsi:.1f})' if is_divergence else f'RSI={curr_rsi:.1f}'
-                        new_row = pd.DataFrame([{'股票代码': code, 'RSI_Signal': rsi_msg}])
-                        ta_signals['RSI'] = pd.concat([
-                            ta_signals['RSI'],
-                            new_row
-                        ], ignore_index=True)
-            except Exception:
-                pass
-
-            # ── BOLL ──────────────────────────────────────────────────────
-            try:
-                df.ta.bbands(append=True, length=20, std=2, close='close')
-                boll_lower_cols = [col for col in df.columns if col.startswith('BBL_')]
-                boll_upper_cols = [col for col in df.columns if col.startswith('BBU_')]
-                if boll_lower_cols and boll_upper_cols:
-                    df['BOLL_BANDWIDTH'] = (
-                        (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df['close']
-                    )
-                    is_narrow = (
-                        df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
-                    )
-                    new_row = pd.DataFrame([{
-                        '股票代码':    code,
-                        'BOLL_Signal': '低波/缩口' if is_narrow else '常态/张口',
-                    }])
-                    ta_signals['BOLL'] = pd.concat([
-                        ta_signals['BOLL'],
-                        new_row
-                    ], ignore_index=True)
-            except Exception:
-                pass
+        ta_signals['MACD_12269'] = pd.DataFrame(macd_12269_rows)
+        ta_signals[f'MACD_{second_period_name}'] = pd.DataFrame(macd_second_rows)
+        ta_signals['MACD_FULL_BULL'] = pd.DataFrame(bull_rows)
+        ta_signals['MACD_DIF_MOMENTUM'] = pd.DataFrame(mom_rows)
+        ta_signals['KDJ'] = pd.DataFrame(kdj_rows)
+        ta_signals['CCI'] = pd.DataFrame(cci_rows)
+        ta_signals['RSI'] = pd.DataFrame(rsi_rows)
+        ta_signals['BOLL'] = pd.DataFrame(boll_rows)
 
         # ── 统一清洗股票代码格式 ──────────────────────────────────────────
         for key in ta_signals:
             df_sig = ta_signals[key]
             if not df_sig.empty and '股票代码' in df_sig.columns:
-                # 提取6位股票代码
                 df_sig['股票代码'] = df_sig['股票代码'].astype(str).apply(
                     lambda x: re.search(r'(\d{6})', str(x)).group(1) if re.search(r'(\d{6})', str(x)) else x
                 )

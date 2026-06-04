@@ -1,4 +1,4 @@
-import akshare as ak
+﻿import akshare as ak
 import pandas as pd
 import numpy as np
 import os
@@ -57,17 +57,17 @@ class SWIndustryDataPipeline:
             # 先读取缓存，检查其完整性
             try:
                 cached_hist = pd.read_parquet(self.cache_file)
-            except:
+            except Exception:
                 cached_hist = pd.read_csv(self.cache_csv_file, parse_dates=['date'])
             
             cached_val = pd.read_csv(self.valuation_file)
             cached_industry_count = len(cached_val)
             
-            # 🔑 关键：获取当前接口的行业总数
+            # [KEY] 关键：获取当前接口的行业总数
             df_info = ak.sw_index_second_info()
             current_total_industries = len(df_info)
             
-            # ✅ 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
+            # [OK] 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
             if cached_industry_count == current_total_industries:
                 print(f"[*] 缓存完整({cached_industry_count}个行业)，使用缓存数据")
                 return cached_hist

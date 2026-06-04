@@ -130,16 +130,15 @@ class DataAcquisitionService:
                         # Pandera 数据契约校验
                         is_pandera_valid, pandera_errors = SchemaValidator.validate_fund_flow(fund_flow_df)
                         if is_pandera_valid:
-                            logger.info(f"  - ✓ 已获取 {period}日资金流数据 ({len(fund_flow_df)} 条记录)")
+                            logger.info(f"  - [OK] 已获取 {period}日资金流数据 ({len(fund_flow_df)} 条记录)")
                             data[key] = fund_flow_df
                         else:
-                            logger.warning(f"  - ⚠ {period}日资金流数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - ⚠ 继续使用该数据，但请注意可能存在数据质量问题")
-                            data[key] = fund_flow_df
+                            logger.warning(f"  - [WARN] {period}日资金流数据契约校验失败: {pandera_errors}")
+                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                     else:
-                        logger.warning(f"  - ⚠ {period}日资金流数据缺少列: {missing}，跳过")
+                        logger.warning(f"  - [WARN] {period}日资金流数据缺少列: {missing}，跳过")
                 else:
-                    logger.warning(f"  - ⚠ {period}日资金流数据为空")
+                    logger.warning(f"  - [WARN] {period}日资金流数据为空")
 
             except Exception as e:
                 handle_exception_with_recovery(
@@ -171,33 +170,35 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        logger.info(f"  - ✓ {desc}: {len(df)} 条记录")
+                        logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
                         return key, df
                     else:
-                        logger.warning(f"  - ⚠ {desc} 缺少列: {missing}")
+                        logger.warning(f"  - [WARN] {desc} 缺少列: {missing}")
                         return key, pd.DataFrame()
                 else:
-                    logger.warning(f"  - ⚠ {desc} 数据为空")
+                    logger.warning(f"  - [WARN] {desc} 数据为空")
                     return key, pd.DataFrame()
 
             except Exception as e:
-                logger.error(f"  - ✗ 获取{desc}失败: {e}")
+                logger.error(f"  - [FAIL] 获取{desc}失败: {e}")
                 return key, pd.DataFrame()
 
         # 并行获取所有数据源
         from concurrent.futures import ThreadPoolExecutor
 
         executor2 = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
+        try:
+            futures = {executor2.submit(fetch_data_source_worker, item): item for item in data_sources.items()}
 
-        futures = {executor2.submit(fetch_data_source_worker, item): item for item in data_sources.items()}
-
-        for future in as_completed(futures):
-            try:
-                key, df = future.result()
-                if not df.empty:
-                    data[key] = df
-            except Exception as e:
-                logger.error(f"获取数据源时发生异常: {e}")
+            for future in as_completed(futures):
+                try:
+                    key, df = future.result()
+                    if not df.empty:
+                        data[key] = df
+                except Exception as e:
+                    logger.error(f"获取数据源时发生异常: {e}")
+        finally:
+            executor2.shutdown(wait=True)
 
         # 均线突破数据 (Akshare接口参数不同，需分开获取，并行优化版)
         logger.info("\n>>> 正在并行获取均线突破数据...")
@@ -219,33 +220,35 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        logger.info(f"  - ✓ {desc}: {len(df)} 条记录")
+                        logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
                         return key, df
                     else:
-                        logger.warning(f"  - ⚠ {desc} 缺少列: {missing}")
+                        logger.warning(f"  - [WARN] {desc} 缺少列: {missing}")
                         return key, pd.DataFrame()
                 else:
-                    logger.warning(f"  - ⚠ {desc} 数据为空")
+                    logger.warning(f"  - [WARN] {desc} 数据为空")
                     return key, pd.DataFrame()
 
             except Exception as e:
-                logger.error(f"  - ✗ 获取{desc}失败: {e}")
+                logger.error(f"  - [FAIL] 获取{desc}失败: {e}")
                 return key, pd.DataFrame()
 
         # 并行获取所有均线突破数据
         from concurrent.futures import ThreadPoolExecutor
 
         executor3 = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
+        try:
+            futures = {executor3.submit(fetch_xstp_worker, config): config for config in xstp_configs}
 
-        futures = {executor3.submit(fetch_xstp_worker, config): config for config in xstp_configs}
-
-        for future in as_completed(futures):
-            try:
-                key, df = future.result()
-                if not df.empty:
-                    data[key] = df
-            except Exception as e:
-                logger.error(f"获取均线突破数据时发生异常: {e}")
+            for future in as_completed(futures):
+                try:
+                    key, df = future.result()
+                    if not df.empty:
+                        data[key] = df
+                except Exception as e:
+                    logger.error(f"获取均线突破数据时发生异常: {e}")
+        finally:
+            executor3.shutdown(wait=True)
 
         # 行业板块数据
         industry_board_df = self._fetch_industry_data(today_str)
@@ -285,23 +288,23 @@ class DataAcquisitionService:
                     is_pandera_valid, pandera_errors = SchemaValidator.validate_main_cost(main_cost_df)
                     if is_pandera_valid:
                         data["main_cost_data"] = main_cost_df
-                        logger.info(f"  - ✓ 主力成本数据: {len(main_cost_df)} 条记录")
+                        logger.info(f"  - [OK] 主力成本数据: {len(main_cost_df)} 条记录")
                     else:
-                        logger.warning(f"  - ⚠ 主力成本数据契约校验失败: {pandera_errors}")
-                        logger.warning(f"  - ⚠ 继续使用该数据，但请注意可能存在数据质量问题")
+                        logger.warning(f"  - [WARN] 主力成本数据契约校验失败: {pandera_errors}")
+                        logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                         data["main_cost_data"] = main_cost_df
 
                     # 打印主力成本数据摘要
                     cost_manager.print_cost_summary(main_cost_df)
                 else:
-                    logger.warning(f"  - ⚠ 主力成本数据缺少列: {missing}")
+                    logger.warning(f"  - [WARN] 主力成本数据缺少列: {missing}")
                     data["main_cost_data"] = pd.DataFrame()
             else:
-                logger.warning("  - ⚠ 主力成本数据为空")
+                logger.warning("  - [WARN] 主力成本数据为空")
                 data["main_cost_data"] = pd.DataFrame()
 
         except Exception as e:
-            logger.error(f"  - ✗ 获取主力成本数据失败: {e}")
+            logger.error(f"  - [FAIL] 获取主力成本数据失败: {e}")
             data["main_cost_data"] = pd.DataFrame()
 
         return data
@@ -337,15 +340,15 @@ class DataAcquisitionService:
                         # Pandera 数据契约校验
                         is_pandera_valid, pandera_errors = SchemaValidator.validate_industry_board(industry_board_df)
                         if is_pandera_valid:
-                            logger.info(f"  - ✓ 缓存数据有效: {len(industry_board_df)} 个板块")
+                            logger.info(f"  - [OK] 缓存数据有效: {len(industry_board_df)} 个板块")
                         else:
-                            logger.warning(f"  - ⚠ 行业板块数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - ⚠ 继续使用该数据，但请注意可能存在数据质量问题")
+                            logger.warning(f"  - [WARN] 行业板块数据契约校验失败: {pandera_errors}")
+                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                     else:
-                        logger.warning(f"  - ⚠ 缓存数据缺少列: {missing}，将重新获取")
+                        logger.warning(f"  - [WARN] 缓存数据缺少列: {missing}，将重新获取")
                         industry_board_df = pd.DataFrame()
                 else:
-                    logger.warning("  - ⚠ 缓存数据为空，将重新获取")
+                    logger.warning("  - [WARN] 缓存数据为空，将重新获取")
                     industry_board_df = pd.DataFrame()
 
             except Exception as e:
@@ -374,12 +377,12 @@ class DataAcquisitionService:
                                     index=False,
                                     encoding="utf-8-sig",
                                 )
-                                logger.info(f"  - ✓ 获取成功并已保存: {len(industry_board_df)} 个板块")
+                                logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
                             except Exception as e:
-                                logger.error(f"  - ✗ 保存文件失败: {e}")
+                                logger.error(f"  - [FAIL] 保存文件失败: {e}")
                         else:
-                            logger.warning(f"  - ⚠ 行业板块数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - ⚠ 继续使用该数据，但请注意可能存在数据质量问题")
+                            logger.warning(f"  - [WARN] 行业板块数据契约校验失败: {pandera_errors}")
+                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                             try:
                                 industry_board_df.to_csv(
                                     industry_info_path,
@@ -387,17 +390,17 @@ class DataAcquisitionService:
                                     index=False,
                                     encoding="utf-8-sig",
                                 )
-                                logger.info(f"  - ✓ 获取成功并已保存: {len(industry_board_df)} 个板块")
+                                logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
                             except Exception as e:
-                                logger.error(f"  - ✗ 保存文件失败: {e}")
+                                logger.error(f"  - [FAIL] 保存文件失败: {e}")
                     else:
-                        logger.warning(f"  - ⚠ 接口数据缺少列: {missing}")
+                        logger.warning(f"  - [WARN] 接口数据缺少列: {missing}")
                         industry_board_df = pd.DataFrame()
                 else:
-                    logger.warning("  - ⚠ 行业板块接口返回空数据")
+                    logger.warning("  - [WARN] 行业板块接口返回空数据")
 
             except Exception as e:
-                logger.error(f"  - ✗ 调用行业板块接口失败: {e}")
+                logger.error(f"  - [FAIL] 调用行业板块接口失败: {e}")
 
         return industry_board_df
 

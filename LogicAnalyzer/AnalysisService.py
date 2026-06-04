@@ -207,9 +207,8 @@ class AnalysisService:
         try:
             from DataCollection.HistDataEngine import StockSyncEngine
 
-            # 调用get_main_board_pool方法
             stock_sync_engine = StockSyncEngine()
-            main_board_pool = stock_sync_engine.get_main_board_pool()
+            main_board_pool = stock_sync_engine.get_stock_pool_from_db()
 
             # 筛选出需要的股票代码
             from UtilsManager.CodeNormalizer import CodeNormalizer

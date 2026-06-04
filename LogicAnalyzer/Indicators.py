@@ -68,7 +68,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
         price_pos = 10 if close_price > latest["MA20"] else 0
 
         total = (20 if base_mid else 0) + slope_benefit + long_up + price_pos
-        desc = f"骨架得分: {total}/40 (中期:{'✓' if base_mid else '✗'}, 长期:{'↑' if long_up else '→'}, 位置:{'↑' if price_pos else '↓'})"
+        desc = f"骨架得分: {total}/40 (中期:{'是' if base_mid else '否'}, 长期:{'上行' if long_up else '横盘'}, 位置:{'上方' if price_pos else '下方'})"
         return total, desc
 
     def _short_attack_score() -> tuple[int, str]:
@@ -128,7 +128,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
         volume_check = 10 if (is_shrinking and is_above_ma20) else 0
 
         total = convergence + volume_check
-        desc = f"容错分: {total}/20 (收敛:{'✓' if convergence else '✗'}, 缩量:{'✓' if volume_check else '✗'})"
+        desc = f"容错分: {total}/20 (收敛:{'达标' if convergence else '未达标'}, 缩量:{'达标' if volume_check else '未达标'})"
         return total, desc
 
     def _risk_control_check() -> tuple[bool, str]:

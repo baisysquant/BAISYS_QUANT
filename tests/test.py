@@ -1,4 +1,4 @@
-"""
+﻿"""
 申万二级行业成分股字典生成器
 从 akshare 获取申万二级行业全部成分股，输出标准化的股票字典文件
 """
@@ -57,11 +57,11 @@ def get_all_component_stocks(industry_df, retry=3, sleep_sec=1.5):
                 if attempt < retry - 1:
                     time.sleep(sleep_sec * (attempt + 1))  # 递增等待
                 else:
-                    print(f"✗ 失败({e})")
+                    print(f"[FAIL] 失败({e})")
                     fail_list.append((symbol, ind_name, str(e)))
 
         if component_df is None or component_df.empty:
-            print("✗ 无数据")
+            print("[FAIL] 无数据")
             continue
 
         # ---------- 组装结果行 ----------
@@ -77,7 +77,7 @@ def get_all_component_stocks(industry_df, retry=3, sleep_sec=1.5):
                 "更新时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
 
-        print(f"✓ {len(component_df)} 只")
+        print(f"[OK] {len(component_df)} 只")
 
         # 请求间隔，避免被反爬
         time.sleep(sleep_sec)
@@ -138,7 +138,7 @@ def main():
     all_stocks_df = get_all_component_stocks(industry_df)
 
     if all_stocks_df.empty:
-        print("\n✗ 未获取到任何数据，请检查网络或 akshare 版本")
+        print("\n[FAIL] 未获取到任何数据，请检查网络或 akshare 版本")
         return
 
     # 第3步：保存结果

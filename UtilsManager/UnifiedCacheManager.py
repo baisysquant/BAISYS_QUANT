@@ -458,7 +458,7 @@ class UnifiedCacheManager:
         """打印缓存统计信息"""
         stats = self.get_stats()
         print("\n" + "=" * 60)
-        print("📊 缓存统计信息")
+        print(" 缓存统计信息")
         print("=" * 60)
         print(f"  缓存命中次数: {stats['hits']}")
         print(f"  缓存未命中次数: {stats['misses']}")

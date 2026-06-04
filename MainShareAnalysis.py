@@ -1,4 +1,4 @@
-from StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+﻿from StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
 from UtilsManager.LoggerManager import get_logger
 
 
@@ -49,7 +49,7 @@ def main():
 
         logger.info("")
         logger.info("=" * 80)
-        logger.info("✅ 分析流程完成！")
+        logger.info("[OK] 分析流程完成！")
         logger.info("=" * 80)
         logger.info("")
         logger.info("   - Excel报告: temp_data/审计报告_YYYYMMDD.xlsx")
@@ -59,7 +59,7 @@ def main():
     except Exception as e:
         logger.error("")
         logger.error("=" * 80)
-        logger.error(f"❌ 分析流程失败: {type(e).__name__}")
+        logger.error(f"[FAIL] 分析流程失败: {type(e).__name__}")
         logger.error(f"   错误信息: {e}")
         logger.error("=" * 80)
         logger.error("")

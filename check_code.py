@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 代码质量检查脚本
 使用 Ruff 和 MyPy 进行代码检查
@@ -32,11 +32,11 @@ def main():
         import ruff
         import mypy
     except ImportError as e:
-        print(f"\n❌ 缺少依赖: {e}")
+        print(f"\n[FAIL] 缺少依赖: {e}")
         print("请运行: pip install ruff mypy")
         return 1
 
-    print("\n✅ 检查 Ruff 和 MyPy 已安装")
+    print("\n[OK] 检查 Ruff 和 MyPy 已安装")
 
     # 运行 Ruff 检查
     ruff_code = run_command(
@@ -55,14 +55,14 @@ def main():
     print("\n" + "=" * 60)
     print("检查结果汇总:")
     print("=" * 60)
-    print(f"  Ruff 检查: {'✅ 通过' if ruff_code == 0 else '❌ 失败'}")
-    print(f"  Ruff 格式化: {'✅ 通过' if ruff_format_code == 0 else '❌ 失败'}")
-    print(f"  MyPy 类型检查: {'✅ 通过' if mypy_code == 0 else '❌ 失败'}")
+    print(f"  Ruff 检查: {'[OK] 通过' if ruff_code == 0 else '[FAIL] 失败'}")
+    print(f"  Ruff 格式化: {'[OK] 通过' if ruff_format_code == 0 else '[FAIL] 失败'}")
+    print(f"  MyPy 类型检查: {'[OK] 通过' if mypy_code == 0 else '[FAIL] 失败'}")
     print("=" * 60)
 
     # 提示修复方法
     if ruff_code != 0 or ruff_format_code != 0:
-        print("\n💡 提示:")
+        print("\n 提示:")
         print("  - 运行 `ruff check . --fix` 自动修复部分问题")
         print("  - 运行 `ruff format .` 自动格式化代码")
 

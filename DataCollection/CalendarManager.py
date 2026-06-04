@@ -101,7 +101,7 @@ class TradingCalendarAnalyzer:
                     self._cached_dates = dates
                     self._cache_load_time = datetime.now().timestamp()
                     return dates
-            except:
+            except Exception:
                 pass
 
         logger.critical("[Calendar CRITICAL] 缓存和接口均不可用，回退到仅周末逻辑（无法识别法定节假日）。")

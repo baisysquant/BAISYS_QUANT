@@ -31,15 +31,23 @@ class Config:
             raise FileNotFoundError(f"配置文件未找到: {os.path.abspath(self.config_file)}")
 
     def _load_config(self):
+        from UtilsManager.ConfigCipher import ConfigCipher
+
         config = configparser.ConfigParser()
         config.read(self.config_file, encoding="utf-8")
 
         db = config["DATABASE"]
+
+        # 密钥路径可配置，默认 ~/.baisys_quant_key
+        key_path = db.get("encryption_key_path", fallback=None)
+        if key_path:
+            ConfigCipher.default_key_path = key_path
+
         self.DB_USER = db.get("user")
-        self.DB_PASSWORD = db.get("password")
-        self.DB_HOST = db.get("host")
-        self.DB_PORT = db.get("port")
-        self.DB_NAME = db.get("db_name")
+        self.DB_PASSWORD = ConfigCipher.maybe_decrypt(db.get("password"))
+        self.DB_HOST = ConfigCipher.maybe_decrypt(db.get("host"))
+        self.DB_PORT = ConfigCipher.maybe_decrypt(db.get("port"))
+        self.DB_NAME = ConfigCipher.maybe_decrypt(db.get("db_name"))
 
         system = config["SYSTEM"]
         home_dir = system.get("HOME_DIRECTORY", "~/Downloads/CoreNews_Reports")
@@ -62,10 +70,6 @@ class Config:
             "收盘价": "最新价",
         }
 
-        self.TUSHARE_TOKEN = db.get("tushare_token")  # 如果没有配置，默认为 None
-        if not self.TUSHARE_TOKEN:
-            raise ValueError("配置文件中缺少 'tushare_token'，请在 [DATABASE] 节点下添加。")
-
         log = config["LOGGING"]
         self.LOG_LEVEL = log.get("LOG_LEVEL", "INFO")
         self.LOG_DIR = os.path.join(self.HOME_DIRECTORY, log.get("LOG_DIR", "Logs"))
@@ -80,7 +84,7 @@ class Config:
             os.makedirs(d, exist_ok=True)
 
     def get_db_connection_string(self) -> str:
-        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        return f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
 
 
 def calculate_kdj_from_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -308,11 +312,11 @@ class MACDKDJDoubleBottomAnalyzer:
                 # 测试连接是否仍然有效
                 self.conn.cursor().execute("SELECT 1")
                 return
-            except:
+            except Exception:
                 # 连接失效，关闭旧连接
                 try:
                     self.conn.close()
-                except:
+                except Exception:
                     pass
                 self.conn = None
 
@@ -350,20 +354,23 @@ class MACDKDJDoubleBottomAnalyzer:
                         self.connect_database()
 
                     # 构建SQL查询 (使用 amount 替代 vol)
-                    query = f"""
+                    query = """
                     SELECT trade_date, symbol, "open", "close", high, low, amount, close_normal, adj_ratio
                     FROM stock_daily_kline
-                    WHERE symbol = '{symbol}'
+                    WHERE symbol = %s
                     """
+                    params: list = [symbol]
 
                     if start_date:
-                        query += f" AND trade_date >= '{start_date}'"
+                        query += " AND trade_date >= %s"
+                        params.append(start_date)
                     if end_date:
-                        query += f" AND trade_date <= '{end_date}'"
+                        query += " AND trade_date <= %s"
+                        params.append(end_date)
 
                     query += " ORDER BY trade_date ASC"
 
-                    df = pd.read_sql_query(query, self.conn)
+                    df = pd.read_sql_query(query, self.conn, params=params)
                     df["trade_date"] = pd.to_datetime(df["trade_date"])
                     df = df.sort_values("trade_date").reset_index(drop=True)
 
@@ -390,7 +397,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     try:
                         if self.conn:
                             self.conn.close()
-                    except:
+                    except Exception:
                         pass
                     self.conn = None
                     time.sleep(1)  # 等待1秒后重试
@@ -432,7 +439,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     try:
                         if self.conn:
                             self.conn.close()
-                    except:
+                    except Exception:
                         pass
                     self.conn = None
                     time.sleep(1)  # 等待1秒后重试
@@ -451,14 +458,14 @@ class MACDKDJDoubleBottomAnalyzer:
                     self.connect_database()
 
             # 构建SQL查询，从stock_basic_info表获取股票名称
-            query = f"""
+            query = """
             SELECT "name"
             FROM stock_basic_info
-            WHERE symbol = '{symbol[2:]}' OR ts_code = '{symbol}'
+            WHERE symbol = %s OR ts_code = %s
             LIMIT 1
             """
 
-            df = pd.read_sql_query(query, self.conn)
+            df = pd.read_sql_query(query, self.conn, params=(symbol[2:], symbol))
 
             if not df.empty and not pd.isna(df["name"].iloc[0]):
                 return df["name"].iloc[0]
@@ -1178,7 +1185,7 @@ def export_results_to_excel(results, buy_signals, config):
         for cell in column:
             try:
                 max_length = max(max_length, len(str(cell.value)))
-            except:
+            except Exception:
                 pass
 
         adjusted_width = min(max_length + 2, 50)

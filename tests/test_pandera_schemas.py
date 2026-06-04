@@ -1,4 +1,4 @@
-"""
+﻿"""
 Pandera 数据契约测试脚本
 
 验证 Pandera Schema 定义和校验功能测试。
@@ -32,9 +32,9 @@ def test_stock_basic_schema():
 
     is_valid, errors = SchemaValidator.validate_stock_basic(valid_data)
     if is_valid:
-        logger.info("有效数据校验: ✓ 通过")
+        logger.info("有效数据校验: [OK] 通过")
     else:
-        logger.info(f"有效数据校验: ✗ 失败: {errors}")
+        logger.info(f"有效数据校验: [FAIL] 失败: {errors}")
     assert is_valid, "有效数据应该通过校验"
 
     # 测试无效数据 - 股票代码格式错误
@@ -47,10 +47,10 @@ def test_stock_basic_schema():
     )
 
     is_valid, errors = SchemaValidator.validate_stock_basic(invalid_data)
-    logger.info(f"无效数据校验: ✓ 正确检测到错误" if not is_valid else f"✗ 应该失败但通过了")
+    logger.info(f"无效数据校验: [OK] 正确检测到错误" if not is_valid else f"[FAIL] 应该失败但通过了")
     logger.info(f"检测到的错误: {errors}")
 
-    logger.info("✓ 股票基础信息 Schema 测试完成\n")
+    logger.info("[OK] 股票基础信息 Schema 测试完成\n")
 
 
 def test_stock_price_schema():
@@ -68,12 +68,12 @@ def test_stock_price_schema():
 
     is_valid, errors = SchemaValidator.validate_stock_price(valid_data)
     if is_valid:
-        logger.info("有效数据校验: ✓ 通过")
+        logger.info("有效数据校验: [OK] 通过")
     else:
-        logger.info(f"有效数据校验: ✗ 失败: {errors}")
+        logger.info(f"有效数据校验: [FAIL] 失败: {errors}")
     assert is_valid, "有效数据应该通过校验"
 
-    logger.info("✓ 股票价格 Schema 测试完成\n")
+    logger.info("[OK] 股票价格 Schema 测试完成\n")
 
 
 def test_industry_board_schema():
@@ -92,12 +92,12 @@ def test_industry_board_schema():
 
     is_valid, errors = SchemaValidator.validate_industry_board(valid_data)
     if is_valid:
-        logger.info("有效数据校验: ✓ 通过")
+        logger.info("有效数据校验: [OK] 通过")
     else:
-        logger.info(f"有效数据校验: ✗ 失败: {errors}")
+        logger.info(f"有效数据校验: [FAIL] 失败: {errors}")
     assert is_valid, "有效数据应该通过校验"
 
-    logger.info("✓ 行业板块 Schema 测试完成\n")
+    logger.info("[OK] 行业板块 Schema 测试完成\n")
 
 
 def test_main_cost_schema():
@@ -118,12 +118,12 @@ def test_main_cost_schema():
 
     is_valid, errors = SchemaValidator.validate_main_cost(valid_data)
     if is_valid:
-        logger.info("有效数据校验: ✓ 通过")
+        logger.info("有效数据校验: [OK] 通过")
     else:
-        logger.info(f"有效数据校验: ✗ 失败: {errors}")
+        logger.info(f"有效数据校验: [FAIL] 失败: {errors}")
     assert is_valid, "有效数据应该通过校验"
 
-    logger.info("✓ 主力成本 Schema 测试完成\n")
+    logger.info("[OK] 主力成本 Schema 测试完成\n")
 
 
 def test_coerce_types():
@@ -142,11 +142,11 @@ def test_coerce_types():
 
     is_valid, errors = SchemaValidator.validate_stock_price(data)
     if is_valid:
-        logger.info("类型转换校验: ✓ 通过")
+        logger.info("类型转换校验: [OK] 通过")
     else:
-        logger.info(f"类型转换校验: ✗ 失败: {errors}")
+        logger.info(f"类型转换校验: [FAIL] 失败: {errors}")
 
-    logger.info("✓ 类型转换测试完成\n")
+    logger.info("[OK] 类型转换测试完成\n")
 
 
 def main():
@@ -165,7 +165,7 @@ def main():
         test_coerce_types()
 
         logger.info("=" * 60)
-        logger.info("✓ 所有测试通过！")
+        logger.info("[OK] 所有测试通过！")
         logger.info("=" * 60)
         return 0
     except Exception as e:

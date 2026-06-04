@@ -28,7 +28,6 @@ class StockSyncEngine:
 
         self.config_file = config_file
         self.config = Config(config_file=config_file)
-        self.token = self.config.TUSHARE_TOKEN
 
         url_object = URL.create(
             "postgresql+psycopg2",
@@ -99,13 +98,12 @@ class StockSyncEngine:
             print(f"[WARNING] 计算起始日期失败: {e}，使用默认值20250301")
             return "20250301"
 
-    def get_main_board_pool(self) -> pd.DataFrame:
+    def get_stock_pool_from_db(self) -> pd.DataFrame:
         """
-        从数据库获取主板股票池
+        从 stock_basic_info_sw 表获取全量股票池
         返回包含 ts_code、name、industry
         """
         try:
-            # 直接从数据库查询股票基本信息
             query = """
             SELECT 
                stock_code as  ts_code,
@@ -121,7 +119,6 @@ class StockSyncEngine:
 
             print(f"[INFO] 从数据库获取 {len(stock_index_df)} 只股票。")
 
-            # 标准化股票代码格式（确保6位数字）
             if "股票代码" in stock_index_df.columns:
                 stock_index_df["股票代码"] = stock_index_df["股票代码"].astype(str).str.zfill(6)
 
@@ -134,7 +131,6 @@ class StockSyncEngine:
 
         except Exception as e:
             print(f"[ERROR] 从数据库获取股票池失败: {e}")
-            # 如果数据库查询失败，返回空DataFrame
             return pd.DataFrame(columns=["ts_code", "name", "industry", "股票代码"])
 
     def _safe_ak_fetch(
@@ -556,7 +552,7 @@ class StockSyncEngine:
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
-            except:
+            except Exception:
                 pass
             raise
 
@@ -576,7 +572,7 @@ class StockSyncEngine:
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
-            except:
+            except Exception:
                 pass
             raise
 
@@ -596,25 +592,25 @@ class StockSyncEngine:
         print(f"[DEBUG] 数据引擎运行日期: {self.today_str}")
 
         # Step 1: 获取数据库中的股票池
-        tushare_df = self.get_main_board_pool()
-        if tushare_df.empty or "股票代码" not in tushare_df.columns:
+        stock_pool_df = self.get_stock_pool_from_db()
+        if stock_pool_df.empty or "股票代码" not in stock_pool_df.columns:
             print("[CRITICAL] 基础股票池无效")
             return
 
         # Step 1.5: 过滤ST股票
-        if "name" in tushare_df.columns:
-            st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
-            before_count = len(tushare_df)
-            tushare_df = tushare_df[~tushare_df["name"].astype(str).str.contains(st_pattern, na=False)].copy()
-            after_count = len(tushare_df)
+        if "name" in stock_pool_df.columns:
+            st_pattern = r"(?:\s*(?:\*|*|※|•|·))?(?:[Ss][Tt])"
+            before_count = len(stock_pool_df)
+            stock_pool_df = stock_pool_df[~stock_pool_df["name"].astype(str).str.contains(st_pattern, na=False)].copy()
+            after_count = len(stock_pool_df)
             filtered_count = before_count - after_count
             if filtered_count > 0:
                 print(f"[FILTER] 已过滤 {filtered_count} 只ST股票，剩余 {after_count} 只正常股票。")
             else:
                 print("[INFO] 无ST股票需要过滤。")
 
-        tushare_pure_codes = set(tushare_df["股票代码"].unique().tolist())
-        print(f"[INFO] 从数据库获取 {len(tushare_pure_codes)} 只股票（已剔除ST）。")
+        pure_codes = set(stock_pool_df["股票代码"].unique().tolist())
+        print(f"[INFO] 从数据库获取 {len(pure_codes)} 只股票（已剔除ST）。")
 
         # Step 2: 获取研报数据（作为特征，不过滤）
         report_df = self._get_research_report_data()
@@ -631,10 +627,10 @@ class StockSyncEngine:
 
         #  Step 3: 根据配置决定是否只保留主板股票
         if self.config.MAIN_BOARD_ONLY:
-            final_codes = {code for code in tushare_pure_codes if code.startswith(("60", "00"))}
+            final_codes = {code for code in pure_codes if code.startswith(("60", "00"))}
             print(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
         else:
-            final_codes = tushare_pure_codes
+            final_codes = pure_codes
             print(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
 
         # 【新增】Step 3.5: 如果启用了研报过滤，则进行二次过滤

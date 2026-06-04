@@ -42,7 +42,6 @@ class DatabaseConfig(BaseModel):
     host: str
     port: str
     db_name: str
-    tushare_token: str = Field(default="")
     main_board_only: bool = Field(default=False)
 
 
@@ -299,15 +298,21 @@ class Config:
         config = configparser.ConfigParser()
         config.read(self.config_file, encoding="utf-8")
 
-        # 读取数据库配置
+        # 读取数据库配置（所有敏感字段支持 ENC: 前缀加密）
+        from UtilsManager.ConfigCipher import ConfigCipher
+
         db = config["DATABASE"]
+
+        # 密钥路径可配置，默认 ~/.baisys_quant_key
+        key_path = db.get("encryption_key_path", fallback=None)
+        if key_path:
+            ConfigCipher.default_key_path = key_path
         database_config = DatabaseConfig(
             user=db.get("user"),
-            password=db.get("password"),
-            host=db.get("host"),
-            port=db.get("port"),
-            db_name=db.get("db_name"),
-            tushare_token=(db.get("tushare_token", fallback="") or "").strip(),
+            password=ConfigCipher.maybe_decrypt(db.get("password")),
+            host=ConfigCipher.maybe_decrypt(db.get("host")),
+            port=ConfigCipher.maybe_decrypt(db.get("port")),
+            db_name=ConfigCipher.maybe_decrypt(db.get("db_name")),
             main_board_only=db.getboolean("main_board_only", fallback=False),
         )
 
@@ -403,7 +408,6 @@ class Config:
         self.DB_HOST = database_config.host
         self.DB_PORT = database_config.port
         self.DB_NAME = database_config.db_name
-        self.TUSHARE_TOKEN = database_config.tushare_token
         self.MAIN_BOARD_ONLY = database_config.main_board_only
 
         self.HOME_DIRECTORY = system_config.HOME_DIRECTORY
@@ -446,4 +450,4 @@ class Config:
             os.makedirs(d, exist_ok=True)
 
     def get_db_connection_string(self) -> str:
-        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        return f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"

@@ -302,12 +302,11 @@ class StockAnalysisCoordinator:
             self.logger.warning("[WARN] 待分析股票代码列表为空，跳过历史数据查询。")
             return pd.DataFrame(), pd.DataFrame()
 
-        symbols_str = ",".join([f"'{s}'" for s in stock_codes_prefixed])
         query = text(
-            f"""
+            """
             SELECT *
             FROM stock_daily_kline
-            WHERE symbol IN ({symbols_str})
+            WHERE symbol = ANY(:symbols)
             ORDER BY trade_date
             """
         )
@@ -315,7 +314,7 @@ class StockAnalysisCoordinator:
         hist_df_all = pd.DataFrame()
         try:
             with self.db_engine.connect() as conn:
-                hist_df_all = pd.read_sql(query, conn)
+                hist_df_all = pd.read_sql(query, conn, params={"symbols": list(stock_codes_prefixed)})
 
                 if not hist_df_all.empty:
                     self.logger.info(
@@ -330,7 +329,7 @@ class StockAnalysisCoordinator:
             try:
                 with self.db_engine.connect() as conn:
                     conn.rollback()
-            except:
+            except Exception:
                 pass
             hist_df_all = pd.DataFrame()
 

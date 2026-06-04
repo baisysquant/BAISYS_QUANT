@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 
 # 将项目根目录加入系统路径，支持直接运行此脚本
@@ -27,25 +27,25 @@ if __name__ == "__main__":
     # 加载配置
     try:
         config = Config(config_path)
-        print(f"✅ 成功加载配置文件: {config_path}")
+        print(f"[OK] 成功加载配置文件: {config_path}")
     except Exception as e:
-        print(f"❌ 配置加载失败: {e}")
+        print(f"[FAIL] 配置加载失败: {e}")
         sys.exit(1)
 
     # --- 2. 数据库连接构建 ---
     DB_URI = f"postgresql://{config.DB_USER}:{config.DB_PASSWORD}@{config.DB_HOST}:{config.DB_PORT}/{config.DB_NAME}"
-    print("📊 数据库连接准备就绪")
+    print("[DB] 数据库连接准备就绪")
 
     # --- 3. 报告路径设置 ---
     # 读取配置文件中的 home_directory 并展开 ~
     REPORT_OUTPUT_DIR = os.path.expanduser(config.HOME_DIRECTORY)
     os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)  # 确保路径存在
-    print(f"📁 报告将保存至: {REPORT_OUTPUT_DIR}")
+    print(f"[DIR] 报告将保存至: {REPORT_OUTPUT_DIR}")
 
     # --- 4. 业务逻辑：数据计算 ---
     # 计算周期 (15天前)
     one_month_ago = (datetime.today() - timedelta(days=15)).strftime("%Y-%m-%d")
-    print(f"📅 统计周期: {one_month_ago} 至今天")
+    print(f"[DATE] 统计周期: {one_month_ago} 至今天")
 
     # 创建引擎
     engine = create_engine(DB_URI)
@@ -62,7 +62,7 @@ if __name__ == "__main__":
     engine.dispose()
 
     if df_signal_stocks.empty:
-        print("⚠️ 未找到有非空 kdj_signal 的股票。")
+        print("[WARN] 未找到有非空 kdj_signal 的股票。")
         exit()
 
     # --- 4.2 股票代码映射处理 (添加交易所前缀) ---
@@ -87,7 +87,7 @@ if __name__ == "__main__":
 
     # --- 4.3 筛选有价格数据的股票 ---
     signal_stock_codes = list(stock_info_map.keys())
-    print(f"🔍 从策略报告中找到 {len(signal_stock_codes)} 只有信号的股票")
+    print(f"[SEARCH] 从策略报告中找到 {len(signal_stock_codes)} 只有信号的股票")
     print("正在从 stock_daily_kline 查询这些股票的近30天价格数据...")
 
     engine = create_engine(DB_URI)
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     engine.dispose()
 
     valid_symbols_set = set(df_valid_symbols["symbol"].tolist())
-    print(f"✅ 在 stock_daily_kline 中找到 {len(valid_symbols_set)} 只有实际价格数据的股票")
+    print(f"[OK] 在 stock_daily_kline 中找到 {len(valid_symbols_set)} 只有实际价格数据的股票")
 
     # 构建有效股票池
     effective_stock_codes = []
@@ -115,11 +115,11 @@ if __name__ == "__main__":
         if symbol in valid_symbols_set:
             effective_stock_codes.append(code)
 
-    print(f"✅ 初步有效股票数（有信号 + 有价格）：{len(effective_stock_codes)}")
-    print(f"🧹 已剔除 {len(signal_stock_codes) - len(effective_stock_codes)} 个无价格数据的无效股票")
+    print(f"[OK] 初步有效股票数（有信号 + 有价格）：{len(effective_stock_codes)}")
+    print(f"[CLEAN] 已剔除 {len(signal_stock_codes) - len(effective_stock_codes)} 个无价格数据的无效股票")
 
     if len(effective_stock_codes) == 0:
-        print("⚠️ 没有股票同时满足‘有KDJ信号’且‘有价格数据’。")
+        print("[WARN] 没有股票同时满足‘有KDJ信号’且‘有价格数据’。")
         exit()
 
     # --- 4.4 获取信号日及涨幅计算 ---
@@ -142,7 +142,7 @@ if __name__ == "__main__":
         code = row["stock_code"]
         last_signal_date_map[code] = row["last_signal_date"].strftime("%Y-%m-%d")
 
-    print("💰 正在获取每只股票在信号日的收盘价...")
+    print("[CASH] 正在获取每只股票在信号日的收盘价...")
     signal_dates_list = []
     for code in effective_stock_codes:
         symbol = stock_info_map[code]["symbol"]
@@ -151,7 +151,7 @@ if __name__ == "__main__":
 
     # 查询信号日收盘价
     if not signal_dates_list:
-        print("⚠️ 无有效信号日数据。")
+        print("[WARN] 无有效信号日数据。")
         exit()
 
     symbol_date_pairs = []
@@ -178,7 +178,7 @@ if __name__ == "__main__":
             if info["symbol"] == symbol:
                 close_on_signal_map[code] = close_val
                 break
-    print(f"✅ 成功获取 {len(close_on_signal_map)} 只股票的信号日收盘价")
+    print(f"[OK] 成功获取 {len(close_on_signal_map)} 只股票的信号日收盘价")
 
     # --- 4.5 获取最新收盘价 ---
     engine = create_engine(DB_URI)
@@ -225,15 +225,15 @@ if __name__ == "__main__":
             final_effective_stock_codes.append(code)
         else:
             filtered_out.append(
-                f"{stock_info_map[code]['name']} ({symbol}) - 信号日 {signal_close}, 最新价 {latest_close} ❌ 未上涨"
+                f"{stock_info_map[code]['name']} ({symbol}) - 信号日 {signal_close}, 最新价 {latest_close} [FAIL] 未上涨"
             )
 
-    print(f"✅ 最终通过趋势验证的有效股票：{len(final_effective_stock_codes)} 只")
+    print(f"[OK] 最终通过趋势验证的有效股票：{len(final_effective_stock_codes)} 只")
     for reason in filtered_out:
         print(f" - {reason}")
 
     if len(final_effective_stock_codes) == 0:
-        print("⚠️ 没有任何股票满足‘KDJ信号后股价上涨’的条件。")
+        print("[WARN] 没有任何股票满足‘KDJ信号后股价上涨’的条件。")
         exit()
 
     # --- 4.7 计算涨幅百分比 ---
@@ -245,7 +245,7 @@ if __name__ == "__main__":
         gain_pct = ((latest_close - signal_close) / signal_close) * 100
         gain_percentage_map[code] = round(gain_pct, 2)
 
-    print(f"📈 已计算 {len(gain_percentage_map)} 只股票的涨幅百分比")
+    print(f"[UP] 已计算 {len(gain_percentage_map)} 只股票的涨幅百分比")
 
     # --- 4.8 获取30天交易数据 ---
     engine = create_engine(DB_URI)
@@ -264,13 +264,13 @@ if __name__ == "__main__":
     engine.dispose()
 
     if df_kline.empty:
-        print("⚠️ 未找到有效股票的交易数据（近30天）。")
+        print("[WARN] 未找到有效股票的交易数据（近30天）。")
         exit()
 
     # 格式化日期
     df_kline["trade_date"] = pd.to_datetime(df_kline["trade_date"]).dt.strftime("%Y-%m-%d")
     trade_dates = sorted(df_kline["trade_date"].unique())
-    print(f"✅ 共获取 {len(trade_dates)} 个交易日，覆盖范围：{trade_dates[0]} 至 {trade_dates[-1]}")
+    print(f"[OK] 共获取 {len(trade_dates)} 个交易日，覆盖范围：{trade_dates[0]} 至 {trade_dates[-1]}")
 
     # 构建价格映射表
     close_map = {}
@@ -298,7 +298,7 @@ if __name__ == "__main__":
         prefixed_symbol = add_exchange_prefix(stock_code)
         if prefixed_symbol in prefixed_stock_symbols:
             highlight_map[(prefixed_symbol, date_str)] = True
-    print(f"✅ 共 {len(highlight_map)} 个 KDJ 信号点可用于高亮")
+    print(f"[OK] 共 {len(highlight_map)} 个 KDJ 信号点可用于高亮")
 
     # --- 4.10 获取MACD信号高亮点 ---
     query_macd_signals = f"""
@@ -329,10 +329,10 @@ if __name__ == "__main__":
             color = "9370DB"  # 紫色
             macd_highlight_map[(prefixed_symbol, date_str)] = color
 
-    print(f"✅ 共 {len(macd_highlight_map)} 个 MACD 信号点可用于高亮")
+    print(f"[OK] 共 {len(macd_highlight_map)} 个 MACD 信号点可用于高亮")
 
     # --- 5. Excel 报告生成 (核心修改区) ---
-    print("📝 正在生成 Excel 报告...")
+    print("[REPORT] 正在生成 Excel 报告...")
     wb = Workbook()
     ws = wb.active
     ws.title = "Stock Close & Signal Report"
@@ -352,12 +352,12 @@ if __name__ == "__main__":
     note_cell = ws.cell(
         row=2,
         column=1,
-        value="📌 筛选逻辑：仅展示‘有KDJ信号’且‘信号后股价上涨’的股票。\n"
-        "🎨 高亮说明：\n"
-        "🔵 蓝色：MACD 零轴下金叉（买入信号）\n"
-        "🟣 紫色：MACD 零轴上金叉（买入信号）\n"
-        "🔴 红色：KDJ 信号（买入/卖出）\n"
-        "✅ 所有股票均满足：信号日后价格上涨，确保动能有效。",
+        value="[NOTE] 筛选逻辑：仅展示‘有KDJ信号’且‘信号后股价上涨’的股票。\n"
+        "[STYLE] 高亮说明：\n"
+        "[BLUE] 蓝色：MACD 零轴下金叉（买入信号）\n"
+        "[PURPLE] 紫色：MACD 零轴上金叉（买入信号）\n"
+        "[RED] 红色：KDJ 信号（买入/卖出）\n"
+        "[OK] 所有股票均满足：信号日后价格上涨，确保动能有效。",
     )
     note_cell.font = Font(bold=True, color="2E5488", size=12)
     note_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
@@ -425,4 +425,4 @@ if __name__ == "__main__":
     today_str = calendar_mgr.get_last_trading_day()
     excel_file = os.path.join(REPORT_OUTPUT_DIR, f"KDJ报告_{today_str}.xlsx")
     wb.save(excel_file)
-    print(f"🎉 Excel 文件已生成：{excel_file}")
+    print(f"[DONE] Excel 文件已生成：{excel_file}")

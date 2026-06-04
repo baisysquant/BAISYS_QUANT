@@ -79,3 +79,6 @@ cache/
 # Configuration files with sensitive data (optional)
 # config.local.ini
 # .env
+
+# Encryption key for database credentials
+.baisys_quant_key

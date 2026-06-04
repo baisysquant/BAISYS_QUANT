@@ -35,8 +35,10 @@ class ColumnNames:
     MACD_12269 = "MACD_12269"
     MACD_12269_DIF = "MACD_12269_DIF"
     MACD_12269_MOMENTUM = "MACD_12269_动能"
+    MACD_FULL_BULL_LABEL = "MACD_FULL_BULL_Label"
     MACD_FULL_BULL_SIGNAL = "MACD_FULL_BULL_Signals"
     FULL_BULL_SCORE = "FullBull_Score"
+    FULL_BULL_SCORE_BASE = "FullBull_Score_Base"
 
     # MACD第二周期（动态生成，这里提供模板）
     # 格式: f"MACD_{fast}{slow}{signal}"
@@ -137,8 +139,9 @@ class ColumnNames:
             cls.MACD_12269,
             cls.MACD_12269_MOMENTUM,
             cls.MACD_12269_DIF,
-            cls.MACD_FULL_BULL_SIGNAL,
+            cls.MACD_FULL_BULL_LABEL,
             cls.FULL_BULL_SCORE,
+            cls.FULL_BULL_SCORE_BASE,
         ]
 
         if second_period_name:
