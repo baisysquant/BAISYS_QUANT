@@ -22,6 +22,13 @@ from datetime import datetime, timedelta
 # 确保能找到项目根目录的模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 处理 Windows 控制台编码问题
+if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
+
 import pandas as pd
 import akshare as ak
 import pandas_ta as ta
@@ -71,8 +78,9 @@ def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
 
     try:
-        df = ak.stock_zh_a_hist_tx(
+        df = ak.stock_zh_a_hist(
             symbol=symbol,
+            period="daily",
             start_date=start_date,
             end_date=end_date,
             adjust="qfq",
@@ -87,12 +95,13 @@ def fetch_kline_data(symbol: str, days: int = 200) -> pd.DataFrame | None:
 
     df = df.rename(
         columns={
-            "trade_date": "date",
-            "open": "open",
-            "close": "close",
-            "high": "high",
-            "low": "low",
-            "vol": "volume",
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
         }
     )
     if "date" in df.columns:
@@ -157,11 +166,20 @@ def main():
     # ── 2a. 获取股票名称 ──────────────────────────────────────────────
     stock_name = pure_code
     try:
-        stock_info = ak.stock_individual_info_em(symbol=symbol)
-        if stock_info is not None and not stock_info.empty:
-            name_row = stock_info[stock_info.iloc[:, 0].astype(str).str.contains("股票名称")]
-            if not name_row.empty:
-                stock_name = name_row.iloc[0, 1]
+        # 使用 akshare 获取个股简况（含股票名称）
+        info_df = ak.stock_individual_info_em(symbol=symbol)
+        # 兼容处理不同 akshare 版本的返回格式
+        if info_df is not None and not info_df.empty:
+            if "item" in info_df.columns and "value" in info_df.columns:
+                name_row = info_df[info_df["item"].astype(str).str.contains("股票名称")]
+                if not name_row.empty:
+                    stock_name = name_row.iloc[0]["value"]
+            elif len(info_df.columns) >= 2:
+                first_col = info_df.columns[0]
+                second_col = info_df.columns[1]
+                name_row = info_df[info_df[first_col].astype(str).str.contains("股票名称")]
+                if not name_row.empty:
+                    stock_name = name_row.iloc[0].iloc[1]
     except Exception:
         pass
 

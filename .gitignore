@@ -82,3 +82,8 @@ cache/
 
 # Encryption key for database credentials
 .baisys_quant_key
+
+# 根目录下所有带.的目录均不上传
+.arts/
+.opencode/
+.ruff_cache/
