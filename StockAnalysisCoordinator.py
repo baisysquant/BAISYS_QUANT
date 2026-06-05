@@ -451,7 +451,6 @@ class StockAnalysisCoordinator:
             "数据汇总": consolidated_report,
             "行业深度分析": industry_df,
             "主力研报筛选": processed_data.get("processed_main_report", pd.DataFrame()),
-            "前十板块成分股": processed_data.get("top_industry_cons_df", pd.DataFrame()),
             "主力成本分析": processed_data.get("main_cost_data", pd.DataFrame()),
         }
 

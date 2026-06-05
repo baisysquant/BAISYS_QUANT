@@ -160,7 +160,7 @@ class DataProcessingService:
         # 步骤4：合并技术指标（MACD、KDJ、CCI、RSI、BOLL）
         final_df = self.merge_technical_indicators(final_df, processed_data)
 
-        # 步骤5：合并特殊数据（TOP10行业、主力成本、均线突破）
+        # 步骤5：合并特殊数据（主力成本、均线突破）
         final_df = self.merge_special_data(final_df, processed_data)
 
         # 步骤6：筛选有信号的股票
@@ -533,9 +533,7 @@ class DataProcessingService:
         # MACD 完全多头综合评分 + 级联流水线输出
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
-            cols = ["股票代码", "FullBull_Score", "MACD_FULL_BULL_Label"]
-            if "FullBull_Score_Base" in macd_full_bull_df.columns:
-                cols.append("FullBull_Score_Base")
+            cols = ["股票代码"]
             for pipe_col in ["综合分析结论", "综合分析评分", "综合级别", "风险等级"]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
@@ -575,7 +573,7 @@ class DataProcessingService:
         # 合并 MACD 动能数据
         momentum_df = processed_data.get("MACD_DIF_MOMENTUM", pd.DataFrame())
         if not momentum_df.empty and "股票代码" in momentum_df.columns:
-            final_df = pd.merge(final_df, momentum_df, on="股票代码", how="left")
+            final_df = pd.merge(final_df, momentum_df.drop_duplicates(subset=["股票代码"]), on="股票代码", how="left")
             # 使用辅助方法批量填充动能列
             macd_momentum_cols = ["MACD_12269_动能"]
 
@@ -590,7 +588,7 @@ class DataProcessingService:
                     final_df[col] = final_df[col].fillna("")
 
         # 使用辅助方法批量填充缺失的技术指标列
-        macd_cols = ["MACD_12269", "MACD_FULL_BULL_Label"]
+        macd_cols = ["MACD_12269"]
         # 添加第二周期列名（必填）
         fast, slow, signal = self.config.MACD_SECOND_PARAMS
         second_period_name = f"{fast}{slow}{signal}"
@@ -603,21 +601,11 @@ class DataProcessingService:
             else:
                 final_df[col] = final_df[col].fillna("")
 
-        if "FullBull_Score" not in final_df.columns:
-            final_df["FullBull_Score"] = 0
-        else:
-            final_df["FullBull_Score"] = pd.to_numeric(final_df["FullBull_Score"], errors="coerce").fillna(0)
-
-        if "FullBull_Score_Base" not in final_df.columns:
-            final_df["FullBull_Score_Base"] = 0
-        else:
-            final_df["FullBull_Score_Base"] = pd.to_numeric(final_df["FullBull_Score_Base"], errors="coerce").fillna(0)
-
         return final_df
 
     def merge_special_data(self, final_df: pd.DataFrame, processed_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
         """
-        合并特殊数据：TOP10行业、主力成本、均线突破
+        合并特殊数据：主力成本、均线突破
 
         Args:
             final_df: 基础DataFrame
@@ -626,15 +614,6 @@ class DataProcessingService:
         Returns:
             pd.DataFrame: 添加了特殊数据列的DataFrame
         """
-
-        # 处理行业数据
-        top_ind_df = processed_data.get("top_industry_cons_df", pd.DataFrame())
-        if not top_ind_df.empty and "股票代码" in top_ind_df.columns:
-            top_ind_df = self._normalize_stock_code_in_df(top_ind_df)
-            top_codes = set(top_ind_df["股票代码"].astype(str).unique())
-            final_df["TOP10行业"] = final_df["股票代码"].apply(lambda x: "是" if str(x) in top_codes else "否")
-        else:
-            final_df["TOP10行业"] = "否"
 
         # 主力成本数据
         main_cost_df = processed_data.get("main_cost_data", pd.DataFrame())
@@ -650,24 +629,22 @@ class DataProcessingService:
                             ColumnNames.STOCK_CODE,
                             ColumnNames.MAIN_COST,
                             ColumnNames.INSTITUTION_PARTICIPATION,
-                            ColumnNames.MAIN_COST_DIFF,
                             ColumnNames.MAIN_COST_DIFF_PERCENT,
                             ColumnNames.COST_POSITION,
                             ColumnNames.INSTITUTION_LEVEL,
-                            ColumnNames.MAIN_CONTROL_STRENGTH,
                         ]
-                    ],
+                    ].drop_duplicates(subset=[ColumnNames.STOCK_CODE]),
                     on=ColumnNames.STOCK_CODE,
                     how="left",
                 )
                 # 使用辅助方法批量填充主力成本相关列
                 self._fill_missing_columns(
-                    final_df, ["主力成本", "主力成本差价", "成本位置", "主力控盘强度"], default_value="N/A"
+                    final_df, ["主力成本", "成本位置"], default_value="N/A"
                 )
             else:
                 # 使用辅助方法批量设置默认值
                 self._fill_missing_columns(
-                    final_df, ["主力成本", "主力成本差价", "成本位置", "主力控盘强度"], default_value="N/A"
+                    final_df, ["主力成本", "成本位置"], default_value="N/A"
                 )
 
         # 均线突破数据
@@ -714,7 +691,6 @@ class DataProcessingService:
         - 完全多头排列
         - 强势股
         - 量价齐升
-        - TOP10行业
         - 任意技术指标有信号
 
         Args:
@@ -738,7 +714,6 @@ class DataProcessingService:
             (final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] == "是")
             | final_df[ColumnNames.STRONG_STOCK].eq("是")
             | final_df[ColumnNames.PRICE_VOLUME_RISE].eq("是")
-            | final_df.get(ColumnNames.TOP10_INDUSTRY, "").eq("是")
             | final_df[str_cols].apply(lambda s: s.str.strip().ne("")).any(axis=1)
         )
 

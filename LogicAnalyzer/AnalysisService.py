@@ -119,11 +119,6 @@ class AnalysisService:
         )
         kdj_is_empty = kdj_col.isna() | (kdj_col.astype(str).str.strip().str.lower().isin(["", "nan", "none"]))
 
-        full_bull_score = pd.to_numeric(
-            consolidated_report.get("FullBull_Score", pd.Series(dtype=float)),
-            errors="coerce",
-        ).fillna(0)
-
         full_bull_level = consolidated_report.get("多头排列趋势", pd.Series(dtype=str))
         # 使用配置中的豁免条件
         exempt_from_drop = full_bull_level.isin(self.config.EXEMPT_LEVELS)

@@ -65,9 +65,7 @@ class ReportService:
             ColumnNames.INDUSTRY_SIGNAL,
             ColumnNames.LATEST_PRICE,
             ColumnNames.MAIN_COST,
-            ColumnNames.MAIN_COST_DIFF,
             ColumnNames.COST_POSITION,
-            ColumnNames.MAIN_CONTROL_STRENGTH,
         ]
 
     @staticmethod
@@ -77,13 +75,9 @@ class ReportService:
             ColumnNames.PRICE_VOLUME_RISE,
             ColumnNames.CONSECUTIVE_RISE_DAYS,
             ColumnNames.VOLUME_INCREASE_DAYS,
-            ColumnNames.TOP10_INDUSTRY,
             ColumnNames.MACD_12269,
             ColumnNames.MACD_12269_MOMENTUM,
             ColumnNames.MACD_12269_DIF,
-            ColumnNames.MACD_FULL_BULL_LABEL,
-            ColumnNames.FULL_BULL_SCORE,
-            ColumnNames.FULL_BULL_SCORE_BASE,
             # 级联流水线新列
             ColumnNames.COMPREHENSIVE_ANALYSIS,
             ColumnNames.COMPREHENSIVE_SCORE,

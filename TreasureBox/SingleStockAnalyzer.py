@@ -219,10 +219,6 @@ def main():
     print_section("MACD 完全多头评分")
     bull_result = result.get("bull")
     if bull_result:
-        print_field("FullBull_Score", bull_result.get("score", "N/A"))
-        print_field("FullBull_Score_Base", bull_result.get("score_base", "N/A"))
-        print_field("MACD_FULL_BULL_Label", bull_result.get("conclusion", "N/A"))
-
         details = bull_result.get("details", {})
         if details:
             print()

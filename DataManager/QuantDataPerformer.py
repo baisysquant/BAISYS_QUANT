@@ -186,7 +186,7 @@ class QuantDBSyncTask:
             "量价齐升": "is_vol_price_rise",
             "连涨天数": "consecutive_up_days",
             "放量天数": "high_vol_days",
-            "TOP10行业": "is_top10_industry",
+
             # 标准周期 MACD (固定硬编码)
             "MACD_12269": "macd_12269_signal",
             "MACD_12269_动能": "macd_12269_momentum",
@@ -229,7 +229,6 @@ class QuantDBSyncTask:
             "boll_signal",
             "is_strong_stock",
             "is_vol_price_rise",
-            "is_top10_industry",
             "is_full_bullish",
         ]
 

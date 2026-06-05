@@ -70,7 +70,6 @@ class ColumnNames:
     PRICE_VOLUME_RISE = "量价齐升"
     CONSECUTIVE_RISE_DAYS = "连涨天数"
     VOLUME_INCREASE_DAYS = "放量天数"
-    TOP10_INDUSTRY = "TOP10行业"
 
     # ==================== 主力成本列 ====================
     MAIN_COST = "主力成本"

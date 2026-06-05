@@ -82,7 +82,6 @@ class DataAcquisitionService:
             - cxfl_raw: 持续放量数据
             - xstp_10_raw/xstp_30_raw/xstp_60_raw: 均线突破数据
             - industry_board_df: 行业板块成分股映射
-            - top_industry_cons_df: 前十板块成分股
             - main_cost_data: 主力成本数据
 
         Raises:
@@ -252,7 +251,6 @@ class DataAcquisitionService:
 
         # 行业板块数据
         industry_board_df = self._fetch_industry_data(today_str)
-        data["top_industry_cons_df"] = self._get_top_industry_constituents(industry_board_df)
         data["industry_board_df"] = industry_board_df
 
         # 获取主力成本数据
@@ -404,109 +402,4 @@ class DataAcquisitionService:
 
         return industry_board_df
 
-    def _safe_fetch_constituents(self, symbol: str) -> pd.DataFrame:
-        """
-        安全地获取行业板块成分股数据
 
-        使用异常处理包裹 akshare 接口调用，避免因单个板块数据获取失败
-        而影响整个分析流程。
-
-        Args:
-            symbol: 行业板块代码或名称
-
-        Returns:
-            pd.DataFrame: 成分股数据DataFrame，包含股票代码、名称等字段
-                         如果获取失败，返回空的DataFrame
-        """
-        df = pd.DataFrame()
-        for i in range(self.config.DATA_FETCH_RETRIES):
-            try:
-                df = ak.stock_board_industry_cons_em(symbol=symbol)
-                if df is not None and not df.empty:
-                    return df
-                else:
-                    time.sleep(self.config.DATA_FETCH_DELAY)
-            except Exception:
-                time.sleep(self.config.DATA_FETCH_DELAY)
-        return pd.DataFrame()
-
-    def _get_top_industry_constituents(self, industry_board_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        获取前十板块的成分股数据
-
-        Args:
-            industry_board_df: 行业板块数据DataFrame
-
-        Returns:
-            pd.DataFrame: 前十板块的成分股数据
-        """
-        if industry_board_df.empty or ColumnNames.AKSHARE_INDUSTRY_BOARD_NAME not in industry_board_df.columns:
-            return pd.DataFrame()
-
-        # 1. 使用统一缓存管理器检查缓存
-        cache_name = "前十板块成分股"
-        cached_df = self.cache_manager.load_dataframe(cache_name)
-        if cached_df is not None:
-            logger.debug(f"命中板块成分股缓存: {len(cached_df)}条记录")
-            return cached_df
-
-        top_industries = industry_board_df.sort_values(by="涨跌幅", ascending=False).head(10)
-
-        industry_list = []
-        for _, row in top_industries.iterrows():
-            pure_dict = {col: row[col] for col in top_industries.columns}
-            industry_list.append(pure_dict)
-
-        def fetch_worker(row):
-            try:
-                if isinstance(row, pd.Series) or isinstance(row, dict):
-                    industry_name = row[ColumnNames.AKSHARE_INDUSTRY_BOARD_NAME]
-                else:
-                    logger.error(f"[ERROR] 无法识别的数据类型: {type(row)}")
-                    return None
-
-                logger.info(f" - 正在获取板块成分股: {industry_name}")
-                constituents_df = self._safe_fetch_constituents(symbol=industry_name)
-
-                if constituents_df is not None and not constituents_df.empty:
-                    if ColumnNames.AKSHARE_CODE_RAW in constituents_df.columns:
-                        constituents_df.rename(
-                            columns={ColumnNames.AKSHARE_CODE_RAW: ColumnNames.STOCK_CODE}, inplace=True
-                        )
-
-                    if "股票代码" in constituents_df.columns:
-                        # 使用统一方法标准化股票代码
-                        from UtilsManager.CodeNormalizer import CodeNormalizer
-
-                        constituents_df["股票代码"] = constituents_df["股票代码"].apply(CodeNormalizer.normalize)
-
-                    constituents_df["所属板块"] = industry_name
-                    return constituents_df[["股票代码", "所属板块"]].drop_duplicates()
-                return None
-
-            except Exception as e:
-                logger.error(
-                    f"[WORKER ERROR] 处理板块 {row.get(ColumnNames.AKSHARE_INDUSTRY_BOARD_NAME, 'Unknown')} 时出错: {e}"
-                )
-                return None
-
-        from DataManager import ParallelUtils as utils
-
-        results = utils.run_with_thread_pool(
-            items=industry_list,
-            worker_func=fetch_worker,
-            max_workers=self.config.MAX_WORKERS,
-            desc="获取板块成分股",
-        )
-
-        if results:
-            # 过滤掉 None 结果
-            valid_results = [df for df in results if df is not None and not df.empty]
-            if valid_results:
-                final_df = pd.concat(valid_results, ignore_index=True).drop_duplicates(subset=["股票代码"])
-                # 使用统一缓存管理器保存
-                self.cache_manager.save_dataframe(final_df, cache_name)
-                logger.info(f"板块成分股数据已缓存: {len(final_df)}条记录")
-                return final_df
-
-        return pd.DataFrame()

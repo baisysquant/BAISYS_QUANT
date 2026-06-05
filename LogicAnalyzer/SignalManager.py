@@ -412,8 +412,9 @@ class TASignalProcessor:
             ]),
             # ── 新增：完全多头综合评分 ─────────────────────────────────────
             'MACD_FULL_BULL': pd.DataFrame(columns=[
-                '股票代码', 'FullBull_Score', 'FullBull_Score_Base', 'MACD_FULL_BULL_Label',
+                '股票代码',
                 '零轴条件', '战略金叉', '战术金叉', '动能', 'DIF斜率', '背离信号', '量价配合',
+                'K线形态',
                 '综合分析结论', '综合分析评分', '综合级别', '风险等级',
             ]),
         }
@@ -487,7 +488,7 @@ class TASignalProcessor:
                 executor.submit(
                     self._process_single_stock, code, valid_hist_df, second_params, second_period_name
                 ): code
-                for code in all_codes
+                for code in set(all_codes)
             }
             for future in as_completed(futures):
                 try:
@@ -522,9 +523,6 @@ class TASignalProcessor:
                 pipeline = r.get('pipeline', {})
                 bull_rows.append({
                     '股票代码': code,
-                    'FullBull_Score': r['bull'].get('score', 0),
-                    'FullBull_Score_Base': r['bull'].get('score_base', 0),
-                    'MACD_FULL_BULL_Label': r['bull'].get('conclusion', ''),
                     '零轴条件': detail.get('零轴条件', {}).get('desc', ''),
                     '战略金叉': detail.get('战略金叉', {}).get('desc', ''),
                     '战术金叉': detail.get('战术金叉', {}).get('desc', ''),
@@ -533,7 +531,6 @@ class TASignalProcessor:
                     '背离信号': detail.get('背离信号', {}).get('desc', ''),
                     '量价配合': detail.get('量价配合', {}).get('desc', ''),
                     'K线形态': detail.get('K线形态', {}).get('desc', ''),
-                    # 级联流水线新增列
                     '综合分析结论': pipeline.get('conclusion', ''),
                     '综合分析评分': pipeline.get('score', 0),
                     '综合级别': pipeline.get('level', ''),

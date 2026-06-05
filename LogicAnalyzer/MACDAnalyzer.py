@@ -746,6 +746,17 @@ class MACDAnalyzer:
                     signal_list.append({'type': 'K线反转', 'confidence': confidence, 'desc': d['label']})
                     break
 
+        # 持续多头信号：强趋势 + DIF>0 → 视为趋势延续信号
+        if not signal_list:
+            regime = state.get('regime', '')
+            last_dif = df['MACD_12269_DIF'].iloc[-1] if 'MACD_12269_DIF' in df.columns else 0
+            if regime == 'STRONG_TREND' and last_dif > 0:
+                signal_list.append({
+                    'type': '强势延续',
+                    'confidence': 'high',
+                    'desc': 'MACD多头趋势持续'
+                })
+
         state['signal_list'] = signal_list
 
         # 规则引擎 Gate 1

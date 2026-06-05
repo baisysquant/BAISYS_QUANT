@@ -127,10 +127,7 @@ def create_final_report_schema() -> DataFrameSchema:
             "量价齐升": Column(str, nullable=True, coerce=True),
             "连涨天数": Column(int, nullable=True, coerce=True),
             "放量天数": Column(int, nullable=True, coerce=True),
-            "TOP10行业": Column(str, nullable=True, coerce=True),
-            "MACD_FULL_BULL_Label": Column(str, nullable=True, coerce=True),
-            "FullBull_Score": Column(float, nullable=True, coerce=True),
-            "FullBull_Score_Base": Column(float, nullable=True, coerce=True),
+
             "完全多头排列": Column(str, nullable=True, coerce=True),
             "多头排列趋势": Column(str, nullable=True, coerce=True),
             "股票链接": Column(str, nullable=True, coerce=True),
