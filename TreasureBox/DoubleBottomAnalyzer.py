@@ -309,14 +309,12 @@ class MACDKDJDoubleBottomAnalyzer:
         """
         if self.conn and not force_new:
             try:
-                # 测试连接是否仍然有效
                 self.conn.cursor().execute("SELECT 1")
                 return
-            except Exception:
-                # 连接失效，关闭旧连接
+            except (psycopg2.Error, psycopg2.OperationalError):
                 try:
                     self.conn.close()
-                except Exception:
+                except (psycopg2.Error, psycopg2.OperationalError):
                     pass
                 self.conn = None
 
@@ -326,7 +324,7 @@ class MACDKDJDoubleBottomAnalyzer:
                 self.conn = psycopg2.connect(self.connection_string)
                 logging.info("数据库连接成功")
                 return
-            except Exception as e:
+            except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
                 logging.warning(f"数据库连接失败 (尝试 {retry_count}/{self.max_retries}): {e}")
                 if retry_count < self.max_retries:
@@ -377,33 +375,30 @@ class MACDKDJDoubleBottomAnalyzer:
                     # 重命名 amount 列为 vol 以保持一致性
                     df.rename(columns={"amount": "vol"}, inplace=True)
 
-                    # 计算KDJ指标
                     try:
                         df = calculate_kdj_from_df(df)
-                    except Exception as e:
+                    except (ValueError, TypeError, KeyError) as e:
                         logging.warning(f"KDJ计算失败，跳过: {e}")
-                        # 如果无法计算KDJ，手动添加空的KDJ列
                         df["K"] = np.nan
                         df["D"] = np.nan
                         df["J"] = np.nan
 
                     return df
-            except Exception as e:
+            except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
                 logging.warning(f"获取股票 {symbol} 数据失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
                 if retry_count < self.max_retries:
-                    # 关闭当前连接并重新连接
                     try:
                         if self.conn:
                             self.conn.close()
-                    except Exception:
+                    except (psycopg2.Error, psycopg2.OperationalError):
                         pass
                     self.conn = None
-                    time.sleep(1)  # 等待1秒后重试
+                    time.sleep(1)
                 else:
                     logging.error(f"获取股票 {symbol} 数据最终失败: {e}")
-                    return pd.DataFrame()  # 返回空DataFrame
+                    return pd.DataFrame()
 
     def get_all_symbols(self) -> list[str]:
         """
@@ -430,19 +425,18 @@ class MACDKDJDoubleBottomAnalyzer:
 
                     logging.info(f"共获取到 {len(symbols)} 个不同的股票代码")
                     return symbols
-            except Exception as e:
+            except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
                 logging.warning(f"获取股票代码列表失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
                 if retry_count < self.max_retries:
-                    # 关闭当前连接并重新连接
                     try:
                         if self.conn:
                             self.conn.close()
-                    except Exception:
+                    except (psycopg2.Error, psycopg2.OperationalError):
                         pass
                     self.conn = None
-                    time.sleep(1)  # 等待1秒后重试
+                    time.sleep(1)
                 else:
                     logging.error(f"获取股票代码列表最终失败: {e}")
                     raise
@@ -1185,7 +1179,7 @@ def export_results_to_excel(results, buy_signals, config):
         for cell in column:
             try:
                 max_length = max(max_length, len(str(cell.value)))
-            except Exception:
+            except (ValueError, TypeError):
                 pass
 
         adjusted_width = min(max_length + 2, 50)

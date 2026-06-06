@@ -37,7 +37,7 @@ class TradingCalendarAnalyzer:
             logger.info(f"[Calendar] 成功获取 {len(dates)} 条交易日数据。")
             return dates
 
-        except Exception as e:
+        except (ConnectionError, ValueError, KeyError, AttributeError) as e:
             logger.error(f"[Calendar ERROR] Akshare 接口调用失败: {e}")
             return None
 
@@ -54,7 +54,7 @@ class TradingCalendarAnalyzer:
                     return dates
                 else:
                     logger.info("[Calendar] 本地缓存文件已过期，将尝试更新。")
-            except Exception as e:
+            except (json.JSONDecodeError, OSError, ValueError, KeyError) as e:
                 logger.error(f"[Calendar ERROR] 读取缓存文件失败: {e}")
         else:
             logger.info(f"[Calendar] 本地缓存文件不存在: {self.cache_path}")
@@ -70,7 +70,7 @@ class TradingCalendarAnalyzer:
             with open(self.cache_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             logger.info("[Calendar] 新的交易日历已保存到本地缓存。")
-        except Exception as e:
+        except (OSError, PermissionError, TypeError) as e:
             logger.error(f"[Calendar ERROR] 保存缓存失败: {e}")
 
     def get_official_trading_dates(self):
@@ -101,7 +101,7 @@ class TradingCalendarAnalyzer:
                     self._cached_dates = dates
                     self._cache_load_time = datetime.now().timestamp()
                     return dates
-            except Exception:
+            except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
         logger.critical("[Calendar CRITICAL] 缓存和接口均不可用，回退到仅周末逻辑（无法识别法定节假日）。")

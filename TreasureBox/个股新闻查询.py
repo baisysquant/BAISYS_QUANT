@@ -105,7 +105,7 @@ def query_stock_news():
             try:
                 # 尝试将时间列转换为 datetime 对象，然后格式化为统一的字符串格式
                 display_df["发布时间"] = pd.to_datetime(display_df["发布时间"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
+            except (ValueError, TypeError):
                 pass  # 保持原样如果转换失败
 
         # ** 新闻内容不截断，完整保存到 Excel **

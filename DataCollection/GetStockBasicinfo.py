@@ -5,10 +5,12 @@ from datetime import datetime
 import pandas as pd
 import akshare as ak
 
+from sqlalchemy.exc import DBAPIError, OperationalError
+
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-# 注意：这里假设你的模块路径是正确的
 from DataManager.DatabaseWriter import QuantDBManager
+from UtilsManager.Exceptions import DatabaseError, DatabaseConnectionError
 
 
 class StockBasicInfoService:
@@ -61,9 +63,9 @@ class StockBasicInfoService:
                 db_config["database"]
             )
             self.logger.info("数据库连接初始化成功")
-        except Exception as e:
+        except (DBAPIError, OperationalError, DatabaseError) as e:
             self.logger.error(f"数据库连接初始化失败: {e!s}")
-            raise
+            raise DatabaseConnectionError(str(e)) from e
 
     def _get_latest_data_date(self):
         """获取表中最新的 record_date"""
@@ -77,7 +79,7 @@ class StockBasicInfoService:
         except AttributeError as e:
             self.logger.error(f"调用数据库方法失败，可能方法名不匹配: {e!s}")
             return None
-        except Exception as e:
+        except (DatabaseError, DBAPIError, OperationalError) as e:
             self.logger.error(f"获取最新数据日期失败: {e!s}")
             return None
 
@@ -270,7 +272,7 @@ class StockBasicInfoService:
 
             return True
 
-        except Exception as e:
+        except (DatabaseError, DBAPIError, OperationalError) as e:
             self.logger.error(f"同步成分股信息失败: {e!s}")
             return False
 
@@ -280,7 +282,7 @@ class StockBasicInfoService:
             self._initialize_database()
         try:
             return self.db_manager.get_table_count(self.TABLE_NAME)
-        except Exception as e:
+        except (DatabaseError, DBAPIError, OperationalError) as e:
             self.logger.error(f"获取记录总数失败: {e!s}")
             return 0
 

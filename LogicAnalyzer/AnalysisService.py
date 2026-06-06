@@ -6,6 +6,9 @@
 
 import pandas as pd
 
+from DataManager.ColumnNames import ColumnNames
+from LogicAnalyzer.SignalConstants import MACDMomentum, TrendLevels, BullArrangement
+
 
 class AnalysisService:
     """
@@ -23,18 +26,11 @@ class AnalysisService:
         db_engine: 数据库引擎
     """
 
-    def __init__(self, config, logger, db_engine):
-        """
-        初始化业务分析服务
-
-        Args:
-            config: 配置管理器
-            logger: 日志管理器
-            db_engine: 数据库引擎
-        """
+    def __init__(self, config, logger, db_engine, executor=None):
         self.config = config
         self.logger = logger
         self.db_engine = db_engine
+        self.executor = executor
 
     def process_technical_signals(
         self, stock_codes: list[str], hist_df: pd.DataFrame, spot_data: pd.DataFrame
@@ -54,7 +50,7 @@ class AnalysisService:
 
         self.logger.info(">>> 正在处理技术指标信号...")
 
-        signal_processor = TASignalProcessor(None, config=self.config)
+        signal_processor = TASignalProcessor(None, config=self.config, executor=self.executor)
         ta_signals = signal_processor.process_signals(stock_codes, hist_df, spot_data)
 
         self.logger.info(">>> 股票历史数据和技术指标分析完成。")
@@ -119,7 +115,7 @@ class AnalysisService:
         )
         kdj_is_empty = kdj_col.isna() | (kdj_col.astype(str).str.strip().str.lower().isin(["", "nan", "none"]))
 
-        full_bull_level = consolidated_report.get("多头排列趋势", pd.Series(dtype=str))
+        full_bull_level = consolidated_report.get(ColumnNames.BULL_TREND, pd.Series(dtype=str))
         # 使用配置中的豁免条件
         exempt_from_drop = full_bull_level.isin(self.config.EXEMPT_LEVELS)
 
@@ -128,8 +124,8 @@ class AnalysisService:
             & (consolidated_report.get("量价齐升") == "否")
             & (consolidated_report.get("连涨天数") == 0)
             & (consolidated_report.get("放量天数") == 0)
-            & (consolidated_report.get("MACD_12269_动能") == "加速下跌 (绿柱加长)")
-            & (consolidated_report.get(f"MACD_{second_period_name}_动能") == "加速下跌 (绿柱加长)")
+        & (consolidated_report.get("MACD_12269_动能") == MACDMomentum.ACCELERATE_DOWN)
+        & (consolidated_report.get(f"MACD_{second_period_name}_动能") == MACDMomentum.ACCELERATE_DOWN)
             & (dif_12269 < 0)
             & (dif_second < 0)
             & kdj_is_empty

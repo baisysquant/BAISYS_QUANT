@@ -45,11 +45,12 @@ class Rule:
 # ── 条件函数（返回 True/False） ───────────────────────────────────────────────
 
 def _has_top_divergence(state: dict) -> bool:
-    """顶背离 + 强度 > 0.3"""
+    """顶背离 + 强度 > threshold"""
     div = state.get('divergence') or {}
     cs = div.get('combined_signal', '')
+    threshold = state.get('config', {}).get('divergence', 0.3)
     strength = div.get('strength_12269', 0) or div.get('strength_6135', 0)
-    return '顶背离' in cs and strength > 0.3
+    return '顶背离' in cs and strength > threshold
 
 
 def _has_bearish_kline_strong(state: dict) -> bool:
@@ -132,32 +133,38 @@ def _volume_positive(state: dict) -> bool:
 
 
 def _price_new_high(state: dict) -> bool:
-    """股价创 N 日新高（20 日）"""
+    """股价创 N 日新高"""
     df = state.get('df')
-    if df is None or len(df) < 20:
+    cfg = state.get('config', {})
+    ndays = cfg.get('price_new_high_days', 20)
+    if df is None or len(df) < ndays:
         return False
-    recent = df['close'].iloc[-20:]
+    recent = df['close'].iloc[-ndays:]
     return recent.iloc[-1] >= recent.max()
 
 
 def _rsi_not_new_high(state: dict) -> bool:
     """RSI 未创新高"""
     df = state.get('df')
-    if df is None or len(df) < 20:
+    cfg = state.get('config', {})
+    ndays = cfg.get('price_new_high_days', 20)
+    if df is None or len(df) < ndays:
         return False
     rsi_cols = [c for c in df.columns if c.startswith('RSI_')]
     if not rsi_cols:
         return False
-    rsi = df[rsi_cols[0]].iloc[-20:]
+    rsi = df[rsi_cols[0]].iloc[-ndays:]
     return rsi.iloc[-1] < rsi.max()
 
 
 def _volume_not_new_high(state: dict) -> bool:
     """成交量未创新高"""
     df = state.get('df')
-    if df is None or len(df) < 20 or 'volume' not in df.columns:
+    cfg = state.get('config', {})
+    ndays = cfg.get('price_new_high_days', 20)
+    if df is None or len(df) < ndays or 'volume' not in df.columns:
         return False
-    vol = df['volume'].iloc[-20:]
+    vol = df['volume'].iloc[-ndays:]
     return vol.iloc[-1] < vol.max()
 
 
@@ -192,11 +199,12 @@ def _kline_unconfirmed_bullish(state: dict) -> bool:
 
 
 def _has_bot_divergence(state: dict) -> bool:
-    """底背离 + 强度 > 0.3"""
+    """底背离 + 强度 > threshold"""
     div = state.get('divergence') or {}
     cs = div.get('combined_signal', '')
+    threshold = state.get('config', {}).get('divergence', 0.3)
     strength = div.get('strength_12269', 0) or div.get('strength_6135', 0)
-    return '底背离' in cs and strength > 0.3
+    return '底背离' in cs and strength > threshold
 
 
 def _regime_transition_to_strong(state: dict) -> bool:
@@ -205,15 +213,21 @@ def _regime_transition_to_strong(state: dict) -> bool:
     return state.get('regime') == 'STRONG_TREND'
 
 
-def _chip_winner_rate_high(state: dict, threshold: float = 80) -> bool:
+def _chip_winner_rate_high(state: dict, threshold: float | None = None) -> bool:
     """获利比例 > threshold"""
+    cfg = state.get('config', {})
+    if threshold is None:
+        threshold = cfg.get('winner_rate_high', 80)
     chip = state.get('chip_data')
     if not chip:
         return False
     return chip.get('winner_rate', 0) > threshold
 
-def _chip_winner_rate_low(state: dict, threshold: float = 15) -> bool:
+def _chip_winner_rate_low(state: dict, threshold: float | None = None) -> bool:
     """获利比例 < threshold"""
+    cfg = state.get('config', {})
+    if threshold is None:
+        threshold = cfg.get('winner_rate_low', 15)
     chip = state.get('chip_data')
     if not chip:
         return False
@@ -223,22 +237,26 @@ def _chip_price_at_resistance(state: dict) -> bool:
     """收盘价接近成本上沿 (cost_95pct)"""
     chip = state.get('chip_data')
     df = state.get('df')
+    cfg = state.get('config', {})
     if not chip or df is None:
         return False
     close = df['close'].iloc[-1]
     cost_95 = chip.get('cost_95pct', 0)
-    return cost_95 > 0 and close >= cost_95 * 0.95
+    ratio = cfg.get('cost_resistance_ratio', 0.95)
+    return cost_95 > 0 and close >= cost_95 * ratio
 
 def _chip_cost_concentrated(state: dict) -> bool:
-    """筹码高度集中（(cost_95pct - cost_5pct) / cost_5pct < 0.15）"""
+    """筹码高度集中"""
     chip = state.get('chip_data')
+    cfg = state.get('config', {})
     if not chip:
         return False
     c5 = chip.get('cost_5pct', 0)
     c95 = chip.get('cost_95pct', 0)
     if c5 <= 0 or c95 <= 0:
         return False
-    return (c95 - c5) / c5 < 0.15
+    ratio = cfg.get('chip_concentrated_ratio', 0.15)
+    return (c95 - c5) / c5 < ratio
 
 
 # ── 动作函数（修改 state） ────────────────────────────────────────────────────
@@ -418,5 +436,5 @@ def execute_rules(state: dict, gate: int) -> None:
         try:
             if rule.condition(state):
                 rule.action(state)
-        except Exception:
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError):
             pass

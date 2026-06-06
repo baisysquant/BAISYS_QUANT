@@ -2,6 +2,8 @@ import io
 import urllib.parse
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DBAPIError, OperationalError, IntegrityError, ProgrammingError
+from UtilsManager.Exceptions import DatabaseError
 
 
 class QuantDBManager:
@@ -67,37 +69,36 @@ class QuantDBManager:
                         print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
                         trans.commit()
 
-                    except Exception as e:
+                    except (DBAPIError, OperationalError, IntegrityError) as e:
                         trans.rollback()
                         print(f" - [数据库错误] {table_name} 清理失败: {e}")
-                        raise
+                        raise DatabaseError(f"清理旧数据 {table_name}", str(e)) from e
 
                 try:
                     self._fast_pg_copy(df, table_name)
                     print(f" - [数据库] {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
                     return  # 成功则返回
-                except Exception as e:
+                except (DBAPIError, OperationalError) as e:
                     print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
-                    # 如果写入失败，在重试前再次尝试清理，以防是部分写入导致的残留
                     if attempt < max_retries:
                         with self.engine.connect() as conn:
                             conn.execute(
                                 text(f"DELETE FROM {table_name} WHERE {date_column} = :today"), {"today": today_str}
                             )
                             conn.commit()
-                    raise
+                    raise DatabaseError(f"COPY写入 {table_name}", str(e)) from e
 
-            except Exception as e:
+            except (DBAPIError, OperationalError, IntegrityError) as e:
                 if attempt < max_retries:
                     import time
 
-                    wait_time = 2**attempt  # 指数退避：2s, 4s, 8s
+                    wait_time = 2**attempt
                     print(f"  - [警告] {table_name} 写入失败 (尝试 {attempt}/{max_retries}): {e}")
                     print(f"  - [警告] {wait_time} 秒后重试...")
                     time.sleep(wait_time)
                 else:
                     print(f"  - [错误] {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
-                    raise
+                    raise DatabaseError(f"写入 {table_name} (已达最大重试)", str(e)) from e
 
     def truncate_and_insert(self, df, table_name):
         """
@@ -119,10 +120,10 @@ class QuantDBManager:
                 conn.execute(text(f"DELETE FROM {table_name}"))
                 trans.commit()
                 print(f"  - [数据库] {table_name} 表已清空。")
-            except Exception as e:
+            except (DBAPIError, OperationalError) as e:
                 trans.rollback()
                 print(f"  - [数据库错误] {table_name} 清空失败: {e}")
-                raise
+                raise DatabaseError("清空表", str(e)) from e
 
         # 步骤2: 使用 COPY 协议快速写入
         self._fast_pg_copy(df, table_name)
@@ -154,9 +155,9 @@ class QuantDBManager:
                 print(
                     f"  - [数据库] {table_name} 批次 {i // batch_size + 1}/{(total_rows - 1) // batch_size + 1} 写入成功 ({len(batch_df)} 条)"
                 )
-            except Exception as e:
+            except (DBAPIError, OperationalError) as e:
                 print(f"  - [数据库错误] {table_name} 批次 {i // batch_size + 1} 写入失败: {e}")
-                raise e
+                raise DatabaseError(f"批次写入 {table_name}", str(e)) from e
 
     def _write_batch(self, df, table_name):
         """
@@ -177,9 +178,9 @@ class QuantDBManager:
             # 使用 copy_expert 执行内存流拷贝
             cursor.copy_expert(copy_sql, output)
             raw_conn.commit()
-        except Exception as e:
+        except (DBAPIError, OperationalError) as e:
             raw_conn.rollback()
-            raise e
+            raise DatabaseError("COPY写入", str(e)) from e
         finally:
             cursor.close()
             raw_conn.close()
@@ -210,9 +211,9 @@ class QuantDBManager:
                     result = conn.execute(text(query))
                 trans.commit()
                 return result.rowcount
-            except Exception as e:
+            except (DBAPIError, OperationalError, ProgrammingError) as e:
                 trans.rollback()
-                raise e
+                raise DatabaseError("更新", str(e)) from e
 
     def execute_many(self, query: str, values_list):
         """批量执行SQL语句"""
@@ -222,9 +223,9 @@ class QuantDBManager:
                 result = conn.execute(text(query), values_list)
                 trans.commit()
                 return result.rowcount
-            except Exception as e:
+            except (DBAPIError, OperationalError, ProgrammingError) as e:
                 trans.rollback()
-                raise e
+                raise DatabaseError("批量执行", str(e)) from e
 
     def get_table_count(self, table_name: str):
         """获取表记录数"""
@@ -276,7 +277,7 @@ class QuantDBManager:
         try:
             result = self.execute_query(query)
             return result[0][0] if result and result[0][0] is not None else 0
-        except Exception as e:
+        except (DBAPIError, OperationalError) as e:
             print(f"  - [数据库错误] 获取 {table_name}.{column_name} 去重计数失败: {e}")
             return 0
 

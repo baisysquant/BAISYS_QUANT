@@ -3,6 +3,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from DataManager.ColumnNames import ColumnNames
+from LogicAnalyzer.SignalConstants import TrendLevels
+
 
 def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = None) -> dict[str, Any]:
     """
@@ -21,8 +24,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
 
     # --- 1. 参数校准与数据预处理 ---
     # 自适应检测日期列（兼容 trade_date / date / 日期 / datetime 等命名）
-    _date_col_candidates = ["trade_date", "date", "日期", "datetime", "Date", "TRADE_DATE"]
-    _date_col = next((c for c in _date_col_candidates if c in df.columns), None)
+    _date_col = next((c for c in ColumnNames.DATE_COLUMN_CANDIDATES if c in df.columns), None)
     if _date_col is None:
         return _generate_empty_result(f"缺少日期列，实际列: {list(df.columns)[:10]}")
     # 统一重命名为 trade_date
@@ -195,13 +197,13 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
     trend_oscillation_threshold = thresholds.get("trend_oscillation", 45)
 
     if total_score >= full_bull_threshold:
-        level = "完全主升"
+        level = TrendLevels.FULL_BULL
     elif total_score >= trend_acceleration_threshold:
-        level = "趋势加速"
+        level = TrendLevels.TREND_ACCELERATION
     elif total_score >= trend_oscillation_threshold:
-        level = "趋势震荡"
+        level = TrendLevels.TREND_OSCILLATION
     else:
-        level = "趋势观望"
+        level = TrendLevels.TREND_WATCH
 
     return {
         "level": level,
@@ -218,7 +220,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
 def _generate_empty_result(reason: str) -> dict[str, Any]:
     """生成空结果"""
     return {
-        "level": "趋势观望",
+        "level": TrendLevels.TREND_WATCH,
         "factors": {},
         "status": "FAILED",
     }

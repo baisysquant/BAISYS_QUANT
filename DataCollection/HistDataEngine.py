@@ -13,6 +13,7 @@ import akshare as ak
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
@@ -21,13 +22,12 @@ from UtilsManager.CacheManager import CacheManager
 
 
 class StockSyncEngine:
-    AKSHARE_RETRIES = 3
-    AKSHARE_DELAY = 5
 
-    def __init__(self, config_file: str = "config.ini"):
+    def __init__(self, config_file: str = "config.ini", executor=None):
 
         self.config_file = config_file
         self.config = Config(config_file=config_file)
+        self.executor = executor
 
         url_object = URL.create(
             "postgresql+psycopg2",
@@ -46,7 +46,7 @@ class StockSyncEngine:
             with self.db.connect() as conn:
                 conn.execute(text("SELECT 1"))
             print("[INFO]  数据库引擎初始化成功")
-        except Exception as e:
+        except (DBAPIError, OperationalError) as e:
             raise RuntimeError("数据库引擎初始化失败") from e
 
         # 使用业务交易日而非物理时间
@@ -171,20 +171,20 @@ class StockSyncEngine:
                 return cached_df
 
         df = pd.DataFrame()
-        for i in range(self.AKSHARE_RETRIES):
+        for i in range(self.config.DATA_FETCH_RETRIES):
             try:
-                print(f"  - 正在尝试第 {i + 1}/{self.AKSHARE_RETRIES} 次: {description}...")
+                print(f"  - 正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次: {description}...")
                 df = fetch_func(**kwargs)
                 if df is not None and not df.empty:
                     df = _standardize_columns(df)
                     break
 
                 # 使用指数级退避递增重试延时
-                wait_time = self.AKSHARE_DELAY * (2**i)
+                wait_time = self.config.DATA_FETCH_DELAY * (2**i)
                 print(f"[WARN] 获取 {description} 返回空或无效，将在 {wait_time} 秒后重试")
                 time.sleep(wait_time)
             except Exception as e:
-                wait_time = self.AKSHARE_DELAY * (2**i)
+                wait_time = self.config.DATA_FETCH_DELAY * (2**i)
                 print(f"[ERROR] 获取 {description} 失败: {e}，将在 {wait_time} 秒后重试")
                 time.sleep(wait_time)
 
@@ -546,13 +546,12 @@ class StockSyncEngine:
                 name="stock_daily_kline", con=self.db, if_exists="replace", index=False, method="multi", chunksize=5000
             )
             print(f"[INFO] 成功将 {len(combined_df)} 条记录写入 'stock_daily_kline' 表。")
-        except Exception as e:
+        except (DBAPIError, OperationalError) as e:
             print(f"[ERROR] 写入数据库失败: {e}")
-            # 尝试回滚事务
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
-            except Exception:
+            except (DBAPIError, OperationalError):
                 pass
             raise
 
@@ -566,13 +565,12 @@ class StockSyncEngine:
                 conn.execute(text("DELETE FROM stock_daily_kline;"))
                 conn.commit()
             print("[INFO] 'stock_daily_kline' 表已清空。")
-        except Exception as e:
+        except (DBAPIError, OperationalError) as e:
             print(f"[ERROR] 清空失败: {e}")
-            # 尝试回滚事务
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
-            except Exception:
+            except (DBAPIError, OperationalError):
                 pass
             raise
 
@@ -580,11 +578,10 @@ class StockSyncEngine:
         """主运行函数：研报过滤 + K线数据同步"""
 
         if target_date is None:
-            # 优先使用业务交易日，如果失败则使用初始化时的 today
             try:
                 target_date = TradingCalendarAnalyzer().get_last_trading_day()
-            except Exception:
-                target_date = self.today  # 使用初始化时获取的业务交易日
+            except (ValueError, ConnectionError, RuntimeError):
+                target_date = self.today
 
         self.today_str = target_date
         self.today_dt = pd.to_datetime(target_date).normalize()
@@ -794,9 +791,10 @@ class StockSyncEngine:
             batch_failed = []
 
             batch_desc = f"批次{batch_idx + 1}/{total_new_batches}"
-            with tqdm(total=len(batch_symbols), desc=batch_desc, unit="只", ncols=80, leave=False) as pbar:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(self._fetch_kline_for_symbol, s): s for s in batch_symbols}
+            exec_hist = self.executor or ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                with tqdm(total=len(batch_symbols), desc=batch_desc, unit="只", ncols=80, leave=False) as pbar:
+                    futures = {exec_hist.submit(self._fetch_kline_for_symbol, s): s for s in batch_symbols}
                     for future in as_completed(futures):
                         symbol = futures[future]
                         try:
@@ -807,11 +805,14 @@ class StockSyncEngine:
                             else:
                                 batch_failed.append(symbol)
                                 total_failed += 1
-                        except Exception:
+                        except (TimeoutError, ConnectionError, ValueError, TypeError):
                             batch_failed.append(symbol)
                             total_failed += 1
                         pbar.update(1)
                         pbar.set_postfix_str(f"成{total_success} 败{total_failed}")
+            finally:
+                if self.executor is None:
+                    exec_hist.shutdown(wait=True)
 
                 # 7.3 保存本批成功的数据到本地缓存
                 if batch_success_dfs:
@@ -858,11 +859,9 @@ class StockSyncEngine:
             from DataCollection.ChipDistributionFetcher import ChipDistributionFetcher
 
             chip_fetcher = ChipDistributionFetcher(self.config)
-            chip_df = chip_fetcher.fetch_chip_data(akshare_symbols)
+            chip_df = chip_fetcher.fetch_chip_data()
             if not chip_df.empty:
-                chip_cache_path = os.path.join(self.base_data_dir, f"chip_distribution_{self.today}.csv")
-                chip_df.to_csv(chip_cache_path, index=False, encoding="utf-8-sig")
-                print(f"[ChipDist] 筹码分布数据已保存: {os.path.basename(chip_cache_path)}")
+                print(f"[ChipDist] 筹码分布数据可用 {len(chip_df)} 条")
             else:
                 print("[ChipDist] 未获取到筹码分布数据。")
         else:

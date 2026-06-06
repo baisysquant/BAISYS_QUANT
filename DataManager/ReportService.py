@@ -8,8 +8,10 @@ import os
 import datetime
 
 import pandas as pd
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from DataManager.ColumnNames import ColumnNames
+from UtilsManager.Exceptions import DatabaseError
 
 
 class ReportService:
@@ -323,6 +325,6 @@ class ReportService:
 
             return True
 
-        except Exception as e:
-            self.logger.error(f"!!! [同步中断] 任务运行异常: {e}")
+        except (DBAPIError, OperationalError, DatabaseError) as e:
+            self.logger.error(f"!!! [同步中断] 数据库异常: {e}")
             return False

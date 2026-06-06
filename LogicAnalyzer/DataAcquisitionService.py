@@ -6,7 +6,7 @@
 
 import os
 import time
-from concurrent.futures import as_completed
+from concurrent.futures import as_completed, ThreadPoolExecutor
 
 import akshare as ak
 import pandas as pd
@@ -38,22 +38,14 @@ class DataAcquisitionService:
         data_validator: 数据验证器
     """
 
-    def __init__(self, config, calendar_mgr, logger, cache_manager):
-        """
-        初始化数据获取服务
-
-        Args:
-            config: 配置管理器
-            calendar_mgr: 交易日历管理器
-            logger: 日志管理器
-            cache_manager: 统一缓存管理器
-        """
+    def __init__(self, config, calendar_mgr, logger, cache_manager, executor=None):
         self.config = config
         self.calendar_mgr = calendar_mgr
         self.logger = logger
         self.cache_manager = cache_manager
         self.data_fetcher = DataFetcher(config, calendar_mgr)
         self.data_validator = DataValidator()
+        self.executor = executor
 
     def get_all_raw_data(self, today_str: str) -> dict[str, pd.DataFrame]:
         """
@@ -139,7 +131,7 @@ class DataAcquisitionService:
                 else:
                     logger.warning(f"  - [WARN] {period}日资金流数据为空")
 
-            except Exception as e:
+            except (ValueError, KeyError, TypeError, ConnectionError, RuntimeError) as e:
                 handle_exception_with_recovery(
                     DataFetchError(f"{period}日资金流", str(e)),
                     self.logger,
@@ -178,26 +170,25 @@ class DataAcquisitionService:
                     logger.warning(f"  - [WARN] {desc} 数据为空")
                     return key, pd.DataFrame()
 
-            except Exception as e:
+            except (ValueError, KeyError, TypeError, ConnectionError, RuntimeError) as e:
                 logger.error(f"  - [FAIL] 获取{desc}失败: {e}")
                 return key, pd.DataFrame()
 
         # 并行获取所有数据源
-        from concurrent.futures import ThreadPoolExecutor
-
-        executor2 = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
+        exec_fund = self.executor or ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
         try:
-            futures = {executor2.submit(fetch_data_source_worker, item): item for item in data_sources.items()}
+            futures = {exec_fund.submit(fetch_data_source_worker, item): item for item in data_sources.items()}
 
             for future in as_completed(futures):
                 try:
                     key, df = future.result()
                     if not df.empty:
                         data[key] = df
-                except Exception as e:
+                except (TimeoutError, ValueError, TypeError, KeyError) as e:
                     logger.error(f"获取数据源时发生异常: {e}")
         finally:
-            executor2.shutdown(wait=True)
+            if self.executor is None:
+                exec_fund.shutdown(wait=True)
 
         # 均线突破数据 (Akshare接口参数不同，需分开获取，并行优化版)
         logger.info("\n>>> 正在并行获取均线突破数据...")
@@ -228,26 +219,25 @@ class DataAcquisitionService:
                     logger.warning(f"  - [WARN] {desc} 数据为空")
                     return key, pd.DataFrame()
 
-            except Exception as e:
+            except (ValueError, KeyError, TypeError, ConnectionError, RuntimeError) as e:
                 logger.error(f"  - [FAIL] 获取{desc}失败: {e}")
                 return key, pd.DataFrame()
 
         # 并行获取所有均线突破数据
-        from concurrent.futures import ThreadPoolExecutor
-
-        executor3 = ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
+        exec_xstp = self.executor or ThreadPoolExecutor(max_workers=self.config.MAX_WORKERS)
         try:
-            futures = {executor3.submit(fetch_xstp_worker, config): config for config in xstp_configs}
+            futures = {exec_xstp.submit(fetch_xstp_worker, config): config for config in xstp_configs}
 
             for future in as_completed(futures):
                 try:
                     key, df = future.result()
                     if not df.empty:
                         data[key] = df
-                except Exception as e:
+                except (TimeoutError, ValueError, TypeError, KeyError) as e:
                     logger.error(f"获取均线突破数据时发生异常: {e}")
         finally:
-            executor3.shutdown(wait=True)
+            if self.executor is None:
+                exec_xstp.shutdown(wait=True)
 
         # 行业板块数据
         industry_board_df = self._fetch_industry_data(today_str)
@@ -301,7 +291,7 @@ class DataAcquisitionService:
                 logger.warning("  - [WARN] 主力成本数据为空")
                 data["main_cost_data"] = pd.DataFrame()
 
-        except Exception as e:
+        except (ValueError, TypeError, OSError, ImportError) as e:
             logger.error(f"  - [FAIL] 获取主力成本数据失败: {e}")
             data["main_cost_data"] = pd.DataFrame()
 
@@ -349,7 +339,7 @@ class DataAcquisitionService:
                     logger.warning("  - [WARN] 缓存数据为空，将重新获取")
                     industry_board_df = pd.DataFrame()
 
-            except Exception as e:
+            except (OSError, pd.errors.EmptyDataError, ValueError) as e:
                 logger.warning(f"  - [WARN] 读取本地缓存失败: {e}，将尝试重新获取...")
                 industry_board_df = pd.DataFrame()
         else:
@@ -376,7 +366,7 @@ class DataAcquisitionService:
                                     encoding="utf-8-sig",
                                 )
                                 logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
-                            except Exception as e:
+                            except (OSError, PermissionError) as e:
                                 logger.error(f"  - [FAIL] 保存文件失败: {e}")
                         else:
                             logger.warning(f"  - [WARN] 行业板块数据契约校验失败: {pandera_errors}")
@@ -389,7 +379,7 @@ class DataAcquisitionService:
                                     encoding="utf-8-sig",
                                 )
                                 logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
-                            except Exception as e:
+                            except (OSError, PermissionError) as e:
                                 logger.error(f"  - [FAIL] 保存文件失败: {e}")
                     else:
                         logger.warning(f"  - [WARN] 接口数据缺少列: {missing}")
@@ -397,7 +387,7 @@ class DataAcquisitionService:
                 else:
                     logger.warning("  - [WARN] 行业板块接口返回空数据")
 
-            except Exception as e:
+            except (ConnectionError, ValueError, KeyError, AttributeError, RuntimeError) as e:
                 logger.error(f"  - [FAIL] 调用行业板块接口失败: {e}")
 
         return industry_board_df

@@ -6,6 +6,8 @@
 
 import pandas as pd
 
+from DataManager.ColumnNames import ColumnNames
+
 
 class PriceExtractor:
     """
@@ -29,14 +31,9 @@ class PriceExtractor:
         1  000001  20.3
     """
 
-    # 支持的日期列名候选
-    DATE_COLUMN_CANDIDATES = ["trade_date", "date", "日期", "datetime", "Date", "TRADE_DATE"]
-
-    # 支持的代码列名候选
-    CODE_COLUMN_CANDIDATES = ["symbol", "ts_code", "code", "股票代码"]
-
-    # 支持的价格列名候选
-    PRICE_COLUMN_CANDIDATES = ["close", "收盘价", "price", "latest_price", "最新价"]
+    DATE_COLUMN_CANDIDATES = ColumnNames.DATE_COLUMN_CANDIDATES
+    CODE_COLUMN_CANDIDATES = ColumnNames.CODE_COLUMN_CANDIDATES
+    PRICE_COLUMN_CANDIDATES = ColumnNames.PRICE_COLUMN_CANDIDATES
 
     @staticmethod
     def extract_latest_prices(

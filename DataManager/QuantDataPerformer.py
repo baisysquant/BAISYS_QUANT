@@ -21,7 +21,7 @@ class DataCleaner:
                 multiplier = 0.01
                 s = s.replace("%", "")
             return float(s) * multiplier
-        except Exception:
+        except (ValueError, TypeError):
             return 0.0
 
 

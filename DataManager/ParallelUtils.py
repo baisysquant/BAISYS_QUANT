@@ -44,7 +44,7 @@ def _normalize_fund_data(df):
                         return float(val_str.replace("万", ""))
                     else:
                         return float(val_str)
-                except Exception:
+                except (ValueError, TypeError):
                     return 0.0
 
             # 先转换为Series，再赋值，避免pandas string类型的限制
@@ -90,7 +90,7 @@ def run_with_thread_pool(
                     # 如果结果是 DataFrame 且为空，视具体情况决定是否添加
                     # 这里只要不是 None 就添加，由调用方后续处理 (如 concat)
                     results.append(res)
-            except Exception as e:
+            except (TimeoutError, TypeError, ValueError, KeyError, AttributeError) as e:
                 print(f"[ERROR] 处理 {item} 时发生异常: {e}")
 
     print(f">>> {desc} 执行完毕，成功获取 {len(results)} 条结果。")

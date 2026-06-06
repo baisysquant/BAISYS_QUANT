@@ -8,6 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas_ta as ta  # 勿删
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
+from LogicAnalyzer.SignalConstants import (
+    KLineLevels, KLineDirection, CCILevels, KLinePatternCN,
+    MarketSentiment, RSISignals, BOLLSignals
+)
 from ConfigParser import Config
 
 
@@ -28,18 +32,12 @@ class TASignalProcessor:
         config: 配置管理器实例
     """
 
-    def __init__(self, analyzer_instance: Any, config: Optional[Config] = None) -> None:
-        """
-        初始化技术指标信号处理器
-        
-        Args:
-            analyzer_instance: 股票分析器实例
-            config: 配置管理器实例，用于读取MACD第二周期等配置
-        """
+    def __init__(self, analyzer_instance: Any, config: Optional[Config] = None, executor=None) -> None:
         self.analyzer      = analyzer_instance
         self.kdj_analyzer  = AdvancedKDJAnalyzer()
         self.macd_analyzer = MACDAnalyzer()
         self.config        = config
+        self.executor      = executor
 
     def _classify_cci_level(self, cci_value: float) -> str:
         """
@@ -72,6 +70,7 @@ class TASignalProcessor:
         valid_hist_df: pd.DataFrame,
         second_params: tuple,
         second_period_name: str,
+        macro_adjust: float = 1.0,
     ) -> dict[str, Any] | None:
         code_str = str(code).lower()
         if code_str.startswith(('sh', 'sz', 'bj')):
@@ -101,7 +100,7 @@ class TASignalProcessor:
 
         try:
             df = self.macd_analyzer._custom_macd(df, second_params=second_params)
-        except Exception:
+        except (KeyError, ValueError, TypeError):
             return None
 
         result: dict[str, Any] = {'code': code, 'pure_code': pure_code}
@@ -113,7 +112,8 @@ class TASignalProcessor:
                 result['kline_pattern'] = kp['signal']
                 result['kline_pattern_score'] = kp['score']
                 df.attrs['kline_pattern_score'] = kp['score']
-        except Exception:
+                df.attrs['_kline_pattern_details'] = {'details': kp['details']}
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
         try:
@@ -124,7 +124,7 @@ class TASignalProcessor:
                 weights=weights, thresholds=thresholds,
             )
             result['bull'] = bull_result
-        except Exception:
+        except (KeyError, ValueError, TypeError):
             pass
 
         # 附加筹码分布数据
@@ -133,17 +133,25 @@ class TASignalProcessor:
             code_str = code_str[:2] + code_str[2:].zfill(6)
         else:
             code_str = code_str.zfill(6)
-        if code_str in getattr(self, 'chip_lookup', {}):
-            df.attrs['chip_data'] = self.chip_lookup[code_str]
+        # chip_lookup key 为纯6位代码（已剥离前缀）
+        pure_code = code_str[2:] if code_str[:2] in ('sh', 'sz', 'bj') else code_str
+        if pure_code in getattr(self, 'chip_lookup', {}):
+            cd = self.chip_lookup[pure_code]
+            df.attrs['chip_data'] = cd
+            result['cost_95pct'] = cd.get('cost_95pct', None)
 
         # 级联流水线分析（验证期：与旧逻辑并行输出）
         try:
+            adj_thresholds = None
+            if thresholds and macro_adjust < 1.0:
+                adj_thresholds = {k: int(v * macro_adjust) for k, v in thresholds.items()}
             pipeline_result = self.macd_analyzer.pipeline_analysis(
                 df, second_params=second_params,
-                weights=weights, thresholds=thresholds,
+                weights=weights, thresholds=adj_thresholds or thresholds,
+                rule_thresholds=getattr(self.config, 'RULE_THRESHOLDS', None),
             )
             result['pipeline'] = pipeline_result
-        except Exception:
+        except (KeyError, ValueError, TypeError):
             pass
 
         try:
@@ -154,7 +162,7 @@ class TASignalProcessor:
             )
             result['dif_12269'] = latest_row.get('DIF_12269', 0)
             result['dif_second'] = latest_row.get(f'DIF_{second_period_name}', 0)
-        except Exception:
+        except (KeyError, ValueError, TypeError):
             pass
 
         detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
@@ -173,7 +181,7 @@ class TASignalProcessor:
             kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
             if kdj_signal:
                 result['kdj_signal'] = kdj_signal
-        except Exception:
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
         try:
@@ -182,7 +190,7 @@ class TASignalProcessor:
             if cci_cols:
                 current_cci = df[cci_cols[0]].iloc[-1]
                 result['cci_signal'] = self._classify_cci_level(current_cci) or f'常态波动 ({current_cci:.2f})'
-        except Exception:
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
         try:
@@ -199,7 +207,7 @@ class TASignalProcessor:
                     is_price_low = curr_low <= (min_low_window * 1.02)
                     is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
                     result['rsi_signal'] = f'RSI底背离! ({curr_rsi:.1f})' if is_divergence else f'RSI={curr_rsi:.1f}'
-        except Exception:
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
         try:
@@ -214,7 +222,7 @@ class TASignalProcessor:
                     df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
                 )
                 result['boll_signal'] = '低波/缩口' if is_narrow else '常态/张口'
-        except Exception:
+        except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
         return result
@@ -284,12 +292,12 @@ class TASignalProcessor:
             'CDL_XSIDEGAP3METHODS': '侧跳空三法', 'CDL_MATHOLD': '待变(类旗形)',
         }
 
-        LEVEL_ORDER = {'强反转': 0, '中反转': 1, '弱信号': 2, '持续': 3}
+        LEVEL_ORDER = KLineLevels.LEVEL_ORDER
         LEVEL_MAP = {}
-        for p in STRONG: LEVEL_MAP[p] = '强反转'
-        for p in MEDIUM: LEVEL_MAP[p] = '中反转'
-        for p in WEAK: LEVEL_MAP[p] = '弱信号'
-        for p in CONTINUOUS: LEVEL_MAP[p] = '持续'
+        for p in STRONG: LEVEL_MAP[p] = KLineLevels.STRONG_REVERSAL
+        for p in MEDIUM: LEVEL_MAP[p] = KLineLevels.MEDIUM_REVERSAL
+        for p in WEAK: LEVEL_MAP[p] = KLineLevels.WEAK_SIGNAL
+        for p in CONTINUOUS: LEVEL_MAP[p] = KLineLevels.CONTINUOUS
 
         # 扫描窗口内所有非零模式
         detected = []
@@ -312,7 +320,7 @@ class TASignalProcessor:
                 'base': base,
                 'label': LABELS.get(base, base),
                 'level': level,
-                'direction': '看涨' if is_bullish else '看跌',
+                'direction': KLineDirection.BULLISH if is_bullish else KLineDirection.BEARISH,
                 'bars_ago': bars_ago,
                 'confirmed': bars_ago > 0,
                 'score_val': last_val,
@@ -416,6 +424,7 @@ class TASignalProcessor:
                 '零轴条件', '战略金叉', '战术金叉', '动能', 'DIF斜率', '背离信号', '量价配合',
                 'K线形态',
                 '综合分析结论', '综合分析评分', '综合级别', '风险等级',
+                'cost_95pct',
             ]),
         }
 
@@ -429,6 +438,8 @@ class TASignalProcessor:
                 chip_df = pd.read_csv(chip_path)
                 for _, row in chip_df.iterrows():
                     pure = row['symbol']
+                    if pure.startswith(('sh', 'sz', 'bj')):
+                        pure = pure[2:]
                     self.chip_lookup[pure] = row.to_dict()
                 print(f"[ChipDist] 已加载 {len(self.chip_lookup)} 条筹码数据")
             except Exception as e:
@@ -478,15 +489,34 @@ class TASignalProcessor:
         # 过滤出有效的股票数据
         valid_hist_df = hist_df_all[hist_df_all['股票代码'].isin(code_set) & (hist_df_all['股票代码'] != 'N/A')].copy()
 
+        # ── 宏观过滤（全局一次性判断） ──────────────────────────────────────
+        macro_result = None
+        macro_adjust = 1.0
+        if getattr(self.config, 'ENABLE_MACRO_FILTER', True):
+            try:
+                from LogicAnalyzer.MacroFilter import MacroFilter
+                macro_result = MacroFilter.check(spot_df=spot_df)
+                if macro_result.decision == 'SKIP_ALL':
+                    print(f"[MacroFilter] {macro_result.detail} → SKIP_ALL，跳过当日分析")
+                    return ta_signals
+                elif macro_result.decision == 'CAUTION':
+                    macro_adjust = macro_result.score_adjust
+                    print(f"[MacroFilter] {macro_result.detail} → CAUTION，阈值上浮{int((1-macro_adjust)*100)}%")
+                else:
+                    print(f"[MacroFilter] {macro_result.detail} → NORMAL")
+            except Exception as e:
+                logger.warning("宏观过滤异常 %s，忽略", e)
+
         # ── 并行处理所有股票 ──────────────────────────────────────────────
         second_params = getattr(self.config, 'MACD_SECOND_PARAMS', (6, 13, 5))
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
 
         results: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        exec_signal = self.executor or ThreadPoolExecutor(max_workers=max_workers)
+        try:
             futures = {
-                executor.submit(
-                    self._process_single_stock, code, valid_hist_df, second_params, second_period_name
+                exec_signal.submit(
+                    self._process_single_stock, code, valid_hist_df, second_params, second_period_name, macro_adjust
                 ): code
                 for code in set(all_codes)
             }
@@ -495,8 +525,11 @@ class TASignalProcessor:
                     r = future.result()
                     if r:
                         results.append(r)
-                except Exception:
+                except (KeyError, ValueError, TypeError, AttributeError):
                     continue
+        finally:
+            if self.executor is None:
+                exec_signal.shutdown(wait=True)
 
         # ── 从结果列表构建信号 DataFrame（避免逐行 O(n²) concat）─────────
         macd_12269_rows: list[dict] = []
@@ -535,6 +568,7 @@ class TASignalProcessor:
                     '综合分析评分': pipeline.get('score', 0),
                     '综合级别': pipeline.get('level', ''),
                     '风险等级': pipeline.get('risk_level', ''),
+                    'cost_95pct': r.get('cost_95pct', None),
                 })
 
             if 'mom_12269' in r:

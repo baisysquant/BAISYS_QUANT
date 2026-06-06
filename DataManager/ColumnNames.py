@@ -109,5 +109,10 @@ class ColumnNames:
     COMPREHENSIVE_LEVEL = "综合级别"
     RISK_LEVEL = "风险等级"
 
+    # ==================== 通用列名候选列表 ====================
+    DATE_COLUMN_CANDIDATES = ["trade_date", "date", "日期", "datetime", "Date", "TRADE_DATE"]
+    CODE_COLUMN_CANDIDATES = ["股票代码", "symbol", "code", "ts_code", "代码", "SECURITIES_CODE"]
+    PRICE_COLUMN_CANDIDATES = ["最新价", "close", "收盘价", "当前价格", "price", "current_price"]
+
     # 研报相关
     RESEARCH_REPORT_COUNT = "研报买入次数"

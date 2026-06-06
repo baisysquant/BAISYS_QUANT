@@ -223,7 +223,7 @@ class ResearchReportFilterConfig(BaseModel):
 
 
 class FullBullScoringConfig(BaseModel):
-    """MACD 完全多头评分维度权重"""
+    """MACD 完全多头评分维度权重 + 规则阈值"""
 
     WEIGHT_ZERO_AXIS: int = Field(default=20, ge=0, le=100)
     WEIGHT_STRATEGY_GOLDEN: int = Field(default=15, ge=0, le=100)
@@ -236,6 +236,13 @@ class FullBullScoringConfig(BaseModel):
     CONCLUSION_FULL_BULL: int = Field(default=80, ge=0, le=100)
     CONCLUSION_BULLISH: int = Field(default=60, ge=0, le=100)
     CONCLUSION_OSCILLATE: int = Field(default=40, ge=0, le=100)
+    # 规则阈值
+    RULE_DIVERGENCE_THRESHOLD: float = Field(default=0.3, ge=0, le=1.0)
+    RULE_WINNER_RATE_HIGH: int = Field(default=80, ge=0, le=100)
+    RULE_WINNER_RATE_LOW: int = Field(default=15, ge=0, le=100)
+    RULE_COST_RESISTANCE_RATIO: float = Field(default=0.95, ge=0, le=1.0)
+    RULE_CHIP_CONCENTRATED_RATIO: float = Field(default=0.15, ge=0, le=1.0)
+    RULE_PRICE_NEW_HIGH_DAYS: int = Field(default=20, ge=5, le=120)
 
 
 class KlineDataConfig(BaseModel):
@@ -262,7 +269,26 @@ class AShareHubConfig(BaseModel):
 
     API_KEY: str = Field(default="")
     ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
-    CHIP_HISTORY_DAYS: int = Field(default=90, ge=1, le=200)
+    CHIP_LIMIT: int = Field(default=1, ge=1, le=200)
+    @field_validator("CHIP_LIMIT")
+    @classmethod
+    def validate_limit(cls, v):
+        if v > 50:
+            import warnings
+            warnings.warn("CHIP_LIMIT>50 会拉取多日历史快照，通常用 limit=1（最新快照）即可。", UserWarning)
+        return v
+
+
+class MacroFilterConfig(BaseModel):
+    """宏观过滤器配置"""
+
+    ENABLE_MACRO_FILTER: bool = Field(default=True)
+    INDEX_SYMBOL: str = Field(default="sh000001")
+    TREND_LOOKBACK_DAYS: int = Field(default=250, ge=60, le=500)
+    VOLUME_LOOKBACK_DAYS: int = Field(default=20, ge=5, le=120)
+    ADVANCE_RATIO_ICE: float = Field(default=0.25, ge=0, le=1.0)
+    ADVANCE_RATIO_WEAK: float = Field(default=0.35, ge=0, le=1.0)
+    ADVANCE_RATIO_HOT: float = Field(default=0.70, ge=0, le=1.0)
 
 
 class AppConfig(BaseSettings):
@@ -285,6 +311,7 @@ class AppConfig(BaseSettings):
     user_focus_stocks: UserFocusStocksConfig
     kline_data: KlineDataConfig
     asharehub: AShareHubConfig
+    macro_filter: MacroFilterConfig
 
 
 class Config:
@@ -433,6 +460,12 @@ class Config:
                 CONCLUSION_FULL_BULL=fbs.getint("CONCLUSION_FULL_BULL", fallback=80),
                 CONCLUSION_BULLISH=fbs.getint("CONCLUSION_BULLISH", fallback=60),
                 CONCLUSION_OSCILLATE=fbs.getint("CONCLUSION_OSCILLATE", fallback=40),
+                RULE_DIVERGENCE_THRESHOLD=fbs.getfloat("RULE_DIVERGENCE_THRESHOLD", fallback=0.3),
+                RULE_WINNER_RATE_HIGH=fbs.getint("RULE_WINNER_RATE_HIGH", fallback=80),
+                RULE_WINNER_RATE_LOW=fbs.getint("RULE_WINNER_RATE_LOW", fallback=15),
+                RULE_COST_RESISTANCE_RATIO=fbs.getfloat("RULE_COST_RESISTANCE_RATIO", fallback=0.95),
+                RULE_CHIP_CONCENTRATED_RATIO=fbs.getfloat("RULE_CHIP_CONCENTRATED_RATIO", fallback=0.15),
+                RULE_PRICE_NEW_HIGH_DAYS=fbs.getint("RULE_PRICE_NEW_HIGH_DAYS", fallback=20),
             )
         except KeyError:
             fbs_config = FullBullScoringConfig()
@@ -457,10 +490,25 @@ class Config:
             ah_config = AShareHubConfig(
                 API_KEY=ConfigCipher.maybe_decrypt(ah.get("api_key", "")),
                 ENABLE_CHIP_DISTRIBUTION=ah.getboolean("enable_chip_distribution", fallback=False),
-                CHIP_HISTORY_DAYS=ah.getint("chip_history_days", fallback=90),
+                CHIP_LIMIT=ah.getint("chip_limit", fallback=1),
             )
         except KeyError:
             ah_config = AShareHubConfig()
+
+        # 读取宏观过滤器配置
+        try:
+            mf = config["MACRO_FILTER"]
+            mf_config = MacroFilterConfig(
+                ENABLE_MACRO_FILTER=mf.getboolean("enable_macro_filter", fallback=True),
+                INDEX_SYMBOL=mf.get("index_symbol", fallback="sh000001"),
+                TREND_LOOKBACK_DAYS=mf.getint("trend_lookback_days", fallback=250),
+                VOLUME_LOOKBACK_DAYS=mf.getint("volume_lookback_days", fallback=20),
+                ADVANCE_RATIO_ICE=mf.getfloat("advance_ratio_ice", fallback=0.25),
+                ADVANCE_RATIO_WEAK=mf.getfloat("advance_ratio_weak", fallback=0.35),
+                ADVANCE_RATIO_HOT=mf.getfloat("advance_ratio_hot", fallback=0.70),
+            )
+        except KeyError:
+            mf_config = MacroFilterConfig()
 
         # 创建主配置对象
         self.app_config = AppConfig(
@@ -477,6 +525,7 @@ class Config:
             user_focus_stocks=ufc,
             kline_data=kd_config,
             asharehub=ah_config,
+            macro_filter=mf_config,
         )
 
         # 设置向后兼容的属性
@@ -523,7 +572,10 @@ class Config:
 
         self.ASHAREHUB_API_KEY = ah_config.API_KEY
         self.ENABLE_CHIP_DISTRIBUTION = ah_config.ENABLE_CHIP_DISTRIBUTION
-        self.CHIP_HISTORY_DAYS = ah_config.CHIP_HISTORY_DAYS
+        self.CHIP_LIMIT = ah_config.CHIP_LIMIT
+
+        self.ENABLE_MACRO_FILTER = mf_config.ENABLE_MACRO_FILTER
+        self.MACRO_FILTER_INDEX_SYMBOL = mf_config.INDEX_SYMBOL
 
         self.FULL_BULL_WEIGHTS = {
             "零轴条件": fbs_config.WEIGHT_ZERO_AXIS,
@@ -539,6 +591,15 @@ class Config:
             "fully_bull": fbs_config.CONCLUSION_FULL_BULL,
             "bullish": fbs_config.CONCLUSION_BULLISH,
             "oscillate": fbs_config.CONCLUSION_OSCILLATE,
+        }
+
+        self.RULE_THRESHOLDS = {
+            "divergence": fbs_config.RULE_DIVERGENCE_THRESHOLD,
+            "winner_rate_high": fbs_config.RULE_WINNER_RATE_HIGH,
+            "winner_rate_low": fbs_config.RULE_WINNER_RATE_LOW,
+            "cost_resistance_ratio": fbs_config.RULE_COST_RESISTANCE_RATIO,
+            "chip_concentrated_ratio": fbs_config.RULE_CHIP_CONCENTRATED_RATIO,
+            "price_new_high_days": fbs_config.RULE_PRICE_NEW_HIGH_DAYS,
         }
 
         self.KLINE_HISTORY_DAYS = kd_config.KLINE_HISTORY_DAYS

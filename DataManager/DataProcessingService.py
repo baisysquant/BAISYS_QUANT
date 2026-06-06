@@ -8,6 +8,7 @@ import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
 from DataManager.ShareCodeFormatMgr import format_stock_code
+from LogicAnalyzer.SignalConstants import TrendLevels, BullArrangement, InvestmentRating
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
 
@@ -49,7 +50,7 @@ def get_stock_industry_mapping(
             logger.info(f"从数据库成功获取 {len(result)} 条行业信息")
         return result
 
-    except Exception as e:
+    except (ImportError, KeyError, ValueError, TypeError) as e:
         if logger:
             logger.warning(f"从数据库获取行业信息失败: {e}，返回空DataFrame")
         return pd.DataFrame(columns=["股票代码", "股票简称", "行业"])
@@ -268,7 +269,7 @@ class DataProcessingService:
 
         if hist_df_all.empty:
             self.logger.warning("[WARN] 历史K线数据为空，无法计算多头排列评分，将填充默认值。")
-            final_df["多头排列趋势"] = "趋势观望"
+            final_df[ColumnNames.BULL_TREND] = TrendLevels.TREND_WATCH
             return final_df
 
         # 检测日期列
@@ -276,7 +277,7 @@ class DataProcessingService:
         date_col_in_kline = next((c for c in date_col_candidates if c in hist_df_all.columns), None)
         if date_col_in_kline is None:
             self.logger.warning(f"[WARN] K线数据中未找到日期列（候选: {date_col_candidates}）")
-            final_df["多头排列趋势"] = "趋势观望"
+            final_df[ColumnNames.BULL_TREND] = TrendLevels.TREND_WATCH
             return final_df
 
         # 标准化日期列名
@@ -340,12 +341,12 @@ class DataProcessingService:
         for stock_code in final_df["股票代码"]:
             try:
                 if stock_code not in grouped_klines.groups:
-                    results[stock_code] = "趋势观望"
+                    results[stock_code] = TrendLevels.TREND_WATCH
                     continue
 
                 stock_kline = grouped_klines.get_group(stock_code)
                 if stock_kline.empty or len(stock_kline) < 30:
-                    results[stock_code] = "趋势观望"
+                    results[stock_code] = TrendLevels.TREND_WATCH
                     continue
 
                 # 按日期排序
@@ -353,19 +354,19 @@ class DataProcessingService:
 
                 # 计算评分
                 result = calculate_full_bull_score(stock_kline, thresholds=thresholds)
-                level = result.get("level", "趋势观望")
+                level = result.get("level", TrendLevels.TREND_WATCH)
                 status = result.get("status", "FAILED")
                 if status != "SUCCESS":
-                    level = "趋势观望"
+                    level = TrendLevels.TREND_WATCH
 
                 results[stock_code] = level
 
-            except Exception as e:
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
                 handle_exception_with_recovery(
                     CalculationError("多头排列评分", f"股票 {stock_code}: {e}"),
                     self.logger,
                     f"计算{stock_code}的多头排列评分",
-                    default_value="趋势观望",
+                    default_value=TrendLevels.TREND_WATCH,
                     raise_on_critical=False,
                 )
                 results[stock_code] = "趋势观望"
@@ -377,7 +378,7 @@ class DataProcessingService:
         self.logger.info(">>> 多头排列评分计算完成")
 
         # 将结果添加到 final_df
-        final_df["多头排列趋势"] = final_df["股票代码"].map(results).fillna("趋势观望")
+        final_df[ColumnNames.BULL_TREND] = final_df["股票代码"].map(results).fillna(TrendLevels.TREND_WATCH)
 
         return final_df
 
@@ -453,7 +454,7 @@ class DataProcessingService:
                 elif "资金动能评分" in momentum_df.columns:
                     final_df["资金动能评分"] = momentum_df["资金动能评分"]
                 self.logger.info(" - 资金动能新分析器运行成功。")
-            except Exception as e:
+            except (ValueError, TypeError, KeyError, AttributeError) as e:
                 self.logger.error(f"运行 FundMomentumAnalyzer 失败: {e}")
                 final_df["资金动能"] = "N/A"
         else:
@@ -534,7 +535,7 @@ class DataProcessingService:
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
             cols = ["股票代码"]
-            for pipe_col in ["综合分析结论", "综合分析评分", "综合级别", "风险等级"]:
+            for pipe_col in ["综合分析结论", "综合分析评分", "综合级别", "风险等级", "cost_95pct"]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])
@@ -649,17 +650,16 @@ class DataProcessingService:
 
         # 均线突破数据
         xstp_df = processed_data.get("processed_xstp_df", pd.DataFrame())
-        xstp_cols = ["股票代码", "完全多头排列", "当前价格", "10日均线价", "30日均线价", "60日均线价"]
+        xstp_cols = ["股票代码", ColumnNames.PERFECT_BULL_ARRANGEMENT, "当前价格", "10日均线价", "30日均线价", "60日均线价"]
         if not xstp_df.empty and "股票代码" in xstp_df.columns:
             xstp_df = self._normalize_stock_code_in_df(xstp_df)
             cols_present = [col for col in xstp_cols if col in xstp_df.columns]
             merge_df = xstp_df[cols_present].drop_duplicates(subset=["股票代码"])
             final_df = pd.merge(final_df, merge_df, on="股票代码", how="left")
 
-        if "完全多头排列" not in final_df.columns:
-            final_df["完全多头排列"] = "否"
-        else:
-            final_df["完全多头排列"] = final_df["完全多头排列"].fillna("否")
+        if ColumnNames.PERFECT_BULL_ARRANGEMENT not in final_df.columns:
+            final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] = BullArrangement.NO
+            final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] = final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT].fillna(BullArrangement.NO)
 
         # 合并研报数据（作为加分因子）
         report_df = processed_data.get("research_report_data", pd.DataFrame())

@@ -96,12 +96,28 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "conclusion_full_bull = 80",
         "conclusion_bullish = 60",
         "conclusion_oscillate = 40",
+        "rule_divergence_threshold = 0.3",
+        "rule_winner_rate_high = 80",
+        "rule_winner_rate_low = 15",
+        "rule_cost_resistance_ratio = 0.95",
+        "rule_chip_concentrated_ratio = 0.15",
+        "rule_price_new_high_days = 20",
     ],
     "ASHAREHUB": [
         "[ASHAREHUB]",
         "api_key = (请设置 AShareHub API 密钥)",
         "enable_chip_distribution = false",
-        "chip_history_days = 90",
+        "chip_limit = 1",
+    ],
+    "MACRO_FILTER": [
+        "[MACRO_FILTER]",
+        "enable_macro_filter = true",
+        "index_symbol = sh000001",
+        "trend_lookback_days = 250",
+        "volume_lookback_days = 20",
+        "advance_ratio_ice = 0.25",
+        "advance_ratio_weak = 0.35",
+        "advance_ratio_hot = 0.70",
     ],
 }
 
@@ -354,7 +370,7 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="ASHAREHUB", description="AShareHub筹码分布数据配置", optional=True, fields=[
         FieldRule("api_key", "str"),
         FieldRule("enable_chip_distribution", "bool", required=False, default="false"),
-        FieldRule("chip_history_days", "int", required=False, default="90", min_value=1, max_value=200),
+        FieldRule("chip_limit", "int", required=False, default="1", min_value=1, max_value=200),
     ]),
     SectionRule(name="FULL_BULL_SCORING", description="MACD完全多头评分配置", optional=True, fields=[
         FieldRule("weight_zero_axis", "int", required=False, default="20", min_value=0, max_value=100),
@@ -368,6 +384,21 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("conclusion_full_bull", "int", required=False, default="80", min_value=0, max_value=100),
         FieldRule("conclusion_bullish", "int", required=False, default="60", min_value=0, max_value=100),
         FieldRule("conclusion_oscillate", "int", required=False, default="40", min_value=0, max_value=100),
+        FieldRule("rule_divergence_threshold", "float", required=False, default="0.3", min_value=0, max_value=1),
+        FieldRule("rule_winner_rate_high", "int", required=False, default="80", min_value=0, max_value=100),
+        FieldRule("rule_winner_rate_low", "int", required=False, default="15", min_value=0, max_value=100),
+        FieldRule("rule_cost_resistance_ratio", "float", required=False, default="0.95", min_value=0, max_value=1),
+        FieldRule("rule_chip_concentrated_ratio", "float", required=False, default="0.15", min_value=0, max_value=1),
+        FieldRule("rule_price_new_high_days", "int", required=False, default="20", min_value=5, max_value=120),
+    ]),
+    SectionRule(name="MACRO_FILTER", description="宏观过滤器配置", optional=True, fields=[
+        FieldRule("enable_macro_filter", "bool", required=False, default="true"),
+        FieldRule("index_symbol", "str", required=False, default="sh000001"),
+        FieldRule("trend_lookback_days", "int", required=False, default="250", min_value=60, max_value=500),
+        FieldRule("volume_lookback_days", "int", required=False, default="20", min_value=5, max_value=120),
+        FieldRule("advance_ratio_ice", "float", required=False, default="0.25", min_value=0, max_value=1),
+        FieldRule("advance_ratio_weak", "float", required=False, default="0.35", min_value=0, max_value=1),
+        FieldRule("advance_ratio_hot", "float", required=False, default="0.70", min_value=0, max_value=1),
     ]),
 ]
 
@@ -602,7 +633,7 @@ def auto_repair(config_path: str = "config.ini") -> int:
     bak_path = config_path + ".bak"
     try:
         shutil.copy2(config_path, bak_path)
-    except Exception:
+    except (OSError, shutil.Error):
         print(f"[配置修复] 备份失败: {bak_path}")
         return 0
 

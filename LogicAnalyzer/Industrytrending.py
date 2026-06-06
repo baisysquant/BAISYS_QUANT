@@ -58,7 +58,7 @@ class SWIndustryDataPipeline:
             # 先读取缓存，检查其完整性
             try:
                 cached_hist = pd.read_parquet(self.cache_file)
-            except Exception:
+            except (OSError, ValueError, TypeError):
                 cached_hist = pd.read_csv(self.cache_csv_file, parse_dates=['date'])
             
             cached_val = pd.read_csv(self.valuation_file)

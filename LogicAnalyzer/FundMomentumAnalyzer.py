@@ -114,5 +114,5 @@ class FundMomentumAnalyzer:
         """安全转浮点"""
         try:
             return float(val) if pd.notna(val) else 0.0
-        except Exception:
+        except (ValueError, TypeError):
             return 0.0

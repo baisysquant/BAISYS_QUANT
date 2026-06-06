@@ -100,3 +100,18 @@ class CodeNormalizer:
         if column in df.columns:
             df[column] = df[column].apply(CodeNormalizer.normalize)
         return df
+
+    @staticmethod
+    def add_market_prefix(code: str) -> str:
+        """
+        添加市场前缀（反向操作，委托给 ShareCodeFormatMgr）。
+        6位纯数字 → sh/sz/bj + 6位数字。
+
+        Args:
+            code: 6位纯数字股票代码
+
+        Returns:
+            str: 带市场前缀的股票代码（如 sh600000, sz000001）
+        """
+        from DataManager.ShareCodeFormatMgr import format_stock_code
+        return format_stock_code(code)
