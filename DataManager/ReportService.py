@@ -71,34 +71,45 @@ class ReportService:
         ]
 
     @staticmethod
-    def get_signal_columns(second_period_name: str = None) -> list:
+    def get_signal_columns() -> list:
         cols = [
             ColumnNames.STRONG_STOCK,
             ColumnNames.PRICE_VOLUME_RISE,
+            "量价配合",
             ColumnNames.CONSECUTIVE_RISE_DAYS,
             ColumnNames.VOLUME_INCREASE_DAYS,
-            ColumnNames.MACD_12269,
-            ColumnNames.MACD_12269_MOMENTUM,
-            ColumnNames.MACD_12269_DIF,
-            # 级联流水线新列
-            ColumnNames.COMPREHENSIVE_ANALYSIS,
-            ColumnNames.COMPREHENSIVE_SCORE,
-            ColumnNames.COMPREHENSIVE_LEVEL,
-            ColumnNames.RISK_LEVEL,
-        ]
-        if second_period_name:
-            cols.extend([
-                ColumnNames.MACD_SECOND_TEMPLATE.format(second_period_name),
-                ColumnNames.MACD_SECOND_MOMENTUM_TEMPLATE.format(second_period_name),
-                ColumnNames.MACD_SECOND_DIF_TEMPLATE.format(second_period_name),
-            ])
-        cols.extend([
+            # MACD趋势评分列（前4维度）
+            ColumnNames.MACD_TREND,
+            ColumnNames.MACD_CROSS,
+            "柱状动能",
+            "DIF斜率",
+            # 独立技术指标（水平多因子交叉验证）
             ColumnNames.KDJ_SIGNAL,
             ColumnNames.CCI_SIGNAL,
             ColumnNames.RSI_SIGNAL,
             ColumnNames.BOLL_SIGNAL,
             ColumnNames.KLINE_PATTERN_SIGNAL,
-        ])
+            # 均线参考
+            "10日均线价",
+            "30日均线价",
+            "60日均线价",
+            ColumnNames.FUND_MOMENTUM_SCORE,
+            # 行业中性化
+            ColumnNames.INDUSTRY_PERCENTILE,
+            ColumnNames.INDUSTRY_SIGNAL_SCORE,
+            ColumnNames.INDUSTRY_DEVIATION,
+            # 背离信号 + 位置
+            "背离信号",
+            ColumnNames.DIVERGENCE_DAYS,
+            ColumnNames.DIVERGENCE_PRICE,
+            # 风险 + 退出策略
+            ColumnNames.RISK_LEVEL,
+            ColumnNames.STOP_LOSS,
+            ColumnNames.T1_TARGET,
+            ColumnNames.T2_TARGET,
+            ColumnNames.TRAILING_STOP,
+            ColumnNames.EXIT_RRR,
+        ]
         return cols
 
     @staticmethod
@@ -106,11 +117,13 @@ class ReportService:
         cols = [
             ColumnNames.BULL_TREND,
             ColumnNames.FUND_MOMENTUM,
+            ColumnNames.COMPREHENSIVE_ANALYSIS,
+            ColumnNames.COMPREHENSIVE_SCORE,
+            ColumnNames.COMPREHENSIVE_LEVEL,
             ColumnNames.RESEARCH_REPORT_COUNT,
         ]
         if fund_flow_periods:
             period_map = {
-                3: ColumnNames.FUND_FLOW_3D,
                 5: ColumnNames.FUND_FLOW_5D,
                 10: ColumnNames.FUND_FLOW_10D,
                 20: ColumnNames.FUND_FLOW_20D,
@@ -121,22 +134,20 @@ class ReportService:
         return cols
 
     @staticmethod
-    def get_all_technical_signal_columns(second_period_name: str = None) -> list:
+    def get_all_technical_signal_columns() -> list:
         cols = [
-            ColumnNames.MACD_12269,
+            ColumnNames.MACD_TREND,
             ColumnNames.KDJ_SIGNAL,
             ColumnNames.CCI_SIGNAL,
             ColumnNames.RSI_SIGNAL,
             ColumnNames.BOLL_SIGNAL,
         ]
-        if second_period_name:
-            cols.append(ColumnNames.MACD_SECOND_TEMPLATE.format(second_period_name))
         return cols
 
     @staticmethod
-    def get_final_column_order(second_period_name: str = None, fund_flow_periods: list = None) -> list:
+    def get_final_column_order(fund_flow_periods: list = None) -> list:
         base_cols = ReportService.get_base_columns()
-        signal_cols = ReportService.get_signal_columns(second_period_name)
+        signal_cols = ReportService.get_signal_columns()
         report_cols = ReportService.get_report_columns(fund_flow_periods)
         return base_cols + signal_cols + report_cols + [ColumnNames.STOCK_LINK]
 
@@ -284,7 +295,6 @@ class ReportService:
         consolidated_report: pd.DataFrame,
         industry_df: pd.DataFrame,
         raw_data: dict[str, pd.DataFrame],
-        second_period_name: str,
     ) -> bool:
         """
         同步数据到数据库
@@ -294,7 +304,6 @@ class ReportService:
             consolidated_report: 汇总报告DataFrame
             industry_df: 行业分析结果DataFrame
             raw_data: 原始数据字典
-            second_period_name: MACD第二周期名称
 
         Returns:
             bool: 是否成功
@@ -317,7 +326,6 @@ class ReportService:
                 consolidated_report=consolidated_report,
                 industry_df=industry_df,
                 raw_data=raw_data,
-                second_period_name=second_period_name,
             )
 
             db_manager.close()

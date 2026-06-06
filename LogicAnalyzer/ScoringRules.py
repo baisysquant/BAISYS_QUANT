@@ -22,6 +22,10 @@ state 结构:
     'volume_trend': tuple,        量价趋势 (desc, score)
     'momentum': dict,             动能数据
     'slope': dict,                DIF 斜率数据
+    'moneyflow_data': dict|None,  资金流向原始数据
+    'forecast_data': dict|None,   业绩预告原始数据
+    'config': dict,               规则阈值配置
+    'vol_regime': str,            波动率情景 (HIGH_VOL_TREND/LOW_VOL_REVERSAL/NORMAL)
   }
 """
 
@@ -49,7 +53,7 @@ def _has_top_divergence(state: dict) -> bool:
     div = state.get('divergence') or {}
     cs = div.get('combined_signal', '')
     threshold = state.get('config', {}).get('divergence', 0.3)
-    strength = div.get('strength_12269', 0) or div.get('strength_6135', 0)
+    strength = div.get('strength', 0)
     return '顶背离' in cs and strength > threshold
 
 
@@ -112,7 +116,7 @@ def _macd_golden_cross(state: dict) -> bool:
     df = state.get('df')
     if df is None or len(df) < 2:
         return False
-    detail = df['MACD_12269_SIGNAL_DETAIL'].iloc[-1]
+    detail = df['MACD_SIGNAL_DETAIL'].iloc[-1]
     return '金叉' in str(detail)
 
 
@@ -121,7 +125,7 @@ def _macd_above_zero(state: dict) -> bool:
     df = state.get('df')
     if df is None:
         return False
-    return df['DIF_12269'].iloc[-1] > 0
+    return df['DIF'].iloc[-1] > 0
 
 
 def _volume_positive(state: dict) -> bool:
@@ -173,7 +177,7 @@ def _momentum_decreasing(state: dict) -> bool:
     df = state.get('df')
     if df is None or len(df) < 5:
         return False
-    hist = df['DIF_12269'] - df['DEA_12269']
+    hist = df['DIF'] - df['DEA']
     recent = hist.iloc[-5:]
     diffs = recent.diff().iloc[1:]
     return len(diffs) >= 3 and all(diffs.iloc[-i] < 0 for i in range(1, 4) if i <= len(diffs))
@@ -203,7 +207,7 @@ def _has_bot_divergence(state: dict) -> bool:
     div = state.get('divergence') or {}
     cs = div.get('combined_signal', '')
     threshold = state.get('config', {}).get('divergence', 0.3)
-    strength = div.get('strength_12269', 0) or div.get('strength_6135', 0)
+    strength = div.get('strength', 0)
     return '底背离' in cs and strength > threshold
 
 
@@ -257,6 +261,194 @@ def _chip_cost_concentrated(state: dict) -> bool:
         return False
     ratio = cfg.get('chip_concentrated_ratio', 0.15)
     return (c95 - c5) / c5 < ratio
+
+
+# ── 波动率情景条件 ─────────────────────────────────────────────────────────────
+
+def _vol_regime_is(state: dict, regime: str) -> bool:
+    """波动率情景是否为指定类型"""
+    return state.get('vol_regime') == regime
+
+
+# ── 趋势过滤族条件 ─────────────────────────────────────────────────────────────
+
+def _ma_bearish_alignment(state: dict) -> bool:
+    """均线空头排列：MA5 < MA10 < MA20 < MA30 < MA60"""
+    df = state.get('df')
+    if df is None or len(df) < 60:
+        return False
+    try:
+        return (df['MA_5'].iloc[-1] < df['MA_10'].iloc[-1] < df['MA_20'].iloc[-1]
+                < df['MA_30'].iloc[-1] < df['MA_60'].iloc[-1])
+    except (KeyError, IndexError):
+        return False
+
+
+def _ma_bullish_alignment(state: dict) -> bool:
+    """均线多头排列：MA5 > MA10 > MA20 > MA30 > MA60"""
+    df = state.get('df')
+    if df is None or len(df) < 60:
+        return False
+    try:
+        return (df['MA_5'].iloc[-1] > df['MA_10'].iloc[-1] > df['MA_20'].iloc[-1]
+                > df['MA_30'].iloc[-1] > df['MA_60'].iloc[-1])
+    except (KeyError, IndexError):
+        return False
+
+
+def _score_above_oscillate(state: dict) -> bool:
+    """综合评分 >= oscilate 阈值"""
+    cfg = state.get('config', {})
+    threshold = cfg.get('oscillate', 40)
+    return state.get('score', 0) >= threshold
+
+
+def _adx_below_threshold(state: dict) -> bool:
+    """ADX 低于阈值，表示趋势弱"""
+    df = state.get('df')
+    if df is None or len(df) < 20:
+        return False
+    cfg = state.get('config', {})
+    threshold = cfg.get('adx_fake_breakout', 20)
+    adx_col = next((c for c in df.columns if c.startswith('ADX_')), None)
+    if adx_col is None:
+        return False
+    return df[adx_col].iloc[-1] < threshold
+
+
+def _far_from_ma200(state: dict) -> bool:
+    """价格距 MA200 过远"""
+    df = state.get('df')
+    if df is None or 'MA_200' not in df.columns:
+        return False
+    cfg = state.get('config', {})
+    threshold = cfg.get('ma200_distance', 0.30)
+    close = df['close'].iloc[-1]
+    ma200 = df['MA_200'].iloc[-1]
+    if pd.isna(ma200) or ma200 <= 0:
+        return False
+    return (close - ma200) / ma200 > threshold
+
+
+def _high_volatility_atr(state: dict) -> bool:
+    """ATR/价格 > 阈值，高波动率"""
+    df = state.get('df')
+    if df is None or 'ATR' not in df.columns:
+        return False
+    cfg = state.get('config', {})
+    threshold = cfg.get('atr_volatility', 0.05)
+    atr = df['ATR'].iloc[-1]
+    close = df['close'].iloc[-1]
+    if pd.isna(atr) or close <= 0:
+        return False
+    return atr / close > threshold
+
+
+def _abnormal_amplitude(state: dict) -> bool:
+    """日内振幅超过近 20 日 95 分位数"""
+    df = state.get('df')
+    if df is None or 'AMPLITUDE_PCT' not in df.columns or len(df) < 21:
+        return False
+    cfg = state.get('config', {})
+    percentile = cfg.get('amplitude_percentile', 0.95)
+    recent = df['AMPLITUDE_PCT'].iloc[-21:-1].dropna()
+    if len(recent) < 5:
+        return False
+    threshold = recent.quantile(percentile)
+    current = df['AMPLITUDE_PCT'].iloc[-1]
+    return not pd.isna(current) and current > threshold
+
+
+def _boll_bandwidth_narrowing_then_expanding(state: dict) -> bool:
+    """BOLL 带宽先缩口后张口（突破信号）"""
+    df = state.get('df')
+    bw_col = next((c for c in ('BOLL_BANDWIDTH',) if c in df.columns), None)
+    if df is None or bw_col is None or len(df) < 25:
+        return False
+    bw = df[bw_col].dropna()
+    if len(bw) < 25:
+        return False
+    recent_10 = bw.iloc[-10:].mean()
+    hist_mean = bw.mean()
+    if recent_10 >= hist_mean * 0.8:
+        return False
+    before_10 = bw.iloc[-20:-10].mean()
+    return bw.iloc[-1] > before_10 * 1.05
+
+
+def _low_volume(state: dict) -> bool:
+    """成交额（volume × close）低于阈值"""
+    df = state.get('df')
+    if df is None or 'volume' not in df.columns:
+        return False
+    cfg = state.get('config', {})
+    threshold = cfg.get('volume_threshold', 1e7)
+    close = df['close'].iloc[-1]
+    volume = df['volume'].iloc[-1]
+    return close * volume < threshold
+
+
+def _kdj_golden_cross(state: dict) -> bool:
+    """KDJ 金叉：STOCHk 上穿 STOCHd"""
+    df = state.get('df')
+    if df is None or len(df) < 3:
+        return False
+    k_col = next((c for c in df.columns if c.startswith('STOCHk')), None)
+    d_col = next((c for c in df.columns if c.startswith('STOCHd')), None)
+    if k_col is None or d_col is None:
+        return False
+    k_series = df[k_col]
+    d_series = df[d_col]
+    if len(k_series) < 2:
+        return False
+    return k_series.iloc[-1] > d_series.iloc[-1] and k_series.iloc[-2] <= d_series.iloc[-2]
+
+
+def _rsi_not_overbought(state: dict) -> bool:
+    """RSI 未超买（< 70）"""
+    df = state.get('df')
+    if df is None:
+        return False
+    rsi_col = next((c for c in df.columns if c.startswith('RSI_')), None)
+    if rsi_col is None:
+        return False
+    rsi_val = df[rsi_col].iloc[-1]
+    return not pd.isna(rsi_val) and rsi_val < 70
+
+
+def _has_bot_divergence_with_volume(state: dict) -> bool:
+    """底背离存在且量价得分 > 0"""
+    div = state.get('divergence') or {}
+    cs = div.get('combined_signal', '')
+    vt = state.get('volume_trend')
+    return '底背离' in cs and vt is not None and len(vt) >= 2 and vt[1] > 0
+
+
+def _golden_cross_stagnant(state: dict) -> bool:
+    """金叉已发生 N 天，价格无明显上涨"""
+    df = state.get('df')
+    if df is None or 'MACD_SIGNAL_DETAIL' not in df.columns or len(df) < 30:
+        return False
+    cfg = state.get('config', {})
+    stagnant_days = cfg.get('golden_cross_stagnant_days', 10)
+    stagnant_pct = cfg.get('golden_cross_stagnant_pct', 0.02)
+    detail = df['MACD_SIGNAL_DETAIL']
+    for i in range(len(detail) - 2, max(len(detail) - stagnant_days - 5, 0), -1):
+        if '金叉' in str(detail.iloc[i]):
+            cross_idx = i
+            cross_close = df['close'].iloc[cross_idx]
+            current_close = df['close'].iloc[-1]
+            days_since = len(df) - 1 - cross_idx
+            if days_since >= stagnant_days:
+                return (current_close - cross_close) / cross_close < stagnant_pct
+            return False
+    return False
+
+
+def _has_forecast(state: dict) -> bool:
+    """有业绩预告数据"""
+    fc = state.get('forecast_data')
+    return fc is not None and bool(fc.get('type', ''))
 
 
 # ── 动作函数（修改 state） ────────────────────────────────────────────────────
@@ -330,6 +522,131 @@ def _act_chip_resistance_risk(state: dict) -> None:
     state.setdefault('_notes', [])
     state['_notes'].append('筹码阻力位')
     state['triggered_rules'].append('R10')
+
+
+# ── 趋势过滤族动作 ─────────────────────────────────────────────────────────────
+
+def _act_ma_conflict_downgrade(state: dict) -> None:
+    """R11: 均线方向与评分方向冲突 → 降级"""
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+    state.setdefault('_notes', [])
+    state['_notes'].append('均线排列不支持当前方向')
+    state['triggered_rules'].append('R11')
+
+
+def _act_fake_breakout_warning_adx(state: dict) -> None:
+    """R12: ADX 低位 + 高分 → 假突破预警"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('ADX偏低假突破风险')
+    if state.get('level', 'C') not in ('D',):
+        state['level'] = 'C'
+    state['triggered_rules'].append('R12')
+
+
+def _act_far_from_ma200(state: dict) -> None:
+    """R13: 距 MA200 过远 → 均值回归预警"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('偏离MA200过远均值回归风险')
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+    state['triggered_rules'].append('R13')
+
+
+def _act_high_volatility(state: dict) -> None:
+    """R14: 高波动率 → 缩小仓位提示"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('高波动率注意仓位控制')
+    state['triggered_rules'].append('R14')
+
+
+def _act_abnormal_amplitude(state: dict) -> None:
+    """R15: 振幅异常 → 延迟入场提示"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('异动振幅建议延迟入场')
+    state['triggered_rules'].append('R15')
+
+
+def _act_boll_breakout_boost(state: dict) -> None:
+    """R16: BOLL 缩口后张口 → 突破加分"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('BOLL缩口突破')
+    state['triggered_rules'].append('R16')
+
+
+def _act_low_liquidity(state: dict) -> None:
+    """R17: 低流动性 → 不可交易标记"""
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+    state.setdefault('_notes', [])
+    state['_notes'].append('低流动性注意')
+    state['triggered_rules'].append('R17')
+
+
+def _act_triple_resonance_boost(state: dict) -> None:
+    """R19: MACD+KDJ+RSI 三金叉共振 → 加分"""
+    state.setdefault('_notes', [])
+    if '三金叉共振' not in state.get('_notes', []):
+        state['_notes'].append('三金叉共振')
+    state['triggered_rules'].append('R19')
+
+
+def _act_bottom_divergence_volume_boost(state: dict) -> None:
+    """R20: 底背离 + 量价齐升 → 加分"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('底背离量价共振')
+    state['triggered_rules'].append('R20')
+
+
+def _act_force_level_a(state: dict) -> None:
+    """R21: 多头排列 + MACD 超强 → 强制 A 级"""
+    state['level'] = 'A'
+    state.setdefault('_notes', [])
+    state['_notes'].append('多头共振推A级')
+    state['triggered_rules'].append('R21')
+
+
+def _act_golden_cross_stagnant(state: dict) -> None:
+    """R22: 金叉后未涨 → 信号衰减"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('金叉钝化迟迟未涨')
+    state['score'] = max(0, state.get('score', 0) - 10)
+    state['triggered_rules'].append('R22')
+
+
+def _act_forecast_note(state: dict) -> None:
+    """R25: 业绩预告期间 → 延迟入场提示"""
+    state.setdefault('_notes', [])
+    fc = state.get('forecast_data', {})
+    fc_type = fc.get('type', '未知')
+    state['_notes'].append(f'业绩预告{fc_type}')
+    state['triggered_rules'].append('R25')
+
+
+# ── 波动率情景动作 ─────────────────────────────────────────────────────────────
+
+def _act_vol_trend_boost(state: dict) -> None:
+    """R26: 高波动趋势市 → 强化趋势/突破信号"""
+    state.setdefault('_notes', [])
+    act_notes = ['趋势市优先']
+    if '横盘突破趋势启动' in state.get('_notes', []):
+        act_notes.append('突破确认')
+    if state.get('level') == 'A':
+        act_notes.append('趋势共振')
+    state['_notes'].extend(act_notes)
+    state['triggered_rules'].append('R26')
+
+
+def _act_vol_reversal_boost(state: dict) -> None:
+    """R27: 低波动震荡市 → 强化反转/底部信号"""
+    state.setdefault('_notes', [])
+    act_notes = ['反转市优先']
+    if '共振' in state.get('_notes', []):
+        act_notes.append('底部共振确认')
+    if '底背离' in str(state.get('divergence', {}).get('combined_signal', '')):
+        act_notes.append('底背离强化')
+    state['_notes'].extend(act_notes)
+    state['triggered_rules'].append('R27')
 
 
 # ── 规则库 ────────────────────────────────────────────────────────────────────
@@ -416,6 +733,118 @@ RULES: list[Rule] = [
         condition=lambda s: _chip_price_at_resistance(s) and _chip_winner_rate_high(s, threshold=70),
         action=_act_chip_resistance_risk,
         gate=2,
+    ),
+    # ── R11: 均线方向冲突 ──────────────────────────────────────────────────
+    Rule(
+        id='R11', priority=2, name='均线方向冲突',
+        description='空头排列 + 评分 ≥ 震荡阈值 → 降级',
+        condition=lambda s: _ma_bearish_alignment(s) and _score_above_oscillate(s),
+        action=_act_ma_conflict_downgrade,
+        gate=2,
+    ),
+    # ── R12: ADX 假突破预警 ───────────────────────────────────────────────
+    Rule(
+        id='R12', priority=2, name='ADX假突破预警',
+        description='ADX < 20 + 高分 → 趋势弱，假突破风险',
+        condition=lambda s: _adx_below_threshold(s) and s.get('score', 0) > 70,
+        action=_act_fake_breakout_warning_adx,
+        gate=2,
+    ),
+    # ── R13: 距 MA200 过远 ────────────────────────────────────────────────
+    Rule(
+        id='R13', priority=3, name='偏离MA200',
+        description='价格距 MA200 超过 30% → 均值回归风险',
+        condition=_far_from_ma200,
+        action=_act_far_from_ma200,
+        gate=3,
+    ),
+    # ── R14: 高波动率 ──────────────────────────────────────────────────────
+    Rule(
+        id='R14', priority=4, name='高波动率',
+        description='ATR/价格 > 5% → 高波动率提示',
+        condition=_high_volatility_atr,
+        action=_act_high_volatility,
+        gate=3,
+    ),
+    # ── R15: 振幅异常 ─────────────────────────────────────────────────────
+    Rule(
+        id='R15', priority=3, name='振幅异常',
+        description='日内振幅 > 近20日95分位 → 延迟入场',
+        condition=_abnormal_amplitude,
+        action=_act_abnormal_amplitude,
+        gate=2,
+    ),
+    # ── R16: BOLL 缩口突破 ────────────────────────────────────────────────
+    Rule(
+        id='R16', priority=4, name='BOLL缩口突破',
+        description='带宽缩口后张口 → 突破信号加分',
+        condition=_boll_bandwidth_narrowing_then_expanding,
+        action=_act_boll_breakout_boost,
+        gate=3,
+    ),
+    # ── R17: 低流动性 ─────────────────────────────────────────────────────
+    Rule(
+        id='R17', priority=2, name='低流动性',
+        description='成交额（vol×close）低于阈值 → 不可交易',
+        condition=_low_volume,
+        action=_act_low_liquidity,
+        gate=2,
+    ),
+    # ── R19: 三金叉共振 ────────────────────────────────────────────────────
+    Rule(
+        id='R19', priority=2, name='MACD+KDJ+RSI共振',
+        description='MACD金叉 + KDJ金叉 + RSI未超买 → 共振加分',
+        condition=lambda s: _macd_golden_cross(s) and _kdj_golden_cross(s) and _rsi_not_overbought(s),
+        action=_act_triple_resonance_boost,
+        gate=1,
+    ),
+    # ── R20: 底背离量价共振 ───────────────────────────────────────────────
+    Rule(
+        id='R20', priority=3, name='底背离量价共振',
+        description='底背离存在 + 量价得分 > 0 → 共振加分',
+        condition=_has_bot_divergence_with_volume,
+        action=_act_bottom_divergence_volume_boost,
+        gate=3,
+    ),
+    # ── R21: 多头排列 + MACD 超强 → A 级 ──────────────────────────────────
+    Rule(
+        id='R21', priority=2, name='多头共振推A级',
+        description='均线多头排列 + MACD超强 → 强制A级',
+        condition=lambda s: _ma_bullish_alignment(s) and s.get('macd_trend', '') == '指标超强',
+        action=_act_force_level_a,
+        gate=3,
+    ),
+    # ── R22: 金叉滞涨衰减 ─────────────────────────────────────────────────
+    Rule(
+        id='R22', priority=3, name='金叉钝化',
+        description='金叉发生 N 天后价格无明显上涨 → 信号衰减扣分',
+        condition=_golden_cross_stagnant,
+        action=_act_golden_cross_stagnant,
+        gate=2,
+    ),
+    # ── R25: 业绩预告期间 ─────────────────────────────────────────────────
+    Rule(
+        id='R25', priority=3, name='业绩预告',
+        description='有业绩预告 → 延迟入场提示',
+        condition=_has_forecast,
+        action=_act_forecast_note,
+        gate=2,
+    ),
+    # ── R26: 高波动趋势市 → 趋势强化 ──────────────────────────────────────
+    Rule(
+        id='R26', priority=4, name='趋势市优先',
+        description='ATR↑30%+ADX>25 → 优先趋势突破信号',
+        condition=lambda s: _vol_regime_is(s, 'HIGH_VOL_TREND'),
+        action=_act_vol_trend_boost,
+        gate=3,
+    ),
+    # ── R27: 低波动震荡市 → 反转强化 ──────────────────────────────────────
+    Rule(
+        id='R27', priority=4, name='反转市优先',
+        description='ATR↓30%+ADX<20 → 优先反转底部信号',
+        condition=lambda s: _vol_regime_is(s, 'LOW_VOL_REVERSAL'),
+        action=_act_vol_reversal_boost,
+        gate=3,
     ),
 ]
 

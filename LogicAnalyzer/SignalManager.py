@@ -20,10 +20,11 @@ class TASignalProcessor:
     技术指标信号处理类
     
     负责计算和处理多种技术指标信号，包括：
-    - MACD（标准周期 + 第二周期）
+    - MACD（单参数，用户可配置）
     - KDJ、CCI、RSI、BOLL
     - 背离检测
-    - 完全多头综合评分
+    - MACD趋势综合评分
+    - 水平多因子交叉验证（各指标独立输出至 Excel）
     
     Attributes:
         analyzer: 股票分析器实例
@@ -68,9 +69,9 @@ class TASignalProcessor:
         self,
         code: str,
         valid_hist_df: pd.DataFrame,
-        second_params: tuple,
-        second_period_name: str,
         macro_adjust: float = 1.0,
+        moneyflow_lookup: dict | None = None,
+        forecast_lookup: dict | None = None,
     ) -> dict[str, Any] | None:
         code_str = str(code).lower()
         if code_str.startswith(('sh', 'sz', 'bj')):
@@ -99,7 +100,7 @@ class TASignalProcessor:
             df.reset_index(drop=True, inplace=True)
 
         try:
-            df = self.macd_analyzer._custom_macd(df, second_params=second_params)
+            df = self.macd_analyzer._custom_macd(df)
         except (KeyError, ValueError, TypeError):
             return None
 
@@ -116,16 +117,8 @@ class TASignalProcessor:
         except (KeyError, ValueError, TypeError, AttributeError):
             pass
 
-        try:
-            weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
-            thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
-            bull_result = self.macd_analyzer.analyze_full_bull(
-                df, second_params=second_params, recalc_macd=False,
-                weights=weights, thresholds=thresholds,
-            )
-            result['bull'] = bull_result
-        except (KeyError, ValueError, TypeError):
-            pass
+        weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
+        thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
 
         # 附加筹码分布数据
         code_str = str(code).lower()
@@ -140,42 +133,49 @@ class TASignalProcessor:
             df.attrs['chip_data'] = cd
             result['cost_95pct'] = cd.get('cost_95pct', None)
 
-        # 级联流水线分析（验证期：与旧逻辑并行输出）
+        # 附加资金流向数据
+        if moneyflow_lookup and pure_code in moneyflow_lookup:
+            mf_data = moneyflow_lookup[pure_code]
+            df.attrs['moneyflow_data'] = mf_data
+            result['net_mf_amount'] = mf_data.get('net_mf_amount', 0)
+
+        # 附加业绩预告数据
+        if forecast_lookup and pure_code in forecast_lookup:
+            fc_data = forecast_lookup[pure_code]
+            df.attrs['forecast_data'] = fc_data
+            result['forecast_type'] = fc_data.get('type', '')
+
+        # 流水线分析（统一入口）
         try:
             adj_thresholds = None
             if thresholds and macro_adjust < 1.0:
                 adj_thresholds = {k: int(v * macro_adjust) for k, v in thresholds.items()}
             pipeline_result = self.macd_analyzer.pipeline_analysis(
-                df, second_params=second_params,
+                df,
                 weights=weights, thresholds=adj_thresholds or thresholds,
                 rule_thresholds=getattr(self.config, 'RULE_THRESHOLDS', None),
             )
             result['pipeline'] = pipeline_result
+            result['details'] = pipeline_result.get('details', {})
+            result['stop_loss'] = pipeline_result.get('stop_loss')
+            result['divergence_days'] = pipeline_result.get('divergence_days')
+            result['divergence_price'] = pipeline_result.get('divergence_price')
+            result['_current_dif'] = pipeline_result.get('current_dif')
+            result['t1_target'] = pipeline_result.get('t1_target')
+            result['t2_target'] = pipeline_result.get('t2_target')
+            result['trailing_stop'] = pipeline_result.get('trailing_stop')
+            result['exit_rrr'] = pipeline_result.get('exit_rrr')
         except (KeyError, ValueError, TypeError):
             pass
 
         try:
-            latest_row = df.iloc[-1]
-            result['mom_12269'] = MACDAnalyzer._calculate_macd_momentum(df, 'DIF_12269', 'DEA_12269')
-            result['mom_second'] = MACDAnalyzer._calculate_macd_momentum(
-                df, f'DIF_{second_period_name}', f'DEA_{second_period_name}',
-            )
-            result['dif_12269'] = latest_row.get('DIF_12269', 0)
-            result['dif_second'] = latest_row.get(f'DIF_{second_period_name}', 0)
+            detail_col = 'MACD_SIGNAL_DETAIL'
+            if detail_col in df.columns:
+                val = df[detail_col].iloc[-1]
+                if pd.notna(val) and val != '':
+                    result['macd_signal'] = val
         except (KeyError, ValueError, TypeError):
             pass
-
-        detail_col_12269 = 'MACD_12269_SIGNAL_DETAIL'
-        if detail_col_12269 in df.columns:
-            val = df[detail_col_12269].iloc[-1]
-            if pd.notna(val) and val != '':
-                result['macd_12269_signal'] = val
-
-        detail_col_second = f'MACD_{second_period_name}_SIGNAL_DETAIL'
-        if detail_col_second in df.columns:
-            val = df[detail_col_second].iloc[-1]
-            if pd.notna(val) and val != '':
-                result['macd_second_signal'] = val
 
         try:
             kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
@@ -389,42 +389,29 @@ class TASignalProcessor:
         Returns:
             dict[str, pd.DataFrame]: 技术指标信号字典，key为指标名称，value为对应的信号DataFrame
             包括：
-            - MACD_12269: 标准MACD信号（固定）
-            - MACD_{second_period_name}: 第二周期MACD信号（动态，如 MACD_9186）
-            - MACD_FULL_BULL: MACD完全多头综合评分信号
+            - MACD_FULL_BULL: MACD趋势综合评分信号（7维度+趋势分类+管线结论）
             - KDJ: KDJ信号
             - CCI: CCI信号
             - RSI: RSI信号
             - BOLL: 布林带信号
-            - MACD_DIF_MOMENTUM: MACD动能状态
+            - KLINE_PATTERN: K线形态信号
         """
-
-        # 动态获取第二周期MACD列名
-        if self.config and hasattr(self.config, 'MACD_SECOND_PARAMS'):
-            fast, slow, signal = self.config.MACD_SECOND_PARAMS
-            second_period_name = f"{fast}{slow}{signal}"
-        else:
-            second_period_name = '9186'  # 默认值（与config.ini一致）
         
         ta_signals = {
-            'MACD_12269': pd.DataFrame(columns=['股票代码', 'MACD_12269_Signal']),
-            f'MACD_{second_period_name}': pd.DataFrame(columns=['股票代码', f'MACD_{second_period_name}_Signal']),
             'KDJ':  pd.DataFrame(columns=['股票代码', 'KDJ_Signal']),
             'CCI':  pd.DataFrame(columns=['股票代码', 'CCI_Signal']),
             'RSI':  pd.DataFrame(columns=['股票代码', 'RSI_Signal']),
             'BOLL': pd.DataFrame(columns=['股票代码', 'BOLL_Signal']),
-            'MACD_DIF_MOMENTUM': pd.DataFrame(columns=[
-                '股票代码',
-                'MACD_12269_DIF', 'MACD_12269_动能',
-                f'MACD_{second_period_name}_DIF', f'MACD_{second_period_name}_动能',
-            ]),
-            # ── 新增：完全多头综合评分 ─────────────────────────────────────
+            # ── MACD趋势综合评分（7维度+趋势分类+管线结论） ──────────────
             'MACD_FULL_BULL': pd.DataFrame(columns=[
                 '股票代码',
-                '零轴条件', '战略金叉', '战术金叉', '动能', 'DIF斜率', '背离信号', '量价配合',
-                'K线形态',
+                'MACD趋势', '金叉信号', '柱状动能', 'DIF斜率', '背离信号', '量价配合', 'K线形态',
                 '综合分析结论', '综合分析评分', '综合级别', '风险等级',
+                'MACD趋势分类', 'macd_trend',
                 'cost_95pct',
+                '资金流净额',
+                '背离距今', '背离位置',
+                '止损价', 'T1目标价', 'T2目标价', '移动止损', '盈亏比',
             ]),
         }
 
@@ -444,6 +431,36 @@ class TASignalProcessor:
                 print(f"[ChipDist] 已加载 {len(self.chip_lookup)} 条筹码数据")
             except Exception as e:
                 print(f"[ChipDist] 加载筹码数据失败: {e}")
+
+        # ── 加载资金流向数据 ───────────────────────────────────────────────
+        self.moneyflow_lookup = {}
+        try:
+            from DataCollection.MoneyFlowFetcher import MoneyFlowFetcher
+            mf_fetcher = MoneyFlowFetcher(self.config)
+            mf_df = mf_fetcher.fetch_all()
+            if mf_df is not None and not mf_df.empty:
+                for _, row in mf_df.iterrows():
+                    ts_code = str(row.get('ts_code', ''))
+                    pure = ts_code.split('.')[0]  # 000001.SH → 000001
+                    self.moneyflow_lookup[pure] = row.to_dict()
+                print(f"[MoneyFlow] 已加载 {len(self.moneyflow_lookup)} 条资金流向数据")
+        except Exception as e:
+            print(f"[MoneyFlow] 加载资金流向失败: {e}")
+
+        # ── 加载业绩预告数据 ──────────────────────────────────────────────
+        self.forecast_lookup = {}
+        try:
+            from DataCollection.FinancialForecastFetcher import FinancialForecastFetcher
+            fc_fetcher = FinancialForecastFetcher(self.config)
+            fc_df = fc_fetcher.fetch_all()
+            if fc_df is not None and not fc_df.empty:
+                for _, row in fc_df.iterrows():
+                    ts_code = str(row.get('ts_code', ''))
+                    pure = ts_code.split('.')[0]
+                    self.forecast_lookup[pure] = row.to_dict()
+                print(f"[Forecast] 已加载 {len(self.forecast_lookup)} 条业绩预告数据")
+        except Exception as e:
+            print(f"[Forecast] 加载业绩预告失败: {e}")
 
         if hist_df_all.empty:
             return ta_signals
@@ -508,7 +525,6 @@ class TASignalProcessor:
                 logger.warning("宏观过滤异常 %s，忽略", e)
 
         # ── 并行处理所有股票 ──────────────────────────────────────────────
-        second_params = getattr(self.config, 'MACD_SECOND_PARAMS', (6, 13, 5))
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
 
         results: list[dict[str, Any]] = []
@@ -516,7 +532,8 @@ class TASignalProcessor:
         try:
             futures = {
                 exec_signal.submit(
-                    self._process_single_stock, code, valid_hist_df, second_params, second_period_name, macro_adjust
+                    self._process_single_stock, code, valid_hist_df, macro_adjust,
+                    self.moneyflow_lookup, self.forecast_lookup,
                 ): code
                 for code in set(all_codes)
             }
@@ -532,10 +549,7 @@ class TASignalProcessor:
                 exec_signal.shutdown(wait=True)
 
         # ── 从结果列表构建信号 DataFrame（避免逐行 O(n²) concat）─────────
-        macd_12269_rows: list[dict] = []
-        macd_second_rows: list[dict] = []
         bull_rows: list[dict] = []
-        mom_rows: list[dict] = []
         kdj_rows: list[dict] = []
         cci_rows: list[dict] = []
         rsi_rows: list[dict] = []
@@ -545,21 +559,14 @@ class TASignalProcessor:
         for r in results:
             code = r['code']
 
-            if 'macd_12269_signal' in r:
-                macd_12269_rows.append({'股票代码': code, 'MACD_12269_Signal': r['macd_12269_signal']})
-
-            if 'macd_second_signal' in r:
-                macd_second_rows.append({'股票代码': code, f'MACD_{second_period_name}_Signal': r['macd_second_signal']})
-
-            if 'bull' in r:
-                detail = r['bull'].get('details', {})
-                pipeline = r.get('pipeline', {})
+            pipeline = r.get('pipeline', {})
+            detail = r.get('details', {}) or pipeline.get('details', {})
+            if detail:
                 bull_rows.append({
                     '股票代码': code,
-                    '零轴条件': detail.get('零轴条件', {}).get('desc', ''),
-                    '战略金叉': detail.get('战略金叉', {}).get('desc', ''),
-                    '战术金叉': detail.get('战术金叉', {}).get('desc', ''),
-                    '动能': detail.get('动能', {}).get('desc', ''),
+                    'MACD趋势': detail.get('MACD趋势', {}).get('desc', ''),
+                    '金叉信号': detail.get('金叉信号', {}).get('desc', ''),
+                    '柱状动能': detail.get('柱状动能', {}).get('desc', ''),
                     'DIF斜率': detail.get('DIF斜率', {}).get('desc', ''),
                     '背离信号': detail.get('背离信号', {}).get('desc', ''),
                     '量价配合': detail.get('量价配合', {}).get('desc', ''),
@@ -568,16 +575,18 @@ class TASignalProcessor:
                     '综合分析评分': pipeline.get('score', 0),
                     '综合级别': pipeline.get('level', ''),
                     '风险等级': pipeline.get('risk_level', ''),
+                    'MACD趋势分类': pipeline.get('macd_trend', detail.get('MACD趋势', {}).get('desc', '')),
+                    'macd_trend': pipeline.get('macd_trend', ''),
                     'cost_95pct': r.get('cost_95pct', None),
-                })
-
-            if 'mom_12269' in r:
-                mom_rows.append({
-                    '股票代码': code,
-                    'MACD_12269_DIF': r['dif_12269'],
-                    'MACD_12269_动能': r['mom_12269'],
-                    f'MACD_{second_period_name}_DIF': r.get('dif_second', 0),
-                    f'MACD_{second_period_name}_动能': r.get('mom_second', ''),
+                    '资金流净额': r.get('net_mf_amount', 0),
+                    '_current_dif': r.get('_current_dif', 0),
+                    '背离距今': r.get('divergence_days'),
+                    '背离位置': r.get('divergence_price'),
+                    '止损价': r.get('stop_loss'),
+                    'T1目标价': r.get('t1_target'),
+                    'T2目标价': r.get('t2_target'),
+                    '移动止损': r.get('trailing_stop'),
+                    '盈亏比': r.get('exit_rrr'),
                 })
 
             if 'kdj_signal' in r:
@@ -595,10 +604,7 @@ class TASignalProcessor:
             if 'kline_pattern' in r:
                 kline_rows.append({'股票代码': code, 'K线形态信号': r['kline_pattern']})
 
-        ta_signals['MACD_12269'] = pd.DataFrame(macd_12269_rows)
-        ta_signals[f'MACD_{second_period_name}'] = pd.DataFrame(macd_second_rows)
         ta_signals['MACD_FULL_BULL'] = pd.DataFrame(bull_rows)
-        ta_signals['MACD_DIF_MOMENTUM'] = pd.DataFrame(mom_rows)
         ta_signals['KDJ'] = pd.DataFrame(kdj_rows)
         ta_signals['CCI'] = pd.DataFrame(cci_rows)
         ta_signals['RSI'] = pd.DataFrame(rsi_rows)

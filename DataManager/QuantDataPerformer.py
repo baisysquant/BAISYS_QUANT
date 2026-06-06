@@ -34,7 +34,7 @@ class QuantDBSyncTask:
     def __init__(self, db_manager):
         self.db = db_manager
 
-    def sync_all(self, today_str, consolidated_report, industry_df, raw_data, second_period_name="9186"):
+    def sync_all(self, today_str, consolidated_report, industry_df, raw_data):
         """执行全量同步主入口
 
         Args:
@@ -42,7 +42,6 @@ class QuantDBSyncTask:
             consolidated_report: 最终报告DataFrame
             industry_df: 行业分析DataFrame
             raw_data: 原始数据字典
-            second_period_name: MACD第二周期名称（如 '9186'）
         """
         print("\n" + "=" * 50)
         print(f">>> 启动数据库资产化同步任务 业务日期: {today_str}")
@@ -52,7 +51,7 @@ class QuantDBSyncTask:
             # 1. 同步策略触发归档 (支持一码多策略)
             self._sync_strategy_stocks(today_str, raw_data)
             self._sync_industry_data(today_str, industry_df)
-            self._sync_final_report(today_str, consolidated_report, second_period_name)
+            self._sync_final_report(today_str, consolidated_report)
 
         except Exception as e:
             print(f"!!! [同步中断] 任务运行异常: {e}")
@@ -159,13 +158,12 @@ class QuantDBSyncTask:
 
         self.db.safe_insert_data(df_db, "ods_ak_industry_analysis", "archive_date", today)
 
-    def _sync_final_report(self, today, df, second_period_name="9186"):
+    def _sync_final_report(self, today, df):
         """3. 同步决策报告 (APP层) - 完整字段支持版
 
         Args:
             today: 业务日期
             df: 最终报告DataFrame
-            second_period_name: MACD第二周期名称（如 '9186'）
         """
         if df is None or df.empty:
             return
@@ -187,42 +185,64 @@ class QuantDBSyncTask:
             "连涨天数": "consecutive_up_days",
             "放量天数": "high_vol_days",
 
-            # 标准周期 MACD (固定硬编码)
-            "MACD_12269": "macd_12269_signal",
-            "MACD_12269_动能": "macd_12269_momentum",
-            "MACD_12269_DIF": "macd_12269_dif",
-            # 第二周期 MACD (动态映射到通用列)
-            f"MACD_{second_period_name}": "macd_second_signal",
-            f"MACD_{second_period_name}_动能": "macd_second_momentum",
-            f"MACD_{second_period_name}_DIF": "macd_second_dif",
+            # MACD趋势评分列（单参数）
+            "MACD趋势": "macd_trend",
+            "金叉信号": "macd_cross",
+            "柱状动能": "macd_momentum",
+            "DIF斜率": "dif_slope",
+            "背离信号": "divergence_signal",
+            "量价配合": "volume_price_score",
+            "K线形态": "kline_pattern",
+            "综合分析结论": "comprehensive_conclusion",
+            "综合分析评分": "comprehensive_score",
+            "综合级别": "comprehensive_level",
+            "风险等级": "risk_level",
+            "MACD趋势分类": "macd_trend_type",
+            # 独立技术指标（水平多因子交叉验证）
             "KDJ_Signal": "kdj_signal",
             "CCI_Signal": "cci_signal",
             "RSI_Signal": "rsi_signal",
             "BOLL_Signal": "boll_signal",
             "研报买入次数": "report_buy_count",
-            "完全多头排列": "is_full_bullish",
             "资金动能": "fund_flow_trend",
             "5日资金流入": "fund_inflow_5d",
             "10日资金流入": "fund_inflow_10d",
             "20日资金流入": "fund_inflow_20d",
             "股票链接": "stock_link",
+            # 行业中性化
+            "所属行业信号": "industry_signal_tag",
+            "行业内百分位": "industry_pctile",
+            "行业信号评分": "industry_signal_score",
+            "行业背离扣分": "industry_deviation",
+            # 背离位置
+            "背离距今": "divergence_days",
+            "背离位置": "divergence_price",
+            # 退出策略
+            "止损价": "stop_loss",
+            "T1目标价": "t1_target",
+            "T2目标价": "t2_target",
+            "移动止损": "trailing_stop",
+            "盈亏比": "exit_rrr",
         }
 
         df_db.rename(columns=mapping, inplace=True)
-
-        # 显式添加第二周期名称列
-        df_db["macd_second_period_name"] = second_period_name
 
         text_columns = [
             "stock_code",
             "stock_name",
             "industry",
             "stock_link",
-            "macd_12269_signal",
-            "macd_12269_momentum",
-            "macd_second_signal",
-            "macd_second_momentum",
-            "macd_second_period_name",
+            "macd_trend",
+            "macd_cross",
+            "macd_momentum",
+            "dif_slope",
+            "divergence_signal",
+            "volume_price_score",
+            "kline_pattern",
+            "comprehensive_conclusion",
+            "comprehensive_level",
+            "risk_level",
+            "macd_trend_type",
             "kdj_signal",
             "cci_signal",
             "rsi_signal",
@@ -230,6 +250,7 @@ class QuantDBSyncTask:
             "is_strong_stock",
             "is_vol_price_rise",
             "is_full_bullish",
+            "industry_signal_tag",
         ]
 
         for col in df_db.columns:

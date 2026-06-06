@@ -1,16 +1,20 @@
 """
-完全多头评分模块
+完全多头评分模块 [已弃用]
 
 从 MACDAnalyzer.py 提取，负责完全多头排列评分、K线形态评分等。
+所有功能已迁移至 MACDAnalyzer.analyze_full_bull / pipeline_analysis，此模块保留仅作参考。
 """
+
+import warnings
+warnings.warn("FullBullScorer is deprecated, use MACDAnalyzer instead", DeprecationWarning, stacklevel=2)
 
 import numpy as np
 import pandas as pd
 
-from LogicAnalyzer.MACDDivergence import slope_analysis as calc_slope, calculate_momentum_score
+from LogicAnalyzer.MACDDivergence import slope_analysis as calc_slope
 from LogicAnalyzer.SignalConstants import (
-    MACDSignals, MACDMomentum, Divergence, TrendLevels,
-    Conclusion, FullBullScoring, CombinedSignal, KLineLevels
+    MACDSignals, Divergence, TrendLevels,
+    Conclusion, FullBullScoring, KLineLevels
 )
 
 
@@ -172,9 +176,9 @@ def analyze_full_bull(
             else:
                 scores["战术金叉"] = (f"{second_period_name} 空头/死叉", 0)
 
-    # 动能评分
-    mom_score_val = calculate_momentum_score(df, f"DIF_12269", f"DEA_12269",
-                                              f"DIF_{second_period_name}", f"DEA_{second_period_name}")
+    # 动能评分（简化版，原 calculate_momentum_score 已移除）
+    hist = df["DIF_12269"] - df["DEA_12269"] if "DIF_12269" in df.columns and "DEA_12269" in df.columns else pd.Series([0])
+    mom_score_val = int(min(15, max(-15, (hist.iloc[-1] - hist.iloc[-2]) * 10))) if len(hist) > 1 else 0
     scores["动能"] = (f"动能评分: {mom_score_val}", mom_score_val)
 
     # DIF 斜率

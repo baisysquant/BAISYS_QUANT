@@ -337,8 +337,68 @@ class StockAnalysisCoordinator:
             cols.insert(idx + 1, "所属行业信号")
             consolidated_report = consolidated_report[cols]
 
+        # ── 行业内百分位排名 + 背离检测 ──────────────────────────────────
+        consolidated_report = self._apply_industry_neutralization(consolidated_report)
+
         ctx.set("consolidated_report", consolidated_report)
         return True
+
+    @staticmethod
+    def _apply_industry_neutralization(df: pd.DataFrame) -> pd.DataFrame:
+        """行业内百分位排名 & 个股-行业背离折扣。
+
+        机构做法：用行业内 percentile rank 消除行业间系统性偏差，
+        再与行业信号强度对比，发现背离时扣分。
+        """
+        from DataManager.ColumnNames import ColumnNames as CN
+
+        SCORE_COL = CN.COMPREHENSIVE_SCORE
+        IND_COL = CN.INDUSTRY
+        SIG_COL = CN.INDUSTRY_SIGNAL
+
+        if SCORE_COL not in df.columns or IND_COL not in df.columns:
+            return df
+
+        has_signal = SIG_COL in df.columns
+
+        # 行业信号 → 数值映射 (0-100)
+        SIGNAL_SCORE_MAP = {
+            "核心配置 (低估值+强趋势)": 80,
+            "动量追击 (高景气+资金涌入)": 70,
+            "左侧潜伏 (极度低估+等待拐点)": 50,
+            "均衡/观望": 40,
+            "情绪过热 (高估+趋势透支)": 30,
+        }
+
+        # 1) 行业内百分位 (cross-sectional, 消除行业偏差)
+        df[CN.INDUSTRY_PERCENTILE] = (
+            df.groupby(IND_COL)[SCORE_COL].rank(pct=True) * 100
+        ).fillna(50.0)
+
+        # 2) 所属行业信号 → 行业信号评分
+        if has_signal:
+            df[CN.INDUSTRY_SIGNAL_SCORE] = (
+                df[SIG_COL].map(SIGNAL_SCORE_MAP).fillna(50)
+            )
+        else:
+            df[CN.INDUSTRY_SIGNAL_SCORE] = 50
+
+        # 3) 背离检测
+        ind_score = df[CN.INDUSTRY_SIGNAL_SCORE]
+        pct = df[CN.INDUSTRY_PERCENTILE]
+
+        cond_low = (pct <= 25) & (ind_score >= 70)
+        cond_high = (pct >= 75) & (ind_score <= 40)
+
+        df[CN.INDUSTRY_DEVIATION] = 0
+        df.loc[cond_low, CN.INDUSTRY_DEVIATION] = -10
+        df.loc[cond_high, CN.INDUSTRY_DEVIATION] = -5
+
+        # 4) 扣分
+        discount = df[CN.INDUSTRY_DEVIATION]
+        df[SCORE_COL] = (df[SCORE_COL] + discount).clip(lower=0)
+
+        return df
 
     def _step_11_filter_weak_stocks(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
@@ -432,15 +492,11 @@ class StockAnalysisCoordinator:
         raw_data: dict[str, pd.DataFrame],
     ) -> bool:
         try:
-            fast, slow, signal = self.config.MACD_SECOND_PARAMS
-            second_period_name = f"{fast}{slow}{signal}"
-
             success = self.report_service.sync_to_database(
                 today_str=self.today_str,
                 consolidated_report=consolidated_report,
                 industry_df=industry_df,
                 raw_data=raw_data,
-                second_period_name=second_period_name,
             )
 
             if not success:

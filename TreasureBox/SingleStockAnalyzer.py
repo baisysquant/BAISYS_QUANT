@@ -190,8 +190,6 @@ def main():
 
     # 4. 复用 TASignalProcessor 计算全部技术信号 ──────────────────────
     config = Config()
-    second_params = getattr(config, "MACD_SECOND_PARAMS", (6, 13, 5))
-    second_period_name = f"{second_params[0]}{second_params[1]}{second_params[2]}"
 
     # 准备 TASignalProcessor 要求的 hist_df 格式
     hist_df = df.copy()
@@ -200,7 +198,7 @@ def main():
     from LogicAnalyzer.SignalManager import TASignalProcessor
 
     processor = TASignalProcessor(None, config=config)
-    result = processor._process_single_stock(symbol, hist_df, second_params, second_period_name)
+    result = processor._process_single_stock(symbol, hist_df)
 
     if result is None:
         print("  [ERROR] 技术指标分析失败")
@@ -208,22 +206,19 @@ def main():
 
     # 5. MACD 指标 ────────────────────────────────────────────────────
     print_section("MACD 指标")
-    print_field("MACD_12269", result.get("macd_12269_signal", ""))
-    print_field(f"MACD_{second_period_name}", result.get("macd_second_signal", ""))
-    print_field("MACD_12269_DIF", f"{result.get('dif_12269', 0):.4f}")
-    print_field(f"MACD_{second_period_name}_DIF", f"{result.get('dif_second', 0):.4f}")
-    print_field("MACD_12269_动能", result.get("mom_12269", ""))
-    print_field(f"MACD_{second_period_name}_动能", result.get("mom_second", ""))
+    print_field("MACD信号", result.get("macd_signal", ""))
+    print_field("MACD趋势分类", result.get("pipeline", {}).get("macd_trend", ""))
 
-    # 6. 完全多头评分 ────────────────────────────────────────────────
-    print_section("MACD 完全多头评分")
-    bull_result = result.get("bull")
+    # 6. MACD趋势评分 ────────────────────────────────────────────────
+    print_section("MACD 趋势评分")
+    bull_result = result.get("pipeline")
     if bull_result:
         details = bull_result.get("details", {})
         if details:
             print()
             print("  " + "\u2500" * 18)
-            for dim_key, dim_val in details.items():
+            for dim_key in ["MACD趋势", "金叉信号", "柱状动能", "DIF斜率", "背离信号", "量价配合", "K线形态"]:
+                dim_val = details.get(dim_key, {})
                 desc = dim_val.get("desc", "")
                 score = dim_val.get("score", 0)
                 print(f"    {dim_key:<20} : {score:>3}  ({desc})")

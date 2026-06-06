@@ -7,7 +7,7 @@
 import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
-from LogicAnalyzer.SignalConstants import MACDMomentum, TrendLevels, BullArrangement
+
 
 
 class AnalysisService:
@@ -100,14 +100,7 @@ class AnalysisService:
             return consolidated_report
 
         # 为了安全比较，确保 DIF 列被正确解析为数字，非数字转为 NaN
-        dif_12269 = pd.to_numeric(consolidated_report.get("MACD_12269_DIF"), errors="coerce")
-
-        # 动态获取第二周期DIF列名（必填）
-        fast, slow, signal = self.config.MACD_SECOND_PARAMS
-        second_period_name = f"{fast}{slow}{signal}"
-        dif_second_col = f"MACD_{second_period_name}_DIF"
-
-        dif_second = pd.to_numeric(consolidated_report.get(dif_second_col), errors="coerce")
+        dif_single = pd.to_numeric(consolidated_report.get("_current_dif"), errors="coerce")
 
         kdj_col = consolidated_report.get(
             "KDJ_Signal",
@@ -124,10 +117,7 @@ class AnalysisService:
             & (consolidated_report.get("量价齐升") == "否")
             & (consolidated_report.get("连涨天数") == 0)
             & (consolidated_report.get("放量天数") == 0)
-        & (consolidated_report.get("MACD_12269_动能") == MACDMomentum.ACCELERATE_DOWN)
-        & (consolidated_report.get(f"MACD_{second_period_name}_动能") == MACDMomentum.ACCELERATE_DOWN)
-            & (dif_12269 < 0)
-            & (dif_second < 0)
+            & (dif_single < 0)
             & kdj_is_empty
             & (
                 # 使用配置的第一个资金流周期进行检查
@@ -248,14 +238,6 @@ class AnalysisService:
                 | (xstp_base["30日均线价"] > xstp_base["60日均线价"].fillna(float("-inf")))
             )
         ].copy()
-
-        # 添加完全多头排列标记
-        filtered_df["完全多头排列"] = filtered_df.apply(
-            lambda row: (
-                "是" if row["10日均线价"] > row["30日均线价"] and row["30日均线价"] > row["60日均线价"] else "否"
-            ),
-            axis=1,
-        )
 
         filtered_df.rename(columns={"最新价": "当前价格"}, inplace=True)
         return filtered_df.fillna("N/A")

@@ -29,12 +29,6 @@ class MACDSignals:
         return np.where(dead, np.where((dif < 0) & (dea < 0), cls.DEATH_CROSS_BELOW_ZERO, cls.DEATH_CROSS_ABOVE_ZERO), "")
 
 
-class MACDMomentum:
-    """MACD 动能状态"""
-    ACCELERATE_UP = "加速上涨 (红柱加长)"
-    DECELERATE_UP = "减速上涨 (红柱缩短)"
-    ACCELERATE_DOWN = "加速下跌 (绿柱加长)"
-    DECELERATE_DOWN = "减速下跌 (绿柱缩短)"
 
 
 class KLineLevels:
@@ -63,14 +57,6 @@ class TrendLevels:
     @classmethod
     def all_levels(cls):
         return [cls.FULL_BULL, cls.TREND_ACCELERATION, cls.TREND_OSCILLATION, cls.TREND_WATCH]
-
-
-class BullArrangement:
-    """均线多头排列标记"""
-    PERFECT_BULL = "完全多头排列"
-    BULL_TREND = "多头排列趋势"
-    YES = "是"
-    NO = "否"
 
 
 class Divergence:
@@ -127,28 +113,21 @@ class Conclusion:
 
 class FullBullScoring:
     """完全多头评分维度键名（MACDAnalyzer 内部）"""
-    ZERO_AXIS = "零轴条件"
-    STRATEGIC_GOLDEN = "战略金叉"
-    TACTICAL_GOLDEN = "战术金叉"
-    MOMENTUM = "动能"
+    MACD_TREND = "MACD趋势"
+    CROSS = "金叉信号"
+    MOMENTUM = "柱状动能"
     DIF_SLOPE = "DIF斜率"
     DIVERGENCE = "背离信号"
     VOLUME_PRICE = "量价配合"
     KLINE_PATTERN = "K线形态评分"
 
 
-class CombinedSignal:
-    """组合背离信号"""
-    STRATEGIC_BOTTOM_DIV_CROSS = "战略底背离 + 战术金叉确认 (强烈买入信号)"
-    STRATEGIC_TOP_DIV_CROSS = "战略顶背离 + 战术死叉确认 (强烈卖出信号)"
-    DUAL_BOTTOM_DIV = "双重底背离 (强烈买入关注)"
-    DUAL_TOP_DIV = "双重顶背离 (强烈卖出预警)"
-    STRATEGY_BOTTOM_DIV = "12269 底背离 (战略买入预警)"
-    STRATEGY_TOP_DIV = "12269 顶背离 (战略卖出预警)"
-    TACTICAL_BOTTOM_DIV_BULL = "{} 底背离 (可考虑买入)"
-    TACTICAL_BOTTOM_DIV_BEAR = "{} 底背离 (大趋势偏空，谨慎)"
-    TACTICAL_TOP_DIV_NEUTRAL = "{} 顶背离 (需结合大趋势)"
-    TACTICAL_TOP_DIV_BEAR = "{} 顶背离 (可考虑卖出)"
+class MACDTrend:
+    """MACD 趋势级别"""
+    SUPER_STRONG = "指标超强"
+    STRONG = "指标强势"
+    WEAK = "指标弱势"
+    SUPER_WEAK = "指标超弱"
 
 
 class CCILevels:

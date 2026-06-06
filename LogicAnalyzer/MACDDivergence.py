@@ -103,85 +103,7 @@ def volume_confirmation(df: pd.DataFrame, signal_type: str | None, signal_idx: i
         return f"顶背离：量能萎缩（vol_ratio <= 0.8）→ 确认卖出" if vol_ratio <= 0.8 else f"顶背离：量能正常（vol_ratio={vol_ratio:.2f}）→ 需观察"
 
 
-def detect_combined_divergence(
-    df: pd.DataFrame,
-    distance_slow: int = 25,
-    distance_fast: int = 12,
-    recent_window: int = 5,
-    decay_half_life: int = 8,
-    second_period_name: str = "6135",
-) -> dict:
-    current_idx = len(df) - 1
-    slow_result = detect_divergence_single_param(df, df["close"], df["DIF_12269"], distance=distance_slow)
-    div_12269, idx_12269, str_12269 = slow_result
 
-    dif_col_second = f"DIF_{second_period_name}"
-    if dif_col_second in df.columns:
-        fast_result = detect_divergence_single_param(df, df["close"], df[dif_col_second], distance=distance_fast)
-        div_second, idx_second, str_second = fast_result
-    else:
-        div_second, idx_second, str_second = None, None, 0.0
-
-    decay_12269 = signal_with_decay(div_12269, idx_12269, current_idx, decay_half_life)
-    decay_second = signal_with_decay(div_second, idx_second, current_idx, decay_half_life)
-    threshold = 0.15
-    eff_12269 = decay_12269 * str_12269
-    eff_second = decay_second * str_second
-    top_12269 = div_12269 == Divergence.TOP_DIVERGENCE and eff_12269 >= threshold
-    bot_12269 = div_12269 == Divergence.BOTTOM_DIVERGENCE and eff_12269 >= threshold
-    top_second = div_second == Divergence.TOP_DIVERGENCE and eff_second >= threshold
-    bot_second = div_second == Divergence.BOTTOM_DIVERGENCE and eff_second >= threshold
-
-    if dif_col_second in df.columns:
-        fast_golden = df[dif_col_second].iloc[-1] > df[f"DEA_{second_period_name}"].iloc[-1]
-        fast_dead = df[dif_col_second].iloc[-1] < df[f"DEA_{second_period_name}"].iloc[-1]
-    else:
-        fast_golden = False
-        fast_dead = False
-
-    if bot_12269 and fast_golden:
-        combined = "战略底背离 + 战术金叉确认 (强烈买入信号)"
-    elif top_12269 and fast_dead:
-        combined = "战略顶背离 + 战术死叉确认 (强烈卖出信号)"
-    elif bot_12269 and bot_second:
-        combined = "双重底背离 (强烈买入关注)"
-    elif top_12269 and top_second:
-        combined = "双重顶背离 (强烈卖出预警)"
-    elif bot_12269:
-        combined = "12269 底背离 (战略买入预警)"
-    elif top_12269:
-        combined = "12269 顶背离 (战略卖出预警)"
-    elif bot_second:
-        combined = f"{second_period_name} 底背离 (可考虑买入)" if div_12269 is None else \
-                   f"{second_period_name} 底背离 (大趋势偏空，谨慎)"
-    elif top_second:
-        combined = f"{second_period_name} 顶背离 (需结合大趋势)" if div_12269 is None else \
-                   f"{second_period_name} 顶背离 (可考虑卖出)"
-    else:
-        combined = "无明显背离信号"
-
-    div_signal = ""
-    if bot_12269:
-        div_signal += "底背离 "
-    if top_12269:
-        div_signal += "顶背离 "
-    if bot_second:
-        div_signal += f"{second_period_name}底背离 "
-    if top_second:
-        div_signal += f"{second_period_name}顶背离 "
-    div_signal = div_signal.strip() or "无背离"
-
-    return {
-        "combined_signal": combined,
-        "div_12269": div_12269,
-        "idx_12269": idx_12269,
-        "strength_12269": str_12269,
-        "decay_12269": decay_12269,
-        f"div_{second_period_name}": div_second,
-        f"idx_{second_period_name}": idx_second,
-        f"strength_{second_period_name}": str_second,
-        f"decay_{second_period_name}": decay_second,
-    }
 
 
 # ── 共享工具函数（原 MACDHelpers.py） ────────────────────────────────────
@@ -206,26 +128,3 @@ def slope_analysis(series: pd.Series, window: int = 5) -> dict:
         trend = "震荡"
     return {"slope": slope, "r2": r2, "trend": trend}
 
-
-def calculate_momentum_score(
-    df: pd.DataFrame,
-    dif_12269_col: str = "DIF_12269",
-    dea_12269_col: str = "DEA_12269",
-    dif_second_col: str = "DIF_6135",
-    dea_second_col: str = "DEA_6135",
-) -> int:
-    max_score = 100
-    if len(df) < 5:
-        return max_score // 2
-    score = 0
-    for col, weight in [(dif_12269_col, 0.6), (dif_second_col, 0.4)]:
-        if col not in df.columns:
-            continue
-        hist = df[col].diff().fillna(0)
-        recent = hist.iloc[-5:]
-        if recent.std() == 0:
-            continue
-        z = recent.iloc[-1] / recent.std()
-        raw = max(-1, min(1, z / 3))
-        score += int(50 * (raw + 1) * weight)
-    return min(max_score, max(0, score))

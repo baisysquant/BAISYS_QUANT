@@ -128,7 +128,6 @@ def create_final_report_schema() -> DataFrameSchema:
             "连涨天数": Column(int, nullable=True, coerce=True),
             "放量天数": Column(int, nullable=True, coerce=True),
 
-            "完全多头排列": Column(str, nullable=True, coerce=True),
             "多头排列趋势": Column(str, nullable=True, coerce=True),
             "股票链接": Column(str, nullable=True, coerce=True),
         },

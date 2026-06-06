@@ -32,20 +32,8 @@ class ColumnNames:
     AKSHARE_INDUSTRY_BOARD_CODE = "板块代码"
 
     # ==================== 技术指标列 - MACD ====================
-    MACD_12269 = "MACD_12269"
-    MACD_12269_DIF = "MACD_12269_DIF"
-    MACD_12269_MOMENTUM = "MACD_12269_动能"
-    MACD_FULL_BULL_LABEL = "MACD_FULL_BULL_Label"
-    MACD_FULL_BULL_SIGNAL = "MACD_FULL_BULL_Signals"
-    FULL_BULL_SCORE = "FullBull_Score"
-    FULL_BULL_SCORE_BASE = "FullBull_Score_Base"
-
-    # MACD第二周期（动态生成，这里提供模板）
-    # 格式: f"MACD_{fast}{slow}{signal}"
-    # 例如: MACD_5345, MACD_215526 等
-    MACD_SECOND_TEMPLATE = "MACD_{}"
-    MACD_SECOND_DIF_TEMPLATE = "MACD_{}_DIF"
-    MACD_SECOND_MOMENTUM_TEMPLATE = "MACD_{}_动能"
+    MACD_TREND = "MACD趋势"
+    MACD_CROSS = "金叉信号"
 
     # ==================== 技术指标列 - 其他 ====================
     KDJ_SIGNAL = "KDJ_Signal"
@@ -81,7 +69,6 @@ class ColumnNames:
     MAIN_COST_DIFF_PERCENT = "主力成本差价百分比"
 
     # ==================== 均线突破列 ====================
-    PERFECT_BULL_ARRANGEMENT = "完全多头排列"
     CURRENT_PRICE = "当前价格"
     MA10_PRICE = "10日均线价"
     MA30_PRICE = "30日均线价"
@@ -116,3 +103,19 @@ class ColumnNames:
 
     # 研报相关
     RESEARCH_REPORT_COUNT = "研报买入次数"
+
+    # ==================== 行业中性化列 ====================
+    INDUSTRY_PERCENTILE = "行业内百分位"
+    INDUSTRY_SIGNAL_SCORE = "行业信号评分"
+    INDUSTRY_DEVIATION = "行业背离扣分"
+
+    # ==================== 退出策略列 ====================
+    STOP_LOSS = "止损价"
+    T1_TARGET = "T1目标价"
+    T2_TARGET = "T2目标价"
+    TRAILING_STOP = "移动止损"
+    EXIT_RRR = "盈亏比"
+
+    # ==================== 背离位置列 ====================
+    DIVERGENCE_DAYS = "背离距今"
+    DIVERGENCE_PRICE = "背离位置"

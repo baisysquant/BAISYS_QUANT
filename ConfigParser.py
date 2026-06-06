@@ -159,48 +159,23 @@ class FundFlowConfig(BaseModel):
 class TechnicalIndicatorsConfig(BaseModel):
     """技术指标信号配置"""
 
-    MACD_STANDARD_PARAMS: tuple[int, int, int] = Field(default=(12, 26, 9))
-    MACD_SECOND_PARAMS: tuple[int, int, int] = Field(default=(6, 13, 5))
+    MACD_PARAMS: tuple[int, int, int] = Field(default=(12, 26, 9))
 
-    @field_validator("MACD_STANDARD_PARAMS", mode="before")
+    @field_validator("MACD_PARAMS", mode="before")
     @classmethod
-    def parse_standard_params(cls, v):
+    def parse_macd_params(cls, v):
         if isinstance(v, str):
             return tuple(int(p.strip()) for p in v.split(","))
         return v
 
-    @field_validator("MACD_STANDARD_PARAMS")
+    @field_validator("MACD_PARAMS")
     @classmethod
-    def validate_standard_params(cls, v):
-        if v != (12, 26, 9):
-            warnings.warn(
-                f"警告：MACD标准周期被修改为 {v}，已强制恢复为标准值 (12, 26, 9)。这是业界公认的经典参数。", UserWarning
-            )
-            return (12, 26, 9)
-        return v
-
-    @field_validator("MACD_SECOND_PARAMS", mode="before")
-    @classmethod
-    def parse_second_params(cls, v):
-        if isinstance(v, str):
-            return tuple(int(p.strip()) for p in v.split(","))
-        return v
-
-    @field_validator("MACD_SECOND_PARAMS")
-    @classmethod
-    def validate_second_params(cls, v):
-        if v == (0, 0, 0):
-            raise ValueError(
-                "错误：MACD第二周期参数不能设置为(0,0,0)。"
-                "第二周期为必填项，请设置有效的MACD参数，如(6,13,5)或(24,52,18)。"
-            )
-
+    def validate_macd_params(cls, v):
         fast, slow, signal = v
         if fast >= slow:
-            warnings.warn(
-                f"警告：MACD第二周期参数不合理（快线{fast} >= 慢线{slow}），"
-                f"可能导致技术指标计算异常。建议调整为快线 < 慢线。",
-                UserWarning,
+            raise ValueError(
+                f"错误：MACD参数不合理（快线{fast} >= 慢线{slow}），"
+                f"请确保快线 < 慢线。"
             )
         return v
 
@@ -331,9 +306,7 @@ class Config:
         TEMP_DATA_DIRECTORY: 临时数据目录
         MAX_WORKERS: 最大线程数
         FUND_FLOW_PERIODS: 资金流周期列表（必须为3个）
-        MACD_STANDARD_PARAMS: MACD标准周期 (12,26,9)
-        MACD_SECOND_PARAMS: MACD第二周期（必填）
-        ENABLE_MACD_SECOND: 是否启用MACD第二周期（始终为True）
+        MACD_PARAMS: MACD参数 (fast, slow, signal)，默认(12,26,9)
     """
 
     def __init__(self, config_file: str = "config.ini") -> None:
@@ -419,8 +392,7 @@ class Config:
         # 读取技术指标信号配置
         ti = config["TECHNICAL_INDICATORS"]
         ti_config = TechnicalIndicatorsConfig(
-            MACD_STANDARD_PARAMS=ti.get("MACD_STANDARD_PARAMS", fallback="12,26,9"),
-            MACD_SECOND_PARAMS=ti.get("MACD_SECOND_PARAMS", fallback="6,13,5"),
+            MACD_PARAMS=ti.get("MACD_PARAMS", fallback="12,26,9"),
         )
 
         # 读取列名别名配置
@@ -557,9 +529,7 @@ class Config:
 
         self.FUND_FLOW_PERIODS = ff_config.FUND_FLOW_PERIODS
 
-        self.MACD_STANDARD_PARAMS = ti_config.MACD_STANDARD_PARAMS
-        self.MACD_SECOND_PARAMS = ti_config.MACD_SECOND_PARAMS
-        self.ENABLE_MACD_SECOND = True
+        self.MACD_PARAMS = ti_config.MACD_PARAMS
 
         self.CODE_ALIASES = parse_aliases(col_config.code_aliases)
         self.NAME_ALIASES = parse_aliases(col_config.name_aliases)
@@ -578,10 +548,9 @@ class Config:
         self.MACRO_FILTER_INDEX_SYMBOL = mf_config.INDEX_SYMBOL
 
         self.FULL_BULL_WEIGHTS = {
-            "零轴条件": fbs_config.WEIGHT_ZERO_AXIS,
-            "战略金叉": fbs_config.WEIGHT_STRATEGY_GOLDEN,
-            "战术金叉": fbs_config.WEIGHT_TACTICAL_GOLDEN,
-            "动能": fbs_config.WEIGHT_MOMENTUM,
+            "MACD趋势": fbs_config.WEIGHT_ZERO_AXIS,
+            "金叉信号": fbs_config.WEIGHT_STRATEGY_GOLDEN,
+            "柱状动能": fbs_config.WEIGHT_MOMENTUM,
             "DIF斜率": fbs_config.WEIGHT_DIF_SLOPE,
             "背离信号": fbs_config.WEIGHT_DIVERGENCE,
             "量价配合": fbs_config.WEIGHT_VOLUME_PRICE,

@@ -8,7 +8,7 @@ import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
 from DataManager.ShareCodeFormatMgr import format_stock_code
-from LogicAnalyzer.SignalConstants import TrendLevels, BullArrangement, InvestmentRating
+from LogicAnalyzer.SignalConstants import TrendLevels, InvestmentRating
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
 
@@ -515,27 +515,15 @@ class DataProcessingService:
         """
         ta_dfs_to_merge = []
 
-        # MACD 标准参数（强制保留）
-        macd_df_standard = processed_data.get("MACD_12269", pd.DataFrame())
-        if not macd_df_standard.empty and "股票代码" in macd_df_standard.columns:
-            ta_dfs_to_merge.append(
-                macd_df_standard[["股票代码", "MACD_12269_Signal"]].rename(columns={"MACD_12269_Signal": "MACD_12269"})
-            )
-
-        # MACD 第二周期（必填）
-        fast, slow, signal = self.config.MACD_SECOND_PARAMS
-        second_period_name = f"{fast}{slow}{signal}"
-        macd_key = f"MACD_{second_period_name}"
-        macd_df_second = processed_data.get(macd_key, pd.DataFrame())
-        if not macd_df_second.empty and "股票代码" in macd_df_second.columns:
-            signal_col = f"{macd_key}_Signal"
-            ta_dfs_to_merge.append(macd_df_second[["股票代码", signal_col]].rename(columns={signal_col: macd_key}))
-
-        # MACD 完全多头综合评分 + 级联流水线输出
+        # MACD趋势综合评分（单参数，7维度+趋势分类+管线结论）
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
             cols = ["股票代码"]
-            for pipe_col in ["综合分析结论", "综合分析评分", "综合级别", "风险等级", "cost_95pct"]:
+            for pipe_col in ["MACD趋势", "金叉信号", "柱状动能", "DIF斜率", "背离信号", "量价配合", "K线形态",
+                             "综合分析结论", "综合分析评分", "综合级别", "风险等级", "MACD趋势分类", "macd_trend",
+                             "cost_95pct", "资金流净额", "_current_dif",
+                             "背离距今", "背离位置",
+                             "止损价", "T1目标价", "T2目标价", "移动止损", "盈亏比"]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])
@@ -571,31 +559,8 @@ class DataProcessingService:
                     how="left",
                 )
 
-        # 合并 MACD 动能数据
-        momentum_df = processed_data.get("MACD_DIF_MOMENTUM", pd.DataFrame())
-        if not momentum_df.empty and "股票代码" in momentum_df.columns:
-            final_df = pd.merge(final_df, momentum_df.drop_duplicates(subset=["股票代码"]), on="股票代码", how="left")
-            # 使用辅助方法批量填充动能列
-            macd_momentum_cols = ["MACD_12269_动能"]
-
-            # 第二周期动能列（必填）
-            fast, slow, signal = self.config.MACD_SECOND_PARAMS
-            second_period_name = f"{fast}{slow}{signal}"
-            mom_col = f"MACD_{second_period_name}_动能"
-            macd_momentum_cols.append(mom_col)
-
-            for col in macd_momentum_cols:
-                if col in final_df.columns:
-                    final_df[col] = final_df[col].fillna("")
-
         # 使用辅助方法批量填充缺失的技术指标列
-        macd_cols = ["MACD_12269"]
-        # 添加第二周期列名（必填）
-        fast, slow, signal = self.config.MACD_SECOND_PARAMS
-        second_period_name = f"{fast}{slow}{signal}"
-        macd_cols.append(f"MACD_{second_period_name}")
-
-        ta_signal_cols = macd_cols + ["KDJ_Signal", "CCI_Signal", "RSI_Signal", "BOLL_Signal"]
+        ta_signal_cols = ["KDJ_Signal", "CCI_Signal", "RSI_Signal", "BOLL_Signal"]
         for col in ta_signal_cols:
             if col not in final_df.columns:
                 final_df[col] = ""
@@ -650,16 +615,13 @@ class DataProcessingService:
 
         # 均线突破数据
         xstp_df = processed_data.get("processed_xstp_df", pd.DataFrame())
-        xstp_cols = ["股票代码", ColumnNames.PERFECT_BULL_ARRANGEMENT, "当前价格", "10日均线价", "30日均线价", "60日均线价"]
+        xstp_cols = ["股票代码", "当前价格", "10日均线价", "30日均线价", "60日均线价"]
         if not xstp_df.empty and "股票代码" in xstp_df.columns:
             xstp_df = self._normalize_stock_code_in_df(xstp_df)
             cols_present = [col for col in xstp_cols if col in xstp_df.columns]
             merge_df = xstp_df[cols_present].drop_duplicates(subset=["股票代码"])
             final_df = pd.merge(final_df, merge_df, on="股票代码", how="left")
 
-        if ColumnNames.PERFECT_BULL_ARRANGEMENT not in final_df.columns:
-            final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] = BullArrangement.NO
-            final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] = final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT].fillna(BullArrangement.NO)
 
         # 合并研报数据（作为加分因子）
         report_df = processed_data.get("research_report_data", pd.DataFrame())
@@ -688,7 +650,6 @@ class DataProcessingService:
         筛选有信号的股票
 
         筛选条件：满足以下任一条件
-        - 完全多头排列
         - 强势股
         - 量价齐升
         - 任意技术指标有信号
@@ -702,17 +663,12 @@ class DataProcessingService:
         if final_df.empty:
             return final_df
 
-        # 动态获取第二周期MACD列名
-        fast, slow, signal = self.config.MACD_SECOND_PARAMS
-        second_period_name = f"{fast}{slow}{signal}"
-
         # 使用常量类获取所有技术指标信号列
         from DataManager.ReportService import ReportService
-        str_cols = ReportService.get_all_technical_signal_columns(second_period_name)
+        str_cols = ReportService.get_all_technical_signal_columns()
 
         mask = (
-            (final_df[ColumnNames.PERFECT_BULL_ARRANGEMENT] == "是")
-            | final_df[ColumnNames.STRONG_STOCK].eq("是")
+            final_df[ColumnNames.STRONG_STOCK].eq("是")
             | final_df[ColumnNames.PRICE_VOLUME_RISE].eq("是")
             | final_df[str_cols].apply(lambda s: s.str.strip().ne("")).any(axis=1)
         )
@@ -768,14 +724,10 @@ class DataProcessingService:
         Returns:
             pd.DataFrame: 列重排后的DataFrame
         """
-        # 动态获取第二周期名称
-        fast, slow, signal = self.config.MACD_SECOND_PARAMS
-        second_period_name = f"{fast}{slow}{signal}"
-
         # 使用常量类获取最终列顺序
         from DataManager.ReportService import ReportService
         final_cols = ReportService.get_final_column_order(
-            second_period_name=second_period_name, fund_flow_periods=self.config.FUND_FLOW_PERIODS
+            fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )
 
         # 只保留存在的列
