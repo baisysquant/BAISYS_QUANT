@@ -412,13 +412,17 @@ def _price_below_ma20_ma60(state: dict) -> bool:
 
 
 def _liquidity_crisis(state: dict) -> bool:
-    """成交额（volume × close）低于 500 万"""
+    """成交额 / 自身MA20 < liq_veto_ratio → 流动性枯竭"""
     df = state.get('df')
-    if df is None or 'volume' not in df.columns:
+    if df is None or 'AMOUNT' not in df.columns or 'AMOUNT_MA20' not in df.columns:
         return False
-    close = df['close'].iloc[-1]
-    volume = df['volume'].iloc[-1]
-    return close * volume < 5_000_000
+    amount = df['AMOUNT'].iloc[-1]
+    amount_ma20 = df['AMOUNT_MA20'].iloc[-1]
+    if pd.isna(amount_ma20) or amount_ma20 <= 0:
+        return False
+    config = state.get('config', {})
+    veto_ratio = config.get('liq_veto_ratio', 0.05)
+    return (amount / amount_ma20) < veto_ratio
 
 
 def _amplitude_extreme_99(state: dict) -> bool:
@@ -1484,7 +1488,7 @@ RULES: list[Rule] = [
     # ── R44: 流动性枯竭 ─────────────────────────────────────────────────
     Rule(
         id='R44', priority=2, name='流动性枯竭',
-        description='成交额 < 500万 → 直接否决',
+        description='AMOUNT/AMOUNT_MA20 < liq_veto_ratio → 直接否决',
         condition=_liquidity_crisis,
         action=_act_liquidity_crisis,
         gate=2,

@@ -16,6 +16,11 @@ from LogicAnalyzer.SignalConstants import (
     MarketSentiment, RSISignals, BOLLSignals
 )
 from ConfigParser import Config
+from LogicAnalyzer.ProfessionalIndicators import (
+    analyze_rsi,
+    analyze_bollinger,
+    analyze_cci,
+)
 
 
 class TASignalProcessor:
@@ -181,6 +186,8 @@ class TASignalProcessor:
             result['exit_rrr'] = pipeline_result.get('exit_rrr')
             result['position_adjust'] = pipeline_result.get('position_adjust', 0.0)
             result['macd_trend_raw'] = pipeline_result.get('macd_trend', '')
+            result['amount'] = float(df['AMOUNT'].iloc[-1]) if 'AMOUNT' in df.columns else 0
+            result['amount_ma20'] = float(df['AMOUNT_MA20'].iloc[-1]) if 'AMOUNT_MA20' in df.columns else 0
         except (KeyError, ValueError, TypeError) as e:
             logger.debug("股票 %s 管线分析跳过: %s", pure_code, e)
 
@@ -201,45 +208,32 @@ class TASignalProcessor:
             logger.debug("股票 %s KDJ分析跳过: %s", pure_code, e)
 
         try:
-            df.ta.cci(append=True, close='close', high='high', low='low')
-            cci_cols = [col for col in df.columns if col.startswith('CCI_')]
-            if cci_cols:
-                current_cci = df[cci_cols[0]].iloc[-1]
-                result['cci_signal'] = self._classify_cci_level(current_cci) or f'常态波动 ({current_cci:.2f})'
+            cci_result = analyze_cci(df)
+            if cci_result:
+                result['cci_analysis'] = cci_result
+                result['cci_signal'] = cci_result.get('simple_signal', '')
         except (KeyError, ValueError, TypeError, AttributeError) as e:
-            logger.debug("股票 %s CCI分析跳过: %s", pure_code, e)
+            logger.debug("股票 %s 专业CCI分析跳过: %s", pure_code, e)
 
         try:
-            df.ta.rsi(append=True, close='close', length=14)
-            rsi_cols = [col for col in df.columns if col.startswith('RSI_')]
-            if rsi_cols:
-                rsi_col = rsi_cols[0]
-                curr_rsi = df[rsi_col].iloc[-1]
-                window = 10
-                if len(df) >= window + 1:
-                    curr_low = df['low'].iloc[-1]
-                    min_low_window = df['low'].iloc[-window:-1].min()
-                    min_rsi_window = df[rsi_col].iloc[-window:-1].min()
-                    is_price_low = curr_low <= (min_low_window * 1.02)
-                    is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
-                    result['rsi_signal'] = f'RSI底背离! ({curr_rsi:.1f})' if is_divergence else f'RSI={curr_rsi:.1f}'
+            rsi_result = analyze_rsi(df)
+            if rsi_result:
+                result['rsi_analysis'] = rsi_result
+                result['rsi_signal'] = rsi_result.get('simple_signal', '')
         except (KeyError, ValueError, TypeError, AttributeError) as e:
-            logger.debug("股票 %s RSI分析跳过: %s", pure_code, e)
+            logger.debug("股票 %s 专业RSI分析跳过: %s", pure_code, e)
 
         try:
-            df.ta.bbands(append=True, length=20, std=2, close='close')
-            boll_lower_cols = [col for col in df.columns if col.startswith('BBL_')]
-            boll_upper_cols = [col for col in df.columns if col.startswith('BBU_')]
-            if boll_lower_cols and boll_upper_cols:
-                df['BOLL_BANDWIDTH'] = (
-                    (df[boll_upper_cols[0]] - df[boll_lower_cols[0]]) / df['close']
-                )
-                is_narrow = (
-                    df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
-                )
-                result['boll_signal'] = '低波/缩口' if is_narrow else '常态/张口'
+            boll_result = analyze_bollinger(df)
+            if boll_result:
+                result['boll_analysis'] = boll_result
+                result['boll_signal'] = boll_result.get('simple_signal', '')
+                bbl = next((c for c in df.columns if c.startswith('BBL_')), None)
+                bbu = next((c for c in df.columns if c.startswith('BBU_')), None)
+                if bbl and bbu and 'close' in df.columns:
+                    df['BOLL_BANDWIDTH'] = (df[bbu] - df[bbl]) / df['close']
         except (KeyError, ValueError, TypeError, AttributeError) as e:
-            logger.debug("股票 %s BOLL分析跳过: %s", pure_code, e)
+            logger.debug("股票 %s 专业BOLL分析跳过: %s", pure_code, e)
 
         return result
 
@@ -429,6 +423,7 @@ class TASignalProcessor:
                 '背离距今', '背离位置',
                 '止损价', 'T1目标价', 'T2目标价', '移动止损', '盈亏比',
                 'position_adjust', 'macd_trend_raw',
+                'AMOUNT', 'AMOUNT_MA20',
             ]),
         }
 
@@ -607,6 +602,8 @@ class TASignalProcessor:
                     '盈亏比': r.get('exit_rrr'),
                     'position_adjust': r.get('position_adjust', 0.0),
                     'macd_trend_raw': r.get('macd_trend_raw', ''),
+                    'AMOUNT': r.get('amount', 0),
+                    'AMOUNT_MA20': r.get('amount_ma20', 0),
                 })
 
             if 'kdj_signal' in r:

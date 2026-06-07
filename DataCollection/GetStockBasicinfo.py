@@ -17,12 +17,12 @@ class StockBasicInfoService:
     """股票基本信息业务服务类 (申万二级行业 - 30天缓存优化版)"""
 
     TABLE_NAME = "stock_basic_info_sw"
-    REFRESH_INTERVAL_DAYS = 30  # 强制刷新周期（天）
 
     def __init__(self, config_parser: Config):
         self.config_parser = config_parser
         self.system_config = self._get_system_config_from_attributes(config_parser)
         self.logger = self._setup_logger()
+        self.REFRESH_INTERVAL_DAYS = getattr(config_parser, 'STOCK_BASIC_INFO_EXPIRE_DAYS', 30)
 
         self.db_manager = None
         self.trading_calendar = TradingCalendarAnalyzer()

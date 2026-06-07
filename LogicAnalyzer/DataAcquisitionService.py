@@ -62,7 +62,7 @@ class DataAcquisitionService:
         所有数据都通过 DataFetcher 获取，支持自动缓存和重试机制。
 
         Args:
-            today_str: 当前交易日字符串 (YYYYMMDD格式)
+            today_str: 当前交易日字符串 (YYYY-MM-DD格式，日历管理器返回格式)
 
         Returns:
             Dict[str, pd.DataFrame]: 键值对字典，key为数据名称，value为对应的DataFrame

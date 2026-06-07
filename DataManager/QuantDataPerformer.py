@@ -270,13 +270,30 @@ class QuantDBSyncTask:
             if before_count != after_count:
                 print(f"  - [数据清洗] 发现 {before_count - after_count} 条重复股票代码，已自动去重。")
 
+        db_cols = self.db.get_table_columns("app_stock_strategy_report")
+        if db_cols:
+            missing = set(final_valid_cols) - set(db_cols)
+            if missing:
+                print(f"  - [WARN] DB表缺少列: {', '.join(sorted(missing))}，已自动跳过")
+            final_valid_cols = [c for c in final_valid_cols if c in db_cols]
+
         try:
             self.db.safe_insert_data(df_db[final_valid_cols], "app_stock_strategy_report", "archive_date", today)
         except Exception as e:
+            if db_cols:
+                raise
+            err_str = str(e)
             if 'UndefinedColumn' in type(e).__name__:
-                col_name = str(e).split('"')[1] if '"' in str(e) else 'unknown'
-                print(f"  - [WARN] DB表缺少列 '{col_name}'，跳过该列重试")
-                safe_cols = [c for c in final_valid_cols if c != col_name]
-                self.db.safe_insert_data(df_db[safe_cols], "app_stock_strategy_report", "archive_date", today)
+                for q in ('"', "'"):
+                    parts = err_str.split(q)
+                    candidates = [p for p in set(parts) if p.isidentifier() and p not in ('app_stock_strategy_report', 'stock_code', 'archive_date')]
+                    if candidates:
+                        col_name = candidates[0]
+                        print(f"  - [WARN] DB表缺少列 '{col_name}'，跳过该列重试")
+                        safe_cols = [c for c in final_valid_cols if c != col_name]
+                        self.db.safe_insert_data(df_db[safe_cols], "app_stock_strategy_report", "archive_date", today)
+                        break
+                else:
+                    raise
             else:
                 raise

@@ -88,6 +88,10 @@ class DataProcessingService:
         # 步骤5：合并特殊数据（主力成本、均线突破）
         final_df = self._data_merge.merge_special_data(final_df, processed_data)
 
+        # 步骤5.5：流动性评分（截面+时序+规模三因子）
+        if not final_df.empty:
+            self._apply_liquidity_scoring(final_df)
+
         # 步骤6：筛选有信号的股票
         final_df = self.filter_signal_stocks(final_df)
 
@@ -241,6 +245,62 @@ class DataProcessingService:
         self.logger.info(f"[数据验证] 最终报告生成成功: {len(final_df)} 条记录, {len(final_df.columns)} 个字段")
 
         return True
+
+    def _apply_liquidity_scoring(self, df: pd.DataFrame) -> None:
+        """
+        流动性评分（Gate 4 后处理）：三因子模型 → 流动性等级 + 连续评分。
+        修改 df 新增 LIQUIDITY_SCORE / LIQUIDITY_LEVEL 列。
+        """
+        if df.empty or ColumnNames.AMOUNT not in df.columns:
+            return
+
+        cfg = getattr(self.config, 'POSITION_SIZING', None) or {}
+        w_section = cfg.get("liq_w_section", 0.5)
+        w_timeseries = cfg.get("liq_w_timeseries", 0.5)
+        w_marketcap = cfg.get("liq_w_marketcap", 0.0)
+        min_discount = cfg.get("liq_min_discount", 0.3)
+
+        # 行业中位数成交额
+        if ColumnNames.INDUSTRY in df.columns:
+            df[ColumnNames.INDUSTRY_MEDIAN_AMOUNT] = df.groupby(ColumnNames.INDUSTRY)[
+                ColumnNames.AMOUNT
+            ].transform('median')
+
+        scores = []
+        levels = []
+
+        for _, row in df.iterrows():
+            amount = row.get(ColumnNames.AMOUNT, 0) or 0
+            amount_ma20 = row.get(ColumnNames.AMOUNT_MA20, 0) or 0
+            industry_median = row.get(ColumnNames.INDUSTRY_MEDIAN_AMOUNT, 0) or 0
+
+            section_score = min(amount / max(industry_median, 1), 1.0) if industry_median > 0 else 0.5
+            timeseries_score = min(amount / max(amount_ma20, 1), 1.0) if amount_ma20 > 0 else 0.5
+
+            if w_section + w_timeseries + w_marketcap <= 0:
+                liq_score = 1.0
+            else:
+                norm = w_section + w_timeseries + w_marketcap
+                liq_score = (w_section * section_score + w_timeseries * timeseries_score) / norm
+
+            liq_score = max(0.0, min(1.0, liq_score))
+            scores.append(round(liq_score, 4))
+
+            if liq_score >= 0.8:
+                levels.append('充足')
+            elif liq_score >= 0.4:
+                levels.append('正常')
+            elif liq_score >= 0.1:
+                levels.append('不足')
+            else:
+                levels.append('枯竭')
+
+        df[ColumnNames.LIQUIDITY_SCORE] = scores
+        df[ColumnNames.LIQUIDITY_LEVEL] = levels
+
+        n_low = sum(1 for l in levels if l in ('不足', '枯竭'))
+        if n_low:
+            self.logger.info(f"  - [流动性] 低流动性 {n_low} 只（不足+枯竭），共 {len(df)} 只")
 
     def _apply_gate5_position_constraints(self, df: pd.DataFrame) -> None:
         """

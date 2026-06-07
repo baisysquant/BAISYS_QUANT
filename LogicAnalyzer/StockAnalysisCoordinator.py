@@ -426,7 +426,37 @@ class StockAnalysisCoordinator:
 
         sheets_data = self._prepare_sheets_data(consolidated_report, industry_df, processed_data)
         self.report_service.generate_excel_report(sheets_data, self.today_str)
+        self._validate_report_integrity(consolidated_report)
         return True
+
+    def _validate_report_integrity(self, df: pd.DataFrame):
+        if df.empty:
+            self.logger.warning("[完整性断言] 报告为空，跳过校验")
+            return
+        total = len(df)
+        warnings = []
+        dim_cols = ["MACD趋势", "金叉信号", "柱状动能", "DIF斜率", "背离信号", "量价配合", "K线形态"]
+        for col in dim_cols:
+            if col in df.columns:
+                empty = df[col].astype(str).str.strip().eq("").sum()
+                ratio = empty / total * 100
+                if ratio > 50:
+                    warnings.append(f"  '{col}' 空值率 {ratio:.0f}%")
+        level_col = "综合级别"
+        if level_col in df.columns:
+            dist = df[level_col].value_counts()
+            for level in ["A", "B", "C", "D"]:
+                if level not in dist.index:
+                    warnings.append(f"  '{level}' 级别无股票")
+        score_col = "综合分析评分"
+        if score_col in df.columns:
+            scores = pd.to_numeric(df[score_col], errors="coerce")
+            if scores.nunique() <= 1:
+                warnings.append(f"  '{score_col}' 所有值相同 (均分={scores.mean():.1f})")
+        if warnings:
+            self.logger.warning(f"[完整性断言] 发现 {len(warnings)} 个异常:\n" + "\n".join(warnings))
+        else:
+            self.logger.info("[完整性断言] 数据完整性检查通过")
 
     def _step_13_sync_to_database(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())

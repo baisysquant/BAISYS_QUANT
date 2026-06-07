@@ -143,7 +143,7 @@ class ReportService:
         base_cols = ReportService.get_base_columns()
         signal_cols = ReportService.get_signal_columns()
         report_cols = ReportService.get_report_columns(fund_flow_periods)
-        tail_cols = [ColumnNames.SUGGESTED_POSITION, ColumnNames.STOCK_LINK]
+        tail_cols = [ColumnNames.LIQUIDITY_SCORE, ColumnNames.LIQUIDITY_LEVEL, ColumnNames.SUGGESTED_POSITION, ColumnNames.STOCK_LINK]
         return base_cols + signal_cols + report_cols + tail_cols
 
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:

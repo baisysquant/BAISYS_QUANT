@@ -138,6 +138,11 @@ class MACDAnalyzer:
             except Exception:
                 pass
 
+        if 'AMOUNT' not in df.columns and 'close' in df.columns and 'volume' in df.columns:
+            df['AMOUNT'] = df['close'] * df['volume']
+        if 'AMOUNT_MA20' not in df.columns and 'AMOUNT' in df.columns:
+            df['AMOUNT_MA20'] = df['AMOUNT'].rolling(20, min_periods=5).mean()
+
         if 'AMPLITUDE_PCT' not in df.columns and 'close' in df.columns and len(df) >= 2:
             df['AMPLITUDE_PCT'] = (df['high'] - df['low']) / df['close'].shift(1) * 100
 
@@ -207,7 +212,8 @@ class MACDAnalyzer:
                                "adx_fake_breakout": 20, "ma200_distance": 0.30,
                                "atr_volatility": 0.05, "volume_threshold": 1e7,
                                "amplitude_percentile": 0.95, "golden_cross_stagnant_days": 10,
-                               "golden_cross_stagnant_pct": 0.02}
+                               "golden_cross_stagnant_pct": 0.02,
+                               "liq_veto_ratio": 0.05}
 
         if 'MA_5' not in df.columns:
             for p in [5, 10, 20, 30, 60]:
@@ -356,7 +362,7 @@ class MACDAnalyzer:
 
         trend_score_map = {MACDTrend.SUPER_STRONG: w_trend, MACDTrend.STRONG: w_trend * 3 // 5,
                            MACDTrend.WEAK: w_trend * 2 // 5, MACDTrend.SUPER_WEAK: 0}
-        scores['MACD趋势'] = (f"{macd_trend} (DIF={dif_val:.2f}, DEA={dea_val:.2f})", trend_score_map.get(macd_trend, 0))
+        scores['MACD趋势'] = (f"{macd_trend}(MACD={dif_val:.2f})", trend_score_map.get(macd_trend, 0))
 
         detail_str = df['MACD_SIGNAL_DETAIL'].iloc[-1] if 'MACD_SIGNAL_DETAIL' in df.columns else ''
         is_bull = dif_val > dea_val

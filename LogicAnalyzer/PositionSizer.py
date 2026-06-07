@@ -151,8 +151,15 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
         if pos_adj != 0:
             parts.append(f"规则调整({pos_adj:+.0%})")
 
-        # ── 7. 合成最终仓位 ─────────────────────────────────────────────
-        position = base * risk_mult * regime_mult * kelly_mod * (1 + pos_adj)
+        # ── 7. 流动性折扣（基于截面+时序+规模三因子评分）──────────────────
+        liq_score = _safe_float(row.get(ColumnNames.LIQUIDITY_SCORE, 1.0), 1.0)
+        liq_min = cfg.get("liq_min_discount", 0.3)
+        liq_discount = liq_min + (1.0 - liq_min) * liq_score
+        if liq_discount < 1.0:
+            parts.append(f"流动性(×{liq_discount:.0%})")
+
+        # ── 8. 合成最终仓位 ─────────────────────────────────────────────
+        position = base * risk_mult * regime_mult * kelly_mod * (1 + pos_adj) * liq_discount
         position = min(position, vol_cap, _max_single)
         position = max(position, 0.0)
         position = round(position, 4)

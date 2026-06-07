@@ -57,6 +57,8 @@ class SystemConfig(BaseModel):
     MAX_WORKERS: int = Field(default=15, ge=1)
     DATA_FETCH_RETRIES: int = Field(default=3, ge=1)
     DATA_FETCH_DELAY: int = Field(default=5, ge=1)
+    STOCK_BASIC_INFO_EXPIRE_DAYS: int = Field(default=30, ge=1, le=365,
+                                                description="股票基本信息缓存过期天数")
     SIGNAL_PROCESSING_PROCESSES: int = Field(default_factory=_default_signal_workers, ge=1)
 
     @field_validator("HOME_DIRECTORY")
@@ -90,7 +92,7 @@ class MultiHeadArrangementConfig(BaseModel):
 
 
 class FilterRulesConfig(BaseModel):
-    """弱势股过滤规则配置"""
+    """弱势股过滤规则配置 + 流动性参数"""
 
     ENABLE_WEAK_STOCK_FILTER: bool = Field(default=True)
     EXEMPT_LEVELS: list[str] = Field(default=["完全主升", "趋势加速"])
@@ -101,6 +103,13 @@ class FilterRulesConfig(BaseModel):
         if isinstance(v, str):
             return [level.strip() for level in v.split(",")]
         return v
+
+    # ── 流动性参数 ────────────────────────────────────────────────────
+    LIQ_VETO_RATIO: float = Field(default=0.05, ge=0.01, le=1.0)
+    LIQ_W_SECTION: float = Field(default=0.4, ge=0.0, le=1.0)
+    LIQ_W_TIMESERIES: float = Field(default=0.4, ge=0.0, le=1.0)
+    LIQ_W_MARKETCAP: float = Field(default=0.2, ge=0.0, le=1.0)
+    LIQ_MIN_DISCOUNT: float = Field(default=0.3, ge=0.0, le=1.0)
 
 
 class FundFlowConfig(BaseModel):
@@ -245,6 +254,10 @@ class AShareHubConfig(BaseModel):
     API_KEY: str = Field(default="")
     ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
     CHIP_LIMIT: int = Field(default=1, ge=1, le=200)
+    MONEYFLOW_RETRY: int = Field(default=3, ge=0, le=10,
+                                   description="资金流向 API 429 重试次数")
+    MONEYFLOW_PAGE_DELAY: float = Field(default=1.0, ge=0.0, le=30.0,
+                                          description="资金流分页间隔秒数")
     @field_validator("CHIP_LIMIT")
     @classmethod
     def validate_limit(cls, v):
@@ -469,6 +482,7 @@ class Config:
             MAX_WORKERS=system.getint("MAX_WORKERS", fallback=15),
             DATA_FETCH_RETRIES=system.getint("DATA_FETCH_RETRIES", fallback=3),
             DATA_FETCH_DELAY=system.getint("DATA_FETCH_DELAY", fallback=5),
+            STOCK_BASIC_INFO_EXPIRE_DAYS=system.getint("STOCK_BASIC_INFO_EXPIRE_DAYS", fallback=30),
             SIGNAL_PROCESSING_PROCESSES=system.getint("signal_processing_processes", fallback=_default_signal_workers()),
         )
 
@@ -491,6 +505,11 @@ class Config:
         fr_config = FilterRulesConfig(
             ENABLE_WEAK_STOCK_FILTER=fr.getboolean("ENABLE_WEAK_STOCK_FILTER", fallback=True),
             EXEMPT_LEVELS=fr.get("EXEMPT_LEVELS", fallback="完全主升,趋势加速"),
+            LIQ_VETO_RATIO=fr.getfloat("liq_veto_ratio", fallback=0.05),
+            LIQ_W_SECTION=fr.getfloat("liq_w_section", fallback=0.4),
+            LIQ_W_TIMESERIES=fr.getfloat("liq_w_timeseries", fallback=0.4),
+            LIQ_W_MARKETCAP=fr.getfloat("liq_w_marketcap", fallback=0.2),
+            LIQ_MIN_DISCOUNT=fr.getfloat("liq_min_discount", fallback=0.3),
         )
 
         # 读取资金流分析配置
@@ -571,6 +590,8 @@ class Config:
                 API_KEY=ConfigCipher.maybe_decrypt(ah.get("api_key", "")),
                 ENABLE_CHIP_DISTRIBUTION=ah.getboolean("enable_chip_distribution", fallback=False),
                 CHIP_LIMIT=ah.getint("chip_limit", fallback=1),
+                MONEYFLOW_RETRY=ah.getint("moneyflow_retry", fallback=3),
+                MONEYFLOW_PAGE_DELAY=ah.getfloat("moneyflow_page_delay", fallback=1.0),
             )
         except KeyError:
             ah_config = AShareHubConfig()
@@ -705,6 +726,7 @@ class Config:
         self.MAX_WORKERS = system_config.MAX_WORKERS
         self.DATA_FETCH_RETRIES = system_config.DATA_FETCH_RETRIES
         self.DATA_FETCH_DELAY = system_config.DATA_FETCH_DELAY
+        self.STOCK_BASIC_INFO_EXPIRE_DAYS = system_config.STOCK_BASIC_INFO_EXPIRE_DAYS
         self.SIGNAL_PROCESSING_PROCESSES = system_config.SIGNAL_PROCESSING_PROCESSES
 
         self.LOG_LEVEL = logging_config.LOG_LEVEL
@@ -735,6 +757,8 @@ class Config:
         self.ASHAREHUB_API_KEY = ah_config.API_KEY
         self.ENABLE_CHIP_DISTRIBUTION = ah_config.ENABLE_CHIP_DISTRIBUTION
         self.CHIP_LIMIT = ah_config.CHIP_LIMIT
+        self.MONEYFLOW_RETRY = ah_config.MONEYFLOW_RETRY
+        self.MONEYFLOW_PAGE_DELAY = ah_config.MONEYFLOW_PAGE_DELAY
 
         self.ENABLE_MACRO_FILTER = mf_config.ENABLE_MACRO_FILTER
         self.MACRO_FILTER_INDEX_SYMBOL = mf_config.INDEX_SYMBOL
@@ -799,6 +823,7 @@ class Config:
             "cost_resistance_ratio": fbs_config.RULE_COST_RESISTANCE_RATIO,
             "chip_concentrated_ratio": fbs_config.RULE_CHIP_CONCENTRATED_RATIO,
             "price_new_high_days": fbs_config.RULE_PRICE_NEW_HIGH_DAYS,
+            "liq_veto_ratio": fr_config.LIQ_VETO_RATIO,
         }
 
         self.POSITION_SIZING = {
@@ -812,6 +837,10 @@ class Config:
             "max_industry_exposure": ps_config.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": ps_config.RISK_BUDGET,
             "max_drawdown_reduction": ps_config.MAX_DRAWDOWN_REDUCTION,
+            "liq_w_section": fr_config.LIQ_W_SECTION,
+            "liq_w_timeseries": fr_config.LIQ_W_TIMESERIES,
+            "liq_w_marketcap": fr_config.LIQ_W_MARKETCAP,
+            "liq_min_discount": fr_config.LIQ_MIN_DISCOUNT,
         }
 
         self.KLINE_HISTORY_DAYS = kd_config.KLINE_HISTORY_DAYS

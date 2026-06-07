@@ -151,12 +151,17 @@ class BOLLSignals:
     """布林带信号"""
     LOW_VOLATILITY = "低波/缩口"
     NORMAL = "常态/张口"
+    UPPER_WALK = "沿上轨攀升"
+    LOWER_WALK = "沿下轨下跌"
+    OVERBOUGHT = "突破上轨"
+    OVERSOLD = "跌破下轨"
 
 
 class RSISignals:
     """RSI 信号"""
     DIV_PREFIX = "RSI底背离!"
     DEFAULT_PREFIX = "RSI="
+    BEARISH_DIV_PREFIX = "RSI顶背离!"
 
 
 class KDJSignals:

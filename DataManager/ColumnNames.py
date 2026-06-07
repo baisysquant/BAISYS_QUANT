@@ -130,3 +130,10 @@ class ColumnNames:
     # ==================== 仓位管理列 ====================
     SUGGESTED_POSITION = "建议仓位比例"
     POSITION_REASON = "仓位依据"
+
+    # ==================== 流动性分析列 ====================
+    AMOUNT = "成交额"
+    AMOUNT_MA20 = "成交额MA20"
+    INDUSTRY_MEDIAN_AMOUNT = "行业中位数成交额"
+    LIQUIDITY_SCORE = "流动性评分"
+    LIQUIDITY_LEVEL = "流动性等级"

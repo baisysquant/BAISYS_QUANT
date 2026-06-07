@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 import pandas as pd
 
@@ -13,6 +14,7 @@ class MoneyFlowFetcher:
 
     通过 AShareHub /v1/flows/moneyflow 获取，不传 ts_code 即全市场。
     缓存策略：当日首次分页拉取 → 写 CSV 缓存；当日再次运行直接读缓存。
+    429 限流时自动重试（指数退避），分页间隔可配置。
     """
 
     API_PAGE_SIZE = 2000
@@ -28,6 +30,8 @@ class MoneyFlowFetcher:
         else:
             self._cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports")
         self._client = None
+        self._retry = getattr(config, 'MONEYFLOW_RETRY', 3)
+        self._page_delay = getattr(config, 'MONEYFLOW_PAGE_DELAY', 1.0)
 
     @property
     def _today(self) -> str:
@@ -90,20 +94,38 @@ class MoneyFlowFetcher:
         print(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
 
         while True:
-            try:
-                df = self.client.moneyflow(start_date=fmt_date, end_date=fmt_date,
-                                           limit=self.API_PAGE_SIZE, offset=offset)
-                if df is None or df.empty:
+            last_err = None
+            for attempt in range(1, self._retry + 2):
+                try:
+                    if attempt > 1:
+                        wait = min(2 ** attempt, 30)
+                        print(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
+                        time.sleep(wait)
+                    df = self.client.moneyflow(start_date=fmt_date, end_date=fmt_date,
+                                               limit=self.API_PAGE_SIZE, offset=offset)
+                    if df is None or df.empty:
+                        last_err = "空响应"
+                        break
+                    all_dfs.append(df)
+                    row_count = len(df)
+                    print(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
+                    if row_count < self.API_PAGE_SIZE:
+                        break
+                    offset += row_count
+                    page += 1
+                    if self._page_delay > 0:
+                        time.sleep(self._page_delay)
+                    last_err = None
                     break
-                all_dfs.append(df)
-                row_count = len(df)
-                print(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
-                if row_count < self.API_PAGE_SIZE:
+                except Exception as e:
+                    last_err = e
+                    err_str = str(e)
+                    if '429' in err_str or 'Too Many Requests' in err_str:
+                        if attempt <= self._retry:
+                            continue
+                    print(f"[MoneyFlow] 获取失败: {e}")
                     break
-                offset += row_count
-                page += 1
-            except Exception as e:
-                print(f"[MoneyFlow] 获取失败: {e}")
+            if last_err:
                 break
 
         if not all_dfs:
