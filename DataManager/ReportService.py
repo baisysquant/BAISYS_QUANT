@@ -93,22 +93,11 @@ class ReportService:
             "10日均线价",
             "30日均线价",
             "60日均线价",
-            ColumnNames.FUND_MOMENTUM_SCORE,
-            # 行业中性化
-            ColumnNames.INDUSTRY_PERCENTILE,
-            ColumnNames.INDUSTRY_SIGNAL_SCORE,
-            ColumnNames.INDUSTRY_DEVIATION,
             # 背离信号 + 位置
             "背离信号",
             ColumnNames.DIVERGENCE_DAYS,
             ColumnNames.DIVERGENCE_PRICE,
-            # 风险 + 退出策略
             ColumnNames.RISK_LEVEL,
-            ColumnNames.STOP_LOSS,
-            ColumnNames.T1_TARGET,
-            ColumnNames.T2_TARGET,
-            ColumnNames.TRAILING_STOP,
-            ColumnNames.EXIT_RRR,
         ]
         return cols
 
@@ -116,11 +105,16 @@ class ReportService:
     def get_report_columns(fund_flow_periods: list = None) -> list:
         cols = [
             ColumnNames.BULL_TREND,
-            ColumnNames.FUND_MOMENTUM,
             ColumnNames.COMPREHENSIVE_ANALYSIS,
             ColumnNames.COMPREHENSIVE_SCORE,
             ColumnNames.COMPREHENSIVE_LEVEL,
+            ColumnNames.STOP_LOSS,
+            ColumnNames.T1_TARGET,
+            ColumnNames.T2_TARGET,
+            ColumnNames.TRAILING_STOP,
+            ColumnNames.EXIT_RRR,
             ColumnNames.RESEARCH_REPORT_COUNT,
+            ColumnNames.FUND_MOMENTUM,
         ]
         if fund_flow_periods:
             period_map = {
@@ -177,7 +171,7 @@ class ReportService:
             self.logger.info(f"  - 用户关注股池: {', '.join(sorted(user_focus_stocks))}")
 
         try:
-            writer = pd.ExcelWriter(report_path, engine="xlsxwriter")
+            writer = pd.ExcelWriter(report_path, engine="xlsxwriter", engine_kwargs={'options': {'nan_inf_to_errors': True}})
             workbook = writer.book
 
             header_format = workbook.add_format(

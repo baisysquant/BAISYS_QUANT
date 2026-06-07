@@ -58,7 +58,7 @@ class SWIndustryDataPipeline:
             # 先读取缓存，检查其完整性
             try:
                 cached_hist = pd.read_parquet(self.cache_file)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, ImportError):
                 cached_hist = pd.read_csv(self.cache_csv_file, parse_dates=['date'])
             
             cached_val = pd.read_csv(self.valuation_file)
@@ -152,7 +152,7 @@ class SWIndustryDataPipeline:
         try:
             df_all.to_parquet(self.cache_file, index=False)
             print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
-        except ImportError:
+        except Exception:
             # 如果pyarrow或fastparquet不可用，则保存为CSV
             df_all.to_csv(self.cache_csv_file, index=False, encoding='utf-8-sig')
             print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
@@ -199,7 +199,7 @@ class SWMultiFactorModel:
         # 尝试读取Parquet，如果失败则读取CSV
         try:
             df_hist = pd.read_parquet(self.pipeline.cache_file)
-        except ImportError:
+        except (ImportError, OSError, ValueError, TypeError):
             df_hist = pd.read_csv(self.pipeline.cache_csv_file, parse_dates=['date'])
         
         df_val = pd.read_csv(self.pipeline.valuation_file)

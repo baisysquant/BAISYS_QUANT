@@ -413,6 +413,17 @@ class StockAnalysisCoordinator:
         industry_df: pd.DataFrame = ctx.get("industry_df", pd.DataFrame())
         processed_data: dict = ctx.get("processed_data", {})
 
+        # 裁剪仅保留 final column order 中的列（step 10 可能加入了计算用列）
+        from DataManager.ReportService import ReportService
+        from DataManager.ColumnNames import ColumnNames as CN
+        final_cols = ReportService.get_final_column_order(
+            fund_flow_periods=self.config.FUND_FLOW_PERIODS
+        )
+        existing_cols = [c for c in final_cols if c in consolidated_report.columns]
+        # 明确剔除计算用列（即使因命名不一致混入）
+        drop_cols = {CN.INDUSTRY_PERCENTILE, CN.INDUSTRY_SIGNAL_SCORE, CN.INDUSTRY_DEVIATION}
+        consolidated_report = consolidated_report[[c for c in existing_cols if c not in drop_cols]]
+
         sheets_data = self._prepare_sheets_data(consolidated_report, industry_df, processed_data)
         self.report_service.generate_excel_report(sheets_data, self.today_str)
         return True
@@ -503,8 +514,8 @@ class StockAnalysisCoordinator:
                 self.logger.warning("数据库同步失败，但流程继续")
             return success
 
-        except (DBAPIError, OperationalError) as e:
-            self.logger.error(f"!!! [同步中断] 数据库异常: {e}")
+        except (DBAPIError, OperationalError, Exception) as e:
+            self.logger.warning(f"!!! [同步中断] 数据库异常: {e}，跳过同步")
             return False
 
 

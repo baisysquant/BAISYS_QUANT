@@ -1,24 +1,11 @@
-﻿from StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+﻿from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
 from UtilsManager.LoggerManager import get_logger
 
 
 def main():
     """
     主函数 - 执行完整的股票分析流程
-
-    流程步骤：
-    1. 同步历史数据到数据库
-    2. 获取待分析股票代码列表
-    3. 获取所有原始数据（资金流、技术指标、行业板块等）
-    4. 获取K线数据并提取最新价格
-    5. 处理技术指标信号（MACD、KDJ、CCI、RSI、BOLL）
-    6. 运行行业深度分析
-    7. 处理均线突破数据并筛选多头排列
-    8. 合并和处理所有数据
-    9. 映射行业信号到个股
-    10. 剔除弱势且加速下跌的个股
-    11. 生成Excel审计报告
-    12. 同步结果到数据库
+ 
 
     Raises:
         DatabaseConnectionError: 数据库连接失败

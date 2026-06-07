@@ -567,6 +567,14 @@ class DataProcessingService:
             else:
                 final_df[col] = final_df[col].fillna("")
 
+        # MACD 管线列也补 NaN → 空串（部分股票可能因早期返回未进 MACD_FULL_BULL）
+        macd_fill_cols = ["MACD趋势", "金叉信号", "柱状动能", "DIF斜率",
+                          "背离信号", "量价配合", "K线形态",
+                          "背离距今", "背离位置", "MACD趋势分类", "macd_trend"]
+        for col in macd_fill_cols:
+            if col in final_df.columns:
+                final_df[col] = final_df[col].fillna("")
+
         return final_df
 
     def merge_special_data(self, final_df: pd.DataFrame, processed_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -603,6 +611,9 @@ class DataProcessingService:
                     on=ColumnNames.STOCK_CODE,
                     how="left",
                 )
+                # 主力成本保留2位小数
+                if ColumnNames.MAIN_COST in final_df.columns:
+                    final_df[ColumnNames.MAIN_COST] = pd.to_numeric(final_df[ColumnNames.MAIN_COST], errors='coerce').round(2)
                 # 使用辅助方法批量填充主力成本相关列
                 self._fill_missing_columns(
                     final_df, ["主力成本", "成本位置"], default_value="N/A"

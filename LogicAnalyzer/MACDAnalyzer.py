@@ -217,7 +217,7 @@ class MACDAnalyzer:
             regime = 'STRONG_TREND'
 
         # Step 2: 背离检测（单参数，半衰期=decay_half_life）
-        dist_div = adaptive_distance(df['DIF'], base=10)
+        dist_div = adaptive_distance(df['DIF'], base_distance=10)
         div_type, div_idx, div_strength = detect_divergence_single_param(df, df['close'], df['DIF'], distance=dist_div)
         div_decay = signal_with_decay(div_type, div_idx, len(df) - 1, half_life=decay_half_life)
         div_combined = '无明显背离信号'
@@ -225,8 +225,8 @@ class MACDAnalyzer:
             div_combined = f"底背离 (强度={div_strength:.2f}, 衰减={div_decay:.2f})"
         elif div_type == Divergence.TOP_DIVERGENCE and div_strength > 0.15:
             div_combined = f"顶背离 (强度={div_strength:.2f}, 衰减={div_decay:.2f})"
-        days_since_div = len(df) - 1 - div_idx if div_type != '' else -1
-        divergence_price = round(float(df['close'].iloc[div_idx]), 2) if div_idx is not None and 0 <= div_idx < len(df) else None
+        days_since_div = len(df) - 1 - div_idx if div_type != '' and div_idx is not None else -1
+        divergence_price = round(float(df['close'].iloc[div_idx]), 2) if div_type != '' and div_idx is not None and 0 <= div_idx < len(df) else None
         divergence_info = {
             'combined_signal': div_combined,
             'signal_type': div_type, 'idx': div_idx,
@@ -260,6 +260,7 @@ class MACDAnalyzer:
             'slope': slope_info,
             'chip_data': df.attrs.get('chip_data', None),
             'macd_trend': macd_trend,
+            'current_dif': float(df['DIF'].iloc[-1]) if 'DIF' in df.columns else 0,
             'moneyflow_data': df.attrs.get('moneyflow_data', None),
             'forecast_data': df.attrs.get('forecast_data', None),
             'vol_regime': self._detect_volatility_regime(df),
@@ -353,11 +354,11 @@ class MACDAnalyzer:
 
         # DIF斜率
         if slope_info['trend'] == '明确上行':
-            scores['DIF斜率'] = (f"确认 {slope_info['trend']} (R²={slope_info['r2']})", w_slope_dim)
+            scores['DIF斜率'] = (f"确认 {slope_info['trend']} (R²={slope_info['r2']:.4f})", w_slope_dim)
         elif '上行' in slope_info['trend']:
-            scores['DIF斜率'] = (f"关注 {slope_info['trend']} (R²={slope_info['r2']})", int(w_slope_dim * 0.55))
+            scores['DIF斜率'] = (f"关注 {slope_info['trend']} (R²={slope_info['r2']:.4f})", int(w_slope_dim * 0.55))
         else:
-            scores['DIF斜率'] = (f"弱势 {slope_info['trend']} (R²={slope_info['r2']})", 0)
+            scores['DIF斜率'] = (f"弱势 {slope_info['trend']} (R²={slope_info['r2']:.4f})", 0)
 
         # 背离信号
         has_top_div = div_type == Divergence.TOP_DIVERGENCE
@@ -699,7 +700,7 @@ def _apply_chip_risk(state: dict, df: pd.DataFrame) -> None:
 
 
 def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None) -> str:
-    close = df['close'].astype(float)
+    close = float(df['close'].iloc[-1])
     ma5 = df['close'].rolling(5).mean().iloc[-1]
     ma10 = df['close'].rolling(10).mean().iloc[-1]
     ma20 = df['close'].rolling(20).mean().iloc[-1]
@@ -721,7 +722,7 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None) -> str:
         return 'STRONG_TREND'
     if ma_bearish and dif < 0 and not momentum_positive:
         return 'WEAK_TREND'
-    if is_narrow_boll and hist is not None and len(df) > 30 and abs(hist.iloc[-1]) < 0.1 * close.std():
+    if is_narrow_boll and hist is not None and len(df) > 30 and abs(hist.iloc[-1]) < 0.1 * df['close'].std():
         return 'OSCILLATION'
     if not ma_bullish and 'DIF' in df.columns and len(df) >= 10:
         dif_series = df['DIF']
@@ -784,6 +785,12 @@ def _pipeline_output(state: dict) -> dict:
     # 如果 state 中有 scores 则包含（取自 Gate 3 计算）
     if '_scores' in state:
         details = {k: {'desc': v[0], 'score': v[1]} for k, v in state['_scores'].items()}
+    else:
+        # 早期返回路径：用 state 已有信息推一个最小化的 MACD趋势
+        macd_desc = state.get('conclusion', '') or state.get('risk_desc', '') or ''
+        details = {
+            'MACD趋势': {'desc': macd_desc or '指标偏弱', 'score': state.get('score', 0)},
+        }
 
     exit_strat = state.get('exit_strategy', {})
 
@@ -802,7 +809,7 @@ def _pipeline_output(state: dict) -> dict:
         "divergence": state.get('divergence', {}),
         "divergence_days": state.get('divergence', {}).get('days_since'),
         "divergence_price": state.get('divergence', {}).get('position_price'),
-        "current_dif": df['DIF'].iloc[-1] if 'DIF' in df.columns else 0,
+        "current_dif": state.get('current_dif', 0),
         "momentum": state.get('momentum', {}).get('desc', ''),
         "slope": state.get('slope', {}),
         "winrate_ref": '参考 pipeline',

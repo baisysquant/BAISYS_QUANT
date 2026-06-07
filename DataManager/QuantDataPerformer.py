@@ -186,13 +186,11 @@ class QuantDBSyncTask:
             "放量天数": "high_vol_days",
 
             # MACD趋势评分列（单参数）
-            "MACD趋势": "macd_trend",
             "金叉信号": "macd_cross",
             "柱状动能": "macd_momentum",
             "DIF斜率": "dif_slope",
             "背离信号": "divergence_signal",
             "量价配合": "volume_price_score",
-            "K线形态": "kline_pattern",
             "综合分析结论": "comprehensive_conclusion",
             "综合分析评分": "comprehensive_score",
             "综合级别": "comprehensive_level",
@@ -272,4 +270,13 @@ class QuantDBSyncTask:
             if before_count != after_count:
                 print(f"  - [数据清洗] 发现 {before_count - after_count} 条重复股票代码，已自动去重。")
 
-        self.db.safe_insert_data(df_db[final_valid_cols], "app_stock_strategy_report", "archive_date", today)
+        try:
+            self.db.safe_insert_data(df_db[final_valid_cols], "app_stock_strategy_report", "archive_date", today)
+        except Exception as e:
+            if 'UndefinedColumn' in type(e).__name__:
+                col_name = str(e).split('"')[1] if '"' in str(e) else 'unknown'
+                print(f"  - [WARN] DB表缺少列 '{col_name}'，跳过该列重试")
+                safe_cols = [c for c in final_valid_cols if c != col_name]
+                self.db.safe_insert_data(df_db[safe_cols], "app_stock_strategy_report", "archive_date", today)
+            else:
+                raise

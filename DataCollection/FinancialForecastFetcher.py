@@ -81,7 +81,7 @@ class FinancialForecastFetcher:
 
         while True:
             try:
-                df = self.client.financials_forecast(limit=self.API_PAGE_SIZE, offset=offset)
+                df = self.client.forecast(limit=self.API_PAGE_SIZE, offset=offset)
                 if df is None or df.empty:
                     break
                 all_dfs.append(df)

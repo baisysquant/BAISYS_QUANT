@@ -1,4 +1,4 @@
 import akshare as ak
 
-news_trade_notify_suspend_baidu_df = ak.news_trade_notify_suspend_baidu(date="20260605")
-print(news_trade_notify_suspend_baidu_df)
+stock_zt_pool_strong_em_df = ak.stock_zt_pool_strong_em(date='20260607')
+print(stock_zt_pool_strong_em_df)

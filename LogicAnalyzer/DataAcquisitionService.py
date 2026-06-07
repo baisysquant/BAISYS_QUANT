@@ -143,8 +143,9 @@ class DataAcquisitionService:
         # 获取其他数据源（带验证，并行优化版）
         logger.info("\n>>> 正在并行获取其他技术指标数据...")
 
+        strong_date = today_str.replace("-", "")
         data_sources = {
-            "strong_stocks_raw": (ak.stock_zt_pool_strong_em, "强势股池", {"date": today_str}),
+            "strong_stocks_raw": (ak.stock_zt_pool_strong_em, "强势股池", {"date": strong_date}),
             "consecutive_rise_raw": (ak.stock_rank_lxsz_ths, "连续上涨", {}),
             "ljqs_raw": (ak.stock_rank_ljqs_ths, "量价齐升", {}),
             "cxfl_raw": (ak.stock_rank_cxfl_ths, "持续放量", {}),
@@ -239,10 +240,6 @@ class DataAcquisitionService:
             if self.executor is None:
                 exec_xstp.shutdown(wait=True)
 
-        # 行业板块数据
-        industry_board_df = self._fetch_industry_data(today_str)
-        data["industry_board_df"] = industry_board_df
-
         # 获取主力成本数据
         logger.info("\n>>> 正在获取主力成本数据...")
         try:
@@ -296,100 +293,5 @@ class DataAcquisitionService:
             data["main_cost_data"] = pd.DataFrame()
 
         return data
-
-    def _fetch_industry_data(self, today_str: str) -> pd.DataFrame:
-        """
-        获取行业板块数据
-
-        Args:
-            today_str: 当前交易日字符串
-
-        Returns:
-            pd.DataFrame: 行业板块数据
-        """
-        logger.info("\n>>> 正在获取行业板块名称并保存至本地...")
-        industry_info_filename = f"行业板块信息_{today_str}.txt"
-        industry_info_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, industry_info_filename)
-        industry_board_df = pd.DataFrame()
-
-        if os.path.exists(industry_info_path):
-            try:
-                logger.info(f"  - 发现本地缓存文件，正在读取: {industry_info_filename}")
-                industry_board_df = pd.read_csv(industry_info_path, sep="|", encoding="utf-8-sig")
-
-                # 验证缓存数据
-                if not industry_board_df.empty:
-                    required_cols = [ColumnNames.AKSHARE_INDUSTRY_BOARD_NAME, ColumnNames.AKSHARE_INDUSTRY_BOARD_CODE]
-                    is_valid, missing = self.data_validator.validate_required_columns(
-                        industry_board_df, required_cols, "行业板块缓存"
-                    )
-
-                    if is_valid:
-                        # Pandera 数据契约校验
-                        is_pandera_valid, pandera_errors = SchemaValidator.validate_industry_board(industry_board_df)
-                        if is_pandera_valid:
-                            logger.info(f"  - [OK] 缓存数据有效: {len(industry_board_df)} 个板块")
-                        else:
-                            logger.warning(f"  - [WARN] 行业板块数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
-                    else:
-                        logger.warning(f"  - [WARN] 缓存数据缺少列: {missing}，将重新获取")
-                        industry_board_df = pd.DataFrame()
-                else:
-                    logger.warning("  - [WARN] 缓存数据为空，将重新获取")
-                    industry_board_df = pd.DataFrame()
-
-            except (OSError, pd.errors.EmptyDataError, ValueError) as e:
-                logger.warning(f"  - [WARN] 读取本地缓存失败: {e}，将尝试重新获取...")
-                industry_board_df = pd.DataFrame()
-        else:
-            logger.info("本地无缓存，正在通过接口获取")
-            try:
-                industry_board_df = ak.stock_board_industry_name_em()
-
-                if not industry_board_df.empty:
-                    # 验证接口数据
-                    required_cols = [ColumnNames.AKSHARE_INDUSTRY_BOARD_NAME, ColumnNames.AKSHARE_INDUSTRY_BOARD_CODE]
-                    is_valid, missing = self.data_validator.validate_required_columns(
-                        industry_board_df, required_cols, "行业板块接口"
-                    )
-
-                    if is_valid:
-                        # Pandera 数据契约校验
-                        is_pandera_valid, pandera_errors = SchemaValidator.validate_industry_board(industry_board_df)
-                        if is_pandera_valid:
-                            try:
-                                industry_board_df.to_csv(
-                                    industry_info_path,
-                                    sep="|",
-                                    index=False,
-                                    encoding="utf-8-sig",
-                                )
-                                logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
-                            except (OSError, PermissionError) as e:
-                                logger.error(f"  - [FAIL] 保存文件失败: {e}")
-                        else:
-                            logger.warning(f"  - [WARN] 行业板块数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
-                            try:
-                                industry_board_df.to_csv(
-                                    industry_info_path,
-                                    sep="|",
-                                    index=False,
-                                    encoding="utf-8-sig",
-                                )
-                                logger.info(f"  - [OK] 获取成功并已保存: {len(industry_board_df)} 个板块")
-                            except (OSError, PermissionError) as e:
-                                logger.error(f"  - [FAIL] 保存文件失败: {e}")
-                    else:
-                        logger.warning(f"  - [WARN] 接口数据缺少列: {missing}")
-                        industry_board_df = pd.DataFrame()
-                else:
-                    logger.warning("  - [WARN] 行业板块接口返回空数据")
-
-            except (ConnectionError, ValueError, KeyError, AttributeError, RuntimeError) as e:
-                logger.error(f"  - [FAIL] 调用行业板块接口失败: {e}")
-
-        return industry_board_df
 
 

@@ -522,7 +522,7 @@ class TASignalProcessor:
                 else:
                     print(f"[MacroFilter] {macro_result.detail} → NORMAL")
             except Exception as e:
-                logger.warning("宏观过滤异常 %s，忽略", e)
+                print(f"[MacroFilter] 异常: {e}")
 
         # ── 并行处理所有股票 ──────────────────────────────────────────────
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)

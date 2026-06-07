@@ -48,7 +48,7 @@ def main():
 
     # 运行 MyPy 类型检查
     mypy_code = run_command(
-        [sys.executable, "-m", "mypy", "StockAnalysisCoordinator.py", "MainShareAnalysis.py"], "MyPy 类型检查"
+        [sys.executable, "-m", "mypy", "LogicAnalyzer/StockAnalysisCoordinator.py", "MainShareAnalysis.py"], "MyPy 类型检查"
     )
 
     # 汇总结果
