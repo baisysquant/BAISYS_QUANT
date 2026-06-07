@@ -34,12 +34,18 @@ class ColumnNames:
     # ==================== 技术指标列 - MACD ====================
     MACD_TREND = "MACD趋势"
     MACD_CROSS = "金叉信号"
+    MACD_HIST_MOMENTUM = "柱状动能"
+    DIF_SLOPE = "DIF斜率"
+    DIVERGENCE_SIGNAL = "背离信号"
+    VOLUME_PRICE_CONFIRM = "量价配合"
+    MACD_TREND_TYPE = "MACD趋势分类"
 
     # ==================== 技术指标列 - 其他 ====================
     KDJ_SIGNAL = "KDJ_Signal"
     CCI_SIGNAL = "CCI_Signal"
     RSI_SIGNAL = "RSI_Signal"
     BOLL_SIGNAL = "BOLL_Signal"
+    KLINE_PATTERN = "K线形态"
     KLINE_PATTERN_SIGNAL = "K线形态信号"
 
     # ==================== 资金流列 ====================
@@ -52,6 +58,7 @@ class ColumnNames:
     # 资金流动能
     FUND_MOMENTUM = "资金动能"
     FUND_MOMENTUM_SCORE = "资金动能评分"
+    FUND_MOMENTUM_STATUS = "资金动能状态"
 
     # ==================== 信号列 ====================
     STRONG_STOCK = "强势股"
@@ -119,3 +126,7 @@ class ColumnNames:
     # ==================== 背离位置列 ====================
     DIVERGENCE_DAYS = "背离距今"
     DIVERGENCE_PRICE = "背离位置"
+
+    # ==================== 仓位管理列 ====================
+    SUGGESTED_POSITION = "建议仓位比例"
+    POSITION_REASON = "仓位依据"

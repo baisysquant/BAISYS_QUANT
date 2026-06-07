@@ -266,6 +266,109 @@ class MacroFilterConfig(BaseModel):
     ADVANCE_RATIO_HOT: float = Field(default=0.70, ge=0, le=1.0)
 
 
+class RegimeDetectionConfig(BaseModel):
+    """市场状态分类参数"""
+
+    BOLL_NARROW_RATIO: float = Field(default=0.8, ge=0.1, le=2.0,
+                                      description="窄布林判定阈值：近期BOLL带宽/历史平均带宽 < 此值→震荡")
+    OSCILLATION_HIST_STD_RATIO: float = Field(default=0.1, ge=0.01, le=1.0,
+                                               description="震荡模式柱状图标准差比：abs(柱状图) < 此值×close.std()→震荡")
+    TOP_RISK_MA20_DEVIATION: float = Field(default=0.15, ge=0.01, le=0.5,
+                                            description="顶风险MA20偏离阈值：(close-MA20)/MA20 > 此值→顶部风险")
+    OSCILLATION_MIN_BARS: int = Field(default=30, ge=10, le=120,
+                                       description="震荡判定最小K线数")
+    REVERSAL_LOOKBACK: int = Field(default=10, ge=5, le=60,
+                                    description="反转检测回溯长度（根K线）")
+
+
+class DivergenceConfig(BaseModel):
+    """背离检测参数"""
+
+    BASE_DISTANCE: int = Field(default=10, ge=5, le=60,
+                                description="背离检测基础窗口（adaptive_distance的base_distance）")
+    STRENGTH_THRESHOLD: float = Field(default=0.15, ge=0.01, le=1.0,
+                                       description="背离有效强度门限，超过此值才生成信号")
+    DECAY_HALF_LIFE: int = Field(default=8, ge=2, le=60,
+                                  description="背离信号半衰期（天）")
+    SLOPE_WINDOW: int = Field(default=5, ge=3, le=30,
+                               description="DIF斜率线性回归窗口（根K线）")
+
+
+class ScoringParamsConfig(BaseModel):
+    """评分计算参数"""
+
+    CROSS_DECAY_DAYS: int = Field(default=30, ge=5, le=120,
+                                   description="金叉信号衰减半衰期（天）")
+    CROSS_DECAY_MIN: float = Field(default=0.3, ge=0.1, le=1.0,
+                                    description="金叉衰减下限（比例）")
+    KLINE_DECAY_DAYS: int = Field(default=10, ge=2, le=60,
+                                   description="K线形态衰减半衰期（天）")
+    KLINE_DECAY_MIN: float = Field(default=0.2, ge=0.05, le=1.0,
+                                    description="K线形态衰减下限（比例）")
+    VOL_NORM_DENOMINATOR: float = Field(default=0.15, ge=0.01, le=1.0,
+                                         description="金叉强度波动率归一化分母：(DIF-DEA)/ATR/此值→vol_factor")
+    ATR_STOP_MULT: float = Field(default=1.5, ge=0.5, le=5.0,
+                                  description="止损ATR倍数：止损价=close-ATR×此值")
+    ATR_T1_MULT: float = Field(default=3.0, ge=1.0, le=10.0,
+                                description="T1目标价ATR倍数")
+    ATR_T2_MULT: float = Field(default=5.0, ge=2.0, le=20.0,
+                                description="T2目标价ATR倍数")
+    TRAILING_STOP_HIGH_RATIO: float = Field(default=0.98, ge=0.9, le=1.0,
+                                              description="移动止损高位触发比：close≥近N日最高价×此值")
+    TRAILING_STOP_LOOKBACK: int = Field(default=10, ge=5, le=60,
+                                         description="移动止损回溯窗口（根K线）")
+    TRAILING_STOP_HIGH_LOOKBACK: int = Field(default=20, ge=10, le=120,
+                                              description="移动止损参考高点回溯窗口（根K线）")
+    EXPECTED_RETURN_LOOKBACK: int = Field(default=20, ge=5, le=120,
+                                           description="预期盈亏比计算回溯窗口（根K线）")
+
+
+class TechnicalConstantsConfig(BaseModel):
+    """标准技术指标参数"""
+
+    ATR_LENGTH: int = Field(default=14, ge=5, le=60,
+                             description="ATR计算周期（Wilder标准14）")
+    ADX_LENGTH: int = Field(default=14, ge=5, le=60,
+                             description="ADX计算周期（Wilder标准14）")
+    RSI_LENGTH: int = Field(default=14, ge=5, le=60,
+                             description="RSI计算周期（Wilder标准14）")
+    BOLL_LENGTH: int = Field(default=20, ge=5, le=60,
+                              description="BOLL计算周期（Bollinger标准20）")
+    BOLL_STD: float = Field(default=2.0, ge=1.0, le=4.0,
+                             description="BOLL标准差倍数（标准2）")
+    STOCH_K: int = Field(default=9, ge=3, le=30,
+                          description="Stoch %K周期（Lane标准9）")
+    STOCH_D: int = Field(default=3, ge=2, le=15,
+                          description="Stoch %D平滑周期（标准3）")
+    KLINE_SCAN_WINDOW: int = Field(default=60, ge=20, le=200,
+                                    description="K线形态扫描窗口（根K线）")
+
+
+class PositionSizingConfig(BaseModel):
+    """仓位管理配置模型"""
+
+    MAX_SINGLE_POSITION: float = Field(default=0.33, ge=0.0, le=1.0,
+                                       description="最大单票仓位")
+    KELLY_FRACTION: float = Field(default=0.25, ge=0.0, le=1.0,
+                                  description="半凯利系数")
+    DEFAULT_WIN_RATE: float = Field(default=0.50, ge=0.0, le=1.0,
+                                    description="默认胜率假设")
+    POSITION_A: float = Field(default=0.30, ge=0.0, le=1.0,
+                              description="A级基础仓位")
+    POSITION_B: float = Field(default=0.15, ge=0.0, le=1.0,
+                              description="B级基础仓位")
+    POSITION_C: float = Field(default=0.05, ge=0.0, le=1.0,
+                              description="C级基础仓位")
+    POSITION_D: float = Field(default=0.00, ge=0.0, le=1.0,
+                              description="D级基础仓位")
+    MAX_INDUSTRY_EXPOSURE: float = Field(default=0.30, ge=0.0, le=1.0,
+                                         description="最大行业集中度")
+    RISK_BUDGET: float = Field(default=0.02, ge=0.001, le=0.10,
+                               description="波动率风险预算")
+    MAX_DRAWDOWN_REDUCTION: float = Field(default=0.50, ge=0.0, le=1.0,
+                                          description="最大回撤缩减系数")
+
+
 class AppConfig(BaseSettings):
     """应用配置主模型"""
 
@@ -287,6 +390,11 @@ class AppConfig(BaseSettings):
     kline_data: KlineDataConfig
     asharehub: AShareHubConfig
     macro_filter: MacroFilterConfig
+    regime_detection: RegimeDetectionConfig
+    divergence: DivergenceConfig
+    scoring_params: ScoringParamsConfig
+    technical_constants: TechnicalConstantsConfig
+    position_sizing: PositionSizingConfig
 
 
 class Config:
@@ -482,6 +590,85 @@ class Config:
         except KeyError:
             mf_config = MacroFilterConfig()
 
+        # 读取市场状态分类参数
+        try:
+            rd = config["REGIME_DETECTION"]
+            rd_config = RegimeDetectionConfig(
+                BOLL_NARROW_RATIO=rd.getfloat("boll_narrow_ratio", fallback=0.8),
+                OSCILLATION_HIST_STD_RATIO=rd.getfloat("oscillation_hist_std_ratio", fallback=0.1),
+                TOP_RISK_MA20_DEVIATION=rd.getfloat("top_risk_ma20_deviation", fallback=0.15),
+                OSCILLATION_MIN_BARS=rd.getint("oscillation_min_bars", fallback=30),
+                REVERSAL_LOOKBACK=rd.getint("reversal_lookback", fallback=10),
+            )
+        except KeyError:
+            rd_config = RegimeDetectionConfig()
+
+        # 读取背离检测参数
+        try:
+            dv = config["DIVERGENCE"]
+            dv_config = DivergenceConfig(
+                BASE_DISTANCE=dv.getint("base_distance", fallback=10),
+                STRENGTH_THRESHOLD=dv.getfloat("strength_threshold", fallback=0.15),
+                DECAY_HALF_LIFE=dv.getint("decay_half_life", fallback=8),
+                SLOPE_WINDOW=dv.getint("slope_window", fallback=5),
+            )
+        except KeyError:
+            dv_config = DivergenceConfig()
+
+        # 读取评分计算参数
+        try:
+            sp = config["SCORING_PARAMS"]
+            sp_config = ScoringParamsConfig(
+                CROSS_DECAY_DAYS=sp.getint("cross_decay_days", fallback=30),
+                CROSS_DECAY_MIN=sp.getfloat("cross_decay_min", fallback=0.3),
+                KLINE_DECAY_DAYS=sp.getint("kline_decay_days", fallback=10),
+                KLINE_DECAY_MIN=sp.getfloat("kline_decay_min", fallback=0.2),
+                VOL_NORM_DENOMINATOR=sp.getfloat("vol_norm_denominator", fallback=0.15),
+                ATR_STOP_MULT=sp.getfloat("atr_stop_mult", fallback=1.5),
+                ATR_T1_MULT=sp.getfloat("atr_t1_mult", fallback=3.0),
+                ATR_T2_MULT=sp.getfloat("atr_t2_mult", fallback=5.0),
+                TRAILING_STOP_HIGH_RATIO=sp.getfloat("trailing_stop_high_ratio", fallback=0.98),
+                TRAILING_STOP_LOOKBACK=sp.getint("trailing_stop_lookback", fallback=10),
+                TRAILING_STOP_HIGH_LOOKBACK=sp.getint("trailing_stop_high_lookback", fallback=20),
+                EXPECTED_RETURN_LOOKBACK=sp.getint("expected_return_lookback", fallback=20),
+            )
+        except KeyError:
+            sp_config = ScoringParamsConfig()
+
+        # 读取标准技术指标参数
+        try:
+            tc = config["TECHNICAL_CONSTANTS"]
+            tc_config = TechnicalConstantsConfig(
+                ATR_LENGTH=tc.getint("atr_length", fallback=14),
+                ADX_LENGTH=tc.getint("adx_length", fallback=14),
+                RSI_LENGTH=tc.getint("rsi_length", fallback=14),
+                BOLL_LENGTH=tc.getint("boll_length", fallback=20),
+                BOLL_STD=tc.getfloat("boll_std", fallback=2.0),
+                STOCH_K=tc.getint("stoch_k", fallback=9),
+                STOCH_D=tc.getint("stoch_d", fallback=3),
+                KLINE_SCAN_WINDOW=tc.getint("kline_scan_window", fallback=60),
+            )
+        except KeyError:
+            tc_config = TechnicalConstantsConfig()
+
+        # 读取仓位管理配置
+        try:
+            ps = config["POSITION_SIZING"]
+            ps_config = PositionSizingConfig(
+                MAX_SINGLE_POSITION=ps.getfloat("max_single_position", fallback=0.33),
+                KELLY_FRACTION=ps.getfloat("kelly_fraction", fallback=0.25),
+                DEFAULT_WIN_RATE=ps.getfloat("default_win_rate", fallback=0.50),
+                POSITION_A=ps.getfloat("position_a", fallback=0.30),
+                POSITION_B=ps.getfloat("position_b", fallback=0.15),
+                POSITION_C=ps.getfloat("position_c", fallback=0.05),
+                POSITION_D=ps.getfloat("position_d", fallback=0.00),
+                MAX_INDUSTRY_EXPOSURE=ps.getfloat("max_industry_exposure", fallback=0.30),
+                RISK_BUDGET=ps.getfloat("risk_budget", fallback=0.02),
+                MAX_DRAWDOWN_REDUCTION=ps.getfloat("max_drawdown_reduction", fallback=0.50),
+            )
+        except KeyError:
+            ps_config = PositionSizingConfig()
+
         # 创建主配置对象
         self.app_config = AppConfig(
             database=database_config,
@@ -498,6 +685,11 @@ class Config:
             kline_data=kd_config,
             asharehub=ah_config,
             macro_filter=mf_config,
+            regime_detection=rd_config,
+            divergence=dv_config,
+            scoring_params=sp_config,
+            technical_constants=tc_config,
+            position_sizing=ps_config,
         )
 
         # 设置向后兼容的属性
@@ -547,6 +739,44 @@ class Config:
         self.ENABLE_MACRO_FILTER = mf_config.ENABLE_MACRO_FILTER
         self.MACRO_FILTER_INDEX_SYMBOL = mf_config.INDEX_SYMBOL
 
+        self.REGIME_DETECTION = {
+            "boll_narrow_ratio": rd_config.BOLL_NARROW_RATIO,
+            "oscillation_hist_std_ratio": rd_config.OSCILLATION_HIST_STD_RATIO,
+            "top_risk_ma20_deviation": rd_config.TOP_RISK_MA20_DEVIATION,
+            "oscillation_min_bars": rd_config.OSCILLATION_MIN_BARS,
+            "reversal_lookback": rd_config.REVERSAL_LOOKBACK,
+        }
+        self.DIVERGENCE_PARAMS = {
+            "base_distance": dv_config.BASE_DISTANCE,
+            "strength_threshold": dv_config.STRENGTH_THRESHOLD,
+            "decay_half_life": dv_config.DECAY_HALF_LIFE,
+            "slope_window": dv_config.SLOPE_WINDOW,
+        }
+        self.SCORING_PARAMS = {
+            "cross_decay_days": sp_config.CROSS_DECAY_DAYS,
+            "cross_decay_min": sp_config.CROSS_DECAY_MIN,
+            "kline_decay_days": sp_config.KLINE_DECAY_DAYS,
+            "kline_decay_min": sp_config.KLINE_DECAY_MIN,
+            "vol_norm_denominator": sp_config.VOL_NORM_DENOMINATOR,
+            "atr_stop_mult": sp_config.ATR_STOP_MULT,
+            "atr_t1_mult": sp_config.ATR_T1_MULT,
+            "atr_t2_mult": sp_config.ATR_T2_MULT,
+            "trailing_stop_high_ratio": sp_config.TRAILING_STOP_HIGH_RATIO,
+            "trailing_stop_lookback": sp_config.TRAILING_STOP_LOOKBACK,
+            "trailing_stop_high_lookback": sp_config.TRAILING_STOP_HIGH_LOOKBACK,
+            "expected_return_lookback": sp_config.EXPECTED_RETURN_LOOKBACK,
+        }
+        self.TECHNICAL_CONSTANTS = {
+            "atr_length": tc_config.ATR_LENGTH,
+            "adx_length": tc_config.ADX_LENGTH,
+            "rsi_length": tc_config.RSI_LENGTH,
+            "boll_length": tc_config.BOLL_LENGTH,
+            "boll_std": tc_config.BOLL_STD,
+            "stoch_k": tc_config.STOCH_K,
+            "stoch_d": tc_config.STOCH_D,
+            "kline_scan_window": tc_config.KLINE_SCAN_WINDOW,
+        }
+
         self.FULL_BULL_WEIGHTS = {
             "MACD趋势": fbs_config.WEIGHT_ZERO_AXIS,
             "金叉信号": fbs_config.WEIGHT_STRATEGY_GOLDEN,
@@ -569,6 +799,19 @@ class Config:
             "cost_resistance_ratio": fbs_config.RULE_COST_RESISTANCE_RATIO,
             "chip_concentrated_ratio": fbs_config.RULE_CHIP_CONCENTRATED_RATIO,
             "price_new_high_days": fbs_config.RULE_PRICE_NEW_HIGH_DAYS,
+        }
+
+        self.POSITION_SIZING = {
+            "max_single_position": ps_config.MAX_SINGLE_POSITION,
+            "kelly_fraction": ps_config.KELLY_FRACTION,
+            "default_win_rate": ps_config.DEFAULT_WIN_RATE,
+            "position_a": ps_config.POSITION_A,
+            "position_b": ps_config.POSITION_B,
+            "position_c": ps_config.POSITION_C,
+            "position_d": ps_config.POSITION_D,
+            "max_industry_exposure": ps_config.MAX_INDUSTRY_EXPOSURE,
+            "risk_budget": ps_config.RISK_BUDGET,
+            "max_drawdown_reduction": ps_config.MAX_DRAWDOWN_REDUCTION,
         }
 
         self.KLINE_HISTORY_DAYS = kd_config.KLINE_HISTORY_DAYS

@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from datetime import datetime
@@ -6,6 +7,8 @@ import pandas as pd
 from typing import Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas_ta as ta  # 勿删
+
+logger = logging.getLogger(__name__)
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
 from LogicAnalyzer.SignalConstants import (
@@ -83,6 +86,7 @@ class TASignalProcessor:
 
         df = valid_hist_df[valid_hist_df['股票代码'] == pure_code].copy()
         if df.empty or len(df) < 30:
+            logger.debug("股票 %s 跳过: 数据不足(%s行)", pure_code, len(df) if not df.empty else 0)
             return None
 
         for col in ['close', 'open', 'high', 'low', 'volume']:
@@ -90,10 +94,12 @@ class TASignalProcessor:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(subset=['close', 'open', 'high', 'low'], inplace=True)
         if df.empty:
+            logger.debug("股票 %s 跳过: close/open/high/low 全部空值", pure_code)
             return None
         required_cols = ['close', 'open', 'high', 'low']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
+            logger.debug("股票 %s 跳过: 缺少必要列 %s", pure_code, missing_cols)
             return None
         if 'date' in df.columns:
             df.sort_values('date', inplace=True)
@@ -101,7 +107,8 @@ class TASignalProcessor:
 
         try:
             df = self.macd_analyzer._custom_macd(df)
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError) as e:
+            logger.debug("股票 %s MACD计算跳过: %s", pure_code, e)
             return None
 
         result: dict[str, Any] = {'code': code, 'pure_code': pure_code}
@@ -114,8 +121,8 @@ class TASignalProcessor:
                 result['kline_pattern_score'] = kp['score']
                 df.attrs['kline_pattern_score'] = kp['score']
                 df.attrs['_kline_pattern_details'] = {'details': kp['details']}
-        except (KeyError, ValueError, TypeError, AttributeError):
-            pass
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logger.debug("股票 %s K线形态检测跳过: %s", pure_code, e)
 
         weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
         thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
@@ -150,10 +157,17 @@ class TASignalProcessor:
             adj_thresholds = None
             if thresholds and macro_adjust < 1.0:
                 adj_thresholds = {k: int(v * macro_adjust) for k, v in thresholds.items()}
+            pipeline_params = {
+                "regime": getattr(self.config, 'REGIME_DETECTION', {}),
+                "divergence": getattr(self.config, 'DIVERGENCE_PARAMS', {}),
+                "scoring": getattr(self.config, 'SCORING_PARAMS', {}),
+                "technical": getattr(self.config, 'TECHNICAL_CONSTANTS', {}),
+            }
             pipeline_result = self.macd_analyzer.pipeline_analysis(
                 df,
                 weights=weights, thresholds=adj_thresholds or thresholds,
                 rule_thresholds=getattr(self.config, 'RULE_THRESHOLDS', None),
+                params=pipeline_params,
             )
             result['pipeline'] = pipeline_result
             result['details'] = pipeline_result.get('details', {})
@@ -165,8 +179,8 @@ class TASignalProcessor:
             result['t2_target'] = pipeline_result.get('t2_target')
             result['trailing_stop'] = pipeline_result.get('trailing_stop')
             result['exit_rrr'] = pipeline_result.get('exit_rrr')
-        except (KeyError, ValueError, TypeError):
-            pass
+        except (KeyError, ValueError, TypeError) as e:
+            logger.debug("股票 %s 管线分析跳过: %s", pure_code, e)
 
         try:
             detail_col = 'MACD_SIGNAL_DETAIL'
@@ -174,15 +188,15 @@ class TASignalProcessor:
                 val = df[detail_col].iloc[-1]
                 if pd.notna(val) and val != '':
                     result['macd_signal'] = val
-        except (KeyError, ValueError, TypeError):
-            pass
+        except (KeyError, ValueError, TypeError) as e:
+            logger.debug("股票 %s MACD信号详情跳过: %s", pure_code, e)
 
         try:
             kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
             if kdj_signal:
                 result['kdj_signal'] = kdj_signal
-        except (KeyError, ValueError, TypeError, AttributeError):
-            pass
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logger.debug("股票 %s KDJ分析跳过: %s", pure_code, e)
 
         try:
             df.ta.cci(append=True, close='close', high='high', low='low')
@@ -190,8 +204,8 @@ class TASignalProcessor:
             if cci_cols:
                 current_cci = df[cci_cols[0]].iloc[-1]
                 result['cci_signal'] = self._classify_cci_level(current_cci) or f'常态波动 ({current_cci:.2f})'
-        except (KeyError, ValueError, TypeError, AttributeError):
-            pass
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logger.debug("股票 %s CCI分析跳过: %s", pure_code, e)
 
         try:
             df.ta.rsi(append=True, close='close', length=14)
@@ -207,8 +221,8 @@ class TASignalProcessor:
                     is_price_low = curr_low <= (min_low_window * 1.02)
                     is_divergence = is_price_low and (curr_rsi > min_rsi_window * 1.05) and (curr_rsi < 50)
                     result['rsi_signal'] = f'RSI底背离! ({curr_rsi:.1f})' if is_divergence else f'RSI={curr_rsi:.1f}'
-        except (KeyError, ValueError, TypeError, AttributeError):
-            pass
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logger.debug("股票 %s RSI分析跳过: %s", pure_code, e)
 
         try:
             df.ta.bbands(append=True, length=20, std=2, close='close')
@@ -222,8 +236,8 @@ class TASignalProcessor:
                     df['BOLL_BANDWIDTH'].iloc[-5:].mean() < df['BOLL_BANDWIDTH'].mean()
                 )
                 result['boll_signal'] = '低波/缩口' if is_narrow else '常态/张口'
-        except (KeyError, ValueError, TypeError, AttributeError):
-            pass
+        except (KeyError, ValueError, TypeError, AttributeError) as e:
+            logger.debug("股票 %s BOLL分析跳过: %s", pure_code, e)
 
         return result
 
@@ -538,12 +552,13 @@ class TASignalProcessor:
                 for code in set(all_codes)
             }
             for future in as_completed(futures):
+                code = futures[future]
                 try:
                     r = future.result()
                     if r:
                         results.append(r)
-                except (KeyError, ValueError, TypeError, AttributeError):
-                    continue
+                except (KeyError, ValueError, TypeError, AttributeError) as e:
+                    logger.warning("股票 %s 管线线程异常: %s", code, e)
         finally:
             if self.executor is None:
                 exec_signal.shutdown(wait=True)

@@ -3,6 +3,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from DataManager.ColumnNames import ColumnNames
+
 
 class FundMomentumAnalyzer:
     def __init__(self, trend_weight: float = 0.4, speed_weight: float = 0.6, z_score_threshold: float = 1.0):
@@ -30,9 +32,9 @@ class FundMomentumAnalyzer:
         """
 
         # 提取标准化后的数值 (单位: 万元)
-        T5 = self._safe_float(row.get("5日资金流入万元", row.get("5日资金流入", 0)))
-        T10 = self._safe_float(row.get("10日资金流入万元", row.get("10日资金流入", 0)))
-        T20 = self._safe_float(row.get("20日资金流入万元", row.get("20日资金流入", 0)))
+        T5 = self._safe_float(row.get(ColumnNames.FUND_FLOW_5D, row.get("5日资金流入", 0)))
+        T10 = self._safe_float(row.get(ColumnNames.FUND_FLOW_10D, row.get("10日资金流入", 0)))
+        T20 = self._safe_float(row.get(ColumnNames.FUND_FLOW_20D, row.get("20日资金流入", 0)))
 
         # 趋势因子 如果5日占了10日的80%，说明近期资金主导了中期趋势.
         participation_10 = T5 / T10 if T10 > 0 else 0

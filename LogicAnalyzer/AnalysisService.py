@@ -103,7 +103,7 @@ class AnalysisService:
         dif_single = pd.to_numeric(consolidated_report.get("_current_dif"), errors="coerce")
 
         kdj_col = consolidated_report.get(
-            "KDJ_Signal",
+            ColumnNames.KDJ_SIGNAL,
             pd.Series([""] * len(consolidated_report), index=consolidated_report.index),
         )
         kdj_is_empty = kdj_col.isna() | (kdj_col.astype(str).str.strip().str.lower().isin(["", "nan", "none"]))
@@ -113,10 +113,10 @@ class AnalysisService:
         exempt_from_drop = full_bull_level.isin(self.config.EXEMPT_LEVELS)
 
         drop_condition = (
-            (consolidated_report.get("强势股") == "否")
-            & (consolidated_report.get("量价齐升") == "否")
-            & (consolidated_report.get("连涨天数") == 0)
-            & (consolidated_report.get("放量天数") == 0)
+            (consolidated_report.get(ColumnNames.STRONG_STOCK) == "否")
+            & (consolidated_report.get(ColumnNames.PRICE_VOLUME_RISE) == "否")
+            & (consolidated_report.get(ColumnNames.CONSECUTIVE_RISE_DAYS) == 0)
+            & (consolidated_report.get(ColumnNames.VOLUME_INCREASE_DAYS) == 0)
             & (dif_single < 0)
             & kdj_is_empty
             & (
@@ -146,14 +146,14 @@ class AnalysisService:
         Returns:
             pd.DataFrame: 添加了行业信号的DataFrame
         """
-        if industry_df.empty or stock_df.empty or "行业" not in stock_df.columns:
-            stock_df["所属行业信号"] = ""
+        if industry_df.empty or stock_df.empty or ColumnNames.INDUSTRY not in stock_df.columns:
+            stock_df[ColumnNames.INDUSTRY_SIGNAL] = ""
             return stock_df
 
         required_cols = {"行业名称", "行业信号"}
         if not required_cols.issubset(industry_df.columns):
             self.logger.warning(f"行业分析结果缺少必要列: {required_cols - set(industry_df.columns)}")
-            stock_df["所属行业信号"] = ""
+            stock_df[ColumnNames.INDUSTRY_SIGNAL] = ""
             return stock_df
 
         self.logger.info("  - 正在将行业信号映射至个股...")
@@ -164,14 +164,14 @@ class AnalysisService:
         industry_signal_df = industry_signal_df.drop_duplicates(subset=["行业名称"], keep="first")
 
         signal_map = industry_signal_df.set_index("行业名称")["行业信号"].to_dict()
-        stock_df["所属行业信号"] = (
-            stock_df["行业"].fillna("").astype(str).str.strip().map(signal_map).fillna("")
+        stock_df[ColumnNames.INDUSTRY_SIGNAL] = (
+            stock_df[ColumnNames.INDUSTRY].fillna("").astype(str).str.strip().map(signal_map).fillna("")
         )
 
         return stock_df
 
     def get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
-        from DataManager.DataProcessingService import get_stock_industry_mapping as _get_mapping
+        from DataManager.DataMergeService import get_stock_industry_mapping as _get_mapping
         return _get_mapping(stock_codes, self.logger)
 
     def process_xstp_and_filter(self, raw_data: dict[str, pd.DataFrame], spot_df: pd.DataFrame) -> pd.DataFrame:
@@ -188,58 +188,58 @@ class AnalysisService:
         self.logger.info("正在处理并合并均线突破数据...")
 
         # 1. 清洗均线数据
-        processed_df10 = raw_data.get("xstp_10_raw", pd.DataFrame()).rename(columns={"最新价": "10日均线价"})
-        processed_df30 = raw_data.get("xstp_30_raw", pd.DataFrame()).rename(columns={"最新价": "30日均线价"})
-        processed_df60 = raw_data.get("xstp_60_raw", pd.DataFrame()).rename(columns={"最新价": "60日均线价"})
+        processed_df10 = raw_data.get("xstp_10_raw", pd.DataFrame()).rename(columns={ColumnNames.LATEST_PRICE: ColumnNames.MA10_PRICE})
+        processed_df30 = raw_data.get("xstp_30_raw", pd.DataFrame()).rename(columns={ColumnNames.LATEST_PRICE: ColumnNames.MA30_PRICE})
+        processed_df60 = raw_data.get("xstp_60_raw", pd.DataFrame()).rename(columns={ColumnNames.LATEST_PRICE: ColumnNames.MA60_PRICE})
 
         # 2. 合并
         merged_df = pd.concat(
             [
-                processed_df10[["股票代码", "股票简称"]].dropna(subset=["股票代码"]),
-                processed_df30[["股票代码", "股票简称"]].dropna(subset=["股票代码"]),
-                processed_df60[["股票代码", "股票简称"]].dropna(subset=["股票代码"]),
+                processed_df10[[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME]].dropna(subset=[ColumnNames.STOCK_CODE]),
+                processed_df30[[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME]].dropna(subset=[ColumnNames.STOCK_CODE]),
+                processed_df60[[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME]].dropna(subset=[ColumnNames.STOCK_CODE]),
             ]
-        ).drop_duplicates(subset=["股票代码"])
+        ).drop_duplicates(subset=[ColumnNames.STOCK_CODE])
 
         # 3. 重新合并均线价格，确保同一行有所有数据
-        xstp_base = merged_df[["股票代码", "股票简称"]].drop_duplicates()
+        xstp_base = merged_df[[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME]].drop_duplicates()
         xstp_base = pd.merge(
             xstp_base,
-            processed_df10[["股票代码", "10日均线价"]],
-            on="股票代码",
+            processed_df10[[ColumnNames.STOCK_CODE, ColumnNames.MA10_PRICE]],
+            on=ColumnNames.STOCK_CODE,
             how="left",
         )
         xstp_base = pd.merge(
             xstp_base,
-            processed_df30[["股票代码", "30日均线价"]],
-            on="股票代码",
+            processed_df30[[ColumnNames.STOCK_CODE, ColumnNames.MA30_PRICE]],
+            on=ColumnNames.STOCK_CODE,
             how="left",
         )
         xstp_base = pd.merge(
             xstp_base,
-            processed_df60[["股票代码", "60日均线价"]],
-            on="股票代码",
+            processed_df60[[ColumnNames.STOCK_CODE, ColumnNames.MA60_PRICE]],
+            on=ColumnNames.STOCK_CODE,
             how="left",
         )
 
         # 4. 合并实时价格
-        xstp_base = pd.merge(xstp_base, spot_df[["股票代码", "最新价"]], on="股票代码", how="left")
+        xstp_base = pd.merge(xstp_base, spot_df[[ColumnNames.STOCK_CODE, ColumnNames.LATEST_PRICE]], on=ColumnNames.STOCK_CODE, how="left")
 
         # 5. 类型转换和过滤
-        cols_to_convert = [col for col in xstp_base.columns if "最新价" in col or col == "最新价"]
+        cols_to_convert = [col for col in xstp_base.columns if ColumnNames.LATEST_PRICE in col or col == ColumnNames.LATEST_PRICE]
         for col in cols_to_convert:
             xstp_base[col] = pd.to_numeric(xstp_base[col], errors="coerce")
 
         # 过滤条件: 1. 最新价>10日均线 2. 多头排列 (10>30 或 30>60)
         filtered_df = xstp_base[
-            (xstp_base["最新价"] > xstp_base["10日均线价"])
+            (xstp_base[ColumnNames.LATEST_PRICE] > xstp_base[ColumnNames.MA10_PRICE])
             & (
-                (xstp_base["10日均线价"] > xstp_base["30日均线价"].fillna(float("-inf")))
-                | (xstp_base["30日均线价"] > xstp_base["60日均线价"].fillna(float("-inf")))
+                (xstp_base[ColumnNames.MA10_PRICE] > xstp_base[ColumnNames.MA30_PRICE].fillna(float("-inf")))
+                | (xstp_base[ColumnNames.MA30_PRICE] > xstp_base[ColumnNames.MA60_PRICE].fillna(float("-inf")))
             )
         ].copy()
 
-        filtered_df.rename(columns={"最新价": "当前价格"}, inplace=True)
+        filtered_df.rename(columns={ColumnNames.LATEST_PRICE: ColumnNames.CURRENT_PRICE}, inplace=True)
         return filtered_df.fillna("N/A")
 
     def _get_first_fund_flow_col(self) -> str:
@@ -250,14 +250,14 @@ class AnalysisService:
             str: 资金流列名
         """
         period_map = {
-            3: "3日资金流入万元",
-            5: "5日资金流入万元",
-            10: "10日资金流入万元",
-            20: "20日资金流入万元",
+            3: ColumnNames.FUND_FLOW_3D,
+            5: ColumnNames.FUND_FLOW_5D,
+            10: ColumnNames.FUND_FLOW_10D,
+            20: ColumnNames.FUND_FLOW_20D,
         }
 
         if self.config.FUND_FLOW_PERIODS:
             first_period = self.config.FUND_FLOW_PERIODS[0]
-            return period_map.get(first_period, "5日资金流入万元")
+            return period_map.get(first_period, ColumnNames.FUND_FLOW_5D)
 
-        return "5日资金流入万元"
+        return ColumnNames.FUND_FLOW_5D

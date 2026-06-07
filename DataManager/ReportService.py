@@ -143,7 +143,8 @@ class ReportService:
         base_cols = ReportService.get_base_columns()
         signal_cols = ReportService.get_signal_columns()
         report_cols = ReportService.get_report_columns(fund_flow_periods)
-        return base_cols + signal_cols + report_cols + [ColumnNames.STOCK_LINK]
+        tail_cols = [ColumnNames.SUGGESTED_POSITION, ColumnNames.STOCK_LINK]
+        return base_cols + signal_cols + report_cols + tail_cols
 
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
         """
@@ -223,15 +224,17 @@ class ReportService:
                     max_len = max(df[col].astype(str).str.len().max(), len(col))
                     col_width = min(max_len + 2, 30)
 
-                    if col == "最新价" or "价格" in col or "价" in col or "线" in col or "均线" in col:
+                    if col == ColumnNames.SUGGESTED_POSITION:
+                        worksheet.set_column(i, i, col_width, workbook.add_format({"num_format": "0.0%"}))
+                    elif col == ColumnNames.LATEST_PRICE or "价格" in col or "价" in col or "线" in col or "均线" in col:
                         worksheet.set_column(i, i, col_width, currency_format)
                     elif "代码" in col:
                         worksheet.set_column(i, i, 10, code_format)
                     elif col in [
-                        "3日资金流入万元",
-                        "5日资金流入万元",
-                        "10日资金流入万元",
-                        "20日资金流入万元",
+                        ColumnNames.FUND_FLOW_3D,
+                        ColumnNames.FUND_FLOW_5D,
+                        ColumnNames.FUND_FLOW_10D,
+                        ColumnNames.FUND_FLOW_20D,
                     ]:
                         # 确保资金流入列使用货币格式
                         worksheet.set_column(i, i, col_width, currency_format)
