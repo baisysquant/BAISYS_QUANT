@@ -500,7 +500,7 @@ class Config:
         # 读取技术指标信号配置
         ti = config["TECHNICAL_INDICATORS"]
         ti_config = TechnicalIndicatorsConfig(
-            MACD_PARAMS=ti.get("MACD_PARAMS", fallback="12,26,9"),
+            MACD_PARAMS=ti.get("macd_params", fallback="12,26,9"),
         )
 
         # 读取列名别名配置
