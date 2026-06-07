@@ -264,6 +264,290 @@ def _chip_cost_concentrated(state: dict) -> bool:
     return (c95 - c5) / c5 < ratio
 
 
+# ── Gate 0: 数据质量条件 ───────────────────────────────────────────────────────
+
+def _kline_too_short(state: dict) -> bool:
+    df = state.get('df')
+    return df is None or len(df) < 60
+
+
+def _atr_missing(state: dict) -> bool:
+    df = state.get('df')
+    if df is None or 'ATR' not in df.columns:
+        return True
+    atr_val = df['ATR'].iloc[-1]
+    return pd.isna(atr_val) or atr_val <= 0
+
+
+def _ma60_missing(state: dict) -> bool:
+    df = state.get('df')
+    if df is None or 'MA_60' not in df.columns:
+        return True
+    v = df['MA_60'].iloc[-1]
+    return pd.isna(v) or v <= 0
+
+
+def _volume_empty(state: dict) -> bool:
+    df = state.get('df')
+    if df is None or 'volume' not in df.columns:
+        return True
+    return df['volume'].iloc[-5:].sum() <= 0
+
+
+# ── Gate 0.5: 宏观情景条件 ──────────────────────────────────────────────────────
+
+def _macro_weak_with_high_score(state: dict) -> bool:
+    return state.get('regime') == 'WEAK_TREND' and state.get('score', 0) > 60
+
+
+def _macro_strong_with_high_score(state: dict) -> bool:
+    return state.get('regime') == 'STRONG_TREND' and state.get('score', 0) > 80
+
+
+# ── Gate 1: 多因子共振条件 ──────────────────────────────────────────────────────
+
+def _multi_indicator_aligned(state: dict, required: int = 3) -> bool:
+    df = state.get('df')
+    if df is None or len(df) < 3:
+        return False
+    bullish = 0
+    detail = str(df['MACD_SIGNAL_DETAIL'].iloc[-1]) if 'MACD_SIGNAL_DETAIL' in df.columns else ''
+    if '金叉' in detail:
+        bullish += 1
+    k_col = next((c for c in df.columns if c.startswith('STOCHk')), None)
+    d_col = next((c for c in df.columns if c.startswith('STOCHd')), None)
+    if k_col and d_col and df[k_col].iloc[-1] > df[d_col].iloc[-1]:
+        bullish += 1
+    cci_col = next((c for c in df.columns if c.startswith('CCI_')), None)
+    if cci_col and not pd.isna(df[cci_col].iloc[-1]) and df[cci_col].iloc[-1] > 100:
+        bullish += 1
+    rsi_col = next((c for c in df.columns if c.startswith('RSI_')), None)
+    if rsi_col and not pd.isna(df[rsi_col].iloc[-1]) and df[rsi_col].iloc[-1] > 50:
+        bullish += 1
+    return bullish >= required
+
+
+def _multitimeframe_aligned_bull(state: dict) -> bool:
+    return state.get('mtf_alignment') == 'ALIGNED_BULL'
+
+
+def _macd_kdj_rsi_all_bullish(state: dict) -> bool:
+    """MACD+KDJ+RSI 三金叉（与 R19 同逻辑，用于 Gate 1 加分）"""
+    df = state.get('df')
+    if df is None or len(df) < 3:
+        return False
+    detail = str(df['MACD_SIGNAL_DETAIL'].iloc[-1]) if 'MACD_SIGNAL_DETAIL' in df.columns else ''
+    if '金叉' not in detail:
+        return False
+    k_col = next((c for c in df.columns if c.startswith('STOCHk')), None)
+    d_col = next((c for c in df.columns if c.startswith('STOCHd')), None)
+    if k_col is None or d_col is None:
+        return False
+    if df[k_col].iloc[-1] <= df[d_col].iloc[-1]:
+        return False
+    rsi_col = next((c for c in df.columns if c.startswith('RSI_')), None)
+    if rsi_col is None:
+        return False
+    rsi_val = df[rsi_col].iloc[-1]
+    return not pd.isna(rsi_val) and rsi_val < 70
+
+
+# ── Gate 2: 风险加强条件 ────────────────────────────────────────────────────────
+
+def _extreme_volatility(state: dict) -> bool:
+    df = state.get('df')
+    if df is None or 'ATR' not in df.columns:
+        return False
+    cfg = state.get('config', {})
+    threshold = cfg.get('atr_extreme', 0.08)
+    atr = df['ATR'].iloc[-1]
+    close = df['close'].iloc[-1]
+    if pd.isna(atr) or close <= 0:
+        return False
+    return atr / close > threshold
+
+
+def _top_divergence_volume_down(state: dict) -> bool:
+    """顶背离 + 放量下跌（与 R01 区分：放量恐慌 vs 缩量见顶）"""
+    div = state.get('divergence') or {}
+    cs = div.get('combined_signal', '')
+    if '顶背离' not in cs:
+        return False
+    vt = state.get('volume_trend')
+    return vt is not None and ('放量' in vt[0] or '量增' in vt[0]) and '下跌' in vt[0]
+
+
+def _momentum_exhausting(state: dict) -> bool:
+    """柱状线连续 5 期缩短 + DIF 斜率拐头"""
+    df = state.get('df')
+    if df is None or len(df) < 7:
+        return False
+    if 'DIF' not in df.columns or 'DEA' not in df.columns:
+        return False
+    hist = df['DIF'] - df['DEA']
+    recent = hist.iloc[-6:]
+    if len(recent) < 6:
+        return False
+    diffs = recent.diff().iloc[1:]
+    if len(diffs) < 5:
+        return False
+    all_decreasing = all(diffs.iloc[-i] < 0 for i in range(1, 6) if i <= len(diffs))
+    if not all_decreasing:
+        return False
+    slope = state.get('slope')
+    return slope is not None and slope.get('slope', 0) < 0
+
+
+def _price_below_ma20_ma60(state: dict) -> bool:
+    df = state.get('df')
+    if df is None:
+        return False
+    try:
+        close = df['close'].iloc[-1]
+        ma20 = df['MA_20'].iloc[-1]
+        ma60 = df['MA_60'].iloc[-1]
+        return close < ma20 < ma60
+    except (KeyError, IndexError):
+        return False
+
+
+def _liquidity_crisis(state: dict) -> bool:
+    """成交额（volume × close）低于 500 万"""
+    df = state.get('df')
+    if df is None or 'volume' not in df.columns:
+        return False
+    close = df['close'].iloc[-1]
+    volume = df['volume'].iloc[-1]
+    return close * volume < 5_000_000
+
+
+def _amplitude_extreme_99(state: dict) -> bool:
+    """振幅 > 近 60 日 99 分位数"""
+    df = state.get('df')
+    if df is None or 'AMPLITUDE_PCT' not in df.columns or len(df) < 61:
+        return False
+    recent = df['AMPLITUDE_PCT'].iloc[-61:-1].dropna()
+    if len(recent) < 10:
+        return False
+    threshold = recent.quantile(0.99)
+    current = df['AMPLITUDE_PCT'].iloc[-1]
+    return not pd.isna(current) and current > threshold
+
+
+# ── Gate 3: 评分修饰条件 ───────────────────────────────────────────────────────
+
+def _moneyflow_positive_with_macd_bullish(state: dict) -> bool:
+    """资金净流入 > 0 且 MACD 看涨"""
+    mf = state.get('moneyflow_data')
+    if not mf:
+        return False
+    net = float(mf.get('net_mf_amount', 0))
+    if net <= 0:
+        return False
+    df = state.get('df')
+    if df is None or 'DIF' not in df.columns or 'DEA' not in df.columns:
+        return False
+    return df['DIF'].iloc[-1] > df['DEA'].iloc[-1]
+
+
+def _moneyflow_negative_with_macd_bearish(state: dict) -> bool:
+    """资金净流出 > 0 且 MACD 看跌"""
+    mf = state.get('moneyflow_data')
+    if not mf:
+        return False
+    net = float(mf.get('net_mf_amount', 0))
+    if net >= 0:
+        return False
+    df = state.get('df')
+    if df is None or 'DIF' not in df.columns or 'DEA' not in df.columns:
+        return False
+    return df['DIF'].iloc[-1] < df['DEA'].iloc[-1]
+
+
+def _volume_price_healthy(state: dict) -> bool:
+    """close > MA60 且 volume > MA5 均量"""
+    df = state.get('df')
+    if df is None or 'volume' not in df.columns:
+        return False
+    try:
+        close = df['close'].iloc[-1]
+        ma60 = df['MA_60'].iloc[-1]
+        if pd.isna(ma60) or close <= ma60:
+            return False
+        vol = df['volume'].iloc[-1]
+        vol_ma5 = df['volume'].iloc[-5:].mean()
+        return not pd.isna(vol_ma5) and vol > vol_ma5
+    except (KeyError, IndexError):
+        return False
+
+
+def _chip_bottom_with_divergence(state: dict) -> bool:
+    """筹码获利 < 20% 且 底背离"""
+    chip = state.get('chip_data')
+    if not chip:
+        return False
+    wr = float(chip.get('winner_rate', 100))
+    if wr >= 20:
+        return False
+    div = state.get('divergence') or {}
+    cs = div.get('combined_signal', '')
+    return '底背离' in cs
+
+
+def _three_green_candles_volume_up(state: dict) -> bool:
+    """K 线 3 连阳（收盘>开盘）且成交量依次递增"""
+    df = state.get('df')
+    if df is None or len(df) < 4 or 'volume' not in df.columns:
+        return False
+    for i in range(1, 4):
+        if df['close'].iloc[-i] <= df['open'].iloc[-i]:
+            return False
+    recent_vol = df['volume'].iloc[-3:].values
+    return all(recent_vol[i] < recent_vol[i + 1] for i in range(len(recent_vol) - 1))
+
+
+# ── Gate 4: 仓位调整条件 ────────────────────────────────────────────────────────
+
+def _risk_high_pos(state: dict) -> bool:
+    return state.get('risk_level') == 'HIGH'
+
+
+def _risk_medium_score_low_pos(state: dict) -> bool:
+    return state.get('risk_level') == 'MEDIUM' and (state.get('score', 100) < 60)
+
+
+def _oscillation_score_low_pos(state: dict) -> bool:
+    return state.get('regime') == 'OSCILLATION' and (state.get('score', 100) < 50)
+
+
+def _bot_div_bottom_reversal_pos(state: dict) -> bool:
+    div = state.get('divergence') or {}
+    cs = div.get('combined_signal', '')
+    return '底背离' in cs and state.get('regime') == 'BOTTOM_REVERSAL'
+
+
+def _kline_strong_reversal_volume_pos(state: dict) -> bool:
+    kd = state.get('kline_data')
+    if not kd or not kd.get('details'):
+        return False
+    has_strong_bullish = any(d['level'] == '强反转' and d['direction'] == '看涨' for d in kd['details'])
+    if not has_strong_bullish:
+        return False
+    vt = state.get('volume_trend')
+    return vt is not None and ('放量' in vt[0] or '量增' in vt[0])
+
+
+def _high_vol_atr_pos(state: dict) -> bool:
+    df = state.get('df')
+    if df is None or 'ATR' not in df.columns:
+        return False
+    atr = df['ATR'].iloc[-1]
+    close = df['close'].iloc[-1]
+    if pd.isna(atr) or close <= 0:
+        return False
+    return atr / close > 0.05
+
+
 # ── 波动率情景条件 ─────────────────────────────────────────────────────────────
 
 def _vol_regime_is(state: dict, regime: str) -> bool:
@@ -650,6 +934,237 @@ def _act_vol_reversal_boost(state: dict) -> None:
     state['triggered_rules'].append('R27')
 
 
+# ── Gate 0: 数据质量动作 ───────────────────────────────────────────────────────
+
+def _act_data_insufficient(state: dict) -> None:
+    """R30: 数据不足 → 否决"""
+    state['level'] = 'D'
+    state['score'] = 0
+    state['risk_level'] = 'HIGH'
+    state['conclusion'] = 'D: 数据不足(K线<60)'
+    state['triggered_rules'].append('R30')
+
+
+def _act_no_volatility(state: dict) -> None:
+    """R31: 无波动率数据 → 标记，score=0"""
+    state['score'] = 0
+    state.setdefault('_notes', [])
+    state['_notes'].append('无ATR波动率数据')
+    state['triggered_rules'].append('R31')
+
+
+def _act_no_long_term_trend(state: dict) -> None:
+    """R32: 无长期趋势参考 → 标记"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('MA60缺失无长期趋势')
+    state['triggered_rules'].append('R32')
+
+
+def _act_no_volume(state: dict) -> None:
+    """R33: 无成交量数据 → 中等风险"""
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+    state.setdefault('_notes', [])
+    state['_notes'].append('无成交量数据')
+    state['triggered_rules'].append('R33')
+
+
+# ── Gate 0.5: 宏观情景动作 ─────────────────────────────────────────────────────
+
+def _act_macro_weak_downgrade(state: dict) -> None:
+    """R34: 大盘弱势 + 高分 → 降级"""
+    if state.get('level', 'C') == 'B':
+        state['level'] = 'C'
+    state.setdefault('_notes', [])
+    state['_notes'].append('大盘弱势，降级')
+    state['triggered_rules'].append('R34')
+
+
+def _act_macro_strong_upgrade(state: dict) -> None:
+    """R35: 大盘强势 + 高分 → 升级"""
+    if state.get('level', 'C') == 'B':
+        state['level'] = 'A'
+        state.setdefault('_notes', [])
+        state['_notes'].append('大盘共振升级')
+    elif state.get('level', 'C') in ('C',) and state.get('score', 0) > 70:
+        state['level'] = 'B'
+        state.setdefault('_notes', [])
+        state['_notes'].append('大盘共振升B级')
+    state['triggered_rules'].append('R35')
+
+
+# ── Gate 1: 多因子共振动作 ─────────────────────────────────────────────────────
+
+def _act_multi_factor_boost(state: dict) -> None:
+    """R36: 多指标同向 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 5)
+    state.setdefault('_notes', [])
+    if '多因子共振' not in state['_notes']:
+        state['_notes'].append('多因子共振+5')
+    state['triggered_rules'].append('R36')
+
+
+def _act_kdj_rsi_volume_boost(state: dict) -> None:
+    """R37: KDJ+RSI+量价 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 5)
+    state.setdefault('_notes', [])
+    if 'KDJ+RSI共振' not in state.get('_notes', []):
+        state['_notes'].append('KDJ+RSI共振+5')
+    state['triggered_rules'].append('R37')
+
+
+def _act_multitimeframe_boost(state: dict) -> None:
+    """R38: 日周共振多头 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 10)
+    state.setdefault('_notes', [])
+    state['_notes'].append('日周共振多头+10')
+    state['triggered_rules'].append('R38')
+
+
+def _act_four_indicator_majority(state: dict) -> None:
+    """R39: 四指标多数同向 → 强制升级"""
+    if state['risk_level'] not in ('HIGH',):
+        if state.get('level', 'C') == 'C':
+            state['level'] = 'B'
+            state.setdefault('_notes', [])
+            state['_notes'].append('多指标共振升B级')
+    state['triggered_rules'].append('R39')
+
+
+# ── Gate 2: 风险加强动作 ───────────────────────────────────────────────────────
+
+def _act_extreme_vol_risk(state: dict) -> None:
+    """R40: 极端波动 → 中等风险"""
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+    state.setdefault('_notes', [])
+    state['_notes'].append('极端波动(ATR>8%)')
+    state['triggered_rules'].append('R40')
+
+
+def _act_top_divergence_volume_down(state: dict) -> None:
+    """R41: 顶背离+放量下跌 → 否决"""
+    state['level'] = 'D'
+    state['conclusion'] = 'D: 顶背离+放量下跌'
+    state['risk_level'] = 'HIGH'
+    state['score'] = 0
+    state['triggered_rules'].append('R41')
+
+
+def _act_momentum_exhaustion(state: dict) -> None:
+    """R42: 动能衰竭 → 降级"""
+    if state.get('level', 'C') == 'B':
+        state['level'] = 'C'
+    state.setdefault('_notes', [])
+    state['_notes'].append('动能衰竭(柱状5期缩短)')
+    state['triggered_rules'].append('R42')
+
+
+def _act_price_below_ma20_ma60(state: dict) -> None:
+    """R43: close<MA20<MA60 → 中等风险"""
+    if state['risk_level'] in ('NONE', 'LOW'):
+        state['risk_level'] = 'MEDIUM'
+        state.setdefault('_notes', [])
+        state['_notes'].append('均线空头排列(MA20>MA60)')
+    state['triggered_rules'].append('R43')
+
+
+def _act_liquidity_crisis(state: dict) -> None:
+    """R44: 流动性枯竭 → 否决"""
+    state['level'] = 'D'
+    state['conclusion'] = 'D: 流动性枯竭'
+    state['risk_level'] = 'HIGH'
+    state['score'] = 0
+    state['triggered_rules'].append('R44')
+
+
+def _act_amplitude_extreme_delay(state: dict) -> None:
+    """R45: 振幅极端 → 延迟入场"""
+    state.setdefault('_notes', [])
+    state['_notes'].append('异动振幅(99分位)建议延迟入场')
+    state['triggered_rules'].append('R45')
+
+
+# ── Gate 3: 评分修饰动作 ───────────────────────────────────────────────────────
+
+def _act_moneyflow_confirm_bullish(state: dict) -> None:
+    """R46: 资金净流入确认上涨 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 3)
+    state.setdefault('_notes', [])
+    state['_notes'].append('资金确认+3')
+    state['triggered_rules'].append('R46')
+
+
+def _act_moneyflow_confirm_bearish(state: dict) -> None:
+    """R47: 资金净流出确认下跌 → 扣分"""
+    state['score'] = max(0, state.get('score', 0) - 3)
+    state.setdefault('_notes', [])
+    state['_notes'].append('资金流出-3')
+    state['triggered_rules'].append('R47')
+
+
+def _act_volume_price_healthy_boost(state: dict) -> None:
+    """R48: 量价趋势健康 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 5)
+    state.setdefault('_notes', [])
+    state['_notes'].append('量价健康+5')
+    state['triggered_rules'].append('R48')
+
+
+def _act_chip_bottom_confirm(state: dict) -> None:
+    """R49: 筹码底部+底背离 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 8)
+    state.setdefault('_notes', [])
+    state['_notes'].append('筹码底部确认+8')
+    state['triggered_rules'].append('R49')
+
+
+def _act_three_green_strength(state: dict) -> None:
+    """R50: 三连阳量递增 → 加分"""
+    state['score'] = min(100, state.get('score', 0) + 5)
+    state.setdefault('_notes', [])
+    state['_notes'].append('三连阳量增+5')
+    state['triggered_rules'].append('R50')
+
+
+# ── Gate 4: 仓位调整动作 ────────────────────────────────────────────────────────
+
+def _act_position_zero(state: dict) -> None:
+    """R51: HIGH 风险 → 仓位归零"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) - 1.0
+    state['triggered_rules'].append('R51')
+
+
+def _act_position_half(state: dict) -> None:
+    """R52: MEDIUM风险+低分 → 仓位砍半"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) - 0.5
+    state['triggered_rules'].append('R52')
+
+
+def _act_position_reduce_30(state: dict) -> None:
+    """R53: 震荡+低分 → 减仓"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) - 0.3
+    state['triggered_rules'].append('R53')
+
+
+def _act_position_add_20(state: dict) -> None:
+    """R54: 底背离+底部反转 → 加仓"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) + 0.2
+    state['triggered_rules'].append('R54')
+
+
+def _act_position_add_15(state: dict) -> None:
+    """R55: K线强反转+放量 → 加仓"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) + 0.15
+    state['triggered_rules'].append('R55')
+
+
+def _act_position_reduce_25(state: dict) -> None:
+    """R56: 高波动率 → 减仓"""
+    state['position_adjust'] = state.get('position_adjust', 0.0) - 0.25
+    state['triggered_rules'].append('R56')
+
+
 # ── 规则库 ────────────────────────────────────────────────────────────────────
 
 RULES: list[Rule] = [
@@ -847,7 +1362,235 @@ RULES: list[Rule] = [
         action=_act_vol_reversal_boost,
         gate=3,
     ),
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Gate 0:  数据质量预筛
+    # Gate 0.5: 宏观情景注入
+    # Gate 4:  仓位联动
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── R30: 数据不足 ──────────────────────────────────────────────────────
+    Rule(
+        id='R30', priority=1, name='数据不足',
+        description='K线长度 < 60 → 直接否决',
+        condition=_kline_too_short,
+        action=_act_data_insufficient,
+        gate=0,
+    ),
+    # ── R31: 无波动率 ─────────────────────────────────────────────────────
+    Rule(
+        id='R31', priority=1, name='无波动率',
+        description='ATR/close 缺失或为零 → score=0',
+        condition=_atr_missing,
+        action=_act_no_volatility,
+        gate=0,
+    ),
+    # ── R32: 无长期趋势 ─────────────────────────────────────────────────
+    Rule(
+        id='R32', priority=5, name='无长期趋势',
+        description='MA_60 缺失 → 标记备注',
+        condition=_ma60_missing,
+        action=_act_no_long_term_trend,
+        gate=0,
+    ),
+    # ── R33: 无成交量 ─────────────────────────────────────────────────────
+    Rule(
+        id='R33', priority=3, name='无成交量',
+        description='近5日成交量全零 → 中等风险',
+        condition=_volume_empty,
+        action=_act_no_volume,
+        gate=0,
+    ),
+    # ── R34: 大盘弱势降级 ────────────────────────────────────────────────
+    Rule(
+        id='R34', priority=3, name='大盘弱势降级',
+        description='WEAK_TREND + score>60 → B降C',
+        condition=_macro_weak_with_high_score,
+        action=_act_macro_weak_downgrade,
+        gate=0.5,
+    ),
+    # ── R35: 大盘强势升级 ────────────────────────────────────────────────
+    Rule(
+        id='R35', priority=3, name='大盘强势升级',
+        description='STRONG_TREND + score>80 → B升A',
+        condition=_macro_strong_with_high_score,
+        action=_act_macro_strong_upgrade,
+        gate=0.5,
+    ),
+    # ── R36: 多因子共振 ────────────────────────────────────────────────────
+    Rule(
+        id='R36', priority=4, name='多因子共振',
+        description='MACD/KDJ/CCI/RSI 中任意3个看涨 → +5分',
+        condition=lambda s: _multi_indicator_aligned(s, required=3),
+        action=_act_multi_factor_boost,
+        gate=1,
+    ),
+    # ── R37: KDJ+RSI+量价共振 ────────────────────────────────────────────
+    Rule(
+        id='R37', priority=4, name='KDJ+RSI共振',
+        description='KDJ金叉 + RSI>50 + 放量 → +5分',
+        condition=_macd_kdj_rsi_all_bullish,
+        action=_act_kdj_rsi_volume_boost,
+        gate=1,
+    ),
+    # ── R38: 日周共振 ──────────────────────────────────────────────────────
+    Rule(
+        id='R38', priority=3, name='日周共振多头',
+        description='日线+周线MACD同步多头 → +10分',
+        condition=_multitimeframe_aligned_bull,
+        action=_act_multitimeframe_boost,
+        gate=1,
+    ),
+    # ── R39: 四指标多数同向 → 升级 ────────────────────────────────────────
+    Rule(
+        id='R39', priority=3, name='多指标升级',
+        description='MACD/KDJ/CCI/RSI 中任意3个看涨 → B级',
+        condition=lambda s: _multi_indicator_aligned(s, required=3) and state_highest_risk_not_high(s),
+        action=_act_four_indicator_majority,
+        gate=1,
+    ),
+    # ── R40: 极端波动 ──────────────────────────────────────────────────────
+    Rule(
+        id='R40', priority=3, name='极端波动',
+        description='ATR/价格 > 8% → 中等风险',
+        condition=_extreme_volatility,
+        action=_act_extreme_vol_risk,
+        gate=2,
+    ),
+    # ── R41: 顶背离+放量下跌 ──────────────────────────────────────────────
+    Rule(
+        id='R41', priority=2, name='顶背离放量下跌',
+        description='顶背离 + 放量下跌 → 直接否决',
+        condition=_top_divergence_volume_down,
+        action=_act_top_divergence_volume_down,
+        gate=2,
+    ),
+    # ── R42: 动能衰竭 ─────────────────────────────────────────────────────
+    Rule(
+        id='R42', priority=3, name='动能衰竭',
+        description='柱状连续5期缩短 + DIF斜率拐头 → 降级',
+        condition=_momentum_exhausting,
+        action=_act_momentum_exhaustion,
+        gate=2,
+    ),
+    # ── R43: 均线空头排列 ────────────────────────────────────────────────
+    Rule(
+        id='R43', priority=3, name='均线空头排列',
+        description='close < MA20 < MA60 → 中等风险',
+        condition=_price_below_ma20_ma60,
+        action=_act_price_below_ma20_ma60,
+        gate=2,
+    ),
+    # ── R44: 流动性枯竭 ─────────────────────────────────────────────────
+    Rule(
+        id='R44', priority=2, name='流动性枯竭',
+        description='成交额 < 500万 → 直接否决',
+        condition=_liquidity_crisis,
+        action=_act_liquidity_crisis,
+        gate=2,
+    ),
+    # ── R45: 振幅极端 ────────────────────────────────────────────────────
+    Rule(
+        id='R45', priority=3, name='振幅极端',
+        description='日内振幅 > 近60日99分位 → 延迟入场',
+        condition=_amplitude_extreme_99,
+        action=_act_amplitude_extreme_delay,
+        gate=2,
+    ),
+    # ── R46: 资金确认看涨 ────────────────────────────────────────────────
+    Rule(
+        id='R46', priority=4, name='资金确认看涨',
+        description='资金净流入 + MACD看涨 → +3分',
+        condition=_moneyflow_positive_with_macd_bullish,
+        action=_act_moneyflow_confirm_bullish,
+        gate=3,
+    ),
+    # ── R47: 资金确认看跌 ────────────────────────────────────────────────
+    Rule(
+        id='R47', priority=4, name='资金确认看跌',
+        description='资金净流出 + MACD看跌 → -3分',
+        condition=_moneyflow_negative_with_macd_bearish,
+        action=_act_moneyflow_confirm_bearish,
+        gate=3,
+    ),
+    # ── R48: 量价趋势健康 ────────────────────────────────────────────────
+    Rule(
+        id='R48', priority=4, name='量价健康',
+        description='close>MA60 + vol>MA5均量 → +5分',
+        condition=_volume_price_healthy,
+        action=_act_volume_price_healthy_boost,
+        gate=3,
+    ),
+    # ── R49: 筹码底部确认 ────────────────────────────────────────────────
+    Rule(
+        id='R49', priority=3, name='筹码底部确认',
+        description='获利<20% + 底背离 → +8分',
+        condition=_chip_bottom_with_divergence,
+        action=_act_chip_bottom_confirm,
+        gate=3,
+    ),
+    # ── R50: 三连阳量增 ──────────────────────────────────────────────────
+    Rule(
+        id='R50', priority=4, name='三连阳量增',
+        description='3连阳 + 成交量依次递增 → +5分',
+        condition=_three_green_candles_volume_up,
+        action=_act_three_green_strength,
+        gate=3,
+    ),
+    # ── R51: HIGH风险 → 仓位归零 ─────────────────────────────────────────
+    Rule(
+        id='R51', priority=1, name='仓位归零',
+        description='risk_level=HIGH → position_adjust=-1.0',
+        condition=_risk_high_pos,
+        action=_act_position_zero,
+        gate=4,
+    ),
+    # ── R52: MEDIUM风险低分 → 仓位砍半 ──────────────────────────────────
+    Rule(
+        id='R52', priority=2, name='仓位砍半',
+        description='risk_level=MEDIUM + score<60 → position_adjust=-0.5',
+        condition=_risk_medium_score_low_pos,
+        action=_act_position_half,
+        gate=4,
+    ),
+    # ── R53: 震荡低分 → 减仓 ────────────────────────────────────────────
+    Rule(
+        id='R53', priority=3, name='震荡减仓',
+        description='OSCILLATION + score<50 → position_adjust=-0.3',
+        condition=_oscillation_score_low_pos,
+        action=_act_position_reduce_30,
+        gate=4,
+    ),
+    # ── R54: 底背离底部反转 → 加仓 ─────────────────────────────────────
+    Rule(
+        id='R54', priority=4, name='底背离加仓',
+        description='底背离 + BOTTOM_REVERSAL → position_adjust=+0.2',
+        condition=_bot_div_bottom_reversal_pos,
+        action=_act_position_add_20,
+        gate=4,
+    ),
+    # ── R55: K线强反转+放量 → 加仓 ─────────────────────────────────────
+    Rule(
+        id='R55', priority=4, name='反转加仓',
+        description='K线强反转 + 放量 → position_adjust=+0.15',
+        condition=_kline_strong_reversal_volume_pos,
+        action=_act_position_add_15,
+        gate=4,
+    ),
+    # ── R56: 高波动 → 减仓 ──────────────────────────────────────────────
+    Rule(
+        id='R56', priority=4, name='高波动减仓',
+        description='ATR/价格 > 5% → position_adjust=-0.25',
+        condition=_high_vol_atr_pos,
+        action=_act_position_reduce_25,
+        gate=4,
+    ),
 ]
+
+
+def state_highest_risk_not_high(s: dict) -> bool:
+    """辅助条件：风险不为 HIGH"""
+    return s.get('risk_level') != 'HIGH'
 
 
 def get_rules_by_gate(gate: int) -> list[Rule]:

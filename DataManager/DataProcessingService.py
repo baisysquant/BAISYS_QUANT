@@ -102,6 +102,10 @@ class DataProcessingService:
             final_df[ColumnNames.SUGGESTED_POSITION] = None
             final_df[ColumnNames.POSITION_REASON] = ""
 
+        # 步骤7.5：Gate 5 - 运行时仓位约束（行业集中度 + 总仓位上限）
+        if not final_df.empty:
+            self._apply_gate5_position_constraints(final_df)
+
         # 步骤8：排序和格式化
         final_df = self.sort_and_format_report(final_df)
 
@@ -237,3 +241,37 @@ class DataProcessingService:
         self.logger.info(f"[数据验证] 最终报告生成成功: {len(final_df)} 条记录, {len(final_df.columns)} 个字段")
 
         return True
+
+    def _apply_gate5_position_constraints(self, df: pd.DataFrame) -> None:
+        """
+        Gate 5: 运行时仓位约束（R60 行业集中度 + R61 总仓位上限）。
+        直接修改 df[SUGGESTED_POSITION]。
+        """
+        if df.empty or ColumnNames.SUGGESTED_POSITION not in df.columns:
+            return
+
+        cfg = getattr(self.config, 'POSITION_SIZING', None) or {}
+        max_industry_exposure = cfg.get("max_industry_exposure", 0.30)
+
+        # R60: 同一行业集中度 > 30%，仅保留该行业评分最高者
+        if ColumnNames.INDUSTRY in df.columns:
+            industry_positions = df.groupby(ColumnNames.INDUSTRY)[ColumnNames.SUGGESTED_POSITION].sum()
+            over_limit = industry_positions[industry_positions > max_industry_exposure]
+            for ind, _ in over_limit.items():
+                mask = df[ColumnNames.INDUSTRY] == ind
+                if mask.sum() > 0:
+                    best_idx = df.loc[mask, ColumnNames.COMPREHENSIVE_SCORE].idxmax()
+                    df.loc[mask & (df.index != best_idx), ColumnNames.SUGGESTED_POSITION] = 0.0
+                    df.loc[best_idx, ColumnNames.SUGGESTED_POSITION] = min(
+                        df.loc[best_idx, ColumnNames.SUGGESTED_POSITION], max_industry_exposure
+                    )
+                    self.logger.info(
+                        f"  - [Gate5/R60] 行业 {ind} 超限，仅保留 {df.loc[best_idx, ColumnNames.STOCK_CODE]}"
+                    )
+
+        # R61: 总仓位 > 100%，等比缩仓
+        total_pos = df[ColumnNames.SUGGESTED_POSITION].sum()
+        if total_pos > 1.0:
+            scale = 0.95 / total_pos
+            df[ColumnNames.SUGGESTED_POSITION] = df[ColumnNames.SUGGESTED_POSITION] * scale
+            self.logger.info(f"  - [Gate5/R61] 总仓位 {total_pos:.1%} > 100%，等比缩仓至 95%（系数={scale:.3f}）")

@@ -145,8 +145,14 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
                 if vol_cap < _max_single:
                     parts.append(f"波动约束(ATR%={atr_pct:.1%},上限{vol_cap:.0%})")
 
-        # ── 6. 合成最终仓位 ─────────────────────────────────────────────
-        position = base * risk_mult * regime_mult * kelly_mod
+        # ── 6. Gate 4 仓位调整（来自 ScoringRules 规则引擎）───────────────
+        pos_adj = _safe_float(row.get("position_adjust", 0), 0)
+        pos_adj = max(-1.0, min(1.0, pos_adj))
+        if pos_adj != 0:
+            parts.append(f"规则调整({pos_adj:+.0%})")
+
+        # ── 7. 合成最终仓位 ─────────────────────────────────────────────
+        position = base * risk_mult * regime_mult * kelly_mod * (1 + pos_adj)
         position = min(position, vol_cap, _max_single)
         position = max(position, 0.0)
         position = round(position, 4)

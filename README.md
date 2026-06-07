@@ -29,11 +29,11 @@
 
 系统以 `StockAnalysisCoordinator` 13 步流水线驱动，每日自动完成：
 
-1. **数据层** — 从 PostgreSQL（TuShare）同步历史 K 线，从 AkShare 获取实时行情、资金流向、强势股池、行业板块等原始数据
+1. **数据层** — 从 PostgreSQL 同步历史 K 线，从 AkShare 获取实时行情、资金流向、强势股池、行业板块等原始数据
 2. **指标层** — `TASignalProcessor` 并行计算 MACD、KDJ、CCI、RSI、BOLL 五大指标，结合 MACD 7 维管线评分体系（趋势/金叉/动能/斜率/背离/量价/K 线形态）
-3. **评分层** — 基于 4 道门控规则（Gate 1~3 + 筹码风控）的递进式评分管道，叠加多时间帧对齐、波动率状态切换、信号衰减模型
+3. **评分层** — 6 道门控规则递进式评分管道：Gate 0（数据质量筛查）→ Gate 0.5（宏观环境注入）→ Gate 1（共振信号评分）→ Gate 2（波动率/背离/风险过滤）→ Gate 3（资金流/量价修饰）→ Gate 4（仓位联动调整），叠加多时间帧对齐、波动率状态切换、信号衰减模型
 4. **合并层** — 基础信息、资金流信号、技术指标、行业信号、筹码分布等多源数据统一合并
-5. **输出层** — 生成 43 列结构化 Excel 报告，同时同步到 PostgreSQL 数据库
+5. **输出层** — 生成 44 列结构化 Excel 报告（含建议仓位比例），同时同步到 PostgreSQL 数据库
 
 ### 设计特点
 
@@ -87,9 +87,9 @@
 
 **多源数据整合**
 
-Akshare：获取实时行情、主力研报、财务摘要、市场资金流向、强势股池、连涨股、量价齐升、持续放量、均线突破等数据。
+AkShare：获取实时行情、主力研报、财务摘要、市场资金流向、强势股池、连涨股、量价齐升、持续放量、均线突破等数据。
 
-Tushare (Pro)：获取 A 股主板股票基础信息和交易日历。
+AShareHub：通过 API 获取筹码分布数据（成本分布、获利比例），用于筹码风控规则和评分修饰。
 </br> </br> 
 
 **历史K线数据同步**
@@ -243,14 +243,32 @@ PostgreSQL：请确保您的系统已安装并运行 PostgreSQL 数据库。
 创建表结构：执行PostgreSQL建表语句.sql中的 SQL 语句，创建必要的数据表。
 </br> </br> 
 
-**Tushare Pro Token**
+**AShareHub API Key**
 
-前往 Tushare Pro官网 注册账号并获取您的 Token。您需要在 HistDataEngine.py 和 Ts_GetStockBasicinfo.py 文件中更新 self.token 变量为您的实际 Token。
+筹码分布数据需要 AShareHub API 密钥。免费版每日 100 次调用。
 
-HistDataEngine.py 和 Ts_GetStockBasicinfo.py 中
-self.token = "YOUR_TUSHARE_TOKEN_HERE" # 请替换为你的 Tushare Token
+1. 前往 [AShareHub 官网](https://www.asharehub.com) 注册并获取 API Key
+2. 编辑 `config.ini` 中 `[ASHAREHUB]` 节：
 
-Akshare：Akshare 大部分接口无需 Token，但有访问频率限制。本项目已内置缓存文件和延迟机制以应对。
+```ini
+[ASHAREHUB]
+api_key = ENC:gAAAAAB...         # 你的 API Key（支持 ENC 加密）
+enable_chip_distribution = true  # 是否获取筹码分布数据
+chip_limit = 1                   # 拉取快照数：1=仅最新快照，>1 拉取多日历史
+```
+
+密钥加密方式与数据库密码相同，使用 `ConfigCipher` 工具类。
+若不需要筹码分布功能，可将 `enable_chip_distribution` 设为 `false` 跳过。
+
+**参数说明：**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api_key` | 字符串 | - | API 密钥（支持 `ENC:` 加密） |
+| `enable_chip_distribution` | 布尔 | `false` | 是否启用筹码分布获取 |
+| `chip_limit` | 整数 | `1` | 拉取历史快照数：`1`=最新快照，`>1`=多日历史（最大 200） |
+
+**AkShare**：大部分接口无需 Token，但有访问频率限制。本项目已内置缓存文件和延迟机制以应对。
 
 <br></br> 
 
@@ -264,7 +282,7 @@ cd BAISYS_QUAN
 
 **安装依赖包:**
 
-pip install -r requirements.txt
+运行 `pip install -r requirements.txt` 安装全部依赖。
 
 注：openpyxl 和 xlsxwriter 用于 Excel 文件的读写。psycopg2-binary 是 PostgreSQL 的 Python 驱动。
 
@@ -286,6 +304,7 @@ pip install -r requirements.txt
 | `port` | 字符串 | 是 | - | 数据库端口号 |
 | `db_name` | 字符串 | 是 | - | 数据库名称 |
 | `main_board_only` | 布尔 | 否 | `true` | 是否仅获取主板股票（60/00开头） |
+| `encryption_key_path` | 字符串 | 否 | `~/.baisys_quant_key` | 加密密钥文件路径（用于解密 `ENC:` 前缀的密码/密钥） |
 
 ---
 
@@ -589,7 +608,7 @@ MainShareAnalysis
 
 请确保 PostgreSQL 服务已启动
 
-首次运行需安装依赖：pip install psycopg2-binary akshare pandas ta tushare
+首次运行需安装依赖：`pip install -r requirements.txt`（请确保 `psycopg2-binary`、`akshare`、`pandas`、`pandas_ta` 等已安装）
 
 数据同步依赖 Akshare，建议在交易日 15:30 后运行，数据最全
 

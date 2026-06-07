@@ -141,6 +141,18 @@ class MACDAnalyzer:
         if 'AMPLITUDE_PCT' not in df.columns and 'close' in df.columns and len(df) >= 2:
             df['AMPLITUDE_PCT'] = (df['high'] - df['low']) / df['close'].shift(1) * 100
 
+        if not any(c.startswith('CCI_') for c in df.columns):
+            try:
+                df.ta.cci(append=True, high='high', low='low', close='close')
+            except Exception:
+                pass
+
+        if not any(c.startswith('BBU_') for c in df.columns):
+            try:
+                df.ta.bbands(append=True, close='close', length=20, std=2)
+            except Exception:
+                pass
+
     def pipeline_analysis(
         self,
         df: pd.DataFrame,
@@ -234,6 +246,27 @@ class MACDAnalyzer:
         if macd_trend == MACDTrend.SUPER_STRONG and regime in ('OSCILLATION', 'UNCLEAR'):
             regime = 'STRONG_TREND'
 
+        # Gate 0: 数据质量预筛（在耗费计算资源的背离检测之前）
+        if len(df) < 60:
+            return _pipeline_output({
+                'level': 'D', 'score': 0, 'conclusion': 'D: 数据不足(K线<60)',
+                'regime': regime, 'risk_level': 'HIGH', 'risk_desc': '',
+                'signal_list': [], 'triggered_rules': ['R30'], '_notes': [],
+                'divergence': {}, 'momentum': {}, 'slope': {}, 'chip_data': None,
+                'exit_strategy': {}, 'macd_trend': macd_trend, 'position_adjust': 0.0,
+            })
+        if 'ATR' in df.columns and (pd.isna(df['ATR'].iloc[-1]) or df['ATR'].iloc[-1] <= 0):
+            # ATR 缺失继续运行但 score 会偏低
+            pass  # R31 不会触发 fatal，继续
+        if 'MA_60' not in df.columns or pd.isna(df['MA_60'].iloc[-1]):
+            return _pipeline_output({
+                'level': 'D', 'score': 0, 'conclusion': 'D: MA60缺失无长期趋势',
+                'regime': regime, 'risk_level': 'HIGH', 'risk_desc': '',
+                'signal_list': [], 'triggered_rules': ['R32'], '_notes': [],
+                'divergence': {}, 'momentum': {}, 'slope': {}, 'chip_data': None,
+                'exit_strategy': {}, 'macd_trend': macd_trend, 'position_adjust': 0.0,
+            })
+
         dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
         div_type, div_idx, div_strength = detect_divergence_single_param(df, df['close'], df['DIF'], distance=dist_div)
         div_decay = signal_with_decay(div_type, div_idx, len(df) - 1, half_life=decay_half_life)
@@ -276,6 +309,7 @@ class MACDAnalyzer:
             'moneyflow_data': df.attrs.get('moneyflow_data', None),
             'forecast_data': df.attrs.get('forecast_data', None),
             'vol_regime': self._detect_volatility_regime(df),
+            'position_adjust': 0.0,
         })
 
         signal_list = []
@@ -450,6 +484,13 @@ class MACDAnalyzer:
         state['expected_return'] = round(reward_pct * 100, 1)
         state['risk_reward_ratio'] = round(reward_pct / risk_pct, 2) if risk_pct > 0 else 0
         state['_scores'] = scores
+
+        # Gate 0.5: 宏观情景注入（基于最终评分 + 级别）
+        execute_rules(state, gate=0.5)
+
+        # Gate 4: 仓位调整（基于最终评分 + 级别 + 风控）
+        execute_rules(state, gate=4)
+
         return _pipeline_output(state)
 
     def analyze_full_bull(

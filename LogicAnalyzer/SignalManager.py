@@ -179,6 +179,8 @@ class TASignalProcessor:
             result['t2_target'] = pipeline_result.get('t2_target')
             result['trailing_stop'] = pipeline_result.get('trailing_stop')
             result['exit_rrr'] = pipeline_result.get('exit_rrr')
+            result['position_adjust'] = pipeline_result.get('position_adjust', 0.0)
+            result['macd_trend_raw'] = pipeline_result.get('macd_trend', '')
         except (KeyError, ValueError, TypeError) as e:
             logger.debug("股票 %s 管线分析跳过: %s", pure_code, e)
 
@@ -426,6 +428,7 @@ class TASignalProcessor:
                 '资金流净额',
                 '背离距今', '背离位置',
                 '止损价', 'T1目标价', 'T2目标价', '移动止损', '盈亏比',
+                'position_adjust', 'macd_trend_raw',
             ]),
         }
 
@@ -602,6 +605,8 @@ class TASignalProcessor:
                     'T2目标价': r.get('t2_target'),
                     '移动止损': r.get('trailing_stop'),
                     '盈亏比': r.get('exit_rrr'),
+                    'position_adjust': r.get('position_adjust', 0.0),
+                    'macd_trend_raw': r.get('macd_trend_raw', ''),
                 })
 
             if 'kdj_signal' in r:

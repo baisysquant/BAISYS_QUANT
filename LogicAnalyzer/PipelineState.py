@@ -207,4 +207,6 @@ def _pipeline_output(state: dict) -> dict:
         "t2_target": exit_strat.get('t2_target'),
         "trailing_stop": exit_strat.get('trailing_stop'),
         "exit_rrr": exit_strat.get('exit_rrr'),
+        "macd_trend": state.get('macd_trend', ''),
+        "position_adjust": state.get('position_adjust', 0.0),
     }

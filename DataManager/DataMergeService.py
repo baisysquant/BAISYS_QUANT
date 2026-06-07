@@ -443,7 +443,8 @@ class DataMergeService:
                              ColumnNames.COMPREHENSIVE_ANALYSIS, ColumnNames.COMPREHENSIVE_SCORE, ColumnNames.COMPREHENSIVE_LEVEL, ColumnNames.RISK_LEVEL, ColumnNames.MACD_TREND_TYPE, "macd_trend",
                              "cost_95pct", "资金流净额", "_current_dif",
                              ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE,
-                             ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR]:
+                             ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR,
+                             "position_adjust"]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])
