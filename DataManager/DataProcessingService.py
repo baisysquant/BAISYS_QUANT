@@ -139,6 +139,7 @@ class DataProcessingService:
         # 使用常量类获取所有技术指标信号列
         from DataManager.ReportService import ReportService
         str_cols = ReportService.get_all_technical_signal_columns()
+        str_cols = [c for c in str_cols if c in final_df.columns]
 
         mask = (
             final_df[ColumnNames.STRONG_STOCK].eq("是")

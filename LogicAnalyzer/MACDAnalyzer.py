@@ -1,4 +1,4 @@
-from LogicAnalyzer.Pipeline import MACDAnalyzer
+from LogicAnalyzer.pipeline import MACDAnalyzer
 from LogicAnalyzer.PipelineScoring import (
     _calc_momentum_desc, _volume_price_trend_score, _score_kline_pattern,
     _backtest_signal_winrate, _calc_moneyflow_score,

@@ -6,10 +6,12 @@
 - 自动缓存验证
 - 灵活的失效策略
 - 缓存监控和统计
+- 向后兼容 CacheManager 旧版 API
 """
 
 import hashlib
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -21,17 +23,12 @@ from loguru import logger
 class CacheStrategy:
     """缓存策略枚举"""
 
-    # 按时间失效
-    DAILY = "daily"  # 每日失效（交易日）
-    WEEKLY = "weekly"  # 每周失效
-    MONTHLY = "monthly"  # 每月失效
-
-    # 按事件失效
-    MANUAL = "manual"  # 手动清除
-    NEVER = "never"  # 永不过期（谨慎使用）
-
-    # 自定义
-    CUSTOM = "custom"  # 自定义失效逻辑
+    DAILY = "daily"
+    WEEKLY = "weekly"
+    MONTHLY = "monthly"
+    MANUAL = "manual"
+    NEVER = "never"
+    CUSTOM = "custom"
 
 
 class CacheConfig:
@@ -45,14 +42,6 @@ class CacheConfig:
         compress: bool = False,
         validate_on_load: bool = True,
     ):
-        """
-        Args:
-            strategy: 缓存失效策略
-            ttl_seconds: 自定义TTL（秒），仅在strategy=CUSTOM时有效
-            max_size_mb: 单个缓存文件最大大小（MB）
-            compress: 是否压缩存储
-            validate_on_load: 加载时是否验证数据完整性
-        """
         self.strategy = strategy
         self.ttl_seconds = ttl_seconds
         self.max_size_mb = max_size_mb
@@ -63,17 +52,15 @@ class CacheConfig:
 class CacheEntry:
     """缓存条目元数据"""
 
-    def __init__(self, key: str, created_at: float, size_bytes: int, metadata: dict = None):
+    def __init__(self, key: str, created_at: float, size_bytes: int, metadata: dict | None = None):
         self.key = key
         self.created_at = created_at
         self.size_bytes = size_bytes
         self.metadata = metadata or {}
 
     def is_expired(self, strategy: CacheConfig) -> bool:
-        """检查缓存是否过期"""
         if strategy.strategy == CacheStrategy.NEVER:
             return False
-
         if strategy.strategy == CacheStrategy.MANUAL:
             return False
 
@@ -85,15 +72,12 @@ class CacheEntry:
                 raise ValueError("CUSTOM策略必须指定ttl_seconds")
             return age_seconds > strategy.ttl_seconds
 
-        # 按时间策略
         if strategy.strategy == CacheStrategy.DAILY:
-            # 检查是否是同一天（考虑交易日）
             created_date = datetime.fromtimestamp(self.created_at).date()
             today = datetime.now().date()
             return created_date != today
 
         elif strategy.strategy == CacheStrategy.WEEKLY:
-            # 检查是否是同一周
             created_date = datetime.fromtimestamp(self.created_at).date()
             today = datetime.now().date()
             created_week = created_date.isocalendar()[1]
@@ -101,7 +85,6 @@ class CacheEntry:
             return created_week != today_week
 
         elif strategy.strategy == CacheStrategy.MONTHLY:
-            # 检查是否是同一月
             created_date = datetime.fromtimestamp(self.created_at).date()
             today = datetime.now().date()
             return created_date.year != today.year or created_date.month != today.month
@@ -118,28 +101,153 @@ class UnifiedCacheManager:
     - 多种失效策略
     - 自动缓存验证
     - 缓存统计和监控
+    - 向后兼容旧版 CacheManager API（load_cache/save_cache/cache_exists/get_cache_path）
     """
 
-    def __init__(self, cache_dir: str, default_strategy: str = CacheStrategy.DAILY, auto_cleanup: bool = True):
+    def __init__(
+        self,
+        cache_dir: str,
+        default_strategy: str = CacheStrategy.DAILY,
+        auto_cleanup: bool = True,
+        today_str: str | None = None,
+    ):
         """
         Args:
             cache_dir: 缓存根目录
             default_strategy: 默认缓存策略
             auto_cleanup: 是否自动清理过期缓存
+            today_str: 业务日期字符串（YYYYMMDD 或 YYYY-MM-DD），
+                       仅用于旧版兼容 API 的文件命名。
+                       不传时自动取当前日期。
         """
         self.cache_dir = Path(cache_dir).expanduser()
         self.default_strategy = default_strategy
         self.auto_cleanup = auto_cleanup
+        self._today_str = today_str
 
-        # 确保缓存目录存在
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # 缓存统计
         self.stats = {"hits": 0, "misses": 0, "writes": 0, "cleanups": 0}
 
-        # 启动时清理过期缓存
         if auto_cleanup:
             self.cleanup_expired()
+
+    # ── 旧版 CacheManager 兼容方法 ────────────────────────────────────────
+
+    def _resolve_today(self) -> str:
+        """获取用于旧版文件命名的日期字符串（纯数字 YYYYMMDD）"""
+        if self._today_str:
+            return self._today_str.replace("-", "")
+        return datetime.now().strftime("%Y%m%d")
+
+    def _compat_file_path(self, base_name: str, cleaned: bool = False, suffix: str = ".txt") -> str:
+        """
+        生成与旧版 CacheManager 完全相同的文件路径。
+        格式: {base_name}{_经清洗}_{todayYYYYMMDD}{suffix}
+        """
+        clean_suffix = "_经清洗" if cleaned else ""
+        file_name = f"{base_name}{clean_suffix}_{self._resolve_today()}{suffix}"
+        return os.path.join(str(self.cache_dir), file_name)
+
+    def load_cache(
+        self,
+        base_name: str,
+        cleaned: bool = True,
+        sep: str = "|",
+        encoding: str = "utf-8",
+        dtype_mapping: dict | None = None,
+    ) -> pd.DataFrame:
+        """
+        旧版兼容：从缓存加载数据（与 CacheManager.load_cache 签名一致）
+
+        Args:
+            base_name: 文件基础名称
+            cleaned: 是否加载清洗后的缓存
+            sep: CSV分隔符
+            encoding: 文件编码
+            dtype_mapping: 列数据类型映射
+
+        Returns:
+            pd.DataFrame: 加载的数据，不存在或失败返回空 DataFrame
+        """
+        file_path = self._compat_file_path(base_name, cleaned=cleaned)
+
+        if not os.path.exists(file_path):
+            return pd.DataFrame()
+
+        try:
+            if dtype_mapping is None:
+                dtype_mapping = {"股票代码": str, "symbol": str}
+
+            df = pd.read_csv(file_path, sep=sep, encoding=encoding, dtype=dtype_mapping)
+
+            if "symbol" in df.columns and "股票代码" not in df.columns:
+                df.rename(columns={"symbol": "股票代码"}, inplace=True)
+
+            logger.info(f"  - 发现缓存，加载: {os.path.basename(file_path)}")
+            return df
+
+        except Exception as e:
+            logger.warning(f"[WARN] 加载缓存 {os.path.basename(file_path)} 失败: {e}，将重新获取。")
+            return pd.DataFrame()
+
+    def save_cache(
+        self, df: pd.DataFrame, base_name: str, cleaned: bool = True, sep: str = "|", encoding: str = "utf-8"
+    ) -> bool:
+        """
+        旧版兼容：保存数据到缓存（与 CacheManager.save_cache 签名一致）
+
+        Args:
+            df: 要保存的 DataFrame
+            base_name: 文件基础名称
+            cleaned: 是否保存为清洗后的数据
+            sep: CSV分隔符，默认 '|'
+            encoding: 文件编码，默认 'utf-8'
+
+        Returns:
+            bool: 保存是否成功
+        """
+        if df is None or df.empty:
+            return False
+
+        file_path = self._compat_file_path(base_name, cleaned=cleaned)
+
+        try:
+            df.to_csv(file_path, sep=sep, index=False, encoding=encoding)
+            logger.info(f"  - 保存数据至缓存: {os.path.basename(file_path)}")
+            return True
+
+        except Exception as e:
+            logger.error(f"[ERROR] 保存数据到缓存 {os.path.basename(file_path)} 失败: {e}")
+            return False
+
+    def cache_exists(self, base_name: str, cleaned: bool = True) -> bool:
+        """
+        旧版兼容：检查缓存文件是否存在
+
+        Args:
+            base_name: 文件基础名称
+            cleaned: 是否检查清洗后的缓存
+
+        Returns:
+            bool: 缓存是否存在
+        """
+        file_path = self._compat_file_path(base_name, cleaned=cleaned)
+        return os.path.exists(file_path)
+
+    def get_cache_path(self, base_name: str, cleaned: bool = True, suffix: str = ".txt") -> str:
+        """
+        旧版兼容：获取缓存文件的完整路径（不检查是否存在）
+
+        Args:
+            base_name: 文件基础名称
+            cleaned: 是否为清洗后的数据
+            suffix: 文件扩展名
+
+        Returns:
+            str: 完整的文件路径
+        """
+        return self._compat_file_path(base_name, cleaned=cleaned, suffix=suffix)
 
     def _generate_cache_key(self, name: str, params: dict = None) -> str:
         """

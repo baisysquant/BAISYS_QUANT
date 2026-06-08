@@ -93,7 +93,8 @@ class MoneyFlowFetcher:
         page = 1
         print(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
 
-        while True:
+        done = False
+        while not done:
             last_err = None
             for attempt in range(1, self._retry + 2):
                 try:
@@ -110,6 +111,7 @@ class MoneyFlowFetcher:
                     row_count = len(df)
                     print(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
                     if row_count < self.API_PAGE_SIZE:
+                        done = True
                         break
                     offset += row_count
                     page += 1

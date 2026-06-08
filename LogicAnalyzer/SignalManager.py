@@ -621,7 +621,8 @@ class TASignalProcessor:
             if 'kline_pattern' in r:
                 kline_rows.append({'股票代码': code, 'K线形态信号': r['kline_pattern']})
 
-        ta_signals['MACD_FULL_BULL'] = pd.DataFrame(bull_rows)
+        macd_full_bull = pd.DataFrame(bull_rows, columns=ta_signals['MACD_FULL_BULL'].columns)
+        ta_signals['MACD_FULL_BULL'] = macd_full_bull
         ta_signals['KDJ'] = pd.DataFrame(kdj_rows)
         ta_signals['CCI'] = pd.DataFrame(cci_rows)
         ta_signals['RSI'] = pd.DataFrame(rsi_rows)

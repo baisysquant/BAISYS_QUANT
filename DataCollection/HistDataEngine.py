@@ -18,7 +18,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.ShareCodeFormatMgr import format_stock_code
-from UtilsManager.CacheManager import CacheManager
+from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
 class StockSyncEngine:
@@ -61,8 +61,10 @@ class StockSyncEngine:
         self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
 
-        # 初始化缓存管理器
-        self.cache_manager = CacheManager(temp_dir=self.base_data_dir, today_str=self.today)
+        # 初始化缓存管理器（向后兼容 API）
+        self.cache_manager = UnifiedCacheManager(
+            cache_dir=self.base_data_dir, today_str=self.today
+        )
 
         # 缓存文件路径（使用 CacheManager 生成）
         self.main_report_cache_path = self.cache_manager.get_cache_path(

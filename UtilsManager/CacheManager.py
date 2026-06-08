@@ -1,11 +1,16 @@
 """
-缓存管理器模块
+缓存管理器模块（已废弃）
 
-提供统一的数据缓存读写接口，避免在多个类中重复实现缓存逻辑。
-支持自动识别交易日、文件路径生成、数据标准化等功能。
+⚠️ 此模块已废弃，请使用 UnifiedCacheManager 替代。
+    保留此文件仅用于向后兼容引用，所有新代码应导入：
+    from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
+
+旧版 CacheManager 的功能已完整迁移至 UnifiedCacheManager，
+包括 load_cache/save_cache/cache_exists/get_cache_path 等兼容方法。
 """
 
 import os
+import warnings
 
 import pandas as pd
 from loguru import logger
@@ -34,6 +39,12 @@ class CacheManager:
             temp_dir: 临时数据目录路径
             today_str: 当前交易日字符串（格式：YYYY-MM-DD）
         """
+        warnings.warn(
+            "CacheManager 已废弃，请使用 UnifiedCacheManager 替代。"
+            "当前实例已自动委托给 UnifiedCacheManager。",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.temp_dir = temp_dir
         self.today_str = today_str
         os.makedirs(self.temp_dir, exist_ok=True)

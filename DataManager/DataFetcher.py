@@ -7,7 +7,7 @@ from loguru import logger
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-from UtilsManager.CacheManager import CacheManager
+from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
 class DataFetcher:
@@ -23,8 +23,10 @@ class DataFetcher:
         self.calendar_mgr = calendar_mgr
         self.today_str = calendar_mgr.get_last_trading_day()
         self.temp_dir = config.TEMP_DATA_DIRECTORY
-        # 初始化缓存管理器
-        self.cache_manager = CacheManager(self.temp_dir, self.today_str)
+        # 初始化缓存管理器（向后兼容 API，保持同名方法）
+        self.cache_manager = UnifiedCacheManager(
+            cache_dir=self.temp_dir, today_str=self.today_str
+        )
 
     def _clean_and_standardize(
         self, df: pd.DataFrame, df_name: str, clean_pipeline: Callable | None = None
