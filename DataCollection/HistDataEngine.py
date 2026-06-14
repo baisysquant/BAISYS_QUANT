@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 import os
 import sys
+from typing import Any
+
+from loguru import logger
 
 # 将项目根目录加入系统路径，支持直接运行此脚本
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,42 +17,43 @@ from datetime import datetime
 import akshare as ak
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-from DataManager.ShareCodeFormatMgr import format_stock_code
+from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
 class StockSyncEngine:
 
-    def __init__(self, config_file: str = "config.ini", executor=None):
+    def __init__(self, config_file: str = "config.ini", executor: ThreadPoolExecutor | None = None, db_engine: Engine | None = None) -> None:
 
         self.config_file = config_file
         self.config = Config(config_file=config_file)
         self.executor = executor
 
-        url_object = URL.create(
-            "postgresql+psycopg2",
-            username=self.config.DB_USER,
-            password=self.config.DB_PASSWORD,
-            host=self.config.DB_HOST,
-            port=self.config.DB_PORT,
-            database=self.config.DB_NAME,
-        )
+        if db_engine is not None:
+            self.db = db_engine
+        else:
+            url_object = URL.create(
+                "postgresql+psycopg2",
+                username=self.config.DB_USER,
+                password=self.config.DB_PASSWORD,
+                host=self.config.DB_HOST,
+                port=self.config.DB_PORT,
+                database=self.config.DB_NAME,
+            )
+            self.db = create_engine(url_object, pool_pre_ping=True, pool_recycle=3600, echo=False, client_encoding="utf8")
 
-        #  初始化数据库引擎
-        self.db = create_engine(url_object, pool_pre_ping=True, pool_recycle=3600, echo=False, client_encoding="utf8")
-
-        #  测试数据库连接
-        try:
-            with self.db.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            print("[INFO]  数据库引擎初始化成功")
-        except (DBAPIError, OperationalError) as e:
-            raise RuntimeError("数据库引擎初始化失败") from e
+            #  测试数据库连接
+            try:
+                with self.db.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                logger.info("[INFO]  数据库引擎初始化成功")
+            except (DBAPIError, OperationalError) as e:
+                raise RuntimeError("数据库引擎初始化失败") from e
 
         # 使用业务交易日而非物理时间
         self.calendar_mgr = TradingCalendarAnalyzer()
@@ -56,7 +62,7 @@ class StockSyncEngine:
 
         # 根据配置的天数动态计算起始日期
         self.global_start = self._calculate_start_date(self.calendar_mgr, self.config.KLINE_HISTORY_DAYS)
-        print(f"[INFO] K线数据获取范围: {self.global_start} 至 {self.today} (共{self.config.KLINE_HISTORY_DAYS}天)")
+        logger.info(f"[INFO] K线数据获取范围: {self.global_start} 至 {self.today} (共{self.config.KLINE_HISTORY_DAYS}天)")
 
         self.base_data_dir = self.config.TEMP_DATA_DIRECTORY
         os.makedirs(self.base_data_dir, exist_ok=True)
@@ -66,7 +72,7 @@ class StockSyncEngine:
             cache_dir=self.base_data_dir, today_str=self.today
         )
 
-        # 缓存文件路径（使用 CacheManager 生成）
+        # 缓存文件路径
         self.main_report_cache_path = self.cache_manager.get_cache_path(
             "主力研报盈利预测_完整数据", cleaned=True, suffix=".csv"
         )
@@ -79,7 +85,7 @@ class StockSyncEngine:
         # 已成功获取的股票列表文件路径（用于增量更新）
         self.success_symbols_file = os.path.join(self.base_data_dir, f"success_symbols_{self.today}.json")
 
-    def _calculate_start_date(self, calendar_mgr, history_days: int) -> str:
+    def _calculate_start_date(self, calendar_mgr: TradingCalendarAnalyzer, history_days: int) -> str:
         """
         根据配置的天数动态计算K线数据的起始日期
 
@@ -97,7 +103,7 @@ class StockSyncEngine:
             start_date_str = start_date.replace("-", "")
             return start_date_str
         except Exception as e:
-            print(f"[WARNING] 计算起始日期失败: {e}，使用默认值20250301")
+            logger.info(f"[WARNING] 计算起始日期失败: {e}，使用默认值20250301")
             return "20250301"
 
     def get_stock_pool_from_db(self) -> pd.DataFrame:
@@ -119,7 +125,7 @@ class StockSyncEngine:
             with self.db.connect() as conn:
                 stock_index_df = pd.read_sql(text(query), conn)
 
-            print(f"[INFO] 从数据库获取 {len(stock_index_df)} 只股票。")
+            logger.info(f"[INFO] 从数据库获取 {len(stock_index_df)} 只股票。")
 
             if "股票代码" in stock_index_df.columns:
                 stock_index_df["股票代码"] = stock_index_df["股票代码"].astype(str).str.zfill(6)
@@ -132,11 +138,11 @@ class StockSyncEngine:
             return stock_index_df[required_cols]
 
         except Exception as e:
-            print(f"[ERROR] 从数据库获取股票池失败: {e}")
+            logger.info(f"[ERROR] 从数据库获取股票池失败: {e}")
             return pd.DataFrame(columns=["ts_code", "name", "industry", "股票代码"])
 
     def _safe_ak_fetch(
-        self, fetch_func: callable, description: str, cache_base_name: str = None, **kwargs
+        self, fetch_func: callable, description: str, cache_base_name: str | None = None, **kwargs: Any  # noqa: ANN401
     ) -> pd.DataFrame:
         """带重试、缓存、清洗的 Akshare 数据获取。"""
 
@@ -167,7 +173,7 @@ class StockSyncEngine:
             )
             if not cached_df.empty:
                 cached_df = _standardize_columns(cached_df)
-                print(
+                logger.info(
                     f"  -  从缓存加载: {os.path.basename(self.cache_manager.get_cache_path(cache_base_name, cleaned=True))}"
                 )
                 return cached_df
@@ -175,7 +181,7 @@ class StockSyncEngine:
         df = pd.DataFrame()
         for i in range(self.config.DATA_FETCH_RETRIES):
             try:
-                print(f"  - 正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次: {description}...")
+                logger.info(f"  - 正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次: {description}...")
                 df = fetch_func(**kwargs)
                 if df is not None and not df.empty:
                     df = _standardize_columns(df)
@@ -183,15 +189,15 @@ class StockSyncEngine:
 
                 # 使用指数级退避递增重试延时
                 wait_time = self.config.DATA_FETCH_DELAY * (2**i)
-                print(f"[WARN] 获取 {description} 返回空或无效，将在 {wait_time} 秒后重试")
+                logger.info(f"[WARN] 获取 {description} 返回空或无效，将在 {wait_time} 秒后重试")
                 time.sleep(wait_time)
             except Exception as e:
                 wait_time = self.config.DATA_FETCH_DELAY * (2**i)
-                print(f"[ERROR] 获取 {description} 失败: {e}，将在 {wait_time} 秒后重试")
+                logger.info(f"[ERROR] 获取 {description} 失败: {e}，将在 {wait_time} 秒后重试")
                 time.sleep(wait_time)
 
         if df.empty:
-            print(f"[CRITICAL] 所有重试失败，未能获取 {description}")
+            logger.info(f"[CRITICAL] 所有重试失败，未能获取 {description}")
             return pd.DataFrame()
 
         # 清洗 + 保存到缓存
@@ -209,7 +215,7 @@ class StockSyncEngine:
         获取研报数据（不过滤），返回包含股票代码和买入评级的DataFrame。
         用于后续作为特征列添加到报告中。
         """
-        print("\n>>> 正在获取主力研报盈利预测数据...")
+        logger.info("\n>>> 正在获取主力研报盈利预测数据...")
 
         # 获取原始数据
         report_df = self._safe_ak_fetch(
@@ -217,7 +223,7 @@ class StockSyncEngine:
         )
 
         if report_df.empty:
-            print("[WARNING] 未获取到研报数据，返回空DataFrame")
+            logger.info("[WARNING] 未获取到研报数据，返回空DataFrame")
             return pd.DataFrame()
 
         # 标准化列名
@@ -235,7 +241,7 @@ class StockSyncEngine:
             pd.to_numeric(report_df["机构投资评级(近六个月)-买入"], errors="coerce").fillna(0).astype(int)
         )
 
-        print(f"[INFO] 获取到 {len(report_df)} 只股票的研报数据。")
+        logger.info(f"[INFO] 获取到 {len(report_df)} 只股票的研报数据。")
         return report_df[["股票代码", "机构投资评级(近六个月)-买入"]]
 
     def _fetch_kline_for_symbol(self, symbol: str) -> pd.DataFrame:
@@ -254,7 +260,7 @@ class StockSyncEngine:
             missing = [c for c in expected_cols if c not in df_qfq.columns]
             if missing:
                 # 北交所股票可能返回不同结构的数，记录并跳过
-                print(f"[WARN] {symbol} QFQ 数据缺失列: {missing}，跳过。")
+                logger.info(f"[WARN] {symbol} QFQ 数据缺失列: {missing}，跳过。")
                 return None
 
             # 尝试获取不复权数据
@@ -265,7 +271,7 @@ class StockSyncEngine:
                 return None
 
             if "close" not in df_norm.columns or "amount" not in df_norm.columns:
-                print(f"[WARN] {symbol} 不复权数据缺失必要列，跳过。")
+                logger.info(f"[WARN] {symbol} 不复权数据缺失必要列，跳过。")
                 return None
 
             df_norm = df_norm[["date", "close", "amount"]].rename(
@@ -292,7 +298,7 @@ class StockSyncEngine:
             if df.empty:
                 return None
 
-            df["symbol"] = format_stock_code(symbol)
+            df["symbol"] = CodeNormalizer.add_market_prefix(symbol)
             df["date"] = pd.to_datetime(df["date"])
             df.rename(columns={"date": "trade_date"}, inplace=True)
 
@@ -307,14 +313,16 @@ class StockSyncEngine:
                 "close_normal",
                 "volume",
                 "adj_ratio",
+                "adj_factor",
             ]
+            df["adj_factor"] = df["adj_ratio"]
             return df[final_cols]
         except KeyError as e:
             # 专门捕获键错误（如 'day'），这通常意味着接口返回结构异常
-            print(f"[ERROR] 获取 {symbol} 数据结构异常 (KeyError: {e})，可能是接口不支持该股票。")
+            logger.info(f"[ERROR] 获取 {symbol} 数据结构异常 (KeyError: {e})，可能是接口不支持该股票。")
             return None
         except Exception as e:
-            print(f"[ERROR] 获取 {symbol} 数据失败: {e}")
+            logger.info(f"[ERROR] 获取 {symbol} 数据失败: {e}")
             return None
 
     def _fetch_kline_with_delay(self, symbol: str, delay_seconds: float = 0) -> pd.DataFrame:
@@ -337,29 +345,29 @@ class StockSyncEngine:
         try:
             with open(self.failed_symbols_file, encoding="utf-8") as f:
                 failed_list = json.load(f)
-            print(f"[断点续传] 加载失败列表: {len(failed_list)} 只股票")
+            logger.info(f"[断点续传] 加载失败列表: {len(failed_list)} 只股票")
             return failed_list
         except Exception as e:
-            print(f"[WARN] 加载失败列表失败: {e}")
+            logger.info(f"[WARN] 加载失败列表失败: {e}")
             return []
 
-    def _save_failed_symbols(self, failed_symbols: list[str]):
+    def _save_failed_symbols(self, failed_symbols: list[str]) -> None:
         """保存失败的股票列表到本地"""
         try:
             with open(self.failed_symbols_file, "w", encoding="utf-8") as f:
                 json.dump(failed_symbols, f, ensure_ascii=False, indent=2)
-            print(f"[断点续传] 已保存 {len(failed_symbols)} 只失败股票至: {os.path.basename(self.failed_symbols_file)}")
+            logger.info(f"[断点续传] 已保存 {len(failed_symbols)} 只失败股票至: {os.path.basename(self.failed_symbols_file)}")
         except Exception as e:
-            print(f"[ERROR] 保存失败列表失败: {e}")
+            logger.info(f"[ERROR] 保存失败列表失败: {e}")
 
-    def _clear_failed_symbols(self):
+    def _clear_failed_symbols(self) -> None:
         """清除失败股票列表文件（全部成功时调用）"""
         if os.path.exists(self.failed_symbols_file):
             try:
                 os.remove(self.failed_symbols_file)
-                print("[断点续传] 已清除失败列表文件")
+                logger.info("[断点续传] 已清除失败列表文件")
             except Exception as e:
-                print(f"[WARN] 清除失败列表文件失败: {e}")
+                logger.info(f"[WARN] 清除失败列表文件失败: {e}")
 
     def _load_success_symbols(self) -> set[str]:
         """加载已成功获取的股票列表（用于增量更新）"""
@@ -369,13 +377,13 @@ class StockSyncEngine:
         try:
             with open(self.success_symbols_file, encoding="utf-8") as f:
                 success_set = set(json.load(f))
-            print(f"[增量更新] 发现今日已成功获取 {len(success_set)} 只股票，将跳过重复获取")
+            logger.info(f"[增量更新] 发现今日已成功获取 {len(success_set)} 只股票，将跳过重复获取")
             return success_set
         except Exception as e:
-            print(f"[WARN] 加载成功列表失败: {e}")
+            logger.info(f"[WARN] 加载成功列表失败: {e}")
             return set()
 
-    def _save_success_symbols(self, success_symbols: list[str], append: bool = True):
+    def _save_success_symbols(self, success_symbols: list[str], append: bool = True) -> None:
         """
         保存已成功获取的股票列表
 
@@ -395,16 +403,16 @@ class StockSyncEngine:
             with open(self.success_symbols_file, "w", encoding="utf-8") as f:
                 json.dump(list(all_success), f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"[ERROR] 保存成功列表失败: {e}")
+            logger.info(f"[ERROR] 保存成功列表失败: {e}")
 
-    def _clear_success_symbols(self):
+    def _clear_success_symbols(self) -> None:
         """清除成功股票列表文件"""
         if os.path.exists(self.success_symbols_file):
             try:
                 os.remove(self.success_symbols_file)
-                print("[增量更新] 已清除成功列表文件")
+                logger.info("[增量更新] 已清除成功列表文件")
             except Exception as e:
-                print(f"[WARN] 清除成功列表文件失败: {e}")
+                logger.info(f"[WARN] 清除成功列表文件失败: {e}")
 
     def _has_today_batch_files(self, kline_cache_dir: str) -> bool:
         """
@@ -436,10 +444,10 @@ class StockSyncEngine:
 
             return False
         except Exception as e:
-            print(f"[WARN] 检查批次文件失败: {e}")
+            logger.info(f"[WARN] 检查批次文件失败: {e}")
             return False
 
-    def _cleanup_old_batch_files(self, kline_cache_dir: str):
+    def _cleanup_old_batch_files(self, kline_cache_dir: str) -> None:
         """清理旧的批次文件，只保留当前业务交易日的批次（通过时间戳判断）"""
         if not os.path.exists(kline_cache_dir):
             return
@@ -461,21 +469,21 @@ class StockSyncEngine:
                         if file_date != trading_date_prefix:
                             file_path = os.path.join(kline_cache_dir, filename)
                             os.remove(file_path)
-                            print(f"[清理] 已删除旧批次文件: {filename} (数据日期: {file_date})")
+                            logger.info(f"[清理] 已删除旧批次文件: {filename} (数据日期: {file_date})")
                             cleaned_count += 1
                     else:
                         # 兼容旧格式（带批次序号或无时间戳），直接删除
                         file_path = os.path.join(kline_cache_dir, filename)
                         os.remove(file_path)
-                        print(f"[清理] 已删除旧批次文件: {filename} (旧格式)")
+                        logger.info(f"[清理] 已删除旧批次文件: {filename} (旧格式)")
                         cleaned_count += 1
 
             if cleaned_count > 0:
-                print(f"[清理] 共清理 {cleaned_count} 个旧批次文件")
+                logger.info(f"[清理] 共清理 {cleaned_count} 个旧批次文件")
         except Exception as e:
-            print(f"[WARN] 清理旧批次文件失败: {e}")
+            logger.info(f"[WARN] 清理旧批次文件失败: {e}")
 
-    def _load_and_merge_cached_data(self, kline_cache_dir: str):
+    def _load_and_merge_cached_data(self, kline_cache_dir: str) -> None:
         """
         加载并合并今日已缓存的批次数据，直接写入数据库
 
@@ -483,7 +491,7 @@ class StockSyncEngine:
             kline_cache_dir: 批次缓存目录路径
         """
         if not os.path.exists(kline_cache_dir):
-            print("[WARN] 批次缓存目录不存在")
+            logger.info("[WARN] 批次缓存目录不存在")
             return
 
         # 查找所有批次文件（只加载当前交易日的）
@@ -508,10 +516,10 @@ class StockSyncEngine:
         batch_files = sorted(batch_files)
 
         if not batch_files:
-            print("[WARN] 未找到任何批次缓存文件")
+            logger.info("[WARN] 未找到任何批次缓存文件")
             return
 
-        print(f"[INFO] 发现 {len(batch_files)} 个批次缓存文件，开始合并...")
+        logger.info(f"[INFO] 发现 {len(batch_files)} 个批次缓存文件，开始合并...")
 
         # 加载并合并所有批次
         all_dfs = []
@@ -523,33 +531,33 @@ class StockSyncEngine:
                 df = pd.read_csv(file_path, sep="|", encoding="utf-8-sig")
                 all_dfs.append(df)
                 total_records += len(df)
-                print(f"  - 加载 {batch_file}: {len(df)} 条记录")
+                logger.info(f"  - 加载 {batch_file}: {len(df)} 条记录")
             except Exception as e:
-                print(f"[ERROR] 加载 {batch_file} 失败: {e}")
+                logger.info(f"[ERROR] 加载 {batch_file} 失败: {e}")
 
         if not all_dfs:
-            print("[WARNING] 所有批次文件加载失败")
+            logger.info("[WARNING] 所有批次文件加载失败")
             return
 
         # 合并所有批次
         combined_df = pd.concat(all_dfs, ignore_index=True)
-        print(f"[INFO] 成功合并 {total_records} 条 K 线记录。")
+        logger.info(f"[INFO] 成功合并 {total_records} 条 K 线记录。")
 
         # 保存到完整缓存文件
         try:
             combined_df.to_csv(self.kline_cache_path, sep="|", index=False, encoding="utf-8-sig")
-            print(f"[INFO] K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
+            logger.info(f"[INFO] K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
         except Exception as e:
-            print(f"[ERROR] 保存 K线数据缓存失败: {e}")
+            logger.info(f"[ERROR] 保存 K线数据缓存失败: {e}")
 
         # 写入数据库
         try:
             combined_df.to_sql(
                 name="stock_daily_kline", con=self.db, if_exists="replace", index=False, method="multi", chunksize=5000
             )
-            print(f"[INFO] 成功将 {len(combined_df)} 条记录写入 'stock_daily_kline' 表。")
+            logger.info(f"[INFO] 成功将 {len(combined_df)} 条记录写入 'stock_daily_kline' 表。")
         except (DBAPIError, OperationalError) as e:
-            print(f"[ERROR] 写入数据库失败: {e}")
+            logger.info(f"[ERROR] 写入数据库失败: {e}")
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
@@ -557,18 +565,18 @@ class StockSyncEngine:
                 pass
             raise
 
-    def _clear_stock_daily_kline_table(self):
+    def _clear_stock_daily_kline_table(self) -> None:
         """清空 stock_daily_kline 表"""
         if self.db is None:
-            print("[CRITICAL] 数据库未初始化")
+            logger.info("[CRITICAL] 数据库未初始化")
             return
         try:
             with self.db.connect() as conn:
                 conn.execute(text("DELETE FROM stock_daily_kline;"))
                 conn.commit()
-            print("[INFO] 'stock_daily_kline' 表已清空。")
+            logger.info("[INFO] 'stock_daily_kline' 表已清空。")
         except (DBAPIError, OperationalError) as e:
-            print(f"[ERROR] 清空失败: {e}")
+            logger.info(f"[ERROR] 清空失败: {e}")
             try:
                 with self.db.connect() as conn:
                     conn.rollback()
@@ -576,7 +584,7 @@ class StockSyncEngine:
                 pass
             raise
 
-    def run_engine(self, target_date: str = None):
+    def run_engine(self, target_date: str | None = None) -> set[str] | None:
         """主运行函数：研报过滤 + K线数据同步"""
 
         if target_date is None:
@@ -588,12 +596,12 @@ class StockSyncEngine:
         self.today_str = target_date
         self.today_dt = pd.to_datetime(target_date).normalize()
 
-        print(f"[DEBUG] 数据引擎运行日期: {self.today_str}")
+        logger.info(f"[DEBUG] 数据引擎运行日期: {self.today_str}")
 
         # Step 1: 获取数据库中的股票池
         stock_pool_df = self.get_stock_pool_from_db()
         if stock_pool_df.empty or "股票代码" not in stock_pool_df.columns:
-            print("[CRITICAL] 基础股票池无效")
+            logger.info("[CRITICAL] 基础股票池无效")
             return set()
 
         # Step 1.5: 过滤ST股票
@@ -604,12 +612,12 @@ class StockSyncEngine:
             after_count = len(stock_pool_df)
             filtered_count = before_count - after_count
             if filtered_count > 0:
-                print(f"[FILTER] 已过滤 {filtered_count} 只ST股票，剩余 {after_count} 只正常股票。")
+                logger.info(f"[FILTER] 已过滤 {filtered_count} 只ST股票，剩余 {after_count} 只正常股票。")
             else:
-                print("[INFO] 无ST股票需要过滤。")
+                logger.info("[INFO] 无ST股票需要过滤。")
 
         pure_codes = set(stock_pool_df["股票代码"].unique().tolist())
-        print(f"[INFO] 从数据库获取 {len(pure_codes)} 只股票（已剔除ST）。")
+        logger.info(f"[INFO] 从数据库获取 {len(pure_codes)} 只股票（已剔除ST）。")
 
         # Step 2: 获取研报数据（作为特征，不过滤）
         report_df = self._get_research_report_data()
@@ -620,21 +628,21 @@ class StockSyncEngine:
             report_cache_path = self.cache_manager.get_cache_path("研报买入次数", cleaned=True)
             try:
                 report_df.to_csv(report_cache_path, sep="|", index=False, encoding="utf-8-sig")
-                print(f"[INFO] 研报数据已保存至缓存: {os.path.basename(report_cache_path)}")
+                logger.info(f"[INFO] 研报数据已保存至缓存: {os.path.basename(report_cache_path)}")
             except Exception as e:
-                print(f"[ERROR] 保存研报数据失败: {e}")
+                logger.info(f"[ERROR] 保存研报数据失败: {e}")
 
         #  Step 3: 根据配置决定是否只保留主板股票
         if self.config.MAIN_BOARD_ONLY:
             final_codes = {code for code in pure_codes if code.startswith(("60", "00"))}
-            print(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
+            logger.info(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
         else:
             final_codes = pure_codes
-            print(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
+            logger.info(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
 
         # 【新增】Step 3.5: 如果启用了研报过滤，则进行二次过滤
         if self.config.ENABLE_RESEARCH_REPORT_FILTER and not report_df.empty:
-            print(f"\n[研报过滤] 启用研报二次过滤，阈值: {self.config.RESEARCH_REPORT_MIN_COUNT} 次买入评级")
+            logger.info(f"\n[研报过滤] 启用研报二次过滤，阈值: {self.config.RESEARCH_REPORT_MIN_COUNT} 次买入评级")
 
             # 筛选出研报买入次数大于阈值的股票
             filtered_report_df = report_df[
@@ -648,13 +656,13 @@ class StockSyncEngine:
             after_count = len(final_codes)
             filtered_count = before_count - after_count
 
-            print(f"[研报过滤] 原始股票数: {before_count}, 研报过滤后: {after_count}, 过滤掉: {filtered_count}")
+            logger.info(f"[研报过滤] 原始股票数: {before_count}, 研报过滤后: {after_count}, 过滤掉: {filtered_count}")
 
             if after_count == 0:
-                print("[警告] 研报过滤后无股票剩余，请检查阈值设置或研报数据")
+                logger.info("[警告] 研报过滤后无股票剩余，请检查阈值设置或研报数据")
                 return set()
         elif self.config.ENABLE_RESEARCH_REPORT_FILTER:
-            print("[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
+            logger.info("[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
 
         # 【测试模式】如果环境变量设置了 TEST_MODE，只取前10只股票测试
         import os as _os
@@ -662,12 +670,12 @@ class StockSyncEngine:
         if _os.getenv("TEST_MODE", "").lower() == "true":
             test_count = int(_os.getenv("TEST_COUNT", "10"))
             final_codes = sorted(list(final_codes))[:test_count]
-            print(f"[测试模式] 仅获取前 {test_count} 只股票进行流程验证")
+            logger.info(f"[测试模式] 仅获取前 {test_count} 只股票进行流程验证")
 
         #  Step 4: 缓存检查 → 决定是否重取
 
         if os.path.exists(self.kline_cache_path):
-            print(f" 缓存文件存在: {os.path.basename(self.kline_cache_path)}")
+            logger.info(f" 缓存文件存在: {os.path.basename(self.kline_cache_path)}")
             try:
                 df = pd.read_csv(self.kline_cache_path, sep="|", encoding="utf-8-sig")
                 # 确保字段存在
@@ -682,15 +690,16 @@ class StockSyncEngine:
                     "close_normal",
                     "volume",
                     "adj_ratio",
+                    "adj_factor",
                 ]
                 missing = [c for c in expected_cols if c not in df.columns]
                 if missing:
-                    print(f"[WARN] 缓存缺少列: {missing}，将重取")
+                    logger.info(f"[WARN] 缓存缺少列: {missing}，将重取")
                     df = pd.DataFrame()
                 else:
                     # 将 symbol 明确转换为 sh/sz/bj 格式（可选）
                     df["symbol"] = df["symbol"].astype(str)
-                    print(f" 成功加载缓存，共 {len(df)} 条记录。")
+                    logger.info(f" 成功加载缓存，共 {len(df)} 条记录。")
 
                     try:
                         df.to_sql(
@@ -701,9 +710,9 @@ class StockSyncEngine:
                             method="multi",
                             chunksize=5000,
                         )
-                        print(f"成功将 {len(df)} 条记录写入 'stock_daily_kline' 表。")
+                        logger.info(f"成功将 {len(df)} 条记录写入 'stock_daily_kline' 表。")
                     except Exception as e:
-                        print(f"[ERROR] 写入数据库失败: {e}")
+                        logger.info(f"[ERROR] 写入数据库失败: {e}")
                         raise
 
                     final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
@@ -711,30 +720,30 @@ class StockSyncEngine:
                         with open(final_output_path, "w", encoding="utf-8") as f:
                             for code in sorted(final_codes):
                                 f.write(f"{code}\n")
-                        print(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
+                        logger.info(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
                     except Exception as e:
-                        print(f"[ERROR] 保存最终代码列表失败: {e}")
+                        logger.info(f"[ERROR] 保存最终代码列表失败: {e}")
 
-                    print(f"  - 今日日期: {self.today}")
-                    print(f"  - 筛选股票数: {len(final_codes)}")
+                    logger.info(f"  - 今日日期: {self.today}")
+                    logger.info(f"  - 筛选股票数: {len(final_codes)}")
 
                     return final_codes
 
             except Exception as e:
-                print(f"[WARN] 缓存加载失败: {e}")
+                logger.info(f"[WARN] 缓存加载失败: {e}")
 
         filtered_codes = final_codes  # ←  这才是真正的"最终要处理的股票"
-        print(f"[INFO]  将获取 {len(filtered_codes)} 只股票的 K 线（基于交集结果）。")
+        logger.info(f"[INFO]  将获取 {len(filtered_codes)} 只股票的 K 线（基于交集结果）。")
 
         #  Step 6: 获取最终 Akshare 格式代码（使用统一的格式化函数）
-        from DataManager.ShareCodeFormatMgr import format_stock_code
+        from UtilsManager.CodeNormalizer import CodeNormalizer
 
-        akshare_symbols = [format_stock_code(code) for code in filtered_codes]
+        akshare_symbols = [CodeNormalizer.add_market_prefix(code) for code in filtered_codes]
 
         #  Step 7: 多线程并发获取 K 线数据（带断点续传 + 增量更新 + 进度条）
         from tqdm import tqdm
 
-        print(f"[INFO] 正在获取 {len(akshare_symbols)} 只股票的 K 线数据（多线程并发模式）...")
+        logger.info(f"[INFO] 正在获取 {len(akshare_symbols)} 只股票的 K 线数据（多线程并发模式）...")
 
         # 7.0 检查是否有今天的批次文件（判断是否需要全量获取）
         kline_cache_dir = os.path.join(self.base_data_dir, "kline_batches")
@@ -746,8 +755,8 @@ class StockSyncEngine:
 
         # 如果没有今天的批次文件，说明是历史数据，需要清空成功列表，从头开始
         if success_symbols and not has_today_batches:
-            print("[警告] 检测到成功列表，但未找到今天的批次文件（可能是历史数据）")
-            print("[清理] 清空成功列表和失败列表，将从头开始全量获取...")
+            logger.info("[警告] 检测到成功列表，但未找到今天的批次文件（可能是历史数据）")
+            logger.info("[清理] 清空成功列表和失败列表，将从头开始全量获取...")
             self._clear_success_symbols()
             self._clear_failed_symbols()
             success_symbols = set()
@@ -756,17 +765,17 @@ class StockSyncEngine:
             original_count = len(akshare_symbols)
             akshare_symbols = [s for s in akshare_symbols if s not in success_symbols]
             skipped_count = original_count - len(akshare_symbols)
-            print(f"[增量更新] 跳过 {skipped_count} 只已成功的股票，本次需获取 {len(akshare_symbols)} 只")
+            logger.info(f"[增量更新] 跳过 {skipped_count} 只已成功的股票，本次需获取 {len(akshare_symbols)} 只")
 
             if not akshare_symbols:
-                print("[INFO] 今日所有股票 K 线数据已成功获取，无需重复调用接口！")
+                logger.info("[INFO] 今日所有股票 K 线数据已成功获取，无需重复调用接口！")
                 self._load_and_merge_cached_data(kline_cache_dir)
                 return
 
         # 7.2 检查是否有上次失败的任务需要重试
         failed_symbols = self._load_failed_symbols()
         if failed_symbols:
-            print(f"[断点续传] 发现上次失败的 {len(failed_symbols)} 只股票，优先重试...")
+            logger.info(f"[断点续传] 发现上次失败的 {len(failed_symbols)} 只股票，优先重试...")
             akshare_symbols = failed_symbols + [s for s in akshare_symbols if s not in failed_symbols]
 
         # 分批并发获取（每500只股票为一批，每批内多线程并发）
@@ -834,27 +843,27 @@ class StockSyncEngine:
         # 7.4 统计输出
         if all_failed_symbols:
             self._save_failed_symbols(all_failed_symbols)
-            print(f"\n[统计] 总{len(akshare_symbols)}只 | 成功{total_success} | 失败{total_failed}")
+            logger.info(f"\n[统计] 总{len(akshare_symbols)}只 | 成功{total_success} | 失败{total_failed}")
         else:
             self._clear_failed_symbols()
             self._clear_success_symbols()
             self._cleanup_old_batch_files(kline_cache_dir)
-            print(f"\n[统计] 总{len(akshare_symbols)}只 | 全部成功 ✓")
+            logger.info(f"\n[统计] 总{len(akshare_symbols)}只 | 全部成功 ✓")
 
         # 7.5 合并所有批次的数据
         if not all_success_dfs:
-            print("[WARNING] 所有股票 K 线获取失败，数据库将清空。")
+            logger.info("[WARNING] 所有股票 K 线获取失败，数据库将清空。")
             self._clear_stock_daily_kline_table()
             return
 
         combined_kline_df = pd.concat(all_success_dfs, ignore_index=True)
-        print(f"[INFO] 成功合并 {len(combined_kline_df)} 条 K 线记录。")
+        logger.info(f"[INFO] 成功合并 {len(combined_kline_df)} 条 K 线记录。")
         try:
             # 保存为 CSV，不包含 index
             combined_kline_df.to_csv(self.kline_cache_path, sep="|", index=False, encoding="utf-8-sig")
-            print(f"[INFO]  K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
+            logger.info(f"[INFO]  K线数据已保存至本地缓存: {os.path.basename(self.kline_cache_path)}")
         except Exception as e:
-            print(f"[ERROR] 保存 K线数据缓存失败: {e}")
+            logger.info(f"[ERROR] 保存 K线数据缓存失败: {e}")
 
         #  Step 8: 获取筹码分布数据（仅当启用时）
         if self.config.ENABLE_CHIP_DISTRIBUTION:
@@ -863,11 +872,11 @@ class StockSyncEngine:
             chip_fetcher = ChipDistributionFetcher(self.config)
             chip_df = chip_fetcher.fetch_chip_data()
             if not chip_df.empty:
-                print(f"[ChipDist] 筹码分布数据可用 {len(chip_df)} 条")
+                logger.info(f"[ChipDist] 筹码分布数据可用 {len(chip_df)} 条")
             else:
-                print("[ChipDist] 未获取到筹码分布数据。")
+                logger.info("[ChipDist] 未获取到筹码分布数据。")
         else:
-            print("[ChipDist] 筹码分布获取未启用（config.ini 中 enable_chip_distribution = false）")
+            logger.info("[ChipDist] 筹码分布获取未启用（config.ini 中 enable_chip_distribution = false）")
 
         #  Step 9: 写入数据库
         try:
@@ -879,13 +888,13 @@ class StockSyncEngine:
                 method="multi",
                 chunksize=5000,
             )
-            print(f"[INFO]  成功将 {len(combined_kline_df)} 条记录写入 'stock_daily_kline' 表。")
+            logger.info(f"[INFO]  成功将 {len(combined_kline_df)} 条记录写入 'stock_daily_kline' 表。")
         except Exception as e:
-            print(f"[ERROR] 写入数据库失败: {e}")
+            logger.info(f"[ERROR] 写入数据库失败: {e}")
             raise
 
-        print(f"  - 今日日期: {self.today}")
-        print(f"  - 筛选股票数: {len(filtered_codes)}")
+        logger.info(f"  - 今日日期: {self.today}")
+        logger.info(f"  - 筛选股票数: {len(filtered_codes)}")
 
         #  可选：保存最终过滤列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
@@ -893,9 +902,9 @@ class StockSyncEngine:
             with open(final_output_path, "w", encoding="utf-8") as f:
                 for code in sorted(filtered_codes):
                     f.write(f"{code}\n")
-            print(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
+            logger.info(f"[INFO] 最终筛选代码已保存至: {final_output_path}")
         except Exception as e:
-            print(f"[ERROR] 保存最终代码列表失败: {e}")
+            logger.info(f"[ERROR] 保存最终代码列表失败: {e}")
 
         return filtered_codes
 

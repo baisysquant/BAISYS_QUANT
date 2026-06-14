@@ -87,9 +87,9 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
     slope_info = slope_analysis(df['DIF'] if 'DIF' in df.columns else df['close'])
     slope_positive = slope_info['slope'] > 0
     is_narrow_boll = False
-    if boll_col and boll_col in df.columns:
+    if boll_col and boll_col in df.columns and len(df) > 5:
         recent_bw = df[boll_col].iloc[-5:].mean()
-        hist_bw = df[boll_col].mean()
+        hist_bw = df[boll_col].iloc[:-5].mean()
         boll_narrow_ratio = params.get('boll_narrow_ratio', 0.8)
         is_narrow_boll = recent_bw < hist_bw * boll_narrow_ratio
     if ma_bullish and slope_positive and momentum_positive:

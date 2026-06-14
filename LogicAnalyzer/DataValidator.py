@@ -8,6 +8,10 @@
 - 必需字段验证
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
 from loguru import logger
 
@@ -19,7 +23,7 @@ class DataValidator:
     提供多种数据质量检查方法，确保数据的完整性和准确性。
     """
 
-    def __init__(self, logger_instance=None):
+    def __init__(self, logger_instance: Any = None) -> None:  # noqa: ANN401
         self.logger = logger_instance if logger_instance is not None else logger
 
     def validate_dataframe_not_empty(self, df: pd.DataFrame, data_name: str = "数据") -> bool:
@@ -102,39 +106,12 @@ class DataValidator:
         if df.empty or code_col not in df.columns:
             return df, 0
 
+        from UtilsManager.CodeNormalizer import CodeNormalizer
+
         original_codes = df[code_col].copy()
-        fixed_count = 0
+        df[code_col] = df[code_col].apply(CodeNormalizer.normalize)
 
-        # 标准化股票代码
-
-        def normalize_code(code):
-            nonlocal fixed_count
-            if pd.isna(code):
-                return code
-
-            code_str = str(code).strip()
-
-            # 尝试提取6位数字
-            import re
-
-            match = re.search(r"(\d{6})", code_str)
-            if match:
-                normalized = match.group(1)
-                if normalized != code_str:
-                    fixed_count += 1
-                return normalized
-
-            # 如果没有找到6位数字，尝试补零
-            digits_only = re.sub(r"\D", "", code_str)
-            if len(digits_only) <= 6:
-                normalized = digits_only.zfill(6)
-                if normalized != code_str:
-                    fixed_count += 1
-                return normalized
-
-            return code_str
-
-        df[code_col] = df[code_col].apply(normalize_code)
+        fixed_count = (original_codes != df[code_col]).sum()
 
         if fixed_count > 0 and self.logger:
             logger.info(f"[数据验证] {data_name}: 修复了 {fixed_count} 个股票代码格式")
@@ -237,7 +214,6 @@ class DataValidator:
                 return False, error_msg
 
             # 检查日期范围
-            min_date = dates.min()
             max_date = dates.max()
 
             if expected_date:
@@ -324,7 +300,7 @@ class DataValidator:
         required_cols: list[str] | None = None,
         price_cols: list[str] | None = None,
         check_completeness: bool = True,
-    ) -> dict[str, any]:
+    ) -> dict[str, Any]:
         """
         综合验证 DataFrame 的质量
 

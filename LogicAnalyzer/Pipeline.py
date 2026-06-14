@@ -1,22 +1,30 @@
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+from loguru import logger
 
 from LogicAnalyzer.MACDDivergence import (
-    adaptive_distance, detect_divergence_single_param, slope_analysis, signal_with_decay,
-)
-from LogicAnalyzer.SignalConstants import (
-    MACDSignals, Divergence, TrendLevels,
-    FullBullScoring, Conclusion, KLineLevels, MACDTrend
+    adaptive_distance,
+    detect_divergence_single_param,
+    signal_with_decay,
+    slope_analysis,
 )
 from LogicAnalyzer.PipelineScoring import (
-    _calc_momentum_desc, _volume_price_trend_score, _score_kline_pattern,
-    _backtest_signal_winrate, _calc_moneyflow_score,
+    _calc_momentum_desc,
+    _calc_moneyflow_score,
+    _score_kline_pattern,
+    _volume_price_trend_score,
 )
 from LogicAnalyzer.PipelineState import (
-    _make_state, _get_regime_multiplier, _get_macd_trend_mult,
-    _apply_chip_risk, _detect_market_regime, _calc_exit_strategy, _pipeline_output,
+    _apply_chip_risk,
+    _calc_exit_strategy,
+    _detect_market_regime,
+    _get_macd_trend_mult,
+    _get_regime_multiplier,
+    _make_state,
+    _pipeline_output,
 )
+from LogicAnalyzer.SignalConstants import Divergence, MACDSignals, MACDTrend
 
 
 class MACDAnalyzer:
@@ -110,7 +118,8 @@ class MACDAnalyzer:
         if 'ATR' not in df.columns:
             try:
                 df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"ATR 计算失败: {e}")
                 df['ATR'] = float('nan')
 
         if 'ADX' not in df.columns:
@@ -118,7 +127,8 @@ class MACDAnalyzer:
                 adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
                 for c in adx_df.columns:
                     df[c] = adx_df[c]
-            except Exception:
+            except Exception as e:
+                logger.warning(f"ADX 计算失败: {e}")
                 df['ADX_14'] = float('nan')
 
         if 'MA_200' not in df.columns:
@@ -127,16 +137,16 @@ class MACDAnalyzer:
         if not any(c.startswith('RSI_') for c in df.columns):
             try:
                 df.ta.rsi(append=True, close='close', length=14)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"RSI 计算失败: {e}")
 
         if not any(c.startswith('STOCHk') for c in df.columns):
             try:
                 stoch_df = ta.stoch(df['high'], df['low'], df['close'], k=9, d=3)
                 for c in stoch_df.columns:
                     df[c] = stoch_df[c]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"STOCH 计算失败: {e}")
 
         if 'AMOUNT' not in df.columns and 'close' in df.columns and 'volume' in df.columns:
             df['AMOUNT'] = df['close'] * df['volume']
@@ -149,14 +159,14 @@ class MACDAnalyzer:
         if not any(c.startswith('CCI_') for c in df.columns):
             try:
                 df.ta.cci(append=True, high='high', low='low', close='close')
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"CCI 计算失败: {e}")
 
         if not any(c.startswith('BBU_') for c in df.columns):
             try:
                 df.ta.bbands(append=True, close='close', length=20, std=2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"BBANDS 计算失败: {e}")
 
     def pipeline_analysis(
         self,
@@ -409,7 +419,7 @@ class MACDAnalyzer:
         if '底背离' in div_combined:
             scores['背离信号'] = (f'确认 底背离 (强度={div_strength:.2f}, 有效={eff})', int(w_div * (0.5 + 0.5 * eff)))
         elif has_top_div:
-            scores['背离信号'] = (f'否定 顶背离（一票否决）', 0)
+            scores['背离信号'] = ('否定 顶背离（一票否决）', 0)
         else:
             scores['背离信号'] = ('中性: 无背离信号', 0)
 

@@ -4,13 +4,18 @@
 负责数据的清洗、合并、转换、筛选和格式化。
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
+from pandera.errors import SchemaErrors
 
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DataMergeService import DataMergeService
-from DataManager.ShareCodeFormatMgr import format_stock_code
+from DataManager.DataSchemas import create_final_report_schema
 from LogicAnalyzer.PositionSizer import calculate_positions
-from LogicAnalyzer.SignalConstants import TrendLevels, InvestmentRating
+from UtilsManager.CodeNormalizer import CodeNormalizer
 
 
 class DataProcessingService:
@@ -29,7 +34,7 @@ class DataProcessingService:
         momentum_analyzer: 资金流动能分析器
     """
 
-    def __init__(self, config, logger, momentum_analyzer, calendar_mgr=None):
+    def __init__(self, config: Any, logger: Any, momentum_analyzer: Any, calendar_mgr: Any | None = None) -> None:  # noqa: ANN401
         """
         初始化数据处理服务
 
@@ -175,7 +180,7 @@ class DataProcessingService:
         final_df.reset_index(drop=True, inplace=True)
 
         # 生成股票链接
-        final_df["完整股票代码"] = final_df[ColumnNames.STOCK_CODE].apply(format_stock_code)
+        final_df["完整股票代码"] = final_df[ColumnNames.STOCK_CODE].apply(CodeNormalizer.add_market_prefix)
         final_df[ColumnNames.STOCK_LINK] = "https://hybrid.gelonghui.com/stock-check/" + final_df["完整股票代码"]
         final_df.drop(columns=["完整股票代码"], inplace=True, errors="ignore")
 
@@ -218,6 +223,9 @@ class DataProcessingService:
 
         Returns:
             bool: 验证是否通过
+
+        Raises:
+            ValueError: Pandera 数据合约校验失败时抛出，阻断 pipeline
         """
         from LogicAnalyzer.DataValidator import DataValidator
 
@@ -225,9 +233,19 @@ class DataProcessingService:
             self.logger.warning("[数据验证] 最终报告为空")
             return False
 
+        # ── Pandera 数据合约校验（阻塞式） ──
+        try:
+            schema = create_final_report_schema()
+            schema.validate(final_df, lazy=True)
+            self.logger.info("[数据合约] 最终报告通过 Pandera 校验")
+        except SchemaErrors as e:
+            msg = f"[数据合约] 最终报告校验失败: {e}"
+            self.logger.error(msg)
+            raise ValueError(msg) from e
+
+        # ── 业务规则校验（非阻塞，仅告警） ──
         data_validator = DataValidator(self.logger)
 
-        # 检查必需列
         required_report_cols = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.LATEST_PRICE]
         is_valid, missing = data_validator.validate_required_columns(final_df, required_report_cols, "最终报告")
 
@@ -235,7 +253,6 @@ class DataProcessingService:
             self.logger.error(f"[数据验证] 最终报告缺少关键列: {missing}")
             return False
 
-        # 验证价格数据
         price_valid, anomalies = data_validator.validate_price_data(
             final_df, [ColumnNames.LATEST_PRICE], "最终报告价格"
         )
@@ -259,7 +276,6 @@ class DataProcessingService:
         w_section = cfg.get("liq_w_section", 0.5)
         w_timeseries = cfg.get("liq_w_timeseries", 0.5)
         w_marketcap = cfg.get("liq_w_marketcap", 0.0)
-        min_discount = cfg.get("liq_min_discount", 0.3)
 
         # 行业中位数成交额
         if ColumnNames.INDUSTRY in df.columns:

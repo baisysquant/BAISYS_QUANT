@@ -104,14 +104,24 @@ class CodeNormalizer:
     @staticmethod
     def add_market_prefix(code: str) -> str:
         """
-        添加市场前缀（反向操作，委托给 ShareCodeFormatMgr）。
+        添加市场前缀（反向操作）。
         6位纯数字 → sh/sz/bj + 6位数字。
+        兼容已带前缀的输入，此时原样返回。
 
         Args:
-            code: 6位纯数字股票代码
+            code: 股票代码（6位纯数字 或 已带前缀）
 
         Returns:
             str: 带市场前缀的股票代码（如 sh600000, sz000001）
         """
-        from DataManager.ShareCodeFormatMgr import format_stock_code
-        return format_stock_code(code)
+        code_str = str(code)
+        if code_str.startswith(("sh", "sz", "bj")):
+            return code_str
+        code_str = code_str.zfill(6)
+        if code_str.startswith("6"):
+            return "sh" + code_str
+        if code_str.startswith(("0", "3")):
+            return "sz" + code_str
+        if code_str.startswith(("4", "8", "9")):
+            return "bj" + code_str
+        return code_str

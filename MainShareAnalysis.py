@@ -1,8 +1,10 @@
-﻿from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+﻿from __future__ import annotations
+
+from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
 from UtilsManager.LoggerManager import get_logger
 
 
-def main():
+def main() -> None:
     """
     主函数 - 执行完整的股票分析流程
  
@@ -12,8 +14,8 @@ def main():
         ReportGenerationError: 报告生成失败
         Exception: 其他未预期的错误
     """
-    import sys
     import io
+    import sys
 
     # 强制在 Windows 终端下支持 UTF-8 编码，防止特殊 Unicode/Emoji 字符导致 UnicodeEncodeError
     if sys.platform.startswith("win"):

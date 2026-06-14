@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from collections.abc import Callable
 from typing import Any
@@ -18,7 +20,7 @@ class DataFetcher:
     3. 可配置的数据清洗策略
     """
 
-    def __init__(self, config: Config, calendar_mgr: TradingCalendarAnalyzer):
+    def __init__(self, config: Config, calendar_mgr: TradingCalendarAnalyzer) -> None:
         self.config = config
         self.calendar_mgr = calendar_mgr
         self.today_str = calendar_mgr.get_last_trading_day()
@@ -42,17 +44,7 @@ class DataFetcher:
         if clean_pipeline:
             return clean_pipeline(df)
 
-        # 默认清洗逻辑
-        def extract_pure_code(code_str):
-            if pd.isna(code_str):
-                return None
-            code_str = str(code_str).strip().upper()
-            # 去掉 SH/SZ/BJ 前缀
-            for prefix in ["SH", "SZ", "BJ"]:
-                if code_str.startswith(prefix):
-                    code_str = code_str[2:]
-                    break
-            return code_str.zfill(6)
+        from UtilsManager.CodeNormalizer import CodeNormalizer
 
         def find_column_by_candidates(df: pd.DataFrame, candidates: list) -> str:
             """
@@ -92,15 +84,15 @@ class DataFetcher:
 
         # --- 2. 处理股票代码 ---
         if "股票代码" in df.columns:
-            df["股票代码"] = df["股票代码"].astype(str).apply(extract_pure_code)
+            df["股票代码"] = df["股票代码"].astype(str).apply(CodeNormalizer.normalize)
         else:
             # 尝试从通用列生成
             code_col = find_column_by_candidates(df, ["code", "ts_code", "symbol"])
             if code_col:
-                df["股票代码"] = df[code_col].astype(str).apply(extract_pure_code)
+                df["股票代码"] = df[code_col].astype(str).apply(CodeNormalizer.normalize)
 
             else:
-                print(f"[ERROR] {df_name} 无代码字段！列名：{df.columns.tolist()}")
+                logger.error(f"{df_name} 无代码字段！列名：{df.columns.tolist()}")
                 return pd.DataFrame()
 
         # --- 3. 处理股票简称 (ST过滤) ---
@@ -111,24 +103,24 @@ class DataFetcher:
                 df["股票简称"] = df[name_col]
             else:
                 df["股票简称"] = "N/A"
-                print(f"[WARN] {df_name} 无简称列，使用占位符。")
+                logger.warning(f"{df_name} 无简称列，使用占位符。")
 
         # ST股过滤 (统一正则)
         st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
         if df["股票简称"].dtype == "object" and df["股票简称"].astype(str).str.contains(st_pattern, na=False).any():
             st_count = df["股票简称"].astype(str).str.contains(st_pattern, na=False).sum()
             df = df[~df["股票简称"].astype(str).str.contains(st_pattern, na=False)].copy()
-            print(f"[FILTER] 已过滤 {st_count} 只ST股票。")
+            logger.info(f"已过滤 {st_count} 只ST股票。")
 
         # --- 4. 处理最新价 ---
         if "最新价" not in df.columns:
             price_col = find_column_by_candidates(df, ["price", "close"])
             if price_col:
                 df["最新价"] = pd.to_numeric(df[price_col], errors="coerce")
-                print(f"[INFO] 已从 '{price_col}' 生成 '最新价' 列。")
+                logger.info(f"已从 '{price_col}' 生成 '最新价' 列。")
             else:
                 df["最新价"] = 0.0
-                print(f"[WARN] {df_name} 无价格列，设为默认值 0.0。")
+                logger.warning(f"{df_name} 无价格列，设为默认值 0.0。")
 
         # --- 5. 最终通用清洗 ---
         df.dropna(subset=["股票代码"], inplace=True)
@@ -138,7 +130,7 @@ class DataFetcher:
         return df
 
     def fetch(
-        self, fetch_func: Callable, file_base_name: str, clean_pipeline: Callable | None = None, **kwargs: Any
+        self, fetch_func: Callable, file_base_name: str, clean_pipeline: Callable | None = None, **kwargs: Any  # noqa: ANN401
     ) -> pd.DataFrame:
         """
         统一的数据获取方法
@@ -161,7 +153,7 @@ class DataFetcher:
         df = pd.DataFrame()
         for i in range(self.config.DATA_FETCH_RETRIES):
             try:
-                print(f"  - 正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次获取数据: {file_base_name}...")
+                logger.info(f"正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次获取数据: {file_base_name}...")
                 df = fetch_func(**kwargs)
                 if df is not None and not df.empty:
                     break

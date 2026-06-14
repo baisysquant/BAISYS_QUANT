@@ -4,8 +4,10 @@ Pandera 数据契约测试脚本
 验证 Pandera Schema 定义和校验功能测试。
 """
 
-import sys
+from __future__ import annotations
+
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,7 +17,7 @@ from loguru import logger
 from DataManager.DataSchemas import SchemaValidator
 
 
-def test_stock_basic_schema():
+def test_stock_basic_schema() -> None:
     """测试股票基础信息 Schema"""
     logger.info("=" * 60)
     logger.info("测试股票基础信息 Schema")
@@ -47,13 +49,13 @@ def test_stock_basic_schema():
     )
 
     is_valid, errors = SchemaValidator.validate_stock_basic(invalid_data)
-    logger.info(f"无效数据校验: [OK] 正确检测到错误" if not is_valid else f"[FAIL] 应该失败但通过了")
+    logger.info("无效数据校验: [OK] 正确检测到错误" if not is_valid else "[FAIL] 应该失败但通过了")
     logger.info(f"检测到的错误: {errors}")
 
     logger.info("[OK] 股票基础信息 Schema 测试完成\n")
 
 
-def test_stock_price_schema():
+def test_stock_price_schema() -> None:
     """测试股票价格 Schema"""
     logger.info("=" * 60)
     logger.info("测试股票价格 Schema")
@@ -76,7 +78,7 @@ def test_stock_price_schema():
     logger.info("[OK] 股票价格 Schema 测试完成\n")
 
 
-def test_industry_board_schema():
+def test_industry_board_schema() -> None:
     """测试行业板块 Schema"""
     logger.info("=" * 60)
     logger.info("测试行业板块 Schema")
@@ -100,7 +102,7 @@ def test_industry_board_schema():
     logger.info("[OK] 行业板块 Schema 测试完成\n")
 
 
-def test_main_cost_schema():
+def test_main_cost_schema() -> None:
     """测试主力成本 Schema"""
     logger.info("=" * 60)
     logger.info("测试主力成本 Schema")
@@ -126,7 +128,7 @@ def test_main_cost_schema():
     logger.info("[OK] 主力成本 Schema 测试完成\n")
 
 
-def test_coerce_types():
+def test_coerce_types() -> None:
     """测试类型自动转换"""
     logger.info("=" * 60)
     logger.info("测试类型自动转换")
@@ -149,7 +151,7 @@ def test_coerce_types():
     logger.info("[OK] 类型转换测试完成\n")
 
 
-def main():
+def main() -> int:
     """运行所有测试"""
     logger.info("\n")
     logger.info("╔" + "=" * 58 + "╗")

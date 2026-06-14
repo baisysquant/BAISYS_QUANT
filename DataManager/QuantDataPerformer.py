@@ -1,11 +1,22 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pandas as pd
+from loguru import logger
+from pandera.errors import SchemaErrors
+
+from DataManager.DataSchemas import create_final_report_schema
+
+if TYPE_CHECKING:
+    from DataManager.DatabaseWriter import QuantDBManager
 
 
 class DataCleaner:
     """金融数据清洗工具类：处理亿、万、百分比及非法字符"""
 
     @staticmethod
-    def parse_money_str(val):
+    def parse_money_str(val: object) -> float:
         if pd.isna(val) or val == "" or val in ["--", "-"]:
             return 0.0
         s = str(val).strip()
@@ -31,10 +42,16 @@ class QuantDBSyncTask:
     支持联合主键: (archive_date, strategy_type, stock_code)
     """
 
-    def __init__(self, db_manager):
+    def __init__(self, db_manager: QuantDBManager) -> None:
         self.db = db_manager
 
-    def sync_all(self, today_str, consolidated_report, industry_df, raw_data):
+    def sync_all(
+        self,
+        today_str: str,
+        consolidated_report: pd.DataFrame,
+        industry_df: pd.DataFrame,
+        raw_data: dict,
+    ) -> None:
         """执行全量同步主入口
 
         Args:
@@ -43,25 +60,29 @@ class QuantDBSyncTask:
             industry_df: 行业分析DataFrame
             raw_data: 原始数据字典
         """
-        print("\n" + "=" * 50)
-        print(f">>> 启动数据库资产化同步任务 业务日期: {today_str}")
-        print("=" * 50)
+        logger.info("\n" + "=" * 50)
+        logger.info(f">>> 启动数据库资产化同步任务 业务日期: {today_str}")
+        logger.info("=" * 50)
 
         try:
             # 1. 同步策略触发归档 (支持一码多策略)
             self._sync_strategy_stocks(today_str, raw_data)
             self._sync_industry_data(today_str, industry_df)
+
+            # ── Pandera 数据合约校验（阻塞式） ──
+            self._validate_final_report(consolidated_report, today_str)
+
             self._sync_final_report(today_str, consolidated_report)
 
         except Exception as e:
-            print(f"!!! [同步中断] 任务运行异常: {e}")
+            logger.info(f"!!! [同步中断] 任务运行异常: {e}")
             import traceback
 
             traceback.print_exc()
         finally:
-            print(">>> 数据库同步任务结束。\n")
+            logger.info(">>> 数据库同步任务结束。\n")
 
-    def _sync_strategy_stocks(self, today, raw_data):
+    def _sync_strategy_stocks(self, today: str, raw_data: dict) -> None:
         """1. 同步策略触发归档 (ODS层) - 适配联合主键并修复列名KeyError"""
         strategy_frames = []
         # 配置映射：raw_data的key -> 数据库中的 strategy_type
@@ -116,10 +137,10 @@ class QuantDBSyncTask:
 
             self.db.safe_insert_data(all_strat_df[final_cols], "ods_ak_ranking_stocks", "archive_date", today)
 
-    def _sync_industry_data(self, today, industry_df):
+    def _sync_industry_data(self, today: str, industry_df: pd.DataFrame) -> None:
         """同步行业权重趋势深度数据"""
         if industry_df is None or industry_df.empty:
-            print("  - [警告] industry_df 为空，跳过行业数据同步")
+            logger.info("  - [警告] industry_df 为空，跳过行业数据同步")
             return
 
         df_db = industry_df.copy()
@@ -158,7 +179,21 @@ class QuantDBSyncTask:
 
         self.db.safe_insert_data(df_db, "ods_ak_industry_analysis", "archive_date", today)
 
-    def _sync_final_report(self, today, df):
+    def _validate_final_report(self, df: pd.DataFrame, today_str: str) -> None:
+        """Pandera 数据合约校验，失败时阻断写入"""
+        if df is None or df.empty:
+            logger.info(f"  - [数据合约] {today_str} 最终报告为空，跳过校验")
+            return
+        try:
+            schema = create_final_report_schema()
+            schema.validate(df, lazy=True)
+            logger.info(f"  - [数据合约] {today_str} 最终报告校验通过 ({len(df)} 条)")
+        except SchemaErrors as e:
+            msg = f"[数据合约] {today_str} 最终报告校验失败，终止数据库写入: {e}"
+            logger.info(f"!!! {msg}")
+            raise ValueError(msg) from e
+
+    def _sync_final_report(self, today: str, df: pd.DataFrame) -> None:
         """3. 同步决策报告 (APP层) - 完整字段支持版
 
         Args:
@@ -268,13 +303,13 @@ class QuantDBSyncTask:
             df_db = df_db.drop_duplicates(subset=["stock_code"], keep="last")
             after_count = len(df_db)
             if before_count != after_count:
-                print(f"  - [数据清洗] 发现 {before_count - after_count} 条重复股票代码，已自动去重。")
+                logger.info(f"  - [数据清洗] 发现 {before_count - after_count} 条重复股票代码，已自动去重。")
 
         db_cols = self.db.get_table_columns("app_stock_strategy_report")
         if db_cols:
             missing = set(final_valid_cols) - set(db_cols)
             if missing:
-                print(f"  - [WARN] DB表缺少列: {', '.join(sorted(missing))}，已自动跳过")
+                logger.info(f"  - [WARN] DB表缺少列: {', '.join(sorted(missing))}，已自动跳过")
             final_valid_cols = [c for c in final_valid_cols if c in db_cols]
 
         try:
@@ -289,7 +324,7 @@ class QuantDBSyncTask:
                     candidates = [p for p in set(parts) if p.isidentifier() and p not in ('app_stock_strategy_report', 'stock_code', 'archive_date')]
                     if candidates:
                         col_name = candidates[0]
-                        print(f"  - [WARN] DB表缺少列 '{col_name}'，跳过该列重试")
+                        logger.info(f"  - [WARN] DB表缺少列 '{col_name}'，跳过该列重试")
                         safe_cols = [c for c in final_valid_cols if c != col_name]
                         self.db.safe_insert_data(df_db[safe_cols], "app_stock_strategy_report", "archive_date", today)
                         break

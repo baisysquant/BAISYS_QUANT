@@ -4,19 +4,24 @@
 负责从akshare等外部数据源获取原始数据，并管理数据缓存。
 """
 
+from __future__ import annotations
+
 import os
-import time
-from concurrent.futures import as_completed, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import akshare as ak
 import pandas as pd
 from loguru import logger
 
+from ConfigParser import Config
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DataFetcher import DataFetcher
 from DataManager.DataSchemas import SchemaValidator
 from LogicAnalyzer.DataValidator import DataValidator
 from UtilsManager.Exceptions import DataFetchError, handle_exception_with_recovery
+from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
 class DataAcquisitionService:
@@ -38,7 +43,7 @@ class DataAcquisitionService:
         data_validator: 数据验证器
     """
 
-    def __init__(self, config, calendar_mgr, logger, cache_manager, executor=None):
+    def __init__(self, config: Config, calendar_mgr: TradingCalendarAnalyzer, logger: Any, cache_manager: UnifiedCacheManager, executor: ThreadPoolExecutor | None = None) -> None:  # noqa: ANN401
         self.config = config
         self.calendar_mgr = calendar_mgr
         self.logger = logger
@@ -125,7 +130,7 @@ class DataAcquisitionService:
                             data[key] = fund_flow_df
                         else:
                             logger.warning(f"  - [WARN] {period}日资金流数据契约校验失败: {pandera_errors}")
-                            logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
+                            logger.warning("  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                     else:
                         logger.warning(f"  - [WARN] {period}日资金流数据缺少列: {missing}，跳过")
                 else:
@@ -152,7 +157,7 @@ class DataAcquisitionService:
         }
 
         # 定义单个数据源获取的worker函数
-        def fetch_data_source_worker(item):
+        def fetch_data_source_worker(item: Any) -> tuple[str, pd.DataFrame]:  # noqa: ANN401
             key, (api_func, desc, params) = item
             try:
                 df = self.data_fetcher.fetch(api_func, desc, **params)
@@ -201,7 +206,7 @@ class DataAcquisitionService:
         ]
 
         # 定义单个均线突破数据获取的worker函数
-        def fetch_xstp_worker(config):
+        def fetch_xstp_worker(config: tuple[str, str, str]) -> tuple[str, pd.DataFrame]:
             key, desc, symbol = config
             try:
                 df = self.data_fetcher.fetch(ak.stock_rank_xstp_ths, desc, symbol=symbol)
@@ -276,7 +281,7 @@ class DataAcquisitionService:
                         logger.info(f"  - [OK] 主力成本数据: {len(main_cost_df)} 条记录")
                     else:
                         logger.warning(f"  - [WARN] 主力成本数据契约校验失败: {pandera_errors}")
-                        logger.warning(f"  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
+                        logger.warning("  - [WARN] 继续使用该数据，但请注意可能存在数据质量问题")
                         data["main_cost_data"] = main_cost_df
 
                     # 打印主力成本数据摘要

@@ -15,13 +15,17 @@
       输出：DataFrame + ［建议仓位比例, 仓位依据］两列
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
 
 
-def _safe_float(val, default=0.0) -> float:
+def _safe_float(val: Any, default: float = 0.0) -> float:  # noqa: ANN401
     try:
         v = float(val)
         return v if np.isfinite(v) else default
@@ -29,7 +33,7 @@ def _safe_float(val, default=0.0) -> float:
         return default
 
 
-def _safe_str(val, default="") -> str:
+def _safe_str(val: Any, default: str = "") -> str:  # noqa: ANN401
     if isinstance(val, str):
         return val
     try:
@@ -45,7 +49,8 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
         df: 经过 filter_signal_stocks 之后的 DataFrame，需要包含
             COMPREHENSIVE_LEVEL, COMPREHENSIVE_SCORE, RISK_LEVEL, EXIT_RRR,
             STOP_LOSS, LATEST_PRICE, MACD_TREND_TYPE, 行业 等列。
-        config: 仓位配置字典，缺省时使用内部默认值。
+        config: 仓位配置字典。必须由调用方从 ``Config.POSITION_SIZING`` 构造，
+            可使用 ``.get(key, default)`` 保证容错。
 
     Returns:
         添加了 ``SUGGESTED_POSITION`` 和 ``POSITION_REASON`` 两列的 DataFrame。
@@ -55,21 +60,19 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
         df[ColumnNames.POSITION_REASON] = ""
         return df
 
-    cfg = _default_config()
-    if config:
-        cfg.update(config)
+    cfg = config or {}
 
     result = df.copy()
-    _max_single = cfg["max_single_position"]
-    _kelly_frac = cfg["kelly_fraction"]
-    _win_rate = cfg["default_win_rate"]
-    _risk_budget = cfg["risk_budget"]
+    _max_single = cfg.get("max_single_position", 0.33)
+    _kelly_frac = cfg.get("kelly_fraction", 0.25)
+    _win_rate = cfg.get("default_win_rate", 0.50)
+    _risk_budget = cfg.get("risk_budget", 0.02)
     _atr_stop_mult = cfg.get("atr_stop_mult", 1.5)
     _level_pos = {
-        "A": cfg["position_a"],
-        "B": cfg["position_b"],
-        "C": cfg["position_c"],
-        "D": cfg["position_d"],
+        "A": cfg.get("position_a", 0.30),
+        "B": cfg.get("position_b", 0.15),
+        "C": cfg.get("position_c", 0.05),
+        "D": cfg.get("position_d", 0.00),
     }
 
     positions = []
@@ -172,18 +175,3 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
     return result
 
 
-def _default_config() -> dict:
-    """默认仓位配置参数，与 config.ini [POSITION_SIZING] 对应。"""
-    return {
-        "max_single_position": 0.33,
-        "kelly_fraction": 0.25,
-        "default_win_rate": 0.50,
-        "position_a": 0.30,
-        "position_b": 0.15,
-        "position_c": 0.05,
-        "position_d": 0.00,
-        "max_industry_exposure": 0.30,
-        "risk_budget": 0.02,
-        "max_drawdown_reduction": 0.50,
-        "atr_stop_mult": 1.5,
-    }

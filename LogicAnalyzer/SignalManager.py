@@ -1,26 +1,21 @@
-import logging
-import os
+from __future__ import annotations
+
 import re
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 import pandas as pd
-from typing import Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas_ta as ta  # 勿删
+from loguru import logger
 
-logger = logging.getLogger(__name__)
-from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
-from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
-from LogicAnalyzer.SignalConstants import (
-    KLineLevels, KLineDirection, CCILevels, KLinePatternCN,
-    MarketSentiment, RSISignals, BOLLSignals
-)
 from ConfigParser import Config
+from LogicAnalyzer.KDJAnalyzer import AdvancedKDJAnalyzer
+from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.ProfessionalIndicators import (
-    analyze_rsi,
     analyze_bollinger,
     analyze_cci,
+    analyze_rsi,
 )
+from LogicAnalyzer.SignalConstants import KLineDirection, KLineLevels
 
 
 class TASignalProcessor:
@@ -41,7 +36,7 @@ class TASignalProcessor:
         config: 配置管理器实例
     """
 
-    def __init__(self, analyzer_instance: Any, config: Optional[Config] = None, executor=None) -> None:
+    def __init__(self, analyzer_instance: Any, config: Config | None = None, executor: ThreadPoolExecutor | None = None) -> None:  # noqa: ANN401
         self.analyzer      = analyzer_instance
         self.kdj_analyzer  = AdvancedKDJAnalyzer()
         self.macd_analyzer = MACDAnalyzer()
@@ -78,6 +73,7 @@ class TASignalProcessor:
         code: str,
         valid_hist_df: pd.DataFrame,
         macro_adjust: float = 1.0,
+        chip_lookup: dict | None = None,
         moneyflow_lookup: dict | None = None,
         forecast_lookup: dict | None = None,
     ) -> dict[str, Any] | None:
@@ -133,15 +129,9 @@ class TASignalProcessor:
         thresholds = getattr(self.config, 'FULL_BULL_THRESHOLDS', None)
 
         # 附加筹码分布数据
-        code_str = str(code).lower()
-        if code_str.startswith(('sh', 'sz', 'bj')):
-            code_str = code_str[:2] + code_str[2:].zfill(6)
-        else:
-            code_str = code_str.zfill(6)
-        # chip_lookup key 为纯6位代码（已剥离前缀）
-        pure_code = code_str[2:] if code_str[:2] in ('sh', 'sz', 'bj') else code_str
-        if pure_code in getattr(self, 'chip_lookup', {}):
-            cd = self.chip_lookup[pure_code]
+        chip_lookup = chip_lookup or {}
+        if pure_code in chip_lookup:
+            cd = chip_lookup[pure_code]
             df.attrs['chip_data'] = cd
             result['cost_95pct'] = cd.get('cost_95pct', None)
 
@@ -385,17 +375,23 @@ class TASignalProcessor:
         all_codes: list[str],
         hist_df_all: pd.DataFrame,
         spot_df: pd.DataFrame,
+        chip_lookup: dict[str, dict] | None = None,
+        moneyflow_lookup: dict[str, dict] | None = None,
+        forecast_lookup: dict[str, dict] | None = None,
     ) -> dict[str, pd.DataFrame]:
         """
         处理所有股票的技术指标信号
-        
+         
         对给定的股票列表进行批量技术分析，计算多种技术指标并生成信号。
-        
+         
         Args:
             all_codes: 股票代码列表（6位纯数字格式）
             hist_df_all: 历史K线数据DataFrame，包含所有股票的OHLCV数据
             spot_df: 实时行情数据DataFrame，包含最新价格等信息
-            
+            chip_lookup: 筹码分布查找表 {纯6位代码: dict}，由 SignalDataLoader 预加载
+            moneyflow_lookup: 资金流向查找表 {纯6位代码: dict}
+            forecast_lookup: 业绩预告查找表 {纯6位代码: dict}
+             
         Returns:
             dict[str, pd.DataFrame]: 技术指标信号字典，key为指标名称，value为对应的信号DataFrame
             包括：
@@ -424,55 +420,13 @@ class TASignalProcessor:
                 '止损价', 'T1目标价', 'T2目标价', '移动止损', '盈亏比',
                 'position_adjust', 'macd_trend_raw',
                 'AMOUNT', 'AMOUNT_MA20',
+                '宏观风险',
             ]),
         }
 
-        # ── 加载筹码分布数据 ───────────────────────────────────────────────
-        self.chip_lookup = {}
-        today_str = datetime.now().strftime('%Y%m%d')
-        chip_path = os.path.join(getattr(self.config, 'HOME_DIRECTORY', '~/Downloads/CoreNews_Reports'), f"chip_distribution_{today_str}.csv")
-        chip_path = os.path.expanduser(chip_path)
-        if os.path.exists(chip_path):
-            try:
-                chip_df = pd.read_csv(chip_path)
-                for _, row in chip_df.iterrows():
-                    pure = row['symbol']
-                    if pure.startswith(('sh', 'sz', 'bj')):
-                        pure = pure[2:]
-                    self.chip_lookup[pure] = row.to_dict()
-                print(f"[ChipDist] 已加载 {len(self.chip_lookup)} 条筹码数据")
-            except Exception as e:
-                print(f"[ChipDist] 加载筹码数据失败: {e}")
-
-        # ── 加载资金流向数据 ───────────────────────────────────────────────
-        self.moneyflow_lookup = {}
-        try:
-            from DataCollection.MoneyFlowFetcher import MoneyFlowFetcher
-            mf_fetcher = MoneyFlowFetcher(self.config)
-            mf_df = mf_fetcher.fetch_all()
-            if mf_df is not None and not mf_df.empty:
-                for _, row in mf_df.iterrows():
-                    ts_code = str(row.get('ts_code', ''))
-                    pure = ts_code.split('.')[0]  # 000001.SH → 000001
-                    self.moneyflow_lookup[pure] = row.to_dict()
-                print(f"[MoneyFlow] 已加载 {len(self.moneyflow_lookup)} 条资金流向数据")
-        except Exception as e:
-            print(f"[MoneyFlow] 加载资金流向失败: {e}")
-
-        # ── 加载业绩预告数据 ──────────────────────────────────────────────
-        self.forecast_lookup = {}
-        try:
-            from DataCollection.FinancialForecastFetcher import FinancialForecastFetcher
-            fc_fetcher = FinancialForecastFetcher(self.config)
-            fc_df = fc_fetcher.fetch_all()
-            if fc_df is not None and not fc_df.empty:
-                for _, row in fc_df.iterrows():
-                    ts_code = str(row.get('ts_code', ''))
-                    pure = ts_code.split('.')[0]
-                    self.forecast_lookup[pure] = row.to_dict()
-                print(f"[Forecast] 已加载 {len(self.forecast_lookup)} 条业绩预告数据")
-        except Exception as e:
-            print(f"[Forecast] 加载业绩预告失败: {e}")
+        _chip_lookup = chip_lookup or {}
+        _moneyflow_lookup = moneyflow_lookup or {}
+        _forecast_lookup = forecast_lookup or {}
 
         if hist_df_all.empty:
             return ta_signals
@@ -484,15 +438,8 @@ class TASignalProcessor:
         # 确保symbol列是字符串格式
         hist_df_all['symbol'] = hist_df_all['symbol'].astype(str)
         
-        # 提取股票代码，支持多种格式（sh600000, sz000001, 600000, 000001等）
-        def extract_code(symbol):
-            clean_symbol = str(symbol).lower()
-            if clean_symbol.startswith(('sh', 'sz', 'bj')):
-                clean_symbol = clean_symbol[2:]
-            match = re.search(r'(\d{6})', clean_symbol)
-            return match.group(1) if match else 'N/A'
-        
-        hist_df_all['股票代码'] = hist_df_all['symbol'].apply(extract_code)
+        from UtilsManager.CodeNormalizer import CodeNormalizer
+        hist_df_all['股票代码'] = hist_df_all['symbol'].apply(CodeNormalizer.normalize)
 
         # 日期列标准化
         if 'date' not in hist_df_all.columns and 'trade_date' in hist_df_all.columns:
@@ -516,25 +463,33 @@ class TASignalProcessor:
         code_set = set(pure_codes_list)
         
         # 过滤出有效的股票数据
-        valid_hist_df = hist_df_all[hist_df_all['股票代码'].isin(code_set) & (hist_df_all['股票代码'] != 'N/A')].copy()
+        valid_hist_df = hist_df_all[hist_df_all['股票代码'].isin(code_set) & (hist_df_all['股票代码'] != '')].copy()
 
         # ── 宏观过滤（全局一次性判断） ──────────────────────────────────────
         macro_result = None
         macro_adjust = 1.0
         if getattr(self.config, 'ENABLE_MACRO_FILTER', True):
-            try:
-                from LogicAnalyzer.MacroFilter import MacroFilter
-                macro_result = MacroFilter.check(spot_df=spot_df)
+            from LogicAnalyzer.MacroFilter import MacroFilter
+            _retries = 2
+            for _attempt in range(_retries + 1):
+                try:
+                    macro_result = MacroFilter.check(spot_df=spot_df)
+                    break
+                except Exception as e:
+                    if _attempt < _retries:
+                        logger.warning(f"[MacroFilter] 第{_attempt+1}次失败，重试: {e}")
+                        import time
+                        time.sleep(2 ** _attempt)
+                    else:
+                        logger.warning(f"[MacroFilter] {_retries+1}次均失败: {e}")
+            if macro_result:
                 if macro_result.decision == 'SKIP_ALL':
-                    print(f"[MacroFilter] {macro_result.detail} → SKIP_ALL，跳过当日分析")
-                    return ta_signals
+                    logger.info(f"[MacroFilter] {macro_result.detail} → SKIP_ALL，继续计算但标记宏观风险")
                 elif macro_result.decision == 'CAUTION':
                     macro_adjust = macro_result.score_adjust
-                    print(f"[MacroFilter] {macro_result.detail} → CAUTION，阈值上浮{int((1-macro_adjust)*100)}%")
+                    logger.info(f"[MacroFilter] {macro_result.detail} → CAUTION，阈值上浮{int((1-macro_adjust)*100)}%")
                 else:
-                    print(f"[MacroFilter] {macro_result.detail} → NORMAL")
-            except Exception as e:
-                print(f"[MacroFilter] 异常: {e}")
+                    logger.info(f"[MacroFilter] {macro_result.detail} → NORMAL")
 
         # ── 并行处理所有股票 ──────────────────────────────────────────────
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
@@ -545,7 +500,7 @@ class TASignalProcessor:
             futures = {
                 exec_signal.submit(
                     self._process_single_stock, code, valid_hist_df, macro_adjust,
-                    self.moneyflow_lookup, self.forecast_lookup,
+                    _chip_lookup, _moneyflow_lookup, _forecast_lookup,
                 ): code
                 for code in set(all_codes)
             }
@@ -622,6 +577,14 @@ class TASignalProcessor:
                 kline_rows.append({'股票代码': code, 'K线形态信号': r['kline_pattern']})
 
         macd_full_bull = pd.DataFrame(bull_rows, columns=ta_signals['MACD_FULL_BULL'].columns)
+        if not macd_full_bull.empty:
+            macro_label = ""
+            if macro_result:
+                if macro_result.decision == 'SKIP_ALL':
+                    macro_label = f"宏观看空: {macro_result.detail}"
+                elif macro_result.decision == 'CAUTION':
+                    macro_label = f"宏观谨慎: {macro_result.detail}"
+            macd_full_bull['宏观风险'] = macro_label
         ta_signals['MACD_FULL_BULL'] = macd_full_bull
         ta_signals['KDJ'] = pd.DataFrame(kdj_rows)
         ta_signals['CCI'] = pd.DataFrame(cci_rows)

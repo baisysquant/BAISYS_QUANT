@@ -4,6 +4,10 @@
 负责数据的清洗、合并、转换（从DataProcessingService拆分）。
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
@@ -14,13 +18,15 @@ from UtilsManager.Exceptions import CalculationError, handle_exception_with_reco
 
 def get_stock_industry_mapping(
     stock_codes: list[str],
-    logger=None,
+    logger: Any | None = None,  # noqa: ANN401
+    engine: Any | None = None,  # noqa: ANN401
 ) -> pd.DataFrame:
     """Standalone: 从数据库获取股票的行业信息。
 
     Args:
         stock_codes: 股票代码列表
         logger: 可选的日志器实例
+        engine: 可选的 SQLAlchemy Engine（不传则使用全局单例）
 
     Returns:
         pd.DataFrame: 包含股票代码、名称、行业的DataFrame
@@ -30,9 +36,14 @@ def get_stock_industry_mapping(
 
     try:
         from DataCollection.HistDataEngine import StockSyncEngine
+        from DataManager.DbEngine import get_engine as _get_engine
 
-        engine = StockSyncEngine()
-        pool = engine.get_stock_pool_from_db()
+        if engine is None:
+            from ConfigParser import Config
+            engine = _get_engine(Config())
+
+        sync = StockSyncEngine(db_engine=engine)
+        pool = sync.get_stock_pool_from_db()
 
         formatted = [CodeNormalizer.normalize(c) for c in stock_codes]
         filtered = pool[pool[ColumnNames.STOCK_CODE].isin(formatted)]
@@ -69,11 +80,12 @@ class DataMergeService:
         momentum_analyzer: 资金流动能分析器
     """
 
-    def __init__(self, config, logger, momentum_analyzer, calendar_mgr=None):
+    def __init__(self, config: Any, logger: Any, momentum_analyzer: Any, calendar_mgr: Any | None = None) -> None:  # noqa: ANN401
         self.config = config
         self.logger = logger
         self.momentum_analyzer = momentum_analyzer
         self.calendar_mgr = calendar_mgr
+        self._industry_cache: pd.DataFrame | None = None
 
     # ── 工具方法 ─────────────────────────────────────────────
 
@@ -82,7 +94,7 @@ class DataMergeService:
             df[code_col] = CodeNormalizer.normalize_series(df[code_col])
         return df
 
-    def _fill_missing_columns(self, df: pd.DataFrame, columns: list, default_value="N/A") -> pd.DataFrame:
+    def _fill_missing_columns(self, df: pd.DataFrame, columns: list, default_value: str = "N/A") -> pd.DataFrame:
         for col in columns:
             if col not in df.columns:
                 df[col] = default_value
@@ -91,7 +103,16 @@ class DataMergeService:
         return df
 
     def _get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
-        return get_stock_industry_mapping(stock_codes, self.logger)
+        if self._industry_cache is None:
+            from DataCollection.HistDataEngine import StockSyncEngine
+            from DataManager.DbEngine import get_engine as _get_engine
+            sync = StockSyncEngine(db_engine=_get_engine(self.config))
+            pool = sync.get_stock_pool_from_db()
+            industry = pool[["ts_code", "name", "industry"]].copy()
+            industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
+            self._industry_cache = industry
+        formatted = [CodeNormalizer.normalize(c) for c in stock_codes]
+        return self._industry_cache[self._industry_cache[ColumnNames.STOCK_CODE].isin(formatted)]
 
     # ── 合并方法 ─────────────────────────────────────────────
 
@@ -445,7 +466,8 @@ class DataMergeService:
                              ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE,
                              ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR,
                              "position_adjust",
-                             ColumnNames.AMOUNT, ColumnNames.AMOUNT_MA20]:
+                             ColumnNames.AMOUNT, ColumnNames.AMOUNT_MA20,
+                             "宏观风险"]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])

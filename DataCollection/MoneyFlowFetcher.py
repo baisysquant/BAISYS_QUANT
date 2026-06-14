@@ -1,8 +1,12 @@
+from __future__ import annotations
+
 import os
 import sys
 import time
+from typing import Any
 
 import pandas as pd
+from loguru import logger
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,7 +23,7 @@ class MoneyFlowFetcher:
 
     API_PAGE_SIZE = 2000
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config) -> None:
         self.config = config
         if hasattr(config, 'ASHAREHUB_API_KEY'):
             self.api_key = config.ASHAREHUB_API_KEY
@@ -43,7 +47,7 @@ class MoneyFlowFetcher:
         return os.path.join(self._cache_dir, f"moneyflow_{self._today}.csv")
 
     @property
-    def client(self):
+    def client(self) -> Any:  # noqa: ANN401
         if self._client is None and self.api_key:
             from asharehub import AShareHub
             self._client = AShareHub(api_key=self.api_key)
@@ -64,7 +68,7 @@ class MoneyFlowFetcher:
             net_mf_vol, net_mf_amount
         """
         if not self.api_key:
-            print("[MoneyFlow] API 密钥未配置，跳过。")
+            logger.info("[MoneyFlow] API 密钥未配置，跳过。")
             return pd.DataFrame()
 
         if date is not None:
@@ -78,20 +82,20 @@ class MoneyFlowFetcher:
         if target_date == self._today and os.path.exists(cache_path):
             try:
                 cached = pd.read_csv(cache_path)
-                print(f"[MoneyFlow] 读取当日缓存: {os.path.basename(cache_path)} ({len(cached)} 条)")
+                logger.info(f"[MoneyFlow] 读取当日缓存: {os.path.basename(cache_path)} ({len(cached)} 条)")
                 return cached
             except Exception as e:
-                print(f"[MoneyFlow] 缓存读取失败，将重新拉取: {e}")
+                logger.info(f"[MoneyFlow] 缓存读取失败，将重新拉取: {e}")
 
         if not self.client:
-            print("[MoneyFlow] 客户端初始化失败，跳过。")
+            logger.info("[MoneyFlow] 客户端初始化失败，跳过。")
             return pd.DataFrame()
 
         fmt_date = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}"
         all_dfs = []
         offset = 0
         page = 1
-        print(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
+        logger.info(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
 
         done = False
         while not done:
@@ -100,7 +104,7 @@ class MoneyFlowFetcher:
                 try:
                     if attempt > 1:
                         wait = min(2 ** attempt, 30)
-                        print(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
+                        logger.info(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
                         time.sleep(wait)
                     df = self.client.moneyflow(start_date=fmt_date, end_date=fmt_date,
                                                limit=self.API_PAGE_SIZE, offset=offset)
@@ -109,7 +113,7 @@ class MoneyFlowFetcher:
                         break
                     all_dfs.append(df)
                     row_count = len(df)
-                    print(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
+                    logger.info(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
                     if row_count < self.API_PAGE_SIZE:
                         done = True
                         break
@@ -125,25 +129,25 @@ class MoneyFlowFetcher:
                     if '429' in err_str or 'Too Many Requests' in err_str:
                         if attempt <= self._retry:
                             continue
-                    print(f"[MoneyFlow] 获取失败: {e}")
+                    logger.info(f"[MoneyFlow] 获取失败: {e}")
                     break
             if last_err:
                 break
 
         if not all_dfs:
-            print("[MoneyFlow] 未获取到任何资金流向数据。")
+            logger.info("[MoneyFlow] 未获取到任何资金流向数据。")
             return pd.DataFrame()
 
         combined = pd.concat(all_dfs, ignore_index=True)
-        print(f"[MoneyFlow] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
+        logger.info(f"[MoneyFlow] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
 
         # 写缓存（仅当天数据）
         if target_date == self._today:
             try:
                 os.makedirs(self._cache_dir, exist_ok=True)
                 combined.to_csv(cache_path, index=False, encoding="utf-8-sig")
-                print(f"[MoneyFlow] 已缓存至: {os.path.basename(cache_path)}")
+                logger.info(f"[MoneyFlow] 已缓存至: {os.path.basename(cache_path)}")
             except Exception as e:
-                print(f"[MoneyFlow] 缓存写入失败: {e}")
+                logger.info(f"[MoneyFlow] 缓存写入失败: {e}")
 
         return combined

@@ -16,24 +16,23 @@
     python sensitivity_runner.py --resume --scan weights     # 断点续跑
 """
 
+from __future__ import annotations
+
+import configparser
+import glob
 import json
 import os
-import sys
-import time
-import glob
-import configparser
-import tempfile
 import shutil
-from datetime import datetime
+import sys
+import tempfile
+import time
 from itertools import product
 
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ConfigParser import Config
 from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
-
 
 # ── 工具函数 ────────────────────────────────────────────────────────
 
@@ -101,7 +100,7 @@ def _extract_stats(report_dir: str, label: str) -> dict:
     }
 
 
-def _cleanup_temp(tmp_dir: str):
+def _cleanup_temp(tmp_dir: str) -> None:
     """清理临时目录。"""
     try:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -286,7 +285,7 @@ def _make_label(combo: dict) -> str:
 
 
 def run_scan(grid: dict, base_config_path: str = "config.ini",
-             dry_run: bool = False, resume: bool = False):
+             dry_run: bool = False, resume: bool = False) -> pd.DataFrame | None:
     """执行网格扫描。"""
     param_combos = _flatten_grid(grid)
     print(f"\n参数组合数: {len(param_combos)}")

@@ -2,14 +2,17 @@
 申万二级行业成分股字典生成器
 从 akshare 获取申万二级行业全部成分股，输出标准化的股票字典文件
 """
-import akshare as ak
-import pandas as pd
-import time
+from __future__ import annotations
+
 import os
+import time
 from datetime import datetime
 
+import akshare as ak
+import pandas as pd
 
-def get_sw_industry_dict():
+
+def get_sw_industry_dict() -> pd.DataFrame:
     """
     获取申万二级行业字典
     返回: DataFrame，包含 行业代码, 行业名称 等信息
@@ -23,7 +26,7 @@ def get_sw_industry_dict():
     return industry_df
 
 
-def get_all_component_stocks(industry_df, retry=3, sleep_sec=1.5):
+def get_all_component_stocks(industry_df: pd.DataFrame, retry: int = 3, sleep_sec: float = 1.5) -> pd.DataFrame:
     """
     遍历每个申万二级行业，获取其全部成分股
     """
@@ -91,7 +94,7 @@ def get_all_component_stocks(industry_df, retry=3, sleep_sec=1.5):
     return pd.DataFrame(all_rows)
 
 
-def save_stock_dict(df, output_dir="output"):
+def save_stock_dict(df: pd.DataFrame, output_dir: str = "output") -> pd.DataFrame:
     """
     保存股票字典到 CSV 和 TXT 文件
     """
@@ -124,7 +127,7 @@ def save_stock_dict(df, output_dir="output"):
     return out_df_unique
 
 
-def main():
+def main() -> None:
     print("=" * 65)
     print("  申万二级行业成分股字典生成器")
     print(f"  运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -142,17 +145,17 @@ def main():
         return
 
     # 第3步：保存结果
-    print(f"\n[3/3] 保存股票字典文件...")
+    print("\n[3/3] 保存股票字典文件...")
     unique_df = save_stock_dict(all_stocks_df)
 
     # 统计摘要
     print(f"\n{'=' * 65}")
-    print(f"  统计摘要")
+    print("  统计摘要")
     print(f"{'=' * 65}")
     print(f"  行业总数  : {industry_df.shape[0]}")
     print(f"  成分股记录: {len(all_stocks_df)} 条（含重复）")
     print(f"  去重股票数: {len(unique_df)} 只")
-    print(f"\n  前10条预览:")
+    print("\n  前10条预览:")
     print(unique_df.head(10).to_string(index=False))
     print()
 

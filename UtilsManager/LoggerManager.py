@@ -1,18 +1,21 @@
 
-# LoggerManager.py
 """
 专业日志管理器（基于 Loguru）
 支持控制台 + 文件双输出，多级别控制，线程/进程安全，日志自动轮转
 """
 
+from __future__ import annotations
+
 import os
 import sys
+import threading
 from datetime import datetime
+from typing import Any
 
 from loguru import logger
 
 
-def setup_logger(log_dir=None, log_filename=None, level="INFO"):
+def setup_logger(log_dir: str | None = None, log_filename: str | None = None, level: str = "INFO") -> loguru.Logger:
     """
     配置并初始化 Loguru 日志系统
 
@@ -39,7 +42,7 @@ def setup_logger(log_dir=None, log_filename=None, level="INFO"):
     logger.remove()
 
     # 定义格式函数 - 根据级别显示不同的信息
-    def format_console(record):
+    def format_console(record: Any) -> str:  # noqa: ANN401
         if record["level"].name in ["ERROR", "CRITICAL"]:
             return (
                 "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
@@ -54,7 +57,7 @@ def setup_logger(log_dir=None, log_filename=None, level="INFO"):
                 "<level>{message}</level>\n"
             )
 
-    def format_file(record):
+    def format_file(record: Any) -> str:  # noqa: ANN401
         if record["level"].name in ["ERROR", "CRITICAL"]:
             return "{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}\n"
         else:
@@ -84,14 +87,15 @@ def setup_logger(log_dir=None, log_filename=None, level="INFO"):
     return logger
 
 
-# 全局 logger 实例（单例模式）
+# 全局 logger 实例（单例模式，线程安全）
 _global_logger = None
 _global_log_path = None
+_init_lock = threading.Lock()
 
 
-def get_logger(log_dir=None, log_filename=None, level="INFO"):
+def get_logger(log_dir: str | None = None, log_filename: str | None = None, level: str = "INFO") -> loguru.Logger:
     """
-    获取全局 logger 实例（单例模式）
+    获取全局 logger 实例（单例模式，线程安全）
 
     Args:
         log_dir: 日志目录
@@ -104,15 +108,17 @@ def get_logger(log_dir=None, log_filename=None, level="INFO"):
     global _global_logger
     global _global_log_path
     if _global_logger is None:
-        _global_logger = setup_logger(log_dir, log_filename, level)
-        _global_log_path = os.path.join(
-            log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs"),
-            log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log",
-        )
+        with _init_lock:
+            if _global_logger is None:
+                _global_logger = setup_logger(log_dir, log_filename, level)
+                _global_log_path = os.path.join(
+                    log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs"),
+                    log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log",
+                )
     return _global_logger
 
 
-def get_log_path():
+def get_log_path() -> str | None:
     """获取当前日志文件路径"""
     global _global_log_path
     return _global_log_path or ""

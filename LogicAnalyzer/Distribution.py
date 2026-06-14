@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import os
 from typing import Any
 
 import akshare as ak
 import pandas as pd
+from loguru import logger
 
 
 class MainCostDataManager:
@@ -11,7 +14,7 @@ class MainCostDataManager:
     提供主力成本、机构参与度等相关数据的获取、分析和管理功能
     """
 
-    def __init__(self, cache_enabled: bool = True, cache_dir: str = "~/Downloads/CoreNews_Reports"):
+    def __init__(self, cache_enabled: bool = True, cache_dir: str = "~/Downloads/CoreNews_Reports") -> None:
         """
         初始化主力成本数据管理器
 
@@ -41,22 +44,22 @@ class MainCostDataManager:
         if self.cache_enabled and cache_file and os.path.exists(cache_file):
             try:
                 df = pd.read_csv(cache_file)
-                print(f"从缓存加载主力成本数据: {cache_file}")
+                logger.info(f"从缓存加载主力成本数据: {cache_file}")
                 return df
             except Exception as e:
-                print(f"读取缓存失败: {e}")
+                logger.error(f"读取缓存失败: {e}")
 
         # 获取数据
-        print("正在获取主力成本数据...")
+        logger.info("正在获取主力成本数据...")
         df = ak.stock_comment_em()
 
         # 缓存数据
         if self.cache_enabled and cache_file:
             try:
                 df.to_csv(cache_file, index=False)
-                print(f"主力成本数据已缓存: {cache_file}")
+                logger.info(f"主力成本数据已缓存: {cache_file}")
             except Exception as e:
-                print(f"缓存数据失败: {e}")
+                logger.error(f"缓存数据失败: {e}")
 
         return df
 
@@ -87,7 +90,7 @@ class MainCostDataManager:
             ) * 100
 
             # 判断当前价格相对于主力成本的位置
-            def cost_position(row):
+            def cost_position(row: pd.Series) -> str:
                 if row["最新价"] > row["主力成本"]:
                     if row["主力成本差价百分比"] > 10:
                         return "大幅高于成本"
@@ -116,7 +119,7 @@ class MainCostDataManager:
         # 添加主力控盘强度评估
         if "主力成本" in result_df.columns and "机构参与度" in result_df.columns:
 
-            def control_strength(row):
+            def control_strength(row: pd.Series) -> str:
                 if row["机构参与度"] >= 80 and abs(row["主力成本差价百分比"]) <= 10:
                     return "高度控盘"
                 elif row["机构参与度"] >= 50 and abs(row["主力成本差价百分比"]) <= 15:
@@ -205,7 +208,7 @@ class MainCostDataManager:
 
         return result_df
 
-    def print_cost_summary(self, df: pd.DataFrame):
+    def print_cost_summary(self, df: pd.DataFrame) -> None:
         """
         打印主力成本数据摘要信息
 
@@ -213,38 +216,38 @@ class MainCostDataManager:
             df: 包含主力成本数据的DataFrame
         """
         if df is None or df.empty:
-            print("主力成本数据为空")
+            logger.warning("主力成本数据为空")
             return
 
-        print("主力成本数据分析摘要")
+        logger.info("主力成本数据分析摘要")
 
         # 基础统计
-        print(f"总股票数量: {len(df)}")
+        logger.info(f"总股票数量: {len(df)}")
 
         if "主力成本" in df.columns:
-            print(f"主力成本有效数量: {df['主力成本'].notna().sum()}")
-            print(f"主力成本平均值: {df['主力成本'].mean():.2f}")
-            print(f"主力成本中位数: {df['主力成本'].median():.2f}")
-            print(f"主力成本最高值: {df['主力成本'].max():.2f}")
-            print(f"主力成本最低值: {df['主力成本'].min():.2f}")
+            logger.info(f"主力成本有效数量: {df['主力成本'].notna().sum()}")
+            logger.info(f"主力成本平均值: {df['主力成本'].mean():.2f}")
+            logger.info(f"主力成本中位数: {df['主力成本'].median():.2f}")
+            logger.info(f"主力成本最高值: {df['主力成本'].max():.2f}")
+            logger.info(f"主力成本最低值: {df['主力成本'].min():.2f}")
 
         # 成本位置分布
         if "成本位置" in df.columns:
-            print("\n成本位置分布:")
+            logger.info("\n成本位置分布:")
             position_counts = df["成本位置"].value_counts()
             for pos, count in position_counts.items():
-                print(f"  {pos}: {count} 只 ({count / len(df) * 100:.1f}%)")
+                logger.info(f"  {pos}: {count} 只 ({count / len(df) * 100:.1f}%)")
 
         # 机构参与度等级分布
         if "机构参与度等级" in df.columns:
-            print("\n机构参与度等级分布:")
+            logger.info("\n机构参与度等级分布:")
             level_counts = df["机构参与度等级"].value_counts()
             for level, count in level_counts.items():
-                print(f"  {level}: {count} 只 ({count / len(df) * 100:.1f}%)")
+                logger.info(f"  {level}: {count} 只 ({count / len(df) * 100:.1f}%)")
 
         # 主力控盘强度分布
         if "主力控盘强度" in df.columns:
-            print("\n主力控盘强度分布:")
+            logger.info("\n主力控盘强度分布:")
             strength_counts = df["主力控盘强度"].value_counts()
             for strength, count in strength_counts.items():
-                print(f"  {strength}: {count} 只 ({count / len(df) * 100:.1f}%)")
+                logger.info(f"  {strength}: {count} 只 ({count / len(df) * 100:.1f}%)")

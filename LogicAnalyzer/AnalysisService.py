@@ -4,10 +4,14 @@
 负责技术指标信号处理、行业趋势分析、弱势股剔除等业务逻辑。
 """
 
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
 import pandas as pd
 
 from DataManager.ColumnNames import ColumnNames
-
 
 
 class AnalysisService:
@@ -26,7 +30,7 @@ class AnalysisService:
         db_engine: 数据库引擎
     """
 
-    def __init__(self, config, logger, db_engine, executor=None):
+    def __init__(self, config: Any, logger: Any, db_engine: Any, executor: ThreadPoolExecutor | None = None) -> None:  # noqa: ANN401
         self.config = config
         self.logger = logger
         self.db_engine = db_engine
@@ -46,12 +50,19 @@ class AnalysisService:
         Returns:
             Dict[str, pd.DataFrame]: 包含各种技术指标信号的字典
         """
+        from DataManager.SignalDataLoader import SignalDataLoader
         from LogicAnalyzer.SignalManager import TASignalProcessor
 
         self.logger.info(">>> 正在处理技术指标信号...")
 
+        chip_lookup, moneyflow_lookup, forecast_lookup = SignalDataLoader.load_all(self.config)
         signal_processor = TASignalProcessor(None, config=self.config, executor=self.executor)
-        ta_signals = signal_processor.process_signals(stock_codes, hist_df, spot_data)
+        ta_signals = signal_processor.process_signals(
+            stock_codes, hist_df, spot_data,
+            chip_lookup=chip_lookup,
+            moneyflow_lookup=moneyflow_lookup,
+            forecast_lookup=forecast_lookup,
+        )
 
         self.logger.info(">>> 股票历史数据和技术指标分析完成。")
 
@@ -128,9 +139,7 @@ class AnalysisService:
             & (~exempt_from_drop)  # 使用豁免条件
         )
 
-        initial_count = len(consolidated_report)
         consolidated_report = consolidated_report[~drop_condition].copy()
-        dropped_count = initial_count - len(consolidated_report)
         self.logger.info(f"  排除极度弱势特征的股票。剩余 {len(consolidated_report)} 只。")
 
         return consolidated_report
@@ -172,7 +181,7 @@ class AnalysisService:
 
     def get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
         from DataManager.DataMergeService import get_stock_industry_mapping as _get_mapping
-        return _get_mapping(stock_codes, self.logger)
+        return _get_mapping(stock_codes, self.logger, engine=self.db_engine)
 
     def process_xstp_and_filter(self, raw_data: dict[str, pd.DataFrame], spot_df: pd.DataFrame) -> pd.DataFrame:
         """

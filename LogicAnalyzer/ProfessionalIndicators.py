@@ -11,14 +11,9 @@ All outputs are dicts with numeric + categorical fields,
 plus backward-compatible 'simple_signal' string field.
 """
 
-import logging
-from typing import Any
-
 import numpy as np
 import pandas as pd
-
-logger = logging.getLogger(__name__)
-
+import pandas_ta  # noqa: F401
 
 # ── helper ─────────────────────────────────────────────────────────
 
@@ -114,7 +109,7 @@ def _detect_rsi_divergence(
                 candidates.append((t, min(1.0, abs(ind_last_val - ind_prev_val) / 20), desc))
             elif price_last_val < price_prev_val and ind_last_val > ind_prev_val:
                 t = RSI_DivergenceType.HIDDEN_BEARISH
-                desc = f"RSI隐藏顶背离 (价格回落但RSI走强)"
+                desc = "RSI隐藏顶背离 (价格回落但RSI走强)"
                 candidates.append((t, 0.5, desc))
         else:
             if price_last_val < price_prev_val and ind_last_val > ind_prev_val:
@@ -123,7 +118,7 @@ def _detect_rsi_divergence(
                 candidates.append((t, min(1.0, abs(ind_last_val - ind_prev_val) / 20), desc))
             elif price_last_val > price_prev_val and ind_last_val < ind_prev_val:
                 t = RSI_DivergenceType.HIDDEN_BULLISH
-                desc = f"RSI隐藏底背离 (价格上涨但RSI走弱)"
+                desc = "RSI隐藏底背离 (价格上涨但RSI走弱)"
                 candidates.append((t, 0.5, desc))
 
     if not candidates:
@@ -203,8 +198,8 @@ def analyze_rsi(df: pd.DataFrame, period: int = 14) -> dict:
     if not all(c in df.columns for c in required):
         return {}
 
-    # compute RSI via pandas_ta
-    df.ta.rsi(append=True, close='close', length=period)
+    if not any(c.startswith('RSI_') for c in df.columns):
+        df.ta.rsi(append=True, close='close', length=period)
     rsi_col = next((c for c in df.columns if c.startswith('RSI_') and str(period) in c), None)
     if rsi_col is None:
         rsi_col = next((c for c in df.columns if c.startswith('RSI_')), None)
@@ -330,7 +325,8 @@ def analyze_bollinger(df: pd.DataFrame, period: int = 20, std: float = 2.0) -> d
     if not all(c in df.columns for c in required):
         return {}
 
-    df.ta.bbands(append=True, length=period, std=std, close='close')
+    if not any(c.startswith('BBU_') for c in df.columns):
+        df.ta.bbands(append=True, length=period, std=std, close='close')
 
     upper_col = next((c for c in df.columns if c.startswith('BBU_') and str(period) in c), None)
     mid_col = next((c for c in df.columns if c.startswith('BBM_') and str(period) in c), None)
@@ -447,7 +443,8 @@ def analyze_cci(df: pd.DataFrame, period: int = 20) -> dict:
     if not all(c in df.columns for c in required):
         return {}
 
-    df.ta.cci(append=True, close='close', high='high', low='low', length=period)
+    if not any(c.startswith('CCI_') for c in df.columns):
+        df.ta.cci(append=True, close='close', high='high', low='low', length=period)
     cci_col = next((c for c in df.columns if c.startswith('CCI_') and str(period) in c), None)
     if cci_col is None:
         cci_col = next((c for c in df.columns if c.startswith('CCI_')), None)

@@ -1,39 +1,57 @@
 import io
 import urllib.parse
 
+import pandas as pd
+from loguru import logger
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import DBAPIError, OperationalError, IntegrityError, ProgrammingError
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, ProgrammingError
+
 from UtilsManager.Exceptions import DatabaseError
 
 
 class QuantDBManager:
-    def __init__(self, user, password, host, port, db_name):
-        # 1. 关键：对密码进行 URL 转义
-        # 如果密码里有特殊字符（如 ! @ #），不转义会导致连接串解析失败触发 GBK 报错
+    def __init__(
+        self,
+        user: str | None = None,
+        password: str | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        db_name: str | None = None,
+        engine: Engine | None = None,
+    ) -> None:
+        if engine is not None:
+            self.engine = engine
+            self.conn_str = str(engine.url)
+            return
+
         safe_password = urllib.parse.quote_plus(str(password))
-
-        # 2. 构建连接字符串
         self.conn_str = f"postgresql+psycopg2://{user}:{safe_password}@{host}:{port}/{db_name}"
-
-        # 3. 核心修复：强制客户端编码为 UTF8，并增加连接超时
         self.engine = create_engine(
             self.conn_str,
             connect_args={
-                "connect_timeout": 30,  # 增加连接超时到30秒
+                "connect_timeout": 30,
                 "client_encoding": "utf8",
-                "keepalives": 1,  # 启用TCP keepalive
-                "keepalives_idle": 30,  # 空闲30秒后发送keepalive
-                "keepalives_interval": 10,  # keepalive间隔10秒
-                "keepalives_count": 5,  # keepalive重试次数
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 10,
+                "keepalives_count": 5,
             },
-            pool_pre_ping=True,  # 每次使用前检查连接是否有效
-            pool_size=5,  # 连接池大小
-            max_overflow=10,  # 最大溢出连接数
-            pool_timeout=60,  # 获取连接超时时间
-            pool_recycle=3600,  # 连接回收时间（秒）
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=60,
+            pool_recycle=3600,
         )
 
-    def safe_insert_data(self, df, table_name, date_column, today_str, max_retries=3):
+    def safe_insert_data(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        date_column: str,
+        today_str: str,
+        max_retries: int = 3,
+    ) -> None:
         """
         幂等写入：先删除今天的数据，再使用快速 COPY 插入
         支持自动重试机制
@@ -46,7 +64,7 @@ class QuantDBManager:
             max_retries: 最大重试次数，默认3次
         """
         if df is None or df.empty:
-            print(f"  - [数据库] 表 {table_name} 无有效数据，跳过写入。")
+            logger.info(f"  - 表 {table_name} 无有效数据，跳过写入。")
             return
 
         if date_column in df.columns:
@@ -66,20 +84,20 @@ class QuantDBManager:
                         # --- 修改点 2: 使用传入的 today_str 进行删除 ---
                         delete_query = text(f"DELETE FROM {table_name} WHERE {date_column} = :today")
                         result = conn.execute(delete_query, {"today": today_str})
-                        print(f" - [数据库] {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
+                        logger.info(f" - {table_name} 清理旧记录: {result.rowcount} 条 (日期: {today_str})")
                         trans.commit()
 
                     except (DBAPIError, OperationalError, IntegrityError) as e:
                         trans.rollback()
-                        print(f" - [数据库错误] {table_name} 清理失败: {e}")
+                        logger.error(f" - {table_name} 清理失败: {e}")
                         raise DatabaseError(f"清理旧数据 {table_name}", str(e)) from e
 
                 try:
                     self._fast_pg_copy(df, table_name)
-                    print(f" - [数据库] {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
+                    logger.info(f" - {table_name} 成功插入新数据: {len(df)} 条 (日期: {today_str})")
                     return  # 成功则返回
                 except (DBAPIError, OperationalError) as e:
-                    print(f" - [数据库错误] {table_name} COPY 写入失败: {e}")
+                    logger.error(f" - {table_name} COPY 写入失败: {e}")
                     if attempt < max_retries:
                         with self.engine.connect() as conn:
                             conn.execute(
@@ -93,14 +111,14 @@ class QuantDBManager:
                     import time
 
                     wait_time = 2**attempt
-                    print(f"  - [警告] {table_name} 写入失败 (尝试 {attempt}/{max_retries}): {e}")
-                    print(f"  - [警告] {wait_time} 秒后重试...")
+                    logger.warning(f"  - {table_name} 写入失败 (尝试 {attempt}/{max_retries}): {e}")
+                    logger.warning(f"  - {wait_time} 秒后重试...")
                     time.sleep(wait_time)
                 else:
-                    print(f"  - [错误] {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
+                    logger.error(f"  - {table_name} 写入失败，已达到最大重试次数 ({max_retries})")
                     raise DatabaseError(f"写入 {table_name} (已达最大重试)", str(e)) from e
 
-    def truncate_and_insert(self, df, table_name):
+    def truncate_and_insert(self, df: pd.DataFrame, table_name: str) -> None:
         """
         清表覆盖写入模式：先清空全表，再写入新数据
         适用于基础信息表等只需要保留一份最新数据的场景
@@ -110,7 +128,7 @@ class QuantDBManager:
             table_name: 表名
         """
         if df is None or df.empty:
-            print(f"  - [数据库] 表 {table_name} 无有效数据，跳过写入。")
+            logger.info(f"  - 表 {table_name} 无有效数据，跳过写入。")
             return
 
         # 步骤1: 清空全表
@@ -119,17 +137,17 @@ class QuantDBManager:
             try:
                 conn.execute(text(f"DELETE FROM {table_name}"))
                 trans.commit()
-                print(f"  - [数据库] {table_name} 表已清空。")
+                logger.info(f"  - {table_name} 表已清空。")
             except (DBAPIError, OperationalError) as e:
                 trans.rollback()
-                print(f"  - [数据库错误] {table_name} 清空失败: {e}")
+                logger.error(f"  - {table_name} 清空失败: {e}")
                 raise DatabaseError("清空表", str(e)) from e
 
         # 步骤2: 使用 COPY 协议快速写入
         self._fast_pg_copy(df, table_name)
-        print(f"  - [数据库] {table_name} 成功插入新数据: {len(df)} 条。")
+        logger.info(f"  - {table_name} 成功插入新数据: {len(df)} 条。")
 
-    def _fast_pg_copy(self, df, table_name, batch_size=500):
+    def _fast_pg_copy(self, df: pd.DataFrame, table_name: str, batch_size: int = 500) -> None:
         """
         内部方法：利用 PostgreSQL 的 COPY 协议实现秒级入库
         支持分批写入，避免大数据量导致连接断开
@@ -140,7 +158,7 @@ class QuantDBManager:
             batch_size: 每批写入的记录数，默认500条（A股约5000只股票）
         """
         total_rows = len(df)
-        print(f"  - [数据库] 开始分批写入 {table_name}，共 {total_rows} 条记录，每批 {batch_size} 条")
+        logger.info(f"  - 开始分批写入 {table_name}，共 {total_rows} 条记录，每批 {batch_size} 条")
 
         # 如果数据量小于batch_size，直接写入
         if total_rows <= batch_size:
@@ -152,14 +170,14 @@ class QuantDBManager:
             batch_df = df.iloc[i : i + batch_size]
             try:
                 self._write_batch(batch_df, table_name)
-                print(
-                    f"  - [数据库] {table_name} 批次 {i // batch_size + 1}/{(total_rows - 1) // batch_size + 1} 写入成功 ({len(batch_df)} 条)"
+                logger.info(
+                    f"  - {table_name} 批次 {i // batch_size + 1}/{(total_rows - 1) // batch_size + 1} 写入成功 ({len(batch_df)} 条)"
                 )
             except (DBAPIError, OperationalError) as e:
-                print(f"  - [数据库错误] {table_name} 批次 {i // batch_size + 1} 写入失败: {e}")
+                logger.error(f"  - {table_name} 批次 {i // batch_size + 1} 写入失败: {e}")
                 raise DatabaseError(f"批次写入 {table_name}", str(e)) from e
 
-    def _write_batch(self, df, table_name):
+    def _write_batch(self, df: pd.DataFrame, table_name: str) -> None:
         """
         写入单个批次的数据
         """
@@ -185,13 +203,7 @@ class QuantDBManager:
             cursor.close()
             raw_conn.close()
 
-    def close(self):
-        """释放连接池"""
-        if self.engine:
-            self.engine.dispose()
-            print("  - [数据库] 连接池已释放。")
-
-    def execute_query(self, query: str, params=None):
+    def execute_query(self, query: str, params: dict | None = None) -> list:
         """执行查询语句"""
         with self.engine.connect() as conn:
             if params:
@@ -200,7 +212,7 @@ class QuantDBManager:
                 result = conn.execute(text(query))
             return result.fetchall()
 
-    def execute_update(self, query: str, params=None):
+    def execute_update(self, query: str, params: dict | None = None) -> int:
         """执行更新语句"""
         with self.engine.connect() as conn:
             trans = conn.begin()
@@ -215,7 +227,7 @@ class QuantDBManager:
                 trans.rollback()
                 raise DatabaseError("更新", str(e)) from e
 
-    def execute_many(self, query: str, values_list):
+    def execute_many(self, query: str, values_list: list[dict]) -> int:
         """批量执行SQL语句"""
         with self.engine.connect() as conn:
             trans = conn.begin()
@@ -227,7 +239,7 @@ class QuantDBManager:
                 trans.rollback()
                 raise DatabaseError("批量执行", str(e)) from e
 
-    def get_table_count(self, table_name: str):
+    def get_table_count(self, table_name: str) -> int:
         """获取表记录数"""
         query = f"SELECT COUNT(*) FROM {table_name}"
         result = self.execute_query(query)
@@ -278,7 +290,7 @@ class QuantDBManager:
             result = self.execute_query(query)
             return result[0][0] if result and result[0][0] is not None else 0
         except (DBAPIError, OperationalError) as e:
-            print(f"  - [数据库错误] 获取 {table_name}.{column_name} 去重计数失败: {e}")
+            logger.error(f"  - 获取 {table_name}.{column_name} 去重计数失败: {e}")
             return 0
 
     def get_table_columns(self, table_name: str) -> list:
@@ -292,7 +304,7 @@ class QuantDBManager:
         result = self.execute_query(query, {"table_name": table_name})
         return [row[0] for row in result] if result else []
 
-    def truncate_table(self, table_name: str):
+    def truncate_table(self, table_name: str) -> int:
         """清空表数据"""
         query = f"TRUNCATE TABLE {table_name};"
         return self.execute_update(query)

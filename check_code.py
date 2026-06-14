@@ -4,12 +4,14 @@
 使用 Ruff 和 MyPy 进行代码检查
 """
 
+from __future__ import annotations
+
 import subprocess
 import sys
 from datetime import datetime
 
 
-def run_command(cmd, description):
+def run_command(cmd: list[str], description: str) -> int:
     """运行命令并返回结果"""
     print(f"\n{'=' * 60}")
     print(f"执行: {description}")
@@ -20,7 +22,7 @@ def run_command(cmd, description):
     return result.returncode
 
 
-def main():
+def main() -> int:
     """主函数"""
     print("\n" + "=" * 60)
     print("代码质量检查工具")
@@ -29,8 +31,8 @@ def main():
 
     # 检查是否安装了所需工具
     try:
-        import ruff
-        import mypy
+        import mypy  # noqa: F401
+        import ruff  # noqa: F401
     except ImportError as e:
         print(f"\n[FAIL] 缺少依赖: {e}")
         print("请运行: pip install ruff mypy")

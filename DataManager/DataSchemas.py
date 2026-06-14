@@ -4,11 +4,8 @@ Pandera 数据合约定义
 为核心 DataFrame 定义严格的数据模式，确保数据完整性和一致性。
 """
 
-import pandera.pandas as pa
-from pandera.pandas import DataFrameSchema, Column, Check
 import pandas as pd
-
-from DataManager.ColumnNames import ColumnNames
+from pandera.pandas import Column, DataFrameSchema
 
 
 def create_stock_basic_schema() -> DataFrameSchema:

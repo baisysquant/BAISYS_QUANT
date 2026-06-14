@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
+from loguru import logger
 
 
-def _normalize_fund_data(df):
+def _normalize_fund_data(df: pd.DataFrame | None) -> pd.DataFrame:
     """
     标准化资金数据：将所有资金相关的列统一转换为数值型（单位：万元）。
 
@@ -33,7 +36,7 @@ def _normalize_fund_data(df):
         # 处理字符串类型（包含'亿'、'万'单位）
         if is_string_type:
 
-            def convert_to_wan(val):
+            def convert_to_wan(val: Any) -> float:  # noqa: ANN401
                 if val is None or str(val).strip() in ["", "-", "nan", "NaN", "None"]:
                     return 0.0
                 val_str = str(val).strip()
@@ -76,7 +79,7 @@ def run_with_thread_pool(
     results = []
     total = len(list(items))  # 注意：如果items是生成器，这里会消耗掉，建议传list
 
-    print(f"\n>>> 开始并发执行: {desc} (数量: {total}, 线程: {max_workers})...")
+    logger.info(f">>> 开始并发执行: {desc} (数量: {total}, 线程: {max_workers})...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交任务
@@ -91,7 +94,7 @@ def run_with_thread_pool(
                     # 这里只要不是 None 就添加，由调用方后续处理 (如 concat)
                     results.append(res)
             except (TimeoutError, TypeError, ValueError, KeyError, AttributeError) as e:
-                print(f"[ERROR] 处理 {item} 时发生异常: {e}")
+                logger.error(f"处理 {item} 时发生异常: {e}")
 
-    print(f">>> {desc} 执行完毕，成功获取 {len(results)} 条结果。")
+    logger.info(f">>> {desc} 执行完毕，成功获取 {len(results)} 条结果。")
     return results

@@ -5,7 +5,15 @@ description = "A股量化复盘分析系统"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["ruff>=0.3.0", "mypy>=1.8.0"]
+dev = ["ruff>=0.3.0", "mypy>=1.8.0", "pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = []
+python_functions = ["test_*"]
+log_cli = false
+addopts = "-v --tb=short"
 
 [tool.ruff]
 line-length = 120

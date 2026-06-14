@@ -21,11 +21,11 @@ import os
 import warnings
 
 from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _default_signal_workers() -> int:
     return max(os.cpu_count() or 4, 2)
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def parse_aliases(alias_str: str) -> dict[str, str]:
@@ -85,7 +85,7 @@ class MultiHeadArrangementConfig(BaseModel):
 
     @field_validator("MOVING_AVERAGE_PERIODS", mode="before")
     @classmethod
-    def parse_periods(cls, v):
+    def parse_periods(cls, v: str | list[int]) -> list[int]:
         if isinstance(v, str):
             return [int(p.strip()) for p in v.split(",")]
         return v
@@ -99,7 +99,7 @@ class FilterRulesConfig(BaseModel):
 
     @field_validator("EXEMPT_LEVELS", mode="before")
     @classmethod
-    def parse_exempt_levels(cls, v):
+    def parse_exempt_levels(cls, v: str | list[str]) -> list[str]:
         if isinstance(v, str):
             return [level.strip() for level in v.split(",")]
         return v
@@ -119,14 +119,14 @@ class FundFlowConfig(BaseModel):
 
     @field_validator("FUND_FLOW_PERIODS", mode="before")
     @classmethod
-    def parse_periods(cls, v):
+    def parse_periods(cls, v: str | list[int]) -> list[int]:
         if isinstance(v, str):
             return [int(p.strip()) for p in v.split(",")]
         return v
 
     @field_validator("FUND_FLOW_PERIODS")
     @classmethod
-    def validate_periods(cls, v):
+    def validate_periods(cls, v: list[int]) -> list[int]:
         VALID_FUND_FLOW_PERIODS = {3, 5, 10, 20}
         ALLOWED_COMBINATIONS = [
             (3, 5, 10),
@@ -172,14 +172,14 @@ class TechnicalIndicatorsConfig(BaseModel):
 
     @field_validator("MACD_PARAMS", mode="before")
     @classmethod
-    def parse_macd_params(cls, v):
+    def parse_macd_params(cls, v: str | tuple[int, int, int]) -> tuple[int, int, int]:
         if isinstance(v, str):
             return tuple(int(p.strip()) for p in v.split(","))
         return v
 
     @field_validator("MACD_PARAMS")
     @classmethod
-    def validate_macd_params(cls, v):
+    def validate_macd_params(cls, v: tuple[int, int, int]) -> tuple[int, int, int]:
         fast, slow, signal = v
         if fast >= slow:
             raise ValueError(
@@ -236,7 +236,7 @@ class KlineDataConfig(BaseModel):
 
     @field_validator("KLINE_HISTORY_DAYS")
     @classmethod
-    def validate_days(cls, v):
+    def validate_days(cls, v: int) -> int:
         if v > 1000:
             warnings.warn(f"警告：KLINE_HISTORY_DAYS 设置为 {v} 天，数值较大可能导致获取数据时间过长。", UserWarning)
         return v
@@ -260,7 +260,7 @@ class AShareHubConfig(BaseModel):
                                           description="资金流分页间隔秒数")
     @field_validator("CHIP_LIMIT")
     @classmethod
-    def validate_limit(cls, v):
+    def validate_limit(cls, v: int) -> int:
         if v > 50:
             import warnings
             warnings.warn("CHIP_LIMIT>50 会拉取多日历史快照，通常用 limit=1（最新快照）即可。", UserWarning)
@@ -412,443 +412,328 @@ class AppConfig(BaseSettings):
 
 class Config:
     """
-    配置管理器类（保持向后兼容性）
+    配置管理器（INI→Pydantic，自动类型转换）
 
-    负责加载、解析和验证配置文件，提供统一的配置访问接口。
-    所有配置项在初始化时读取并验证，后续通过属性访问。
-
-    Attributes:
-        DB_USER: 数据库用户名
-        DB_PASSWORD: 数据库密码
-        DB_HOST: 数据库主机地址
-        DB_PORT: 数据库端口
-        DB_NAME: 数据库名称
-        HOME_DIRECTORY: 主目录路径
-        TEMP_DATA_DIRECTORY: 临时数据目录
-        MAX_WORKERS: 最大线程数
-        FUND_FLOW_PERIODS: 资金流周期列表（必须为3个）
-        MACD_PARAMS: MACD参数 (fast, slow, signal)，默认(12,26,9)
+    读取 config.ini 并委托 AppConfig（Pydantic）做类型校验与转换。
+    所有历史平铺属性改为 @property 委托，数据归一在 app_config。
     """
 
     def __init__(self, config_file: str = "config.ini") -> None:
-        """
-        初始化配置管理器
-
-        Args:
-            config_file: 配置文件路径，默认为 'config.ini'
-
-        Raises:
-            FileNotFoundError: 配置文件不存在
-            ValueError: 配置参数验证失败
-        """
         self.config_file = config_file
-        self._validate_config_file()
-        self._load_config()
-        self._ensure_directories()
-
-    def _validate_config_file(self):
         if not os.path.exists(self.config_file):
             raise FileNotFoundError(f"配置文件未找到: {os.path.abspath(self.config_file)}")
 
-    def _load_config(self):
+        self._load_config()
+        self._ensure_directories()
+
+    # ── 加载：INI → Pydantic（单次操作，零手动类型转换） ─────────────────
+
+    def _section_upper(self, name: str) -> dict[str, str]:
+        """读取 INI 节并转大写 key，适配 Pydantic UPPER_CASE 字段。"""
+        return {k.upper(): v for k, v in dict(self._raw_section(name)).items()}
+
+    def _raw_section(self, name: str) -> dict[str, str]:
+        """安全读取 INI 节，不存在时返回空 dict。"""
+        try:
+            return dict(self._cp[name])
+        except KeyError:
+            return {}
+
+    def _load_config(self) -> None:
         import configparser
 
-        config = configparser.ConfigParser()
-        config.read(self.config_file, encoding="utf-8")
+        self._cp = configparser.ConfigParser()
+        self._cp.read(self.config_file, encoding="utf-8")
 
-        # 读取数据库配置（所有敏感字段支持 ENC: 前缀加密）
         from UtilsManager.ConfigCipher import ConfigCipher
 
-        db = config["DATABASE"]
-
-        # 密钥路径可配置，默认 ~/.baisys_quant_key
-        key_path = db.get("encryption_key_path", fallback=None)
+        # DATABASE（lowercase 字段名 + 敏感字段解密）
+        key_path = self._cp["DATABASE"].get("encryption_key_path", fallback=None)
         if key_path:
             ConfigCipher.default_key_path = key_path
-        database_config = DatabaseConfig(
-            user=db.get("user"),
-            password=ConfigCipher.maybe_decrypt(db.get("password")),
-            host=ConfigCipher.maybe_decrypt(db.get("host")),
-            port=ConfigCipher.maybe_decrypt(db.get("port")),
-            db_name=ConfigCipher.maybe_decrypt(db.get("db_name")),
-            main_board_only=db.getboolean("main_board_only", fallback=False),
-        )
+        db_raw = self._raw_section("DATABASE")
+        for enc_key in ("password", "host", "port", "db_name"):
+            db_raw[enc_key] = ConfigCipher.maybe_decrypt(db_raw.get(enc_key, ""))
 
-        # 读取 SYSTEM 配置
-        system = config["SYSTEM"]
-        system_config = SystemConfig(
-            HOME_DIRECTORY=system.get("HOME_DIRECTORY", "~/Downloads/CoreNews_Reports"),
-            TEMP_DATA_DIR=system.get("TEMP_DATA_DIR", "."),
-            MAX_WORKERS=system.getint("MAX_WORKERS", fallback=15),
-            DATA_FETCH_RETRIES=system.getint("DATA_FETCH_RETRIES", fallback=3),
-            DATA_FETCH_DELAY=system.getint("DATA_FETCH_DELAY", fallback=5),
-            STOCK_BASIC_INFO_EXPIRE_DAYS=system.getint("STOCK_BASIC_INFO_EXPIRE_DAYS", fallback=30),
-            SIGNAL_PROCESSING_PROCESSES=system.getint("signal_processing_processes", fallback=_default_signal_workers()),
-        )
+        # COLUMN_ALIASES（lowercase 字段名）
+        col_raw = self._raw_section("COLUMN_ALIASES")
 
-        # 读取 LOGGING 配置
-        log = config["LOGGING"]
-        logging_config = LoggingConfig(LOG_LEVEL=log.get("LOG_LEVEL", "INFO"), LOG_DIR=log.get("LOG_DIR", "Logs"))
+        # ASHAREHUB（API_KEY 需解密）
+        ah_raw = self._section_upper("ASHAREHUB")
+        if ah_raw:
+            ah_raw["API_KEY"] = ConfigCipher.maybe_decrypt(ah_raw.get("API_KEY", ""))
 
-        # 读取多头排列评分系统配置
-        mha = config["MULTI_HEAD_ARRANGEMENT"]
-        mha_config = MultiHeadArrangementConfig(
-            FULL_BULL_THRESHOLD=mha.getint("FULL_BULL_THRESHOLD", fallback=85),
-            TREND_ACCELERATION_THRESHOLD=mha.getint("TREND_ACCELERATION_THRESHOLD", fallback=65),
-            TREND_OSCILLATION_THRESHOLD=mha.getint("TREND_OSCILLATION_THRESHOLD", fallback=45),
-            TREND_WATCH_THRESHOLD=mha.getint("TREND_WATCH_THRESHOLD", fallback=45),
-            MOVING_AVERAGE_PERIODS=mha.get("MOVING_AVERAGE_PERIODS", fallback="5,10,20,30,60"),
-        )
-
-        # 读取弱势股过滤规则配置
-        fr = config["FILTER_RULES"]
-        fr_config = FilterRulesConfig(
-            ENABLE_WEAK_STOCK_FILTER=fr.getboolean("ENABLE_WEAK_STOCK_FILTER", fallback=True),
-            EXEMPT_LEVELS=fr.get("EXEMPT_LEVELS", fallback="完全主升,趋势加速"),
-            LIQ_VETO_RATIO=fr.getfloat("liq_veto_ratio", fallback=0.05),
-            LIQ_W_SECTION=fr.getfloat("liq_w_section", fallback=0.4),
-            LIQ_W_TIMESERIES=fr.getfloat("liq_w_timeseries", fallback=0.4),
-            LIQ_W_MARKETCAP=fr.getfloat("liq_w_marketcap", fallback=0.2),
-            LIQ_MIN_DISCOUNT=fr.getfloat("liq_min_discount", fallback=0.3),
-        )
-
-        # 读取资金流分析配置
-        ff = config["FUND_FLOW"]
-        ff_config = FundFlowConfig(FUND_FLOW_PERIODS=ff.get("FUND_FLOW_PERIODS", fallback="5,10,20"))
-
-        # 读取技术指标信号配置
-        ti = config["TECHNICAL_INDICATORS"]
-        ti_config = TechnicalIndicatorsConfig(
-            MACD_PARAMS=ti.get("macd_params", fallback="12,26,9"),
-        )
-
-        # 读取列名别名配置
-        col_aliases = config["COLUMN_ALIASES"]
-        col_config = ColumnAliasesConfig(
-            code_aliases=col_aliases.get("code_aliases", "代码=股票代码,证券代码=股票代码,股票代码=股票代码"),
-            name_aliases=col_aliases.get(
-                "name_aliases", "名称=股票简称,股票名称=股票简称,股票简称=股票简称,简称=股票简称"
-            ),
-            price_aliases=col_aliases.get(
-                "price_aliases", "最新价=最新价,现价=最新价,当前价格=最新价,今收盘=最新价,收盘=最新价,收盘价=最新价"
-            ),
-        )
-
-        # 读取研报过滤配置
-        try:
-            rrf = config["RESEARCH_REPORT_FILTER"]
-            rrf_config = ResearchReportFilterConfig(
-                ENABLE_RESEARCH_REPORT_FILTER=rrf.getboolean("ENABLE_RESEARCH_REPORT_FILTER", fallback=False),
-                RESEARCH_REPORT_MIN_COUNT=rrf.getint("RESEARCH_REPORT_MIN_COUNT", fallback=1),
-            )
-        except KeyError:
-            rrf_config = ResearchReportFilterConfig()
-
-        # 读取 MACD 完全多头评分配置
-        try:
-            fbs = config["FULL_BULL_SCORING"]
-            fbs_config = FullBullScoringConfig(
-                WEIGHT_ZERO_AXIS=fbs.getint("WEIGHT_ZERO_AXIS", fallback=20),
-                WEIGHT_STRATEGY_GOLDEN=fbs.getint("WEIGHT_STRATEGY_GOLDEN", fallback=15),
-                WEIGHT_TACTICAL_GOLDEN=fbs.getint("WEIGHT_TACTICAL_GOLDEN", fallback=10),
-                WEIGHT_MOMENTUM=fbs.getint("WEIGHT_MOMENTUM", fallback=15),
-                WEIGHT_DIF_SLOPE=fbs.getint("WEIGHT_DIF_SLOPE", fallback=10),
-                WEIGHT_DIVERGENCE=fbs.getint("WEIGHT_DIVERGENCE", fallback=10),
-                WEIGHT_VOLUME_PRICE=fbs.getint("WEIGHT_VOLUME_PRICE", fallback=10),
-                WEIGHT_KLINE_PATTERN=fbs.getint("WEIGHT_KLINE_PATTERN", fallback=10),
-                CONCLUSION_FULL_BULL=fbs.getint("CONCLUSION_FULL_BULL", fallback=80),
-                CONCLUSION_BULLISH=fbs.getint("CONCLUSION_BULLISH", fallback=60),
-                CONCLUSION_OSCILLATE=fbs.getint("CONCLUSION_OSCILLATE", fallback=40),
-                RULE_DIVERGENCE_THRESHOLD=fbs.getfloat("RULE_DIVERGENCE_THRESHOLD", fallback=0.3),
-                RULE_WINNER_RATE_HIGH=fbs.getint("RULE_WINNER_RATE_HIGH", fallback=80),
-                RULE_WINNER_RATE_LOW=fbs.getint("RULE_WINNER_RATE_LOW", fallback=15),
-                RULE_COST_RESISTANCE_RATIO=fbs.getfloat("RULE_COST_RESISTANCE_RATIO", fallback=0.95),
-                RULE_CHIP_CONCENTRATED_RATIO=fbs.getfloat("RULE_CHIP_CONCENTRATED_RATIO", fallback=0.15),
-                RULE_PRICE_NEW_HIGH_DAYS=fbs.getint("RULE_PRICE_NEW_HIGH_DAYS", fallback=20),
-            )
-        except KeyError:
-            fbs_config = FullBullScoringConfig()
-
-        # 读取K线数据获取配置
-        try:
-            kd = config["KLINE_DATA"]
-            kd_config = KlineDataConfig(KLINE_HISTORY_DAYS=kd.getint("KLINE_HISTORY_DAYS", fallback=200))
-        except KeyError:
-            kd_config = KlineDataConfig()
-
-        # 读取用户关注股池配置
-        try:
-            ufs = config["USER_FOCUS_STOCKS"]
-            ufc = UserFocusStocksConfig(USER_FOCUS_STOCKS=ufs.get("user_focus_stocks", fallback=""))
-        except KeyError:
-            ufc = UserFocusStocksConfig()
-
-        # 读取 AShareHub 筹码分布配置
-        try:
-            ah = config["ASHAREHUB"]
-            ah_config = AShareHubConfig(
-                API_KEY=ConfigCipher.maybe_decrypt(ah.get("api_key", "")),
-                ENABLE_CHIP_DISTRIBUTION=ah.getboolean("enable_chip_distribution", fallback=False),
-                CHIP_LIMIT=ah.getint("chip_limit", fallback=1),
-                MONEYFLOW_RETRY=ah.getint("moneyflow_retry", fallback=3),
-                MONEYFLOW_PAGE_DELAY=ah.getfloat("moneyflow_page_delay", fallback=1.0),
-            )
-        except KeyError:
-            ah_config = AShareHubConfig()
-
-        # 读取宏观过滤器配置
-        try:
-            mf = config["MACRO_FILTER"]
-            mf_config = MacroFilterConfig(
-                ENABLE_MACRO_FILTER=mf.getboolean("enable_macro_filter", fallback=True),
-                INDEX_SYMBOL=mf.get("index_symbol", fallback="sh000001"),
-                TREND_LOOKBACK_DAYS=mf.getint("trend_lookback_days", fallback=250),
-                VOLUME_LOOKBACK_DAYS=mf.getint("volume_lookback_days", fallback=20),
-                ADVANCE_RATIO_ICE=mf.getfloat("advance_ratio_ice", fallback=0.25),
-                ADVANCE_RATIO_WEAK=mf.getfloat("advance_ratio_weak", fallback=0.35),
-                ADVANCE_RATIO_HOT=mf.getfloat("advance_ratio_hot", fallback=0.70),
-            )
-        except KeyError:
-            mf_config = MacroFilterConfig()
-
-        # 读取市场状态分类参数
-        try:
-            rd = config["REGIME_DETECTION"]
-            rd_config = RegimeDetectionConfig(
-                BOLL_NARROW_RATIO=rd.getfloat("boll_narrow_ratio", fallback=0.8),
-                OSCILLATION_HIST_STD_RATIO=rd.getfloat("oscillation_hist_std_ratio", fallback=0.1),
-                TOP_RISK_MA20_DEVIATION=rd.getfloat("top_risk_ma20_deviation", fallback=0.15),
-                OSCILLATION_MIN_BARS=rd.getint("oscillation_min_bars", fallback=30),
-                REVERSAL_LOOKBACK=rd.getint("reversal_lookback", fallback=10),
-            )
-        except KeyError:
-            rd_config = RegimeDetectionConfig()
-
-        # 读取背离检测参数
-        try:
-            dv = config["DIVERGENCE"]
-            dv_config = DivergenceConfig(
-                BASE_DISTANCE=dv.getint("base_distance", fallback=10),
-                STRENGTH_THRESHOLD=dv.getfloat("strength_threshold", fallback=0.15),
-                DECAY_HALF_LIFE=dv.getint("decay_half_life", fallback=8),
-                SLOPE_WINDOW=dv.getint("slope_window", fallback=5),
-            )
-        except KeyError:
-            dv_config = DivergenceConfig()
-
-        # 读取评分计算参数
-        try:
-            sp = config["SCORING_PARAMS"]
-            sp_config = ScoringParamsConfig(
-                CROSS_DECAY_DAYS=sp.getint("cross_decay_days", fallback=30),
-                CROSS_DECAY_MIN=sp.getfloat("cross_decay_min", fallback=0.3),
-                KLINE_DECAY_DAYS=sp.getint("kline_decay_days", fallback=10),
-                KLINE_DECAY_MIN=sp.getfloat("kline_decay_min", fallback=0.2),
-                VOL_NORM_DENOMINATOR=sp.getfloat("vol_norm_denominator", fallback=0.15),
-                ATR_STOP_MULT=sp.getfloat("atr_stop_mult", fallback=1.5),
-                ATR_T1_MULT=sp.getfloat("atr_t1_mult", fallback=3.0),
-                ATR_T2_MULT=sp.getfloat("atr_t2_mult", fallback=5.0),
-                TRAILING_STOP_HIGH_RATIO=sp.getfloat("trailing_stop_high_ratio", fallback=0.98),
-                TRAILING_STOP_LOOKBACK=sp.getint("trailing_stop_lookback", fallback=10),
-                TRAILING_STOP_HIGH_LOOKBACK=sp.getint("trailing_stop_high_lookback", fallback=20),
-                EXPECTED_RETURN_LOOKBACK=sp.getint("expected_return_lookback", fallback=20),
-            )
-        except KeyError:
-            sp_config = ScoringParamsConfig()
-
-        # 读取标准技术指标参数
-        try:
-            tc = config["TECHNICAL_CONSTANTS"]
-            tc_config = TechnicalConstantsConfig(
-                ATR_LENGTH=tc.getint("atr_length", fallback=14),
-                ADX_LENGTH=tc.getint("adx_length", fallback=14),
-                RSI_LENGTH=tc.getint("rsi_length", fallback=14),
-                BOLL_LENGTH=tc.getint("boll_length", fallback=20),
-                BOLL_STD=tc.getfloat("boll_std", fallback=2.0),
-                STOCH_K=tc.getint("stoch_k", fallback=9),
-                STOCH_D=tc.getint("stoch_d", fallback=3),
-                KLINE_SCAN_WINDOW=tc.getint("kline_scan_window", fallback=60),
-            )
-        except KeyError:
-            tc_config = TechnicalConstantsConfig()
-
-        # 读取仓位管理配置
-        try:
-            ps = config["POSITION_SIZING"]
-            ps_config = PositionSizingConfig(
-                MAX_SINGLE_POSITION=ps.getfloat("max_single_position", fallback=0.33),
-                KELLY_FRACTION=ps.getfloat("kelly_fraction", fallback=0.25),
-                DEFAULT_WIN_RATE=ps.getfloat("default_win_rate", fallback=0.50),
-                POSITION_A=ps.getfloat("position_a", fallback=0.30),
-                POSITION_B=ps.getfloat("position_b", fallback=0.15),
-                POSITION_C=ps.getfloat("position_c", fallback=0.05),
-                POSITION_D=ps.getfloat("position_d", fallback=0.00),
-                MAX_INDUSTRY_EXPOSURE=ps.getfloat("max_industry_exposure", fallback=0.30),
-                RISK_BUDGET=ps.getfloat("risk_budget", fallback=0.02),
-                MAX_DRAWDOWN_REDUCTION=ps.getfloat("max_drawdown_reduction", fallback=0.50),
-            )
-        except KeyError:
-            ps_config = PositionSizingConfig()
-
-        # 创建主配置对象
+        # 装配 AppConfig（Pydantic field_validator 自动处理逗号/bool/int/float 转换）
         self.app_config = AppConfig(
-            database=database_config,
-            system=system_config,
-            logging=logging_config,
-            multi_head_arrangement=mha_config,
-            filter_rules=fr_config,
-            fund_flow=ff_config,
-            technical_indicators=ti_config,
-            column_aliases=col_config,
-            research_report_filter=rrf_config,
-            full_bull_scoring=fbs_config,
-            user_focus_stocks=ufc,
-            kline_data=kd_config,
-            asharehub=ah_config,
-            macro_filter=mf_config,
-            regime_detection=rd_config,
-            divergence=dv_config,
-            scoring_params=sp_config,
-            technical_constants=tc_config,
-            position_sizing=ps_config,
+            database=DatabaseConfig(**db_raw),
+            system=SystemConfig(**self._section_upper("SYSTEM")),
+            logging=LoggingConfig(**self._section_upper("LOGGING")),
+            multi_head_arrangement=MultiHeadArrangementConfig(**self._section_upper("MULTI_HEAD_ARRANGEMENT")),
+            filter_rules=FilterRulesConfig(**self._section_upper("FILTER_RULES")),
+            fund_flow=FundFlowConfig(**self._section_upper("FUND_FLOW")),
+            technical_indicators=TechnicalIndicatorsConfig(**self._section_upper("TECHNICAL_INDICATORS")),
+            column_aliases=ColumnAliasesConfig(**col_raw),
+            research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
+            full_bull_scoring=FullBullScoringConfig(**self._section_upper("FULL_BULL_SCORING")),
+            kline_data=KlineDataConfig(**self._section_upper("KLINE_DATA")),
+            user_focus_stocks=UserFocusStocksConfig(**self._section_upper("USER_FOCUS_STOCKS")),
+            asharehub=AShareHubConfig(**ah_raw),
+            macro_filter=MacroFilterConfig(**self._section_upper("MACRO_FILTER")),
+            regime_detection=RegimeDetectionConfig(**self._section_upper("REGIME_DETECTION")),
+            divergence=DivergenceConfig(**self._section_upper("DIVERGENCE")),
+            scoring_params=ScoringParamsConfig(**self._section_upper("SCORING_PARAMS")),
+            technical_constants=TechnicalConstantsConfig(**self._section_upper("TECHNICAL_CONSTANTS")),
+            position_sizing=PositionSizingConfig(**self._section_upper("POSITION_SIZING")),
         )
 
-        # 设置向后兼容的属性
-        self.DB_USER = database_config.user
-        self.DB_PASSWORD = database_config.password
-        self.DB_HOST = database_config.host
-        self.DB_PORT = database_config.port
-        self.DB_NAME = database_config.db_name
-        self.MAIN_BOARD_ONLY = database_config.main_board_only
+    # ── 向后兼容属性（只读委托至 app_config） ──────────────────────────
 
-        self.HOME_DIRECTORY = system_config.HOME_DIRECTORY
-        self.TEMP_DATA_DIRECTORY = os.path.join(system_config.HOME_DIRECTORY, system_config.TEMP_DATA_DIR)
-        self.MAX_WORKERS = system_config.MAX_WORKERS
-        self.DATA_FETCH_RETRIES = system_config.DATA_FETCH_RETRIES
-        self.DATA_FETCH_DELAY = system_config.DATA_FETCH_DELAY
-        self.STOCK_BASIC_INFO_EXPIRE_DAYS = system_config.STOCK_BASIC_INFO_EXPIRE_DAYS
-        self.SIGNAL_PROCESSING_PROCESSES = system_config.SIGNAL_PROCESSING_PROCESSES
+    # 数据库
+    @property
+    def DB_USER(self) -> str: return self.app_config.database.user
 
-        self.LOG_LEVEL = logging_config.LOG_LEVEL
-        self.LOG_DIR = os.path.join(system_config.HOME_DIRECTORY, logging_config.LOG_DIR)
+    @property
+    def DB_PASSWORD(self) -> str: return self.app_config.database.password
 
-        self.FULL_BULL_THRESHOLD = mha_config.FULL_BULL_THRESHOLD
-        self.TREND_ACCELERATION_THRESHOLD = mha_config.TREND_ACCELERATION_THRESHOLD
-        self.TREND_OSCILLATION_THRESHOLD = mha_config.TREND_OSCILLATION_THRESHOLD
-        self.TREND_WATCH_THRESHOLD = mha_config.TREND_WATCH_THRESHOLD
-        self.MOVING_AVERAGE_PERIODS = mha_config.MOVING_AVERAGE_PERIODS
+    @property
+    def DB_HOST(self) -> str: return self.app_config.database.host
 
-        self.ENABLE_WEAK_STOCK_FILTER = fr_config.ENABLE_WEAK_STOCK_FILTER
-        self.EXEMPT_LEVELS = fr_config.EXEMPT_LEVELS
+    @property
+    def DB_PORT(self) -> str: return self.app_config.database.port
 
-        self.FUND_FLOW_PERIODS = ff_config.FUND_FLOW_PERIODS
+    @property
+    def DB_NAME(self) -> str: return self.app_config.database.db_name
 
-        self.MACD_PARAMS = ti_config.MACD_PARAMS
+    @property
+    def MAIN_BOARD_ONLY(self) -> bool: return self.app_config.database.main_board_only
 
-        self.CODE_ALIASES = parse_aliases(col_config.code_aliases)
-        self.NAME_ALIASES = parse_aliases(col_config.name_aliases)
-        self.PRICE_ALIASES = parse_aliases(col_config.price_aliases)
+    # 系统
+    @property
+    def HOME_DIRECTORY(self) -> str: return self.app_config.system.HOME_DIRECTORY
 
-        self.ENABLE_RESEARCH_REPORT_FILTER = rrf_config.ENABLE_RESEARCH_REPORT_FILTER
-        self.RESEARCH_REPORT_MIN_COUNT = rrf_config.RESEARCH_REPORT_MIN_COUNT
+    @property
+    def TEMP_DATA_DIRECTORY(self) -> str:
+        return os.path.join(self.app_config.system.HOME_DIRECTORY, self.app_config.system.TEMP_DATA_DIR)
 
-        self.USER_FOCUS_STOCKS = ufc.USER_FOCUS_STOCKS
+    @property
+    def MAX_WORKERS(self) -> int: return self.app_config.system.MAX_WORKERS
 
-        self.ASHAREHUB_API_KEY = ah_config.API_KEY
-        self.ENABLE_CHIP_DISTRIBUTION = ah_config.ENABLE_CHIP_DISTRIBUTION
-        self.CHIP_LIMIT = ah_config.CHIP_LIMIT
-        self.MONEYFLOW_RETRY = ah_config.MONEYFLOW_RETRY
-        self.MONEYFLOW_PAGE_DELAY = ah_config.MONEYFLOW_PAGE_DELAY
+    @property
+    def DATA_FETCH_RETRIES(self) -> int: return self.app_config.system.DATA_FETCH_RETRIES
 
-        self.ENABLE_MACRO_FILTER = mf_config.ENABLE_MACRO_FILTER
-        self.MACRO_FILTER_INDEX_SYMBOL = mf_config.INDEX_SYMBOL
+    @property
+    def DATA_FETCH_DELAY(self) -> int: return self.app_config.system.DATA_FETCH_DELAY
 
-        self.REGIME_DETECTION = {
-            "boll_narrow_ratio": rd_config.BOLL_NARROW_RATIO,
-            "oscillation_hist_std_ratio": rd_config.OSCILLATION_HIST_STD_RATIO,
-            "top_risk_ma20_deviation": rd_config.TOP_RISK_MA20_DEVIATION,
-            "oscillation_min_bars": rd_config.OSCILLATION_MIN_BARS,
-            "reversal_lookback": rd_config.REVERSAL_LOOKBACK,
+    @property
+    def STOCK_BASIC_INFO_EXPIRE_DAYS(self) -> int: return self.app_config.system.STOCK_BASIC_INFO_EXPIRE_DAYS
+
+    @property
+    def SIGNAL_PROCESSING_PROCESSES(self) -> int: return self.app_config.system.SIGNAL_PROCESSING_PROCESSES
+
+    # 日志
+    @property
+    def LOG_LEVEL(self) -> str: return self.app_config.logging.LOG_LEVEL
+
+    @property
+    def LOG_DIR(self) -> str:
+        return os.path.join(self.app_config.system.HOME_DIRECTORY, self.app_config.logging.LOG_DIR)
+
+    # 多头排列
+    @property
+    def FULL_BULL_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.FULL_BULL_THRESHOLD
+
+    @property
+    def TREND_ACCELERATION_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.TREND_ACCELERATION_THRESHOLD
+
+    @property
+    def TREND_OSCILLATION_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.TREND_OSCILLATION_THRESHOLD
+
+    @property
+    def TREND_WATCH_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.TREND_WATCH_THRESHOLD
+
+    @property
+    def MOVING_AVERAGE_PERIODS(self) -> list[int]: return self.app_config.multi_head_arrangement.MOVING_AVERAGE_PERIODS
+
+    # 过滤规则
+    @property
+    def ENABLE_WEAK_STOCK_FILTER(self) -> bool: return self.app_config.filter_rules.ENABLE_WEAK_STOCK_FILTER
+
+    @property
+    def EXEMPT_LEVELS(self) -> list[str]: return self.app_config.filter_rules.EXEMPT_LEVELS
+
+    # 资金流
+    @property
+    def FUND_FLOW_PERIODS(self) -> list[int]: return self.app_config.fund_flow.FUND_FLOW_PERIODS
+
+    # 技术指标
+    @property
+    def MACD_PARAMS(self) -> tuple[int, int, int]: return self.app_config.technical_indicators.MACD_PARAMS
+
+    # 列名别名（需 parse_aliases 解析）
+    @property
+    def CODE_ALIASES(self) -> dict[str, str]: return parse_aliases(self.app_config.column_aliases.code_aliases)
+
+    @property
+    def NAME_ALIASES(self) -> dict[str, str]: return parse_aliases(self.app_config.column_aliases.name_aliases)
+
+    @property
+    def PRICE_ALIASES(self) -> dict[str, str]: return parse_aliases(self.app_config.column_aliases.price_aliases)
+
+    # 研报
+    @property
+    def ENABLE_RESEARCH_REPORT_FILTER(self) -> bool: return self.app_config.research_report_filter.ENABLE_RESEARCH_REPORT_FILTER
+
+    @property
+    def RESEARCH_REPORT_MIN_COUNT(self) -> int: return self.app_config.research_report_filter.RESEARCH_REPORT_MIN_COUNT
+
+    # 自选股
+    @property
+    def USER_FOCUS_STOCKS(self) -> str: return self.app_config.user_focus_stocks.USER_FOCUS_STOCKS
+
+    # AShareHub
+    @property
+    def ASHAREHUB_API_KEY(self) -> str: return self.app_config.asharehub.API_KEY
+
+    @property
+    def ENABLE_CHIP_DISTRIBUTION(self) -> bool: return self.app_config.asharehub.ENABLE_CHIP_DISTRIBUTION
+
+    @property
+    def CHIP_LIMIT(self) -> int: return self.app_config.asharehub.CHIP_LIMIT
+
+    @property
+    def MONEYFLOW_RETRY(self) -> int: return self.app_config.asharehub.MONEYFLOW_RETRY
+
+    @property
+    def MONEYFLOW_PAGE_DELAY(self) -> float: return self.app_config.asharehub.MONEYFLOW_PAGE_DELAY
+
+    # 宏观过滤
+    @property
+    def ENABLE_MACRO_FILTER(self) -> bool: return self.app_config.macro_filter.ENABLE_MACRO_FILTER
+
+    @property
+    def MACRO_FILTER_INDEX_SYMBOL(self) -> str: return self.app_config.macro_filter.INDEX_SYMBOL
+
+    # K线
+    @property
+    def KLINE_HISTORY_DAYS(self) -> int: return self.app_config.kline_data.KLINE_HISTORY_DAYS
+
+    # ── Dict 聚合属性（供 SignalManager / DataProcessingService 等使用） ──
+
+    @property
+    def FULL_BULL_WEIGHTS(self) -> dict:
+        f = self.app_config.full_bull_scoring
+        return {
+            "MACD趋势": f.WEIGHT_ZERO_AXIS,
+            "金叉信号": f.WEIGHT_STRATEGY_GOLDEN,
+            "柱状动能": f.WEIGHT_MOMENTUM,
+            "DIF斜率": f.WEIGHT_DIF_SLOPE,
+            "背离信号": f.WEIGHT_DIVERGENCE,
+            "量价配合": f.WEIGHT_VOLUME_PRICE,
+            "K线形态": f.WEIGHT_KLINE_PATTERN,
         }
-        self.DIVERGENCE_PARAMS = {
-            "base_distance": dv_config.BASE_DISTANCE,
-            "strength_threshold": dv_config.STRENGTH_THRESHOLD,
-            "decay_half_life": dv_config.DECAY_HALF_LIFE,
-            "slope_window": dv_config.SLOPE_WINDOW,
-        }
-        self.SCORING_PARAMS = {
-            "cross_decay_days": sp_config.CROSS_DECAY_DAYS,
-            "cross_decay_min": sp_config.CROSS_DECAY_MIN,
-            "kline_decay_days": sp_config.KLINE_DECAY_DAYS,
-            "kline_decay_min": sp_config.KLINE_DECAY_MIN,
-            "vol_norm_denominator": sp_config.VOL_NORM_DENOMINATOR,
-            "atr_stop_mult": sp_config.ATR_STOP_MULT,
-            "atr_t1_mult": sp_config.ATR_T1_MULT,
-            "atr_t2_mult": sp_config.ATR_T2_MULT,
-            "trailing_stop_high_ratio": sp_config.TRAILING_STOP_HIGH_RATIO,
-            "trailing_stop_lookback": sp_config.TRAILING_STOP_LOOKBACK,
-            "trailing_stop_high_lookback": sp_config.TRAILING_STOP_HIGH_LOOKBACK,
-            "expected_return_lookback": sp_config.EXPECTED_RETURN_LOOKBACK,
-        }
-        self.TECHNICAL_CONSTANTS = {
-            "atr_length": tc_config.ATR_LENGTH,
-            "adx_length": tc_config.ADX_LENGTH,
-            "rsi_length": tc_config.RSI_LENGTH,
-            "boll_length": tc_config.BOLL_LENGTH,
-            "boll_std": tc_config.BOLL_STD,
-            "stoch_k": tc_config.STOCH_K,
-            "stoch_d": tc_config.STOCH_D,
-            "kline_scan_window": tc_config.KLINE_SCAN_WINDOW,
+
+    @property
+    def FULL_BULL_THRESHOLDS(self) -> dict:
+        f = self.app_config.full_bull_scoring
+        return {
+            "fully_bull": f.CONCLUSION_FULL_BULL,
+            "bullish": f.CONCLUSION_BULLISH,
+            "oscillate": f.CONCLUSION_OSCILLATE,
         }
 
-        self.FULL_BULL_WEIGHTS = {
-            "MACD趋势": fbs_config.WEIGHT_ZERO_AXIS,
-            "金叉信号": fbs_config.WEIGHT_STRATEGY_GOLDEN,
-            "柱状动能": fbs_config.WEIGHT_MOMENTUM,
-            "DIF斜率": fbs_config.WEIGHT_DIF_SLOPE,
-            "背离信号": fbs_config.WEIGHT_DIVERGENCE,
-            "量价配合": fbs_config.WEIGHT_VOLUME_PRICE,
-            "K线形态": fbs_config.WEIGHT_KLINE_PATTERN,
-        }
-        self.FULL_BULL_THRESHOLDS = {
-            "fully_bull": fbs_config.CONCLUSION_FULL_BULL,
-            "bullish": fbs_config.CONCLUSION_BULLISH,
-            "oscillate": fbs_config.CONCLUSION_OSCILLATE,
+    @property
+    def RULE_THRESHOLDS(self) -> dict:
+        f = self.app_config.full_bull_scoring
+        return {
+            "divergence": f.RULE_DIVERGENCE_THRESHOLD,
+            "winner_rate_high": f.RULE_WINNER_RATE_HIGH,
+            "winner_rate_low": f.RULE_WINNER_RATE_LOW,
+            "cost_resistance_ratio": f.RULE_COST_RESISTANCE_RATIO,
+            "chip_concentrated_ratio": f.RULE_CHIP_CONCENTRATED_RATIO,
+            "price_new_high_days": f.RULE_PRICE_NEW_HIGH_DAYS,
+            "liq_veto_ratio": self.app_config.filter_rules.LIQ_VETO_RATIO,
         }
 
-        self.RULE_THRESHOLDS = {
-            "divergence": fbs_config.RULE_DIVERGENCE_THRESHOLD,
-            "winner_rate_high": fbs_config.RULE_WINNER_RATE_HIGH,
-            "winner_rate_low": fbs_config.RULE_WINNER_RATE_LOW,
-            "cost_resistance_ratio": fbs_config.RULE_COST_RESISTANCE_RATIO,
-            "chip_concentrated_ratio": fbs_config.RULE_CHIP_CONCENTRATED_RATIO,
-            "price_new_high_days": fbs_config.RULE_PRICE_NEW_HIGH_DAYS,
-            "liq_veto_ratio": fr_config.LIQ_VETO_RATIO,
+    @property
+    def REGIME_DETECTION(self) -> dict:
+        r = self.app_config.regime_detection
+        return {
+            "boll_narrow_ratio": r.BOLL_NARROW_RATIO,
+            "oscillation_hist_std_ratio": r.OSCILLATION_HIST_STD_RATIO,
+            "top_risk_ma20_deviation": r.TOP_RISK_MA20_DEVIATION,
+            "oscillation_min_bars": r.OSCILLATION_MIN_BARS,
+            "reversal_lookback": r.REVERSAL_LOOKBACK,
         }
 
-        self.POSITION_SIZING = {
-            "max_single_position": ps_config.MAX_SINGLE_POSITION,
-            "kelly_fraction": ps_config.KELLY_FRACTION,
-            "default_win_rate": ps_config.DEFAULT_WIN_RATE,
-            "position_a": ps_config.POSITION_A,
-            "position_b": ps_config.POSITION_B,
-            "position_c": ps_config.POSITION_C,
-            "position_d": ps_config.POSITION_D,
-            "max_industry_exposure": ps_config.MAX_INDUSTRY_EXPOSURE,
-            "risk_budget": ps_config.RISK_BUDGET,
-            "max_drawdown_reduction": ps_config.MAX_DRAWDOWN_REDUCTION,
-            "liq_w_section": fr_config.LIQ_W_SECTION,
-            "liq_w_timeseries": fr_config.LIQ_W_TIMESERIES,
-            "liq_w_marketcap": fr_config.LIQ_W_MARKETCAP,
-            "liq_min_discount": fr_config.LIQ_MIN_DISCOUNT,
+    @property
+    def DIVERGENCE_PARAMS(self) -> dict:
+        d = self.app_config.divergence
+        return {
+            "base_distance": d.BASE_DISTANCE,
+            "strength_threshold": d.STRENGTH_THRESHOLD,
+            "decay_half_life": d.DECAY_HALF_LIFE,
+            "slope_window": d.SLOPE_WINDOW,
         }
 
-        self.KLINE_HISTORY_DAYS = kd_config.KLINE_HISTORY_DAYS
+    @property
+    def SCORING_PARAMS(self) -> dict:
+        s = self.app_config.scoring_params
+        return {
+            "cross_decay_days": s.CROSS_DECAY_DAYS,
+            "cross_decay_min": s.CROSS_DECAY_MIN,
+            "kline_decay_days": s.KLINE_DECAY_DAYS,
+            "kline_decay_min": s.KLINE_DECAY_MIN,
+            "vol_norm_denominator": s.VOL_NORM_DENOMINATOR,
+            "atr_stop_mult": s.ATR_STOP_MULT,
+            "atr_t1_mult": s.ATR_T1_MULT,
+            "atr_t2_mult": s.ATR_T2_MULT,
+            "trailing_stop_high_ratio": s.TRAILING_STOP_HIGH_RATIO,
+            "trailing_stop_lookback": s.TRAILING_STOP_LOOKBACK,
+            "trailing_stop_high_lookback": s.TRAILING_STOP_HIGH_LOOKBACK,
+            "expected_return_lookback": s.EXPECTED_RETURN_LOOKBACK,
+        }
 
-    def _ensure_directories(self):
-        dirs = [self.HOME_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR]
-        for d in dirs:
+    @property
+    def TECHNICAL_CONSTANTS(self) -> dict:
+        t = self.app_config.technical_constants
+        return {
+            "atr_length": t.ATR_LENGTH,
+            "adx_length": t.ADX_LENGTH,
+            "rsi_length": t.RSI_LENGTH,
+            "boll_length": t.BOLL_LENGTH,
+            "boll_std": t.BOLL_STD,
+            "stoch_k": t.STOCH_K,
+            "stoch_d": t.STOCH_D,
+            "kline_scan_window": t.KLINE_SCAN_WINDOW,
+        }
+
+    @property
+    def POSITION_SIZING(self) -> dict:
+        p = self.app_config.position_sizing
+        f = self.app_config.filter_rules
+        return {
+            "max_single_position": p.MAX_SINGLE_POSITION,
+            "kelly_fraction": p.KELLY_FRACTION,
+            "default_win_rate": p.DEFAULT_WIN_RATE,
+            "position_a": p.POSITION_A,
+            "position_b": p.POSITION_B,
+            "position_c": p.POSITION_C,
+            "position_d": p.POSITION_D,
+            "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
+            "risk_budget": p.RISK_BUDGET,
+            "max_drawdown_reduction": p.MAX_DRAWDOWN_REDUCTION,
+            "liq_w_section": f.LIQ_W_SECTION,
+            "liq_w_timeseries": f.LIQ_W_TIMESERIES,
+            "liq_w_marketcap": f.LIQ_W_MARKETCAP,
+            "liq_min_discount": f.LIQ_MIN_DISCOUNT,
+        }
+
+    # ── 工具方法 ────────────────────────────────────────────────────────
+
+    def _ensure_directories(self) -> None:
+        for d in (self.HOME_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR):
             os.makedirs(d, exist_ok=True)
 
     def get_db_connection_string(self) -> str:
-        return f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        return (f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}"
+                f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}")

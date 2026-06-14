@@ -1,5 +1,4 @@
 import configparser
-import logging
 import os
 import threading
 import time
@@ -10,27 +9,26 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import psycopg2
+from loguru import logger
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 
 class Config:
-    def __init__(self, config_file: str = "../config.ini"):
+    def __init__(self, config_file: str = "../config.ini") -> None:
         self.config_file = config_file
         self._validate_config_file()
         self._load_config()
         self._ensure_directories()
 
-    def _validate_config_file(self):
+    def _validate_config_file(self) -> None:
         if not os.path.exists(self.config_file):
             raise FileNotFoundError(f"配置文件未找到: {os.path.abspath(self.config_file)}")
 
-    def _load_config(self):
+    def _load_config(self) -> None:
         from UtilsManager.ConfigCipher import ConfigCipher
 
         config = configparser.ConfigParser()
@@ -78,7 +76,7 @@ class Config:
             if val is None:
                 raise ValueError(f"配置项 '{key}' 未设置，请在 {self.config_file} 中检查。")
 
-    def _ensure_directories(self):
+    def _ensure_directories(self) -> None:
         dirs = [self.HOME_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR]
         for d in dirs:
             os.makedirs(d, exist_ok=True)
@@ -189,7 +187,7 @@ class StockOpportunityAnalyzer:
     专门分析技术信号的有效期和最佳操作窗口
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.current_date = datetime.now()
 
     def calculate_opportunity_window(
@@ -287,7 +285,7 @@ class MACDKDJDoubleBottomAnalyzer:
     并计算当天股票价格在双谷趋势中的相对状态
     """
 
-    def __init__(self, config: Config, max_retries: int = 3):
+    def __init__(self, config: Config, max_retries: int = 3) -> None:
         """
         初始化分析器
             config: 配置对象
@@ -300,7 +298,7 @@ class MACDKDJDoubleBottomAnalyzer:
         self.lock = threading.Lock()  # 用于多线程安全的数据库连接
         self.opportunity_analyzer = StockOpportunityAnalyzer()  # 新增：时效性分析器
 
-    def connect_database(self, force_new: bool = False):
+    def connect_database(self, force_new: bool = False) -> None:
         """
         连接数据库，支持重试机制
 
@@ -322,11 +320,11 @@ class MACDKDJDoubleBottomAnalyzer:
         while retry_count < self.max_retries:
             try:
                 self.conn = psycopg2.connect(self.connection_string)
-                logging.info("数据库连接成功")
+                logger.info("数据库连接成功")
                 return
             except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
-                logging.warning(f"数据库连接失败 (尝试 {retry_count}/{self.max_retries}): {e}")
+                logger.warning(f"数据库连接失败 (尝试 {retry_count}/{self.max_retries}): {e}")
                 if retry_count < self.max_retries:
                     time.sleep(2)  # 等待2秒后重试
                 else:
@@ -378,7 +376,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     try:
                         df = calculate_kdj_from_df(df)
                     except (ValueError, TypeError, KeyError) as e:
-                        logging.warning(f"KDJ计算失败，跳过: {e}")
+                        logger.warning(f"KDJ计算失败，跳过: {e}")
                         df["K"] = np.nan
                         df["D"] = np.nan
                         df["J"] = np.nan
@@ -386,7 +384,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     return df
             except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
-                logging.warning(f"获取股票 {symbol} 数据失败 (尝试 {retry_count}/{self.max_retries}): {e}")
+                logger.warning(f"获取股票 {symbol} 数据失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
                 if retry_count < self.max_retries:
                     try:
@@ -397,7 +395,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     self.conn = None
                     time.sleep(1)
                 else:
-                    logging.error(f"获取股票 {symbol} 数据最终失败: {e}")
+                    logger.error(f"获取股票 {symbol} 数据最终失败: {e}")
                     return pd.DataFrame()
 
     def get_all_symbols(self) -> list[str]:
@@ -423,11 +421,11 @@ class MACDKDJDoubleBottomAnalyzer:
                     df = pd.read_sql_query(query, self.conn)
                     symbols = df["symbol"].tolist()
 
-                    logging.info(f"共获取到 {len(symbols)} 个不同的股票代码")
+                    logger.info(f"共获取到 {len(symbols)} 个不同的股票代码")
                     return symbols
             except (psycopg2.Error, psycopg2.OperationalError) as e:
                 retry_count += 1
-                logging.warning(f"获取股票代码列表失败 (尝试 {retry_count}/{self.max_retries}): {e}")
+                logger.warning(f"获取股票代码列表失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
                 if retry_count < self.max_retries:
                     try:
@@ -438,7 +436,7 @@ class MACDKDJDoubleBottomAnalyzer:
                     self.conn = None
                     time.sleep(1)
                 else:
-                    logging.error(f"获取股票代码列表最终失败: {e}")
+                    logger.error(f"获取股票代码列表最终失败: {e}")
                     raise
 
     def get_stock_name(self, symbol: str) -> str:
@@ -466,7 +464,7 @@ class MACDKDJDoubleBottomAnalyzer:
             else:
                 return "未知"
         except Exception as e:
-            logging.warning(f"获取股票 {symbol} 名称时出错: {e}")
+            logger.warning(f"获取股票 {symbol} 名称时出错: {e}")
             return "未知"
 
     def is_st_stock(self, stock_name: str) -> bool:
@@ -610,8 +608,6 @@ class MACDKDJDoubleBottomAnalyzer:
             包含颈线信息的字典
         """
         # 获取关键点的价格
-        valley1_high = df.iloc[valley1_idx]["high"]
-        valley2_high = df.iloc[valley2_idx]["high"]
         peak_between_price = df.iloc[peak_between_idx]["high"]
 
         # 颈线是连接两个反弹高点的直线
@@ -652,7 +648,6 @@ class MACDKDJDoubleBottomAnalyzer:
 
         # 计算价格相对位置
         min_valley_price = min(valley1_close, valley2_close)
-        price_range = max(valley1_close, valley2_close) - min_valley_price
 
         # 计算当前价格与各谷的距离
         distance_to_valley1 = current_close - valley1_close
@@ -700,7 +695,6 @@ class MACDKDJDoubleBottomAnalyzer:
         signal_strength = signal_info.get("signal_strength", "weak")
         neckline_breakout = signal_info.get("neckline_info", {}).get("breakout_strength", "未突破") != "未突破"
         sell_signals_count = signal_info.get("sell_signals_count", 0)
-        price_recovery_rate = signal_info.get("price_relative_status", {}).get("price_recovery_rate", 0)
         current_ma60_slope = signal_info.get("current_ma60_slope", 0)
         # --- 新增：获取量能分数 ---
         volume_score = signal_info.get("volume_score", 50)
@@ -744,7 +738,7 @@ class MACDKDJDoubleBottomAnalyzer:
         return base_recommendation
 
     def detect_recent_double_bottom_pattern(
-        self, df: pd.DataFrame, recent_days: int = 30, external_kdj_signals=None
+        self, df: pd.DataFrame, recent_days: int = 30, external_kdj_signals: list[dict] | None = None
     ) -> list[dict]:
         """
         检测最近30个交易日内进入第二个谷的MACD+KDJ双重谷形态
@@ -823,7 +817,7 @@ class MACDKDJDoubleBottomAnalyzer:
                         # 检查KDJ是否也在超卖区（<20）开始反弹
                         k_current = df["K"].iloc[j]
                         d_current = df["D"].iloc[j]
-                        j_current = df["J"].iloc[j]
+                        _j_current = df["J"].iloc[j]
 
                         # 检查KDJ是否从超卖区（<20）开始上升
                         k_prev = df["K"].iloc[j - 1] if j > 0 else df["K"].iloc[j]
@@ -841,17 +835,10 @@ class MACDKDJDoubleBottomAnalyzer:
                             d_current < 30 and d_current > d_prev
                         )
 
-                        # 检查是否存在高位死叉信号（作为风险警示）
-                        has_high_sell_signal = any(
-                            sig["signal_type"] == "sell" and sig["date"] == df.iloc[j]["trade_date"].date()
-                            for sig in external_kdj_signals or self.detect_kdj_signals(df.loc[:j])
-                        )
-
                         # 检查MA60方向是否向上
                         ma60_slope = df["MA60_slope"].iloc[j] if j < len(df) else 0
 
                         # 只有当MACD金叉 + KDJ共振 + MA60方向向上时才确认信号
-                        # 同时记录是否存在高位死叉信号
                         if (kdj_bullish or kdj_low_and_rising) and ma60_slope > 0:
                             signal_found = True
                             signal_idx = j
@@ -866,7 +853,7 @@ class MACDKDJDoubleBottomAnalyzer:
                         # 检查KDJ是否也在超卖区反弹
                         k_current = df["K"].iloc[j]
                         d_current = df["D"].iloc[j]
-                        j_current = df["J"].iloc[j]
+                        _j_current = df["J"].iloc[j]
 
                         # 检查KDJ是否从超卖区（<20）开始上升
                         k_prev = df["K"].iloc[j - 1] if j > 0 else df["K"].iloc[j]
@@ -882,12 +869,6 @@ class MACDKDJDoubleBottomAnalyzer:
                         # 或者KDJ从低位开始向上
                         kdj_low_and_rising = (k_current < 30 and k_current > k_prev) and (
                             d_current < 30 and d_current > d_prev
-                        )
-
-                        # 检查是否存在高位死叉信号（作为风险警示）
-                        has_high_sell_signal = any(
-                            sig["signal_type"] == "sell" and sig["date"] == df.iloc[j]["trade_date"].date()
-                            for sig in external_kdj_signals or self.detect_kdj_signals(df.loc[:j])
                         )
 
                         # 检查MA60方向是否向上
@@ -1005,7 +986,7 @@ class MACDKDJDoubleBottomAnalyzer:
 
                 return [signal_obj]
         except Exception as e:
-            logging.warning(f"解析KDJ信号时出错: {e}")
+            logger.warning(f"解析KDJ信号时出错: {e}")
 
         return []
 
@@ -1069,7 +1050,7 @@ class MACDKDJDoubleBottomAnalyzer:
 
             return result
         except Exception as e:
-            logging.error(f"分析股票 {symbol} 时发生错误: {e}")
+            logger.error(f"分析股票 {symbol} 时发生错误: {e}")
             return {
                 "symbol": symbol,
                 "error": f"分析股票 {symbol} 时发生错误: {e!s}",
@@ -1078,7 +1059,7 @@ class MACDKDJDoubleBottomAnalyzer:
             }
 
 
-def export_results_to_excel(results, buy_signals, config):
+def export_results_to_excel(results: list, buy_signals: list, config: Config) -> None:
     """
     将分析结果导出到Excel文件
     """
@@ -1199,7 +1180,7 @@ def export_results_to_excel(results, buy_signals, config):
     print(f"分析结果已保存到: {filepath}")
 
 
-def main():
+def main() -> None:
     """
     主函数 - 全市场扫描MACD+KDJ双重谷形态（多线程版本，含时效性分析）
     """
@@ -1220,20 +1201,18 @@ def main():
     # 初始化结果字典
     results = {}
     completed_count = 0
-    total_count = len(all_symbols)
-
     # 创建锁来保护共享资源
     lock = threading.Lock()
 
-    def update_progress():
+    def update_progress() -> int:
         nonlocal completed_count
         with lock:
             completed_count += 1
             return completed_count
 
-    def analyze_wrapper(symbol):
+    def analyze_wrapper(symbol: str) -> tuple:
         result = analyzer.analyze_single_symbol(symbol)
-        progress = update_progress()
+        update_progress()
         return symbol, result
 
     # 使用ThreadPoolExecutor进行多线程处理
@@ -1259,7 +1238,7 @@ def main():
     total_stocks = len(results)
     st_stocks = sum(1 for r in results.values() if r.get("is_st_stock", False))
     valid_stocks = total_stocks - st_stocks
-    stocks_with_patterns = sum(
+    sum(
         1 for r in results.values() if r.get("patterns_found", 0) > 0 and not r.get("is_st_stock", False)
     )
 
@@ -1346,7 +1325,6 @@ def main():
         for i, signal in enumerate(buy_signals):
             neckline_info = signal["neckline_info"]
             price_status = signal["price_relative_status"]
-            opportunity_info = signal["opportunity_info"]
             print(f"\n信号 {i + 1}:")
             print(f"  股票简称: {signal['stock_name']}")
             print(f"  买卖建议: {signal['trade_recommendation']}")

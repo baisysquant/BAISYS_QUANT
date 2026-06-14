@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta  # 导入日期时间模块
 
 import akshare as ak
@@ -22,7 +24,7 @@ def get_period_selection() -> int:
             print(f"输入 '{choice}' 无效。请重新输入 1 或 2。")
 
 
-def query_stock_news():
+def query_stock_news() -> None:
     """
     查询指定股票代码的最新新闻资讯，并显示关键信息。
     根据用户选择的周期进行过滤和排序，并将结果保存到 Excel 文件。

@@ -10,15 +10,17 @@ Pipeline 设计：
   - 可单独构造 PipelineContext 调用任一步骤进行单元测试
 """
 
+from __future__ import annotations
+
 import os
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
 
@@ -30,6 +32,7 @@ from DataManager.ReportService import ReportService
 from LogicAnalyzer.AnalysisService import AnalysisService
 from LogicAnalyzer.DataAcquisitionService import DataAcquisitionService
 from UtilsManager.Exceptions import DatabaseConnectionError
+from UtilsManager.IDataProvider import IDataProvider
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
@@ -40,10 +43,10 @@ class PipelineContext:
     data: dict[str, Any] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
 
-    def set(self, key: str, value: Any) -> None:
+    def set(self, key: str, value: Any) -> None:  # noqa: ANN401
         self.data[key] = value
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def get(self, key: str, default: Any = None) -> Any:  # noqa: ANN401
         return self.data.get(key, default)
 
     def has(self, *keys: str) -> bool:
@@ -71,7 +74,8 @@ class StockAnalysisCoordinator:
         stock_sync_engine: 股票同步引擎
         db_engine: 数据库引擎
         executor: 线程池执行器
-        data_acquisition: 数据获取服务
+        data_provider: K 线数据提供者（实时/回测可切换）
+        data_acquisition: 实时数据获取服务（akshare）
         data_processing: 数据处理服务
         analysis_service: 业务分析服务
         report_service: 报告生成服务
@@ -81,17 +85,18 @@ class StockAnalysisCoordinator:
         self,
         config: Config,
         calendar_mgr: TradingCalendarAnalyzer,
-        logger: Any,
+        logger: Any,  # noqa: ANN401
         cache_manager: UnifiedCacheManager,
         stock_sync_engine: StockSyncEngine,
         db_engine: Engine,
         executor: ThreadPoolExecutor,
+        data_provider: IDataProvider,
         data_acquisition: DataAcquisitionService,
         data_processing: DataProcessingService,
         analysis_service: AnalysisService,
         report_service: ReportService,
         today_str: str | None = None,
-    ):
+    ) -> None:
         self.config = config
         self.calendar_mgr = calendar_mgr
         self.logger = logger
@@ -99,6 +104,7 @@ class StockAnalysisCoordinator:
         self.stock_sync_engine = stock_sync_engine
         self.db_engine = db_engine
         self.executor = executor
+        self.data_provider = data_provider
         self.data_acquisition = data_acquisition
         self.data_processing = data_processing
         self.analysis_service = analysis_service
@@ -149,7 +155,7 @@ class StockAnalysisCoordinator:
         )
         self._shutdown()
 
-    def _run_single_step(self, name: str, fn, ctx: PipelineContext) -> bool:
+    def _run_single_step(self, name: str, fn: Callable[[PipelineContext], bool], ctx: PipelineContext) -> bool:
         try:
             self.logger.info(f">>> 步骤: {name}")
             return fn(ctx)
@@ -175,10 +181,10 @@ class StockAnalysisCoordinator:
         return True
 
     def _step_2_format_codes(self, ctx: PipelineContext) -> bool:
-        from DataManager.ShareCodeFormatMgr import format_stock_code
+        from UtilsManager.CodeNormalizer import CodeNormalizer
 
         filtered_pure_codes: set = ctx.get("filtered_pure_codes")
-        stock_codes_prefixed = [format_stock_code(code) for code in sorted(filtered_pure_codes)]
+        stock_codes_prefixed = [CodeNormalizer.add_market_prefix(code) for code in sorted(filtered_pure_codes)]
         stock_codes_pure = sorted(filtered_pure_codes)
         ctx.set("stock_codes_prefixed", stock_codes_prefixed)
         ctx.set("stock_codes_pure", stock_codes_pure)
@@ -202,29 +208,16 @@ class StockAnalysisCoordinator:
             ctx.set("spot_data", pd.DataFrame())
             return True
 
-        query = text("""
-            SELECT * FROM stock_daily_kline
-            WHERE symbol = ANY(:symbols)
-            ORDER BY trade_date
-        """)
-
-        hist_df_all = pd.DataFrame()
         try:
-            with self.db_engine.connect() as conn:
-                hist_df_all = pd.read_sql(query, conn, params={"symbols": list(stock_codes_prefixed)})
-                if not hist_df_all.empty:
-                    self.logger.info(
-                        f"[INFO] 数据日期范围: {hist_df_all['trade_date'].min()} 至 {hist_df_all['trade_date'].max()}"
-                    )
-                else:
-                    self.logger.error("[ERROR] 查询结果为空！可能是股票代码不匹配或日期条件过滤了所有数据。")
-        except (DBAPIError, OperationalError) as e:
+            hist_df_all = self.data_provider.get_kline(stock_codes_prefixed)
+            if not hist_df_all.empty:
+                self.logger.info(
+                    f"[INFO] 数据日期范围: {hist_df_all['trade_date'].min()} 至 {hist_df_all['trade_date'].max()}"
+                )
+            else:
+                self.logger.error("[ERROR] 查询结果为空！可能是股票代码不匹配或日期条件过滤了所有数据。")
+        except Exception as e:
             self.logger.error(f"[ERROR] 数据库查询失败: {e}")
-            try:
-                with self.db_engine.connect() as conn:
-                    conn.rollback()
-            except (DBAPIError, OperationalError):
-                pass
             hist_df_all = pd.DataFrame()
 
         if hist_df_all.empty:
@@ -254,13 +247,13 @@ class StockAnalysisCoordinator:
         ta_signals = self.analysis_service.process_technical_signals(stock_codes_prefixed, hist_df, spot_data)
         self.report_service.save_ta_signals_to_txt(ta_signals, self.today_str)
 
-        print("\n=== 技术指标数据检查 ===")
+        self.logger.info("=== 技术指标数据检查 ===")
         for key, df in ta_signals.items():
             if isinstance(df, pd.DataFrame) and not df.empty:
-                print(f"{key}: {len(df)} 条数据，列名: {list(df.columns)}")
-                print(f"  样本数据:\n{df.head(2)}")
+                self.logger.info(f"{key}: {len(df)} 条数据，列名: {list(df.columns)}")
+                self.logger.info(f"  样本数据:\n{df.head(2)}")
             else:
-                print(f"{key}: 空DataFrame")
+                self.logger.info(f"{key}: 空DataFrame")
 
         ctx.set("ta_signals", ta_signals)
         return True
@@ -414,8 +407,8 @@ class StockAnalysisCoordinator:
         processed_data: dict = ctx.get("processed_data", {})
 
         # 裁剪仅保留 final column order 中的列（step 10 可能加入了计算用列）
-        from DataManager.ReportService import ReportService
         from DataManager.ColumnNames import ColumnNames as CN
+        from DataManager.ReportService import ReportService
         final_cols = ReportService.get_final_column_order(
             fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )
@@ -429,7 +422,7 @@ class StockAnalysisCoordinator:
         self._validate_report_integrity(consolidated_report)
         return True
 
-    def _validate_report_integrity(self, df: pd.DataFrame):
+    def _validate_report_integrity(self, df: pd.DataFrame) -> None:
         if df.empty:
             self.logger.warning("[完整性断言] 报告为空，跳过校验")
             return
@@ -589,8 +582,10 @@ class StockAnalysisCoordinatorFactory:
         executor = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
 
         try:
-            stock_sync_engine = StockSyncEngine(executor=executor)
-            db_engine = stock_sync_engine.db
+            from DataManager.DbEngine import get_engine as _get_engine
+
+            db_engine = _get_engine(config)
+            stock_sync_engine = StockSyncEngine(executor=executor, db_engine=db_engine)
 
             from DataCollection.GetStockBasicinfo import StockBasicInfoService
             basic_info_service = StockBasicInfoService(config)
@@ -599,6 +594,9 @@ class StockAnalysisCoordinatorFactory:
         except (DBAPIError, OperationalError) as e:
             raise DatabaseConnectionError(f"初始化数据库引擎失败: {e}") from e
 
+        from UtilsManager.IDataProvider import LiveDataProvider
+
+        data_provider = LiveDataProvider(db_engine=db_engine)
         data_acquisition = DataAcquisitionService(config, calendar_mgr, logger, cache_manager, executor=executor)
         fund_momentum_analyzer = FundMomentumAnalyzer()
         data_processing = DataProcessingService(config, logger, fund_momentum_analyzer, calendar_mgr)
@@ -613,6 +611,7 @@ class StockAnalysisCoordinatorFactory:
             stock_sync_engine=stock_sync_engine,
             db_engine=db_engine,
             executor=executor,
+            data_provider=data_provider,
             data_acquisition=data_acquisition,
             data_processing=data_processing,
             analysis_service=analysis_service,

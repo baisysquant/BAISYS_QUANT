@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Any
 
 import numpy as np
@@ -7,7 +9,7 @@ from DataManager.ColumnNames import ColumnNames
 
 
 class FundMomentumAnalyzer:
-    def __init__(self, trend_weight: float = 0.4, speed_weight: float = 0.6, z_score_threshold: float = 1.0):
+    def __init__(self, trend_weight: float = 0.4, speed_weight: float = 0.6, z_score_threshold: float = 1.0) -> None:
         """
         初始化.
 
@@ -112,7 +114,7 @@ class FundMomentumAnalyzer:
         return "观望"
 
     @staticmethod
-    def _safe_float(val) -> float:
+    def _safe_float(val: Any) -> float:  # noqa: ANN401
         """安全转浮点"""
         try:
             return float(val) if pd.notna(val) else 0.0

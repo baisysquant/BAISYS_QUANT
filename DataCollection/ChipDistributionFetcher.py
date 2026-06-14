@@ -1,16 +1,16 @@
+from __future__ import annotations
+
 import os
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from typing import Any
 
 import pandas as pd
-from tqdm import tqdm
+from loguru import logger
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ConfigParser import Config
-from UtilsManager.ConfigCipher import ConfigCipher
 
 
 def _akshare_to_ts_code(symbol: str) -> str:
@@ -49,7 +49,7 @@ class ChipDistributionFetcher:
 
     API_PAGE_SIZE = 2000
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config) -> None:
         self.config = config
         self.api_key = config.ASHAREHUB_API_KEY
         self.enabled = config.ENABLE_CHIP_DISTRIBUTION
@@ -65,7 +65,7 @@ class ChipDistributionFetcher:
         return os.path.join(self._cache_dir, f"chip_distribution_{self._today}.csv")
 
     @property
-    def client(self):
+    def client(self) -> Any:  # noqa: ANN401
         if self._client is None and self.api_key:
             from asharehub import AShareHub
             self._client = AShareHub(api_key=self.api_key)
@@ -82,27 +82,27 @@ class ChipDistributionFetcher:
                                      cost_5pct, cost_25pct, cost_50pct, cost_75pct, cost_95pct
         """
         if not self.enabled or not self.api_key:
-            print("[ChipDist] 筹码分布获取未启用或 API 密钥未配置，跳过。")
+            logger.info("[ChipDist] 筹码分布获取未启用或 API 密钥未配置，跳过。")
             return pd.DataFrame()
 
         # ── 读缓存（当日已有文件） ──
         if os.path.exists(self._cache_path):
             try:
                 cached = pd.read_csv(self._cache_path)
-                print(f"[ChipDist] 读取当日缓存: {os.path.basename(self._cache_path)} ({len(cached)} 条)")
+                logger.info(f"[ChipDist] 读取当日缓存: {os.path.basename(self._cache_path)} ({len(cached)} 条)")
                 return cached
             except Exception as e:
-                print(f"[ChipDist] 缓存读取失败，将重新拉取: {e}")
+                logger.info(f"[ChipDist] 缓存读取失败，将重新拉取: {e}")
 
         # ── 拉取 API ──
         if not self.client:
-            print("[ChipDist] 客户端初始化失败，跳过。")
+            logger.info("[ChipDist] 客户端初始化失败，跳过。")
             return pd.DataFrame()
 
         all_dfs = []
         offset = 0
         page = 1
-        print("[ChipDist] 正在从 AShareHub 获取全市场筹码分布数据...")
+        logger.info("[ChipDist] 正在从 AShareHub 获取全市场筹码分布数据...")
 
         while True:
             try:
@@ -112,28 +112,28 @@ class ChipDistributionFetcher:
                 df["symbol"] = df["ts_code"].apply(_ts_code_to_akshare_symbol)
                 all_dfs.append(df)
                 row_count = len(df)
-                print(f"  [筹码分页 {page}] offset={offset}, 返回 {row_count} 行")
+                logger.info(f"  [筹码分页 {page}] offset={offset}, 返回 {row_count} 行")
                 if row_count < self.API_PAGE_SIZE:
                     break
                 offset += row_count
                 page += 1
             except Exception as e:
-                print(f"[ChipDist] 获取失败: {e}")
+                logger.info(f"[ChipDist] 获取失败: {e}")
                 break
 
         if not all_dfs:
-            print("[ChipDist] 未获取到任何筹码分布数据。")
+            logger.info("[ChipDist] 未获取到任何筹码分布数据。")
             return pd.DataFrame()
 
         combined = pd.concat(all_dfs, ignore_index=True)
-        print(f"[ChipDist] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
+        logger.info(f"[ChipDist] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
 
         # ── 写缓存 ──
         try:
             os.makedirs(self._cache_dir, exist_ok=True)
             combined.to_csv(self._cache_path, index=False, encoding="utf-8-sig")
-            print(f"[ChipDist] 已缓存至: {os.path.basename(self._cache_path)}")
+            logger.info(f"[ChipDist] 已缓存至: {os.path.basename(self._cache_path)}")
         except Exception as e:
-            print(f"[ChipDist] 缓存写入失败: {e}")
+            logger.info(f"[ChipDist] 缓存写入失败: {e}")
 
         return combined

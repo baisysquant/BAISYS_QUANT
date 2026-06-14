@@ -4,11 +4,13 @@
 提供分层的异常体系，便于统一处理和错误恢复。
 """
 
+from typing import Any
+
 
 class QuantBaseException(Exception):
     """量化系统基础异常类"""
 
-    def __init__(self, message: str, error_code: str = "UNKNOWN", recoverable: bool = False):
+    def __init__(self, message: str, error_code: str = "UNKNOWN", recoverable: bool = False) -> None:
         """
         Args:
             message: 错误描述信息
@@ -20,7 +22,7 @@ class QuantBaseException(Exception):
         self.error_code = error_code
         self.recoverable = recoverable
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"[{self.error_code}] {self.message}"
 
 
@@ -30,7 +32,7 @@ class QuantBaseException(Exception):
 class DataFetchError(QuantBaseException):
     """数据获取失败异常"""
 
-    def __init__(self, source: str, message: str):
+    def __init__(self, source: str, message: str) -> None:
         super().__init__(
             message=f"从 {source} 获取数据失败: {message}",
             error_code="DATA_FETCH_ERROR",
@@ -42,7 +44,7 @@ class DataFetchError(QuantBaseException):
 class DataValidationError(QuantBaseException):
     """数据验证失败异常"""
 
-    def __init__(self, data_name: str, reason: str):
+    def __init__(self, data_name: str, reason: str) -> None:
         super().__init__(
             message=f"数据验证失败 [{data_name}]: {reason}", error_code="DATA_VALIDATION_ERROR", recoverable=True
         )
@@ -52,7 +54,7 @@ class DataValidationError(QuantBaseException):
 class CacheError(QuantBaseException):
     """缓存操作异常"""
 
-    def __init__(self, operation: str, message: str):
+    def __init__(self, operation: str, message: str) -> None:
         super().__init__(
             message=f"缓存{operation}失败: {message}",
             error_code="CACHE_ERROR",
@@ -67,7 +69,7 @@ class CacheError(QuantBaseException):
 class DataProcessingError(QuantBaseException):
     """数据处理异常"""
 
-    def __init__(self, step: str, message: str):
+    def __init__(self, step: str, message: str) -> None:
         super().__init__(
             message=f"数据处理步骤 [{step}] 失败: {message}",
             error_code="DATA_PROCESSING_ERROR",
@@ -79,7 +81,7 @@ class DataProcessingError(QuantBaseException):
 class CalculationError(QuantBaseException):
     """计算异常（如指标计算、评分计算等）"""
 
-    def __init__(self, calculation_type: str, message: str):
+    def __init__(self, calculation_type: str, message: str) -> None:
         super().__init__(
             message=f"{calculation_type} 计算失败: {message}",
             error_code="CALCULATION_ERROR",
@@ -94,7 +96,7 @@ class CalculationError(QuantBaseException):
 class ConfigError(QuantBaseException):
     """配置错误异常"""
 
-    def __init__(self, config_key: str, message: str):
+    def __init__(self, config_key: str, message: str) -> None:
         super().__init__(
             message=f"配置项 [{config_key}] 错误: {message}",
             error_code="CONFIG_ERROR",
@@ -109,7 +111,7 @@ class ConfigError(QuantBaseException):
 class DatabaseError(QuantBaseException):
     """数据库操作异常"""
 
-    def __init__(self, operation: str, message: str):
+    def __init__(self, operation: str, message: str) -> None:
         super().__init__(
             message=f"数据库{operation}失败: {message}",
             error_code="DATABASE_ERROR",
@@ -121,7 +123,7 @@ class DatabaseError(QuantBaseException):
 class DatabaseConnectionError(DatabaseError):
     """数据库连接异常"""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str) -> None:
         super().__init__(operation="连接", message=message)
         self.error_code = "DB_CONNECTION_ERROR"
 
@@ -132,7 +134,7 @@ class DatabaseConnectionError(DatabaseError):
 class ReportGenerationError(QuantBaseException):
     """报告生成异常"""
 
-    def __init__(self, report_type: str, message: str):
+    def __init__(self, report_type: str, message: str) -> None:
         super().__init__(
             message=f"生成{report_type}报告失败: {message}", error_code="REPORT_GENERATION_ERROR", recoverable=False
         )
@@ -143,8 +145,12 @@ class ReportGenerationError(QuantBaseException):
 
 
 def handle_exception_with_recovery(
-    exception: Exception, logger, context: str, default_value=None, raise_on_critical: bool = True
-):
+    exception: Exception,
+    logger: Any,  # noqa: ANN401
+    context: str,
+    default_value: Any = None,  # noqa: ANN401
+    raise_on_critical: bool = True,
+) -> Any:  # noqa: ANN401
     """
     统一的异常处理工具函数
 

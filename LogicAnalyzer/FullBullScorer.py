@@ -5,17 +5,18 @@
 所有功能已迁移至 MACDAnalyzer.analyze_full_bull / pipeline_analysis，此模块保留仅作参考。
 """
 
+from __future__ import annotations
+
 import warnings
-warnings.warn("FullBullScorer is deprecated, use MACDAnalyzer instead", DeprecationWarning, stacklevel=2)
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from LogicAnalyzer.MACDDivergence import slope_analysis as calc_slope
-from LogicAnalyzer.SignalConstants import (
-    MACDSignals, Divergence, TrendLevels,
-    Conclusion, FullBullScoring, KLineLevels
-)
+from LogicAnalyzer.SignalConstants import Divergence, MACDSignals
+
+warnings.warn("FullBullScorer is deprecated, use MACDAnalyzer instead", DeprecationWarning, stacklevel=2)
 
 
 def score_kline_pattern(kline_signals: list[dict]) -> int:
@@ -116,9 +117,9 @@ def analyze_full_bull(
     df: pd.DataFrame,
     second_params: tuple[int, int, int],
     second_period_name: str,
-    custom_macd_func: callable,
-    divergence_func: callable,
-    config,
+    custom_macd_func: Any,  # noqa: ANN401
+    divergence_func: Any,  # noqa: ANN401
+    config: Any,  # noqa: ANN401
     weights: dict[str, int] | None = None,
     thresholds: dict[str, int] | None = None,
 ) -> dict:
@@ -133,7 +134,6 @@ def analyze_full_bull(
     osc_th = thresholds.get("trend_oscillation", config.TREND_OSCILLATION_THRESHOLD)
 
     scores: dict[str, tuple[str, int]] = {}
-    state = {"detail": ""}
 
     # 零轴条件
     dif_12269_val = df["DIF_12269"].iloc[-1]
@@ -144,7 +144,7 @@ def analyze_full_bull(
         scores["零轴条件"] = ("DIF < 0（空头主导）", -w_zero)
 
     # 慢速 MACD
-    slow_detail = df.get(f"MACD_12269_SIGNAL_DETAIL", pd.Series(dtype=str)).iloc[-1] if f"MACD_12269_SIGNAL_DETAIL" in df.columns else ""
+    slow_detail = df.get("MACD_12269_SIGNAL_DETAIL", pd.Series(dtype=str)).iloc[-1] if "MACD_12269_SIGNAL_DETAIL" in df.columns else ""
     slow_dif = df.get("DIF_12269", pd.Series(dtype=float))
     slow_dea = df.get("DEA_12269", pd.Series(dtype=float))
     w_strat = weights.get("战略金叉", 20)
@@ -183,7 +183,6 @@ def analyze_full_bull(
 
     # DIF 斜率
     slope_val = calc_slope(df["DIF_12269"], window=5)
-    w_slope = weights.get("DIF斜率", 15)
     slope_score = int(min(15, max(-15, slope_val["slope"] * 100)))
     scores["DIF斜率"] = (f"DIF斜率: {slope_val['slope']:.4f} (R²={slope_val['r2']:.2f}, {slope_val['trend']})", slope_score)
 

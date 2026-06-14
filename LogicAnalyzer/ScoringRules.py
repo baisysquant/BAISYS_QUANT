@@ -29,10 +29,11 @@ state 结构:
   }
 """
 
-import pandas as pd
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Callable
 
+import pandas as pd
+from loguru import logger
 
 # ── 规则数据类型 ──────────────────────────────────────────────────────────────
 
@@ -1613,5 +1614,5 @@ def execute_rules(state: dict, gate: int) -> None:
         try:
             if rule.condition(state):
                 rule.action(state)
-        except (KeyError, TypeError, ValueError, AttributeError, IndexError):
-            pass
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+            logger.warning(f"规则 {rule.name}(id={rule.id}) 执行失败: {e}")

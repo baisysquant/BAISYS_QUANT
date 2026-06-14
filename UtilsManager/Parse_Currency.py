@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Any
+
 import pandas as pd
 
 
@@ -7,7 +11,7 @@ class Parse_Currency:
     """
 
     @staticmethod
-    def parse_money_str(val):
+    def parse_money_str(val: Any) -> float:  # noqa: ANN401
         """
         统一处理含有 '亿'、'万'、'%' 或非法字符的金融数据
         """

@@ -1,19 +1,25 @@
-﻿import akshare as ak
-import pandas as pd
-import numpy as np
-import os
-import time
+﻿from __future__ import annotations
+
 import datetime
-import warnings
+import os
 import re
+import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import akshare as ak
+import numpy as np
+import pandas as pd
+from loguru import logger
+
 from ConfigParser import Config
+
 warnings.filterwarnings('ignore')
 
 class SWIndustryDataPipeline:
     """模块一：数据管道（负责拉取、清洗与本地缓存）"""
     
-    def __init__(self, config=None):
+    def __init__(self, config: Config | None = None) -> None:
         self.config = config or Config()
         self.today_str = datetime.datetime.now().strftime("%Y%m%d")
         self.cache_dir = os.path.join(self.config.HOME_DIRECTORY, "sw_data_cache")
@@ -22,7 +28,7 @@ class SWIndustryDataPipeline:
         self.cache_csv_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.csv")
         self.valuation_file = os.path.join(self.cache_dir, f"sw_valuation_{self.today_str}.csv")
 
-    def _map_hist_columns(self, df_hist):
+    def _map_hist_columns(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """
         【核心防御机制】为历史数据接口动态映射列名
         """
@@ -49,7 +55,7 @@ class SWIndustryDataPipeline:
         
         return df_hist.rename(columns=rename_dict)
 
-    def fetch_and_cache_all(self, force_update=False):
+    def fetch_and_cache_all(self, force_update: bool = False) -> pd.DataFrame | None:
         """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
         hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
         valuation_cache_exists = os.path.exists(self.valuation_file)
@@ -70,17 +76,17 @@ class SWIndustryDataPipeline:
             
             # [OK] 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
             if cached_industry_count == current_total_industries:
-                print(f"[*] 缓存完整({cached_industry_count}个行业)，使用缓存数据")
+                logger.info(f"缓存完整({cached_industry_count}个行业)，使用缓存数据")
                 return cached_hist
             else:
-                print(f"[!] 缓存不完整({cached_industry_count}个 vs {current_total_industries}个)，重新拉取...")
+                logger.warning(f"缓存不完整({cached_industry_count}个 vs {current_total_industries}个)，重新拉取...")
 
 
-        print("[1/3] 获取申万二级行业列表及估值数据...")
+        logger.info("获取申万二级行业列表及估值数据...")
         try:
             df_info = ak.sw_index_second_info()
         except Exception as e:
-            print(f"获取行业列表失败: {e}")
+            logger.error(f"获取行业列表失败: {e}")
             return None
 
         valuation_cols_map = {
@@ -94,7 +100,7 @@ class SWIndustryDataPipeline:
         
         missing_valuation_cols = [k for k in valuation_cols_map.keys() if k not in df_info.columns]
         if missing_valuation_cols:
-            print(f"[!] 警告: 估值接口缺少预期列 {missing_valuation_cols}。")
+            logger.warning(f"估值接口缺少预期列 {missing_valuation_cols}。")
         
         available_valuation_cols = {k: v for k, v in valuation_cols_map.items() if k in df_info.columns}
         df_val = df_info[list(available_valuation_cols.keys())].copy()
@@ -107,17 +113,17 @@ class SWIndustryDataPipeline:
         codes = df_val['code'].astype(str).tolist()
         names = df_val['name'].astype(str).tolist()
         
-        print(f"[2/3] 开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
+        logger.info(f"开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
         all_hist_data = []
 
-        def fetch_one(code, name):
+        def fetch_one(code: str, name: str) -> pd.DataFrame | None:
             try:
                 df_hist = ak.index_hist_sw(symbol=code, period="day")
                 if df_hist is not None and not df_hist.empty:
                     df_hist_mapped = self._map_hist_columns(df_hist)
                     required_core_cols = ['date', 'close', 'volume', 'amount']
                     if not all(c in df_hist_mapped.columns for c in required_core_cols):
-                        print(f"   [!] 警告: {code} 历史数据映射后缺少核心字段，跳过。")
+                        logger.warning(f"{code} 历史数据映射后缺少核心字段，跳过。")
                         return None
                     core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
                     df_sub = df_hist_mapped[core_cols].copy()
@@ -127,7 +133,7 @@ class SWIndustryDataPipeline:
                     df_sub['name'] = name
                     return df_sub
             except Exception as e:
-                print(f"   [!] 警告: 获取 {code} ({name}) 失败 -> {e}")
+                logger.warning(f"获取 {code} ({name}) 失败 -> {e}")
             return None
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -138,24 +144,24 @@ class SWIndustryDataPipeline:
                 if result is not None:
                     all_hist_data.append(result)
                 if (idx + 1) % 5 == 0 or idx == len(codes) - 1:
-                    print(f"   -> 进度: {len(all_hist_data)}/{len(codes)}")
+                    logger.info(f"进度: {len(all_hist_data)}/{len(codes)}")
                 time.sleep(0.1)
 
         if not all_hist_data:
-            print("[!] 错误: 未能获取任何历史数据。")
+            logger.error("未能获取任何历史数据。")
             return None
 
-        print("[3/3] 数据合并与本地缓存...")
+        logger.info("数据合并与本地缓存...")
         df_all = pd.concat(all_hist_data, ignore_index=True)
         
         # 尝试保存为Parquet，如果失败则保存为CSV
         try:
             df_all.to_parquet(self.cache_file, index=False)
-            print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
+            logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
         except Exception:
             # 如果pyarrow或fastparquet不可用，则保存为CSV
             df_all.to_csv(self.cache_csv_file, index=False, encoding='utf-8-sig')
-            print(f"[*] 成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
+            logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
             
         return df_all
 
@@ -163,11 +169,11 @@ class SWIndustryDataPipeline:
 class SWMultiFactorModel:
     """模块二：多因子计算引擎（纯本地向量化计算，极速）"""
     
-    def __init__(self, pipeline: SWIndustryDataPipeline):
+    def __init__(self, pipeline: SWIndustryDataPipeline) -> None:
         self.pipeline = pipeline
         self.ma_periods = [10, 20, 30, 60, 90]
 
-    def _calculate_vectorized_factors(self, df_hist):
+    def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
         df = df_hist.sort_values(['code', 'date']).copy()
         
@@ -194,7 +200,7 @@ class SWMultiFactorModel:
         # 只保留因子计算相关的列，避免与估值数据中的name列冲突
         return df_latest[['name', 'close', 'bull_align_score', 'dev_20', 'dev_60', 'vol_ratio', 'amt_ratio']]
 
-    def run_scoring(self):
+    def run_scoring(self) -> pd.DataFrame:
         """执行完整的打分流程"""
         # 尝试读取Parquet，如果失败则读取CSV
         try:
@@ -204,7 +210,7 @@ class SWMultiFactorModel:
         
         df_val = pd.read_csv(self.pipeline.valuation_file)
         
-        print(">>> 正在执行向量化因子计算...")
+        logger.info("正在执行向量化因子计算...")
         df_factors = self._calculate_vectorized_factors(df_hist)
         
         # 解决列名冲突：重命名因子数据中的name列为factor_name
@@ -243,7 +249,7 @@ class SWMultiFactorModel:
             df['factor_volume'] * 0.25
         ).round(2)
         
-        def get_signal(row):
+        def get_signal(row: pd.Series) -> str:
             if row['total_score'] > 75 and row['factor_value'] > 70:
                 return "核心配置 (低估值+强趋势)"
             elif row['total_score'] > 70 and row['factor_trend'] > 80:
@@ -262,19 +268,19 @@ class SWMultiFactorModel:
 class IndustryFlowAnalyzer:
     """兼容主程序调用链的行业分析适配器。"""
 
-    def __init__(self, config=None):
+    def __init__(self, config: Config | None = None) -> None:
         self.config = config
         self.pipeline = SWIndustryDataPipeline(config=config)
         self.model = SWMultiFactorModel(self.pipeline)
 
     @staticmethod
-    def _output_columns():
+    def _output_columns() -> list[str]:
         return [
             '行业代码', '行业名称', '行业信号', '综合得分', '趋势得分', '估值得分', '量能得分',
             'PE_TTM', 'PB', '股息率', '多头排列分', '20日偏离率', '60日偏离率', '量比', '额比'
         ]
 
-    def _format_main_output(self, result_df):
+    def _format_main_output(self, result_df: pd.DataFrame) -> pd.DataFrame:
         if result_df is None or result_df.empty:
             return pd.DataFrame(columns=self._output_columns())
 
@@ -305,7 +311,7 @@ class IndustryFlowAnalyzer:
         df['行业信号'] = df['行业信号'].fillna('').astype(str).str.strip()
         return df[self._output_columns()]
 
-    def run_analysis(self, force_update=False):
+    def run_analysis(self, force_update: bool = False) -> pd.DataFrame:
         df_hist = self.pipeline.fetch_and_cache_all(force_update=force_update)
         if df_hist is None or df_hist.empty:
             return pd.DataFrame(columns=self._output_columns())

@@ -5,15 +5,13 @@
 """
 
 from . import Exceptions
-from .CacheManager import CacheManager
 from .CodeNormalizer import CodeNormalizer
 from .ConfigCipher import ConfigCipher
-from .LoggerManager import get_logger, get_log_path
+from .LoggerManager import get_log_path, get_logger
 from .PriceExtractor import PriceExtractor
 from .UnifiedCacheManager import UnifiedCacheManager
 
 __all__ = [
-    "CacheManager",
     "CodeNormalizer",
     "ConfigCipher",
     "Exceptions",

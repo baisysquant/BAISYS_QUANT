@@ -1,5 +1,8 @@
+from typing import Any
+
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 
 class AdvancedKDJAnalyzer:
@@ -8,8 +11,8 @@ class AdvancedKDJAnalyzer:
     提供全面的KDJ技术分析，包括多种经典及进阶信号
     """
 
-    def __init__(self):
-        self.signals_map = {
+    def __init__(self) -> None:
+        self.signals_map: dict[str, Any] = {
             "买入-极值J线反转": self._check_extreme_j_reversal,
             "买入-底背离金叉": self._check_bottom_divergence_cross,
             "买入-趋势确认金叉": self._check_trend_confirmation_cross,
@@ -26,7 +29,9 @@ class AdvancedKDJAnalyzer:
             "买入-超卖修复启动": self._check_oversold_recovery,
         }
 
-    def calculate_stochastic(self, high, low, close, k_period=9, d_period=3):
+    def calculate_stochastic(
+        self, high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 9, d_period: int = 3
+    ) -> tuple[pd.Series, pd.Series, pd.Series]:
         """
         计算KDJ指标
         """
@@ -39,7 +44,7 @@ class AdvancedKDJAnalyzer:
 
         return stoch_k, stoch_d, stoch_j
 
-    def _calculate_kdj_with_derivatives(self, df):
+    def _calculate_kdj_with_derivatives(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         计算KDJ及其衍生指标
         """
@@ -61,10 +66,10 @@ class AdvancedKDJAnalyzer:
 
         return df
 
-    def _check_extreme_j_reversal(self, df):
+    def _check_extreme_j_reversal(self, df: pd.DataFrame) -> str | None:
         """检查极值J线反转"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
         prev_j = df["j_value"].iloc[-2]
 
@@ -72,7 +77,7 @@ class AdvancedKDJAnalyzer:
             return f"买入-极值J线反转 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_bottom_divergence_cross(self, df):
+    def _check_bottom_divergence_cross(self, df: pd.DataFrame) -> str | None:
         """检查底背离金叉"""
         current_k = df["k_value"].iloc[-1]
         current_low = df["low"].iloc[-1]
@@ -87,10 +92,10 @@ class AdvancedKDJAnalyzer:
             return f"买入-底背离金叉 (K={current_k:.1f}, J={df['j_value'].iloc[-1]:.1f})"
         return None
 
-    def _check_trend_confirmation_cross(self, df):
+    def _check_trend_confirmation_cross(self, df: pd.DataFrame) -> str | None:
         """检查趋势确认金叉"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         had_oversold = (df["k_value"].iloc[-5:-1] < 20).any() and (df["d_value"].iloc[-5:-1] < 20).any()
         above_ma5 = df["close"].iloc[-1] > df["close"].rolling(window=5).mean().iloc[-1]
 
@@ -98,47 +103,47 @@ class AdvancedKDJAnalyzer:
             return f"买入-趋势确认金叉 (K={current_k:.1f}, J={df['j_value'].iloc[-1]:.1f})"
         return None
 
-    def _check_oversold_cross(self, df):
+    def _check_oversold_cross(self, df: pd.DataFrame) -> str | None:
         """检查低位超卖金叉"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         had_oversold = (df["k_value"].iloc[-5:-1] < 20).any() and (df["d_value"].iloc[-5:-1] < 20).any()
 
         if had_oversold and df["golden_cross"].iloc[-1]:
             return f"买入-低位超卖金叉 (K={current_k:.1f}, J={df['j_value'].iloc[-1]:.1f})"
         return None
 
-    def _check_deep_oversold_bounce(self, df):
+    def _check_deep_oversold_bounce(self, df: pd.DataFrame) -> str | None:
         """检查深度超卖反弹"""
         current_k = df["k_value"].iloc[-1]
         current_d = df["d_value"].iloc[-1]
-        current_j = df["j_value"].iloc[-1]
+        _current_j = df["j_value"].iloc[-1]
 
         if current_k < 10 and current_d < 10 and df["golden_cross"].iloc[-1]:
             return f"买入-深度超卖反弹 (K={current_k:.1f}, J={df['j_value'].iloc[-1]:.1f})"
         return None
 
-    def _check_j_top_turn(self, df):
+    def _check_j_top_turn(self, df: pd.DataFrame) -> str | None:
         """检查J线高位拐头"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         if current_j > 100 and df["j_slope"].iloc[-1] < 0 and df["j_slope"].iloc[-2] > 0:
             return f"卖出-J线高位拐头 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_k_rapid_rise(self, df):
+    def _check_k_rapid_rise(self, df: pd.DataFrame) -> str | None:
         """检查K线快速拉升"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         if df["k_slope"].iloc[-1] > 8 and df["k_slope"].iloc[-2] < 3 and current_k < 80:
             return f"观望-K线快速拉升 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_three_line_convergence_breakout(self, df):
+    def _check_three_line_convergence_breakout(self, df: pd.DataFrame) -> str | None:
         """检查三线聚合突破"""
         current_k = df["k_value"].iloc[-1]
         current_d = df["d_value"].iloc[-1]
@@ -149,10 +154,10 @@ class AdvancedKDJAnalyzer:
                 return f"买入-三线聚合向上突破 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_death_cross_support(self, df):
+    def _check_death_cross_support(self, df: pd.DataFrame) -> str | None:
         """检查死叉回踩支撑"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         if df["death_cross"].iloc[-1] and current_k > 20 and current_k < 50:
@@ -161,10 +166,10 @@ class AdvancedKDJAnalyzer:
                 return f"观望-死叉回踩支撑 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_j_limit_regression(self, df):
+    def _check_j_limit_regression(self, df: pd.DataFrame) -> str | None:
         """检查J线极限值回归"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         if current_j > 120 or current_j < -20:
@@ -174,10 +179,10 @@ class AdvancedKDJAnalyzer:
                 return f"买入-J线超卖回归 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_divergence_signal(self, df):
+    def _check_divergence_signal(self, df: pd.DataFrame) -> str | None:
         """检查背离信号"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         price_change = df["close"].iloc[-1] - df["close"].iloc[-2]  # 价格变化值
@@ -188,24 +193,24 @@ class AdvancedKDJAnalyzer:
             return f"买入-底背离信号 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_oscillation_breakout(self, df):
+    def _check_oscillation_breakout(self, df: pd.DataFrame) -> str | None:
         """检查振荡区间突破"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         lookback = 20
         k_max = df["k_value"].iloc[-lookback:].max()
-        k_min = df["k_value"].iloc[-lookback:].min()
+        _k_min = df["k_value"].iloc[-lookback:].min()
 
         if current_k > k_max * 0.95 and df["k_slope"].iloc[-1] > 0:
             return f"买入-振荡区间向上突破 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_kdj_synchronization(self, df):
+    def _check_kdj_synchronization(self, df: pd.DataFrame) -> str | None:
         """检查KDJ三线同步"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         k_positive = df["k_slope"].iloc[-1] > 0
@@ -216,10 +221,10 @@ class AdvancedKDJAnalyzer:
             return f"观望-KDJ三线同向上 (K={current_k:.1f}, J={current_j:.1f})"
         return None
 
-    def _check_oversold_recovery(self, df):
+    def _check_oversold_recovery(self, df: pd.DataFrame) -> str | None:
         """检查超卖修复启动"""
         current_k = df["k_value"].iloc[-1]
-        current_d = df["d_value"].iloc[-1]
+        _current_d = df["d_value"].iloc[-1]
         current_j = df["j_value"].iloc[-1]
 
         oversold_period = sum(df["k_value"] < 20)
@@ -265,4 +270,4 @@ if __name__ == "__main__":
 
     analyzer = AdvancedKDJAnalyzer()
     result = analyzer.calculate_kdj_signal_from_df(test_df)
-    print(f"检测到的信号: {result}")
+    logger.info(f"检测到的信号: {result}")

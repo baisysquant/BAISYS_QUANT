@@ -1,16 +1,18 @@
-﻿import logging
+﻿from __future__ import annotations
+
 import time
 from datetime import datetime
+from typing import Any
 
-import pandas as pd
 import akshare as ak
-
+import pandas as pd
+from loguru import logger
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DatabaseWriter import QuantDBManager
-from UtilsManager.Exceptions import DatabaseError, DatabaseConnectionError
+from UtilsManager.Exceptions import DatabaseConnectionError, DatabaseError
 
 
 class StockBasicInfoService:
@@ -18,7 +20,7 @@ class StockBasicInfoService:
 
     TABLE_NAME = "stock_basic_info_sw"
 
-    def __init__(self, config_parser: Config):
+    def __init__(self, config_parser: Config) -> None:
         self.config_parser = config_parser
         self.system_config = self._get_system_config_from_attributes(config_parser)
         self.logger = self._setup_logger()
@@ -27,47 +29,28 @@ class StockBasicInfoService:
         self.db_manager = None
         self.trading_calendar = TradingCalendarAnalyzer()
 
-    def _get_system_config_from_attributes(self, config_parser) -> dict:
+    def _get_system_config_from_attributes(self, config_parser: Config) -> dict:
         return {
             "max_workers": config_parser.MAX_WORKERS,
             "data_fetch_retries": config_parser.DATA_FETCH_RETRIES,
             "data_fetch_delay": config_parser.DATA_FETCH_DELAY,
         }
 
-    def _setup_logger(self) -> logging.Logger:
-        logger = logging.getLogger(__name__)
-        logger.setLevel(logging.INFO)
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-            handler.setFormatter(formatter)
-            logger.addHandler(handler)
+    def _setup_logger(self) -> Any:  # noqa: ANN401
         return logger
 
-    def _initialize_database(self):
+    def _initialize_database(self) -> None:
         """初始化数据库连接"""
-        db_config = {
-            "user": self.config_parser.DB_USER,
-            "password": self.config_parser.DB_PASSWORD,
-            "host": self.config_parser.DB_HOST,
-            "port": self.config_parser.DB_PORT,
-            "database": self.config_parser.DB_NAME,
-        }
-        # 使用你现有的 QuantDBManager 初始化方式
+        # 注入全局共享引擎
         try:
-            self.db_manager = QuantDBManager(
-                db_config["user"],
-                db_config["password"],
-                db_config["host"],
-                db_config["port"],
-                db_config["database"]
-            )
+            from DataManager.DbEngine import get_engine as _get_engine
+            self.db_manager = QuantDBManager(engine=_get_engine(self.config_parser))
             self.logger.info("数据库连接初始化成功")
         except (DBAPIError, OperationalError, DatabaseError) as e:
             self.logger.error(f"数据库连接初始化失败: {e!s}")
             raise DatabaseConnectionError(str(e)) from e
 
-    def _get_latest_data_date(self):
+    def _get_latest_data_date(self) -> Any | None:  # noqa: ANN401
         """获取表中最新的 record_date"""
         if not self.db_manager:
             self._initialize_database()

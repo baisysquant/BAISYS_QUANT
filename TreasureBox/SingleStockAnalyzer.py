@@ -13,10 +13,11 @@
 依赖：akshare, pandas, pandas-ta
 """
 
-import sys
+from __future__ import annotations
+
 import os
+import sys
 import time
-import random
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -29,43 +30,34 @@ if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
     except Exception:
         pass
 
-import pandas as pd
 import traceback
-import akshare as ak
 
+import akshare as ak
+import pandas as pd
 
 # ── 从项目现有模块导入 ─────────────────────────────────────────────────────
-from DataManager.ShareCodeFormatMgr import format_stock_code
 from ConfigParser import Config
-
-
-def extract_pure_code(code: str) -> str:
-    code_str = str(code).lower()
-    for prefix in ("sh", "sz", "bj"):
-        if code_str.startswith(prefix):
-            return code_str[len(prefix) :]
-    return code_str.zfill(6)
-
+from UtilsManager.CodeNormalizer import CodeNormalizer
 
 # ── 打印辅助函数 ───────────────────────────────────────────────────────────
 WIDTH = 68
 
 
-def print_header():
+def print_header() -> None:
     print()
     print("=" * WIDTH)
     print("  单只股票技术指标分析工具")
     print("=" * WIDTH)
 
 
-def print_section(title: str):
+def print_section(title: str) -> None:
     print()
     print("-" * WIDTH)
     print(f"  {title}")
     print("-" * WIDTH)
 
 
-def print_field(label: str, value: Any):
+def print_field(label: str, value: Any) -> None:  # noqa: ANN401
     if value is not None and str(value).strip():
         print(f"    {label:<26} : {value}")
 
@@ -140,21 +132,21 @@ def fetch_kline_data(symbol: str, days: int = 300) -> pd.DataFrame | None:
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────
-def main():
+def main() -> None:
     print_header()
 
     # 1. 用户输入 ──────────────────────────────────────────────────────
     if len(sys.argv) > 1:
         raw_code = sys.argv[1]
     else:
-        raw_code = input(f"\n  请输入股票代码 (6位数字，如 000001): ").strip()
+        raw_code = input("\n  请输入股票代码 (6位数字，如 000001): ").strip()
 
     if not raw_code:
         print("  [ERROR] 未输入股票代码")
         return
 
-    pure_code = extract_pure_code(raw_code)
-    symbol = format_stock_code(raw_code)
+    pure_code = CodeNormalizer.normalize(raw_code)
+    symbol = CodeNormalizer.add_market_prefix(raw_code)
     print(f"\n  [-] 股票代码: {pure_code}  ({symbol})")
 
     # 2. 获取 K 线数据 ────────────────────────────────────────────────

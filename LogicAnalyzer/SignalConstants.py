@@ -6,6 +6,10 @@
 所有业务模块应引用此类而非直接书写字面量。
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 
 class MACDSignals:
     """MACD 金叉/死叉信号"""
@@ -19,12 +23,12 @@ class MACDSignals:
     BEAR_DEATH_CROSS = "空头/死叉"
 
     @classmethod
-    def golden_cross_label(cls, dif, dea):
+    def golden_cross_label(cls, dif: Any, dea: Any) -> Any:  # noqa: ANN401
         import numpy as np
         return np.where((dif > 0) & (dea > 0), cls.GOLDEN_CROSS_ABOVE_ZERO, cls.GOLDEN_CROSS_BELOW_ZERO)
 
     @classmethod
-    def death_cross_label(cls, dead, dif, dea):
+    def death_cross_label(cls, dead: Any, dif: Any, dea: Any) -> Any:  # noqa: ANN401
         import numpy as np
         return np.where(dead, np.where((dif < 0) & (dea < 0), cls.DEATH_CROSS_BELOW_ZERO, cls.DEATH_CROSS_ABOVE_ZERO), "")
 
@@ -55,7 +59,7 @@ class TrendLevels:
     TREND_WATCH = "趋势观望"
 
     @classmethod
-    def all_levels(cls):
+    def all_levels(cls) -> list[str]:
         return [cls.FULL_BULL, cls.TREND_ACCELERATION, cls.TREND_OSCILLATION, cls.TREND_WATCH]
 
 

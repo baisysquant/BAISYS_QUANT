@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 import json
 import os
@@ -10,7 +11,7 @@ from loguru import logger
 
 
 class TradingCalendarAnalyzer:
-    def __init__(self, cache_dir: str = "./cache"):
+    def __init__(self, cache_dir: str = "./cache") -> None:
         self.beijing_tz = pytz.timezone("Asia/Shanghai")
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -23,7 +24,7 @@ class TradingCalendarAnalyzer:
         self._cached_dates = None
         self._cache_load_time = None
 
-    def _fetch_from_akshare(self):
+    def _fetch_from_akshare(self) -> set[str] | None:
         try:
             logger.info("[Calendar] 正在从 Akshare 接口获取最新的官方交易日历...")
             df = ak.tool_trade_date_hist_sina()
@@ -41,7 +42,7 @@ class TradingCalendarAnalyzer:
             logger.error(f"[Calendar ERROR] Akshare 接口调用失败: {e}")
             return None
 
-    def _load_from_cache(self):
+    def _load_from_cache(self) -> set[str] | None:
         if os.path.exists(self.cache_path):
             try:
                 file_stat = os.stat(self.cache_path)
@@ -60,7 +61,7 @@ class TradingCalendarAnalyzer:
             logger.info(f"[Calendar] 本地缓存文件不存在: {self.cache_path}")
         return None
 
-    def _save_to_cache(self, dates: set[str]):
+    def _save_to_cache(self, dates: set[str]) -> None:
         try:
             data = {
                 "last_updated": datetime.now().isoformat(),
@@ -73,7 +74,7 @@ class TradingCalendarAnalyzer:
         except (OSError, PermissionError, TypeError) as e:
             logger.error(f"[Calendar ERROR] 保存缓存失败: {e}")
 
-    def get_official_trading_dates(self):
+    def get_official_trading_dates(self) -> set[str]:
         if self._cached_dates is not None and self._cache_load_time is not None:
             memory_age = datetime.now().timestamp() - self._cache_load_time
             if memory_age < self.cache_ttl:

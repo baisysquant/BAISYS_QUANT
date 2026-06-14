@@ -1,18 +1,21 @@
 """
 统一缓存管理器
 
-提供一致的缓存读写接口，支持：
-- 统一的缓存命名规范
+特性：
+- 统一的缓存目录
 - 自动缓存验证
 - 灵活的失效策略
 - 缓存监控和统计
-- 向后兼容 CacheManager 旧版 API
+- CSV 文件缓存 API（load_cache / save_cache / cache_exists / get_cache_path）
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -41,7 +44,7 @@ class CacheConfig:
         max_size_mb: float = 100.0,
         compress: bool = False,
         validate_on_load: bool = True,
-    ):
+    ) -> None:
         self.strategy = strategy
         self.ttl_seconds = ttl_seconds
         self.max_size_mb = max_size_mb
@@ -52,7 +55,7 @@ class CacheConfig:
 class CacheEntry:
     """缓存条目元数据"""
 
-    def __init__(self, key: str, created_at: float, size_bytes: int, metadata: dict | None = None):
+    def __init__(self, key: str, created_at: float, size_bytes: int, metadata: dict | None = None) -> None:
         self.key = key
         self.created_at = created_at
         self.size_bytes = size_bytes
@@ -101,7 +104,7 @@ class UnifiedCacheManager:
     - 多种失效策略
     - 自动缓存验证
     - 缓存统计和监控
-    - 向后兼容旧版 CacheManager API（load_cache/save_cache/cache_exists/get_cache_path）
+    - 兼容 CSV 文件缓存（load_cache/save_cache/cache_exists/get_cache_path）
     """
 
     def __init__(
@@ -110,14 +113,14 @@ class UnifiedCacheManager:
         default_strategy: str = CacheStrategy.DAILY,
         auto_cleanup: bool = True,
         today_str: str | None = None,
-    ):
+    ) -> None:
         """
         Args:
             cache_dir: 缓存根目录
             default_strategy: 默认缓存策略
             auto_cleanup: 是否自动清理过期缓存
             today_str: 业务日期字符串（YYYYMMDD 或 YYYY-MM-DD），
-                       仅用于旧版兼容 API 的文件命名。
+                       用于 CSV 文件缓存命名的日期后缀。
                        不传时自动取当前日期。
         """
         self.cache_dir = Path(cache_dir).expanduser()
@@ -132,17 +135,17 @@ class UnifiedCacheManager:
         if auto_cleanup:
             self.cleanup_expired()
 
-    # ── 旧版 CacheManager 兼容方法 ────────────────────────────────────────
+    # ── CSV 文件缓存方法 ──────────────────────────────────────────────────
 
     def _resolve_today(self) -> str:
-        """获取用于旧版文件命名的日期字符串（纯数字 YYYYMMDD）"""
+        """获取用于文件命名的日期字符串（纯数字 YYYYMMDD）"""
         if self._today_str:
             return self._today_str.replace("-", "")
         return datetime.now().strftime("%Y%m%d")
 
     def _compat_file_path(self, base_name: str, cleaned: bool = False, suffix: str = ".txt") -> str:
         """
-        生成与旧版 CacheManager 完全相同的文件路径。
+        生成缓存文件路径。
         格式: {base_name}{_经清洗}_{todayYYYYMMDD}{suffix}
         """
         clean_suffix = "_经清洗" if cleaned else ""
@@ -158,7 +161,7 @@ class UnifiedCacheManager:
         dtype_mapping: dict | None = None,
     ) -> pd.DataFrame:
         """
-        旧版兼容：从缓存加载数据（与 CacheManager.load_cache 签名一致）
+        从 CSV 缓存文件加载数据
 
         Args:
             base_name: 文件基础名称
@@ -195,7 +198,7 @@ class UnifiedCacheManager:
         self, df: pd.DataFrame, base_name: str, cleaned: bool = True, sep: str = "|", encoding: str = "utf-8"
     ) -> bool:
         """
-        旧版兼容：保存数据到缓存（与 CacheManager.save_cache 签名一致）
+        保存数据到 CSV 缓存文件
 
         Args:
             df: 要保存的 DataFrame
@@ -223,7 +226,7 @@ class UnifiedCacheManager:
 
     def cache_exists(self, base_name: str, cleaned: bool = True) -> bool:
         """
-        旧版兼容：检查缓存文件是否存在
+        检查 CSV 缓存文件是否存在
 
         Args:
             base_name: 文件基础名称
@@ -237,7 +240,7 @@ class UnifiedCacheManager:
 
     def get_cache_path(self, base_name: str, cleaned: bool = True, suffix: str = ".txt") -> str:
         """
-        旧版兼容：获取缓存文件的完整路径（不检查是否存在）
+        获取缓存文件的完整路径（不检查是否存在）
 
         Args:
             base_name: 文件基础名称
@@ -276,7 +279,7 @@ class UnifiedCacheManager:
         """获取元数据文件路径"""
         return self.cache_dir / f"{key}.meta.json"
 
-    def _save_metadata(self, key: str, entry: CacheEntry):
+    def _save_metadata(self, key: str, entry: CacheEntry) -> None:
         """保存缓存元数据"""
         meta_path = self._get_metadata_path(key)
         try:
@@ -362,7 +365,7 @@ class UnifiedCacheManager:
             return False
 
     def load_dataframe(
-        self, name: str, config: CacheConfig = None, params: dict = None, validate_func=None
+        self, name: str, config: CacheConfig | None = None, params: dict | None = None, validate_func: Callable[[pd.DataFrame], bool] | None = None
     ) -> pd.DataFrame | None:
         """
         从缓存加载DataFrame
@@ -492,7 +495,7 @@ class UnifiedCacheManager:
             self.stats["misses"] += 1
             return None
 
-    def invalidate(self, name: str, params: dict = None):
+    def invalidate(self, name: str, params: dict | None = None) -> None:
         """
         手动使缓存失效
 
@@ -504,7 +507,7 @@ class UnifiedCacheManager:
         self._remove_cache(key)
         logger.info(f"缓存已手动清除: {name}")
 
-    def clear_all(self):
+    def clear_all(self) -> None:
         """清除所有缓存"""
         for file in self.cache_dir.glob("*"):
             if file.is_file():
@@ -513,7 +516,7 @@ class UnifiedCacheManager:
         self.stats["cleanups"] += 1
         logger.info(f"所有缓存已清除: {self.cache_dir}")
 
-    def cleanup_expired(self):
+    def cleanup_expired(self) -> None:
         """清理所有过期的缓存"""
         config = CacheConfig(strategy=self.default_strategy)
         cleaned_count = 0
@@ -534,7 +537,7 @@ class UnifiedCacheManager:
             self.stats["cleanups"] += 1
             logger.info(f"已清理 {cleaned_count} 个过期缓存")
 
-    def _remove_cache(self, key: str):
+    def _remove_cache(self, key: str) -> None:
         """删除缓存文件及其元数据"""
         cache_path = self._get_cache_path(key)
         meta_path = self._get_metadata_path(key)
@@ -562,17 +565,17 @@ class UnifiedCacheManager:
             ),
         }
 
-    def print_stats(self):
+    def print_stats(self) -> None:
         """打印缓存统计信息"""
         stats = self.get_stats()
-        print("\n" + "=" * 60)
-        print(" 缓存统计信息")
-        print("=" * 60)
-        print(f"  缓存命中次数: {stats['hits']}")
-        print(f"  缓存未命中次数: {stats['misses']}")
-        print(f"  缓存写入次数: {stats['writes']}")
-        print(f"  缓存清理次数: {stats['cleanups']}")
-        print(f"  命中率: {stats['hit_rate']:.2%}")
-        print(f"  缓存文件总数: {stats['cache_files']}")
-        print(f"  总文件数: {stats['total_files']}")
-        print("=" * 60 + "\n")
+        logger.info("\n" + "=" * 60)
+        logger.info(" 缓存统计信息")
+        logger.info("=" * 60)
+        logger.info(f"  缓存命中次数: {stats['hits']}")
+        logger.info(f"  缓存未命中次数: {stats['misses']}")
+        logger.info(f"  缓存写入次数: {stats['writes']}")
+        logger.info(f"  缓存清理次数: {stats['cleanups']}")
+        logger.info(f"  命中率: {stats['hit_rate']:.2%}")
+        logger.info(f"  缓存文件总数: {stats['cache_files']}")
+        logger.info(f"  总文件数: {stats['total_files']}")
+        logger.info("=" * 60 + "\n")

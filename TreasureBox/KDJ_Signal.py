@@ -1,4 +1,6 @@
-﻿import os
+﻿from __future__ import annotations
+
+import os
 import sys
 
 # 将项目根目录加入系统路径，支持直接运行此脚本
@@ -66,7 +68,7 @@ if __name__ == "__main__":
         exit()
 
     # --- 4.2 股票代码映射处理 (添加交易所前缀) ---
-    def add_exchange_prefix(stock_code):
+    def add_exchange_prefix(stock_code: str) -> str:
         stock_str = str(stock_code).strip()
         if stock_str.startswith("6"):
             return f"sh{stock_str}"

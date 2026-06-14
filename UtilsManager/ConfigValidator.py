@@ -16,6 +16,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
+from loguru import logger
 
 # ── 硬编码 Section 默认模板（含注释，修复时直接追加） ────────────────────────
 
@@ -164,14 +165,14 @@ class ValidationReport:
 
     def print_summary(self) -> None:
         if not self.issues:
-            print("[配置校验] config.ini 全部检查通过")
+            logger.info("config.ini 全部检查通过")
             return
 
         errors = [i for i in self.issues if i.severity == Severity.ERROR]
         warnings = [i for i in self.issues if i.severity == Severity.WARNING]
 
         if errors:
-            print(f"\n[配置校验] 发现 {len(errors)} 个错误（将自动修复）：")
+            logger.info(f"\n发现 {len(errors)} 个错误（将自动修复）：")
             for i, iss in enumerate(errors, 1):
                 if iss.field:
                     print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
@@ -181,7 +182,7 @@ class ValidationReport:
                     print(f"  [{i}] [{iss.section}]: {iss.message}")
 
         if warnings:
-            print(f"\n[配置校验] 发现 {len(warnings)} 个警告（不影响运行，建议修正）：")
+            logger.info(f"\n发现 {len(warnings)} 个警告（不影响运行，建议修正）：")
             for i, iss in enumerate(warnings, 1):
                 if iss.field:
                     print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
@@ -192,7 +193,7 @@ class ValidationReport:
                 if iss.expected:
                     print(f"       推荐: {iss.expected}")
 
-        print()
+        logger.info("")
 
 
 # ── 字段校验规则定义 ──────────────────────────────────────────────────────────
@@ -424,7 +425,7 @@ def _type_check(raw: str, rule: FieldRule, issues: list[Issue], section: str) ->
     elif rule.type_hint == "bool":
         if raw.lower() not in ("true", "false", "1", "0", "yes", "no"):
             issues.append(Issue(section=section, field=rule.name, severity=Severity.WARNING,
-                                message=f"应为 true/false", actual_value=raw))
+                                message="应为 true/false", actual_value=raw))
     return True
 
 
@@ -580,9 +581,6 @@ def auto_repair(config_path: str = "config.ini") -> int:
             missing_sections.add(iss.section)
 
     # 1. 补充缺失 Section（确保文件以换行结尾）
-    trailing = "\n"
-    if lines and lines[-1].endswith("\n"):
-        trailing = ""
     need_newline = lines and not lines[-1].endswith("\n")
 
     for sr in SECTION_RULES:
@@ -634,17 +632,17 @@ def auto_repair(config_path: str = "config.ini") -> int:
     try:
         shutil.copy2(config_path, bak_path)
     except (OSError, shutil.Error):
-        print(f"[配置修复] 备份失败: {bak_path}")
+        logger.info(f"备份失败: {bak_path}")
         return 0
 
     # 4. 写回
     with open(config_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
-    print(f"[配置修复] 已备份原文件至 {bak_path}")
+    logger.info(f"已备份原文件至 {bak_path}")
     for op in ops:
         print(f"  + {op}")
-    print(f"[配置修复] 共修复 {len(ops)} 项\n")
+    logger.info(f"共修复 {len(ops)} 项\n")
     return len(ops)
 
 

@@ -4,8 +4,11 @@
 负责Excel报告生成、TXT信号文件保存和数据库同步。
 """
 
-import os
+from __future__ import annotations
+
 import datetime
+import os
+from typing import Any
 
 import pandas as pd
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -28,7 +31,7 @@ class ReportService:
         logger: 日志管理器
     """
 
-    def __init__(self, config, logger):
+    def __init__(self, config: Any, logger: Any) -> None:  # noqa: ANN401
         """
         初始化报告生成服务
         
@@ -59,7 +62,7 @@ class ReportService:
             return set()
 
     @staticmethod
-    def get_base_columns():
+    def get_base_columns() -> list:
         return [
             ColumnNames.STOCK_CODE,
             ColumnNames.STOCK_NAME,
@@ -98,6 +101,7 @@ class ReportService:
             ColumnNames.DIVERGENCE_DAYS,
             ColumnNames.DIVERGENCE_PRICE,
             ColumnNames.RISK_LEVEL,
+            "宏观风险",
         ]
         return cols
 
@@ -307,14 +311,9 @@ class ReportService:
         """
         try:
             from DataManager import DatabaseWriter, QuantDataPerformer
+            from DataManager.DbEngine import get_engine as _get_engine
 
-            db_manager = DatabaseWriter.QuantDBManager(
-                user=self.config.DB_USER,
-                password=self.config.DB_PASSWORD,
-                host=self.config.DB_HOST,
-                port=self.config.DB_PORT,
-                db_name=self.config.DB_NAME,
-            )
+            db_manager = DatabaseWriter.QuantDBManager(engine=_get_engine(self.config))
 
             sync_task = QuantDataPerformer.QuantDBSyncTask(db_manager)
 
@@ -325,7 +324,6 @@ class ReportService:
                 raw_data=raw_data,
             )
 
-            db_manager.close()
             self.logger.info("数据库同步成功完成。")
 
             return True

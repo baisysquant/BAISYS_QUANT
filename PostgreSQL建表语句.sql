@@ -22,3 +22,7 @@ CREATE TABLE public.stock_basic_info_sw ( id serial4 NOT NULL, industry_code var
 CREATE INDEX idx_sbi_industry_name ON public.stock_basic_info_sw USING btree (industry_name);
 CREATE INDEX idx_sbi_record_date ON public.stock_basic_info_sw USING btree (record_date);
 CREATE INDEX idx_sbi_stock_code ON public.stock_basic_info_sw USING btree (stock_code);
+
+-- ── v1.1.0 migration: 复权因子列 ──────────────────────────────
+ALTER TABLE public.stock_daily_kline ADD COLUMN IF NOT EXISTS adj_factor float8 DEFAULT 1.0;
+UPDATE public.stock_daily_kline SET adj_factor = COALESCE(adj_ratio, 1.0) WHERE adj_factor = 1.0 AND adj_ratio IS NOT NULL;

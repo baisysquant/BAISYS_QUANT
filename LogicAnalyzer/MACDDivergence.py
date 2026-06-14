@@ -98,9 +98,9 @@ def volume_confirmation(df: pd.DataFrame, signal_type: str | None, signal_idx: i
         return "量价正常"
     vol_ratio = recent_vol / hist_vol
     if signal_type == Divergence.BOTTOM_DIVERGENCE:
-        return f"底背离：量能放大（vol_ratio >= 1.2）→ 确认买入" if vol_ratio >= 1.2 else f"底背离：量能不足（vol_ratio={vol_ratio:.2f}）→ 需等待"
+        return "底背离：量能放大（vol_ratio >= 1.2）→ 确认买入" if vol_ratio >= 1.2 else f"底背离：量能不足（vol_ratio={vol_ratio:.2f}）→ 需等待"
     else:
-        return f"顶背离：量能萎缩（vol_ratio <= 0.8）→ 确认卖出" if vol_ratio <= 0.8 else f"顶背离：量能正常（vol_ratio={vol_ratio:.2f}）→ 需观察"
+        return "顶背离：量能萎缩（vol_ratio <= 0.8）→ 确认卖出" if vol_ratio <= 0.8 else f"顶背离：量能正常（vol_ratio={vol_ratio:.2f}）→ 需观察"
 
 
 

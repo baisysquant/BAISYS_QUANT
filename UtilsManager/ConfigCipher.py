@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
@@ -24,7 +26,7 @@ class ConfigCipher:
 
     default_key_path: str | Path | None = None
 
-    def __init__(self, key_path: str | Path | None = None):
+    def __init__(self, key_path: str | Path | None = None) -> None:
         self._key_path = key_path or ConfigCipher.default_key_path or Path.home() / ".baisys_quant_key"
         self._fernet: Fernet | None = None
 
@@ -79,7 +81,7 @@ class ConfigCipher:
         return value
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 3 or sys.argv[1] not in ("encrypt", "decrypt"):
         print("用法: python -m UtilsManager.ConfigCipher encrypt|decrypt <文本>")
         sys.exit(1)
