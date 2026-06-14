@@ -672,6 +672,7 @@ class StockSyncEngine:
         # 【全 A 股模式】使用增量同步引擎，直接写入 stock_daily_kline
         if full_a_share:
             from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+            from UtilsManager.CodeNormalizer import CodeNormalizer
 
             engine = IncrementalSyncEngine(self.db)
             akshare_symbols = [CodeNormalizer.add_market_prefix(code) for code in sorted(final_codes)]

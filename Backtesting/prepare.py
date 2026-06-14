@@ -36,8 +36,10 @@ def prepare_backtest_data(
     analyzer = MACDAnalyzer()
     result_rows: list[dict[str, Any]] = []
 
+    from tqdm import tqdm
+
     symbols = kline_df["symbol"].unique()
-    for sym in symbols:
+    for sym in tqdm(symbols, desc="预计算信号", unit="只", ncols=80):
         stock_df = kline_df[kline_df["symbol"] == sym].sort_values("trade_date").copy()
         if len(stock_df) < 60:
             continue

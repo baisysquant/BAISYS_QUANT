@@ -193,6 +193,9 @@ def _fetch_kline(
 
     ensure_table(engine)
 
+    # 补齐缺失股票的历史 K 线
+    _sync_missing_stocks(engine, symbols, config)
+
     end = date.today()
     start = end - timedelta(days=lookback_days * 3)
 
@@ -202,6 +205,25 @@ def _fetch_kline(
         return df
     df = df.sort_values(["symbol", "trade_date"])
     return df
+
+
+def _sync_missing_stocks(engine: Any, symbols: list[str], config: Config) -> None:
+    """补齐 stock_daily_kline 中缺失股票的历史 K 线。"""
+    with engine.connect() as conn:
+        existing = {
+            r[0] for r in
+            conn.execute(text("SELECT DISTINCT symbol FROM stock_daily_kline")).fetchall()
+        }
+    missing = [s for s in symbols if s not in existing]
+    if not missing:
+        logger.info(f"  stock_daily_kline 已包含全部 {len(symbols)} 只股票，无需补齐")
+        return
+
+    logger.info(f"  stock_daily_kline 缺少 {len(missing)} 只股票，开始补齐...")
+    from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+    syncer = IncrementalSyncEngine(engine)
+    inserted = syncer.sync_all(missing)
+    logger.info(f"  补齐完成，新增 {inserted} 行")
 
 
 def _extract_best_params(wf_result: pd.DataFrame) -> dict[str, float]:

@@ -10,6 +10,14 @@ from sqlalchemy import text
 
 from UtilsManager.CodeNormalizer import CodeNormalizer
 
+
+def _strip_prefix(symbol: str) -> str:
+    """去掉 sh/sz/bj 前缀，返回纯数字代码。"""
+    for prefix in ("sh", "sz", "bj"):
+        if symbol.startswith(prefix):
+            return symbol[len(prefix):]
+    return symbol
+
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 20
 
@@ -35,7 +43,7 @@ class IncrementalSyncEngine:
     # ── 单只股票同步 ──────────────────────────────────────────
 
     def _sync_one(self, symbol: str) -> int:
-        pure = CodeNormalizer.strip_market_prefix(symbol)
+        pure = _strip_prefix(symbol)
         latest = self._get_latest_date(symbol)
 
         if latest is None:
