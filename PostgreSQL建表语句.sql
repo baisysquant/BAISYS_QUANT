@@ -26,3 +26,36 @@ CREATE INDEX idx_sbi_stock_code ON public.stock_basic_info_sw USING btree (stock
 -- ── v1.1.0 migration: 复权因子列 ──────────────────────────────
 ALTER TABLE public.stock_daily_kline ADD COLUMN IF NOT EXISTS adj_factor float8 DEFAULT 1.0;
 UPDATE public.stock_daily_kline SET adj_factor = COALESCE(adj_ratio, 1.0) WHERE adj_factor = 1.0 AND adj_ratio IS NOT NULL;
+
+-- backtest_kline 定义
+CREATE TABLE IF NOT EXISTS public.backtest_kline (
+    symbol       VARCHAR(16)    NOT NULL,
+    trade_date   DATE           NOT NULL,
+    open         NUMERIC(12,2)  NOT NULL,
+    high         NUMERIC(12,2)  NOT NULL,
+    low          NUMERIC(12,2)  NOT NULL,
+    close        NUMERIC(12,2)  NOT NULL,
+    volume       NUMERIC(20,0)  NOT NULL,
+    amount       NUMERIC(20,2)  NOT NULL,
+    adj_factor   NUMERIC(10,6),
+    PRIMARY KEY (symbol, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_kline_date    ON public.backtest_kline (trade_date);
+CREATE INDEX IF NOT EXISTS idx_backtest_kline_symbol  ON public.backtest_kline (symbol);
+
+-- backtest_calibration_log 定义
+CREATE TABLE IF NOT EXISTS public.backtest_calibration_log (
+    id              SERIAL PRIMARY KEY,
+    run_time        TIMESTAMP   NOT NULL DEFAULT NOW(),
+    frequency       VARCHAR(16) NOT NULL,
+    lookback_days   INT         NOT NULL,
+    out_of_sample_days INT      NOT NULL,
+    initial_cash    NUMERIC(14,2) NOT NULL,
+    params          JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    sharpe          NUMERIC(8,4),
+    total_return    NUMERIC(8,4),
+    max_drawdown    NUMERIC(8,4),
+    status          VARCHAR(16) NOT NULL DEFAULT 'success'
+);
+CREATE INDEX IF NOT EXISTS idx_backtest_calibration_log_run_time
+    ON public.backtest_calibration_log (run_time DESC);

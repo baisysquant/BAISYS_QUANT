@@ -125,8 +125,9 @@ class MACDAnalyzer:
         if 'ADX' not in df.columns:
             try:
                 adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-                for c in adx_df.columns:
-                    df[c] = adx_df[c]
+                if adx_df is not None:
+                    for c in adx_df.columns:
+                        df[c] = adx_df[c].to_numpy()
             except Exception as e:
                 logger.warning(f"ADX 计算失败: {e}")
                 df['ADX_14'] = float('nan')
@@ -143,8 +144,9 @@ class MACDAnalyzer:
         if not any(c.startswith('STOCHk') for c in df.columns):
             try:
                 stoch_df = ta.stoch(df['high'], df['low'], df['close'], k=9, d=3)
-                for c in stoch_df.columns:
-                    df[c] = stoch_df[c]
+                if stoch_df is not None:
+                    for c in stoch_df.columns:
+                        df[c] = stoch_df[c].to_numpy()
             except Exception as e:
                 logger.warning(f"STOCH 计算失败: {e}")
 

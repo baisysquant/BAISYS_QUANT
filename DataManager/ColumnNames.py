@@ -67,6 +67,7 @@ class ColumnNames:
     VOLUME_INCREASE_DAYS = "放量天数"
 
     # ==================== 主力成本列 ====================
+    CHIP_95_PRICE = "95%筹码价"
     MAIN_COST = "主力成本"
     MAIN_COST_DIFF = "主力成本差价"
     COST_POSITION = "成本位置"

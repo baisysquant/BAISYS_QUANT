@@ -357,6 +357,43 @@ class TechnicalConstantsConfig(BaseModel):
                                     description="K线形态扫描窗口（根K线）")
 
 
+class BacktestConfig(BaseModel):
+    """回测系统配置模型"""
+
+    ENABLED: bool = True
+    OPTIMIZE_FREQUENCY: str = "monthly"
+    LOOKBACK_DAYS: int = Field(default=120, ge=30, le=500)
+    OUT_OF_SAMPLE_DAYS: int = Field(default=20, ge=5, le=120)
+    INITIAL_CASH: float = Field(default=1_000_000, gt=0)
+    FULL_A_SHARE_MODE: bool = Field(default=False)
+
+    # 待寻优参数范围（逗号分隔：min,max,step）
+    ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
+    ATR_T1_MULT_RANGE: str = "2.0,6.0,1.0"
+    KELLY_FRACTION_RANGE: str = "0.1,0.5,0.1"
+    POSITION_A_RANGE: str = "0.2,0.5,0.05"
+    LIQ_VETO_RATIO_RANGE: str = "0.03,0.10,0.01"
+    BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
+    CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
+
+    @field_validator("OPTIMIZE_FREQUENCY")
+    @classmethod
+    def validate_frequency(cls, v: str) -> str:
+        v_lower = v.lower().strip()
+        if v_lower not in ("monthly", "quarterly", "initial"):
+            msg = f"OPTIMIZE_FREQUENCY 必须为 monthly/quarterly/initial，收到 {v}"
+            raise ValueError(msg)
+        return v_lower
+
+    def parse_range(self, key: str) -> tuple[float, float, float]:
+        raw = getattr(self, key.upper(), "")
+        parts = [float(x.strip()) for x in raw.split(",")]
+        if len(parts) != 3:
+            msg = f"{key} 格式应为 min,max,step，收到 {raw!r}"
+            raise ValueError(msg)
+        return (parts[0], parts[1], parts[2])
+
+
 class PositionSizingConfig(BaseModel):
     """仓位管理配置模型"""
 
@@ -408,6 +445,7 @@ class AppConfig(BaseSettings):
     scoring_params: ScoringParamsConfig
     technical_constants: TechnicalConstantsConfig
     position_sizing: PositionSizingConfig
+    backtest: BacktestConfig
 
 
 class Config:
@@ -484,6 +522,7 @@ class Config:
             scoring_params=ScoringParamsConfig(**self._section_upper("SCORING_PARAMS")),
             technical_constants=TechnicalConstantsConfig(**self._section_upper("TECHNICAL_CONSTANTS")),
             position_sizing=PositionSizingConfig(**self._section_upper("POSITION_SIZING")),
+            backtest=BacktestConfig(**self._section_upper("BACKTEST")),
         )
 
     # ── 向后兼容属性（只读委托至 app_config） ──────────────────────────

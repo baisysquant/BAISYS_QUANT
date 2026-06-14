@@ -1,4 +1,4 @@
 import akshare as ak
 
-stock_zt_pool_strong_em_df = ak.stock_zt_pool_strong_em(date='20260607')
-print(stock_zt_pool_strong_em_df)
+stock_zh_a_hist_tx_df = ak.stock_zh_a_hist_tx(symbol="sz000001", start_date="20200101", end_date="20231027", adjust="")
+print(stock_zh_a_hist_tx_df)

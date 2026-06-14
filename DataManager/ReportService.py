@@ -69,6 +69,7 @@ class ReportService:
             ColumnNames.INDUSTRY,
             ColumnNames.INDUSTRY_SIGNAL,
             ColumnNames.LATEST_PRICE,
+            ColumnNames.CHIP_95_PRICE,
             ColumnNames.MAIN_COST,
             ColumnNames.COST_POSITION,
         ]

@@ -596,6 +596,10 @@ class StockAnalysisCoordinatorFactory:
 
         from UtilsManager.IDataProvider import LiveDataProvider
 
+        # 确保 stock_daily_kline 有 adj_factor 列
+        from Backtesting.sync import ensure_table
+        ensure_table(db_engine)
+
         data_provider = LiveDataProvider(db_engine=db_engine)
         data_acquisition = DataAcquisitionService(config, calendar_mgr, logger, cache_manager, executor=executor)
         fund_momentum_analyzer = FundMomentumAnalyzer()

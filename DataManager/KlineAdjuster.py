@@ -23,7 +23,7 @@ def get_adjusted_kline(
     symbols: list[str],
     start_date: str | None = None,
     end_date: str | None = None,
-    adj_type: str = "qfq",
+    adj_type: str = "hfq",
 ) -> pd.DataFrame:
     """从 stock_daily_kline 查询 K 线数据并按要求调整价格。
 

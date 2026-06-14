@@ -459,10 +459,11 @@ class DataMergeService:
         # MACD趋势综合评分（单参数，7维度+趋势分类+管线结论）
         macd_full_bull_df = processed_data.get("MACD_FULL_BULL", pd.DataFrame())
         if not macd_full_bull_df.empty and "股票代码" in macd_full_bull_df.columns:
+            macd_full_bull_df = macd_full_bull_df.rename(columns={"cost_95pct": ColumnNames.CHIP_95_PRICE})
             cols = ["股票代码"]
             for pipe_col in [ColumnNames.MACD_TREND, ColumnNames.MACD_CROSS, ColumnNames.MACD_HIST_MOMENTUM, ColumnNames.DIF_SLOPE, ColumnNames.DIVERGENCE_SIGNAL, ColumnNames.VOLUME_PRICE_CONFIRM, ColumnNames.KLINE_PATTERN,
                              ColumnNames.COMPREHENSIVE_ANALYSIS, ColumnNames.COMPREHENSIVE_SCORE, ColumnNames.COMPREHENSIVE_LEVEL, ColumnNames.RISK_LEVEL, ColumnNames.MACD_TREND_TYPE, "macd_trend",
-                             "cost_95pct", "资金流净额", "_current_dif",
+                             ColumnNames.CHIP_95_PRICE, "资金流净额", "_current_dif",
                              ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE,
                              ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR,
                              "position_adjust",

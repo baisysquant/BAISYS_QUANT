@@ -135,3 +135,38 @@ def _calc_moneyflow_score(mf_data: dict | None) -> tuple[int, str]:
     if divergence < -5:
         return -2, desc + '(主力温和流出)'
     return 0, desc
+
+
+def calc_entry_signal(df: pd.DataFrame, min_score: float = 60.0) -> pd.Series:
+    """按日入场信号判断。
+
+    基于 DataFrame 中已预计算的评分列（进场评分、综合评分、风险等级）
+    逐行判断是否应买入。
+
+    Args:
+        df: 多股票 DataFrame，每行一个股票一个交易日。
+             必须至少包含列：进场评分 或 综合评分。
+        min_score: 最低入场评分阈值（默认 60）。
+
+    Returns:
+        pd.Series[bool]: True 表示该股票当日应买入。
+    """
+    entry_series = pd.Series(False, index=df.index)
+
+    # 综合评分入场
+    score_col = None
+    for candidate in ("进场评分", "综合评分", "score"):
+        if candidate in df.columns:
+            score_col = candidate
+            break
+
+    if score_col:
+        score = pd.to_numeric(df[score_col], errors="coerce").fillna(0)
+        entry_series |= score >= min_score
+
+    # 风控过滤：高风险/弱势不买入
+    if "风险等级" in df.columns:
+        risk = df["风险等级"].astype(str).str.upper()
+        entry_series &= ~risk.isin({"HIGH", "D", "E"})
+
+    return entry_series

@@ -75,7 +75,7 @@ def fetch_kline_data(symbol: str, days: int = 300) -> pd.DataFrame | None:
         try:
             # 1) 前复权数据（价格）
             df_qfq = ak.stock_zh_a_hist_tx(
-                symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq"
+                symbol=symbol, start_date=start_date, end_date=end_date, adjust="hfq"
             )
             if df_qfq is None or df_qfq.empty:
                 raise ValueError("空数据")

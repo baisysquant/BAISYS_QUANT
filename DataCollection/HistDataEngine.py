@@ -249,7 +249,7 @@ class StockSyncEngine:
         try:
             # 尝试获取前复权数据
             df_qfq = ak.stock_zh_a_hist_tx(
-                symbol=symbol, start_date=self.global_start, end_date=self.today, adjust="qfq"
+                symbol=symbol, start_date=self.global_start, end_date=self.today, adjust="hfq"
             )
             time.sleep(0.05)
 
@@ -632,16 +632,21 @@ class StockSyncEngine:
             except Exception as e:
                 logger.info(f"[ERROR] 保存研报数据失败: {e}")
 
-        #  Step 3: 根据配置决定是否只保留主板股票
-        if self.config.MAIN_BOARD_ONLY:
-            final_codes = {code for code in pure_codes if code.startswith(("60", "00"))}
-            logger.info(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
-        else:
+        #  全 A 股模式：跳过所有过滤，强制包含全部股票
+        full_a_share = self.config.app_config.backtest.FULL_A_SHARE_MODE
+        if full_a_share:
             final_codes = pure_codes
-            logger.info(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
+            logger.info(f"[INFO] 全 A 股模式，跳过主板/研报过滤，分析池包含 {len(final_codes)} 只股票。")
+        else:
+            if self.config.MAIN_BOARD_ONLY:
+                final_codes = {code for code in pure_codes if code.startswith(("60", "00"))}
+                logger.info(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
+            else:
+                final_codes = pure_codes
+                logger.info(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
 
-        # 【新增】Step 3.5: 如果启用了研报过滤，则进行二次过滤
-        if self.config.ENABLE_RESEARCH_REPORT_FILTER and not report_df.empty:
+        # Step 3.5: 研报过滤（全 A 股模式下跳过）
+        if not full_a_share and self.config.ENABLE_RESEARCH_REPORT_FILTER and not report_df.empty:
             logger.info(f"\n[研报过滤] 启用研报二次过滤，阈值: {self.config.RESEARCH_REPORT_MIN_COUNT} 次买入评级")
 
             # 筛选出研报买入次数大于阈值的股票
@@ -661,8 +666,29 @@ class StockSyncEngine:
             if after_count == 0:
                 logger.info("[警告] 研报过滤后无股票剩余，请检查阈值设置或研报数据")
                 return set()
-        elif self.config.ENABLE_RESEARCH_REPORT_FILTER:
+        elif not full_a_share and self.config.ENABLE_RESEARCH_REPORT_FILTER:
             logger.info("[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
+
+        # 【全 A 股模式】使用增量同步引擎，直接写入 stock_daily_kline
+        if full_a_share:
+            from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+
+            engine = IncrementalSyncEngine(self.db)
+            akshare_symbols = [CodeNormalizer.add_market_prefix(code) for code in sorted(final_codes)]
+            logger.info(f"[INFO] 增量同步 {len(akshare_symbols)} 只股票到 stock_daily_kline...")
+            inserted = engine.sync_all(akshare_symbols)
+            logger.info(f"[INFO] 增量同步完成，新增 {inserted} 行")
+
+            final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
+            try:
+                with open(final_output_path, "w", encoding="utf-8") as f:
+                    for code in sorted(final_codes):
+                        f.write(f"{code}\n")
+                logger.info(f"[INFO] 最终股票列表已保存至: {final_output_path}")
+            except Exception as e:
+                logger.info(f"[ERROR] 保存最终代码列表失败: {e}")
+
+            return final_codes
 
         # 【测试模式】如果环境变量设置了 TEST_MODE，只取前10只股票测试
         import os as _os

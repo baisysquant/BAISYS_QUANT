@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd
 
 from LogicAnalyzer.MACDDivergence import slope_analysis
@@ -210,3 +212,39 @@ def _pipeline_output(state: dict) -> dict:
         "macd_trend": state.get('macd_trend', ''),
         "position_adjust": state.get('position_adjust', 0.0),
     }
+
+
+def should_exit(df: pd.DataFrame, params: dict[str, Any] | None = None) -> pd.Series:
+    """按日退出信号判断。
+
+    基于 DataFrame 中已预计算的列（风险等级、退出评分、止损价等）
+    逐行判断是否应卖出。
+
+    Args:
+        df: 多股票 DataFrame，每行一个股票一个交易日。
+             必须至少包含列：风险等级, 止损价, 最新价。
+        params: 可选参数（当前预留，后续扩展）。
+
+    Returns:
+        pd.Series[bool]: True 表示该股票当日应退出。
+    """
+    _ = params  # 预留
+    exit_series = pd.Series(False, index=df.index)
+
+    # 风控退出
+    if "风险等级" in df.columns:
+        exit_series |= df["风险等级"].astype(str).str.upper().isin({"HIGH", "D"})
+
+    # 止损退出
+    if "止损价" in df.columns and "最新价" in df.columns:
+        stop_loss = pd.to_numeric(df["止损价"], errors="coerce")
+        close = pd.to_numeric(df["最新价"], errors="coerce")
+        exit_series |= (close < stop_loss) & stop_loss.notna() & close.notna()
+
+    # 评分退出
+    if "退出评分" in df.columns and "进场评分" in df.columns:
+        exit_score = pd.to_numeric(df["退出评分"], errors="coerce").fillna(0)
+        entry_score = pd.to_numeric(df["进场评分"], errors="coerce").fillna(0)
+        exit_series |= (exit_score > entry_score) & (exit_score > 0)
+
+    return exit_series
