@@ -126,11 +126,26 @@ class IncrementalSyncEngine:
         df = raw.rename(columns={"date": "trade_date"}).copy()
         df["symbol"] = CodeNormalizer.add_market_prefix(pure_code)
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+        
+        # 强化数据类型转换 - 用 errors="coerce" 把无效值转成 NaN
         for col in ("open", "close", "high", "low"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["volume"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype("int64") * 100
+        
+        # 修复 volume 计算 - 确保 amount 先转成数字再乘以 100
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["volume"] = (df["amount"].fillna(0) * 100).astype("int64")
+        
+        # 重新计算 amount = close * volume
         df["amount"] = df["close"] * df["volume"]
         df["adj_factor"] = 1.0
+        
+        # 删除数据异常的行（包含 NaN 的关键列）
+        df = df.dropna(subset=["trade_date", "close", "volume"], how="any")
+        
+        if df.empty:
+            logger.warning(f"  {pure_code} 数据清洗后为空")
+            return None
+        
         return df
 
     # ── 除权检测 ─────────────────────────────────────────────
