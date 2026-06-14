@@ -110,9 +110,18 @@ class IncrementalSyncEngine:
     # ── akshare 获取 ─────────────────────────────────────────
 
     def _fetch_from_tx(self, pure_code: str, start: str | None = None) -> pd.DataFrame | None:
+        """
+        从腾讯源获取K线数据。
+        
+        注意: akshare.stock_zh_a_hist_tx 要求小写前缀 + 数字格式，如 "sh600006" 或 "sz000001"
+        不接受纯数字格式。
+        """
+        # 使用 CodeNormalizer.add_market_prefix() 规范化为小写前缀格式
+        tx_symbol = CodeNormalizer.add_market_prefix(pure_code).lower()
+        
         try:
             raw = ak.stock_zh_a_hist_tx(
-                symbol=pure_code,
+                symbol=tx_symbol,
                 start_date=(start or "20000101").replace("-", ""),
                 end_date=date.today().isoformat().replace("-", ""),
                 adjust="hfq",
@@ -120,7 +129,7 @@ class IncrementalSyncEngine:
             if raw is None or raw.empty:
                 return None
         except Exception as e:
-            logger.warning(f"  {pure_code} 腾讯源下载失败: {e}")
+            logger.warning(f"  {tx_symbol} 腾讯源下载失败: {e}")
             return None
 
         df = raw.rename(columns={"date": "trade_date"}).copy()
@@ -143,7 +152,7 @@ class IncrementalSyncEngine:
         df = df.dropna(subset=["trade_date", "close", "volume"], how="any")
         
         if df.empty:
-            logger.warning(f"  {pure_code} 数据清洗后为空")
+            logger.warning(f"  {tx_symbol} 数据清洗后为空")
             return None
         
         return df
