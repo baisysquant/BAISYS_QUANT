@@ -1,7 +1,0 @@
-[
-  {
-    "type": "failure",
-    "error": "type object 'CodeNormalizer' has no attribute 'strip_market_prefix'",
-    "time": "2026-06-15T00:01:27.095361"
-  }
-]
