@@ -74,7 +74,7 @@ def run_backtest_pipeline(
         symbols = _resolve_symbols(engine)
         logger.info(f"  股票数量: {len(symbols)}")
 
-        kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE, config)
+        kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
         if kline_df.empty:
             logger.warning("K 线数据为空，跳过回测")
             return None
@@ -189,14 +189,13 @@ def _fetch_kline(
     engine: Any,
     symbols: list[str],
     backtest_start_date: str,
-    config: Config,
 ) -> pd.DataFrame:
     from Backtesting.sync import ensure_table
 
     ensure_table(engine)
 
     # 补齐缺失股票的历史 K 线
-    _sync_missing_stocks(engine, symbols, config, backtest_start_date)
+    _sync_missing_stocks(engine, symbols, backtest_start_date)
 
     end = date.today()
     start = datetime.strptime(backtest_start_date, "%Y%m%d").date()
@@ -209,7 +208,7 @@ def _fetch_kline(
     return df
 
 
-def _sync_missing_stocks(engine: Any, symbols: list[str], config: Config, backtest_start_date: str) -> None:
+def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: str) -> None:
     """补齐 + 刷新 stock_daily_kline 数据。检查每只股票数据是否齐全，检测除权除息并重拉。"""
     from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 
