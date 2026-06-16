@@ -25,9 +25,9 @@ def _strip_prefix(symbol: str) -> str:
 
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 20
-BATCH_SIZE = 500
-MAX_WORKERS = 15
-RETRY_SLEEP = 10
+BATCH_SIZE = 200
+MAX_WORKERS = 5
+RETRY_SLEEP = 15
 
 
 class IncrementalSyncEngine:
@@ -46,6 +46,13 @@ class IncrementalSyncEngine:
         total_inserted = 0
         all_success: list[str] = []
         all_failed: list[str] = []
+
+        # skip delisted stocks before making any API call
+        delisted = self._load_delisted()
+        if delisted:
+            before = len(symbols_prefixed)
+            symbols_prefixed = [s for s in symbols_prefixed if s not in delisted]
+            logger.info(f"跳过 {before - len(symbols_prefixed)} 只已退市股票")
 
         # load previous run state for resume
         resume_failed = self._load_failed()
@@ -307,6 +314,23 @@ class IncrementalSyncEngine:
                 conn,
                 params={"sym": symbol, "start": start},
             )
+
+    # ── delisted filter ─────────────────────────────────────────
+
+    def _load_delisted(self) -> set[str]:
+        """从 stock_basic_info_sw 查出已退市股票，避免浪费 API 调用。"""
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT stock_code FROM stock_basic_info_sw "
+                        "WHERE delist_date IS NOT NULL"
+                    )
+                ).fetchall()
+            codes = {_strip_prefix(CodeNormalizer.add_market_prefix(r[0])) for r in rows}
+            return {CodeNormalizer.add_market_prefix(c) for c in codes}
+        except Exception:
+            return set()
 
     # ── resume helpers ──────────────────────────────────────────
 
