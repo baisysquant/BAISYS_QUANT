@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 import pytz
+import requests
 from loguru import logger
 
 
@@ -38,7 +39,7 @@ class TradingCalendarAnalyzer:
             logger.info(f"[Calendar] 成功获取 {len(dates)} 条交易日数据。")
             return dates
 
-        except (ConnectionError, ValueError, KeyError, AttributeError) as e:
+        except (ConnectionError, ValueError, KeyError, AttributeError, requests.exceptions.SSLError) as e:
             logger.error(f"[Calendar ERROR] Akshare 接口调用失败: {e}")
             return None
 

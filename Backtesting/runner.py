@@ -208,22 +208,27 @@ def _fetch_kline(
 
 
 def _sync_missing_stocks(engine: Any, symbols: list[str], config: Config) -> None:
-    """补齐 stock_daily_kline 中缺失股票的历史 K 线。"""
+    """补齐 + 刷新 stock_daily_kline 数据。检查每只股票数据是否齐全，检测除权除息并重拉。"""
+    from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+
+    syncer = IncrementalSyncEngine(engine)
+
+    # 检查哪些股票完全缺失
     with engine.connect() as conn:
         existing = {
             r[0] for r in
             conn.execute(text("SELECT DISTINCT symbol FROM stock_daily_kline")).fetchall()
         }
     missing = [s for s in symbols if s not in existing]
-    if not missing:
-        logger.info(f"  stock_daily_kline 已包含全部 {len(symbols)} 只股票，无需补齐")
-        return
+    if missing:
+        logger.info(f"  stock_daily_kline 缺少 {len(missing)} 只股票，开始补齐...")
+        n = syncer.sync_all(missing)
+        logger.info(f"  补齐完成，新增 {n} 行")
 
-    logger.info(f"  stock_daily_kline 缺少 {len(missing)} 只股票，开始补齐...")
-    from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
-    syncer = IncrementalSyncEngine(engine)
-    inserted = syncer.sync_all(missing)
-    logger.info(f"  补齐完成，新增 {inserted} 行")
+    # 对所有股票执行增量刷新：检查最新日期、除权除息检测
+    logger.info(f"  检查 {len(symbols)} 只股票数据完整性...")
+    total = syncer.sync_all(symbols)
+    logger.info(f"  刷新完成，新增 {total} 行")
 
 
 def _extract_best_params(wf_result: pd.DataFrame) -> dict[str, float]:

@@ -5,7 +5,7 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import akshare as ak
@@ -13,6 +13,7 @@ import pandas as pd
 from loguru import logger
 from sqlalchemy import text
 
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from UtilsManager.CodeNormalizer import CodeNormalizer
 
 
@@ -37,6 +38,14 @@ class IncrementalSyncEngine:
             os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
         )
         os.makedirs(self._cache_dir, exist_ok=True)
+        # 使用最新交易日而非 date.today()，避免周末/节假日误判
+        try:
+            _cal = TradingCalendarAnalyzer()
+            _today_str = _cal.get_last_trading_day()
+            self._trade_date = datetime.strptime(_today_str, "%Y-%m-%d").date()
+        except Exception:
+            self._trade_date = date.today()
+        self._trade_date_str = self._trade_date.isoformat().replace("-", "")
 
     # ── public API ──────────────────────────────────────────────
 
@@ -116,7 +125,7 @@ class IncrementalSyncEngine:
                 self._write_batch(merged)
                 cache_file = os.path.join(
                     self._cache_dir,
-                    f"kline_batch_{date.today().isoformat().replace('-', '')}_{batch_idx}.csv",
+                    f"kline_batch_{self._trade_date_str}_{batch_idx}.csv",
                 )
                 merged.to_csv(cache_file, sep="|", index=False, encoding="utf-8-sig")
 
@@ -234,7 +243,7 @@ class IncrementalSyncEngine:
     ) -> pd.DataFrame | None:
         prefixed = CodeNormalizer.add_market_prefix(pure_code)
         start_str = (start or "20000101").replace("-", "")
-        end_str = date.today().isoformat().replace("-", "")
+        end_str = self._trade_date_str
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -336,13 +345,11 @@ class IncrementalSyncEngine:
 
     @property
     def _failed_file(self) -> str:
-        td = date.today().isoformat().replace("-", "")
-        return os.path.join(self._cache_dir, f"failed_{td}.json")
+        return os.path.join(self._cache_dir, f"failed_{self._trade_date_str}.json")
 
     @property
     def _success_file(self) -> str:
-        td = date.today().isoformat().replace("-", "")
-        return os.path.join(self._cache_dir, f"success_{td}.json")
+        return os.path.join(self._cache_dir, f"success_{self._trade_date_str}.json")
 
     def _load_failed(self) -> list[str]:
         if not os.path.exists(self._failed_file):

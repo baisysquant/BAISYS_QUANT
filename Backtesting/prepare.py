@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import os
+import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+from loguru import logger
 
 from ConfigParser import Config
 from LogicAnalyzer.pipeline import MACDAnalyzer
@@ -14,71 +18,106 @@ def prepare_backtest_data(
     kline_df: pd.DataFrame,
     params: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """预计算回测信号列。
-
-    按股票分组，对每只股票逐日滚动计算技术指标和管线信号，
-    输出合并后的 DataFrame，供 ``QuantPipelineStrategy.on_bar`` 读取。
-
-    Args:
-        kline_df: 多股票 K 线 DataFrame。
-                  必须含列: symbol, trade_date, open, high, low, close, volume, amount。
-        params: 集中参数配置（透传给 pipeline_analysis），
-                为空时自动从 Config 加载。
-
-    Returns:
-        追加信号列的 DataFrame：
-            进场评分, 退出评分, 风险等级, 止损价, 综合评分, score 等。
-    """
     if params is None:
         cfg = Config()
         params = _build_params(cfg)
 
-    analyzer = MACDAnalyzer()
-    result_rows: list[dict[str, Any]] = []
+    max_workers = max(1, os.cpu_count() or 4)
+    batch_size = 200
+    tmpdir = tempfile.mkdtemp(prefix="bprep_")
+    symbols = kline_df["symbol"].unique()
+    total = len(symbols)
 
     from tqdm import tqdm
 
-    symbols = kline_df["symbol"].unique()
-    for sym in tqdm(symbols, desc="预计算信号", unit="只", ncols=80):
-        stock_df = kline_df[kline_df["symbol"] == sym].sort_values("trade_date").copy()
-        if len(stock_df) < 60:
-            continue
-        try:
-            _compute_indicators(stock_df)
-        except Exception:
-            continue
+    pbar = tqdm(total=total, desc="预计算信号", unit="只", ncols=80)
+    result_files: list[str] = []
 
-        for i in range(len(stock_df)):
-            bar = stock_df.iloc[: i + 1].reset_index(drop=True)
-            try:
-                signal = _compute_signal(analyzer, bar, params)
-            except Exception:
-                continue
-            result_rows.append({
-                "symbol": sym,
-                "trade_date": bar["trade_date"].iloc[-1],
-                "进场评分": float(signal.get("进场评分", 0)),
-                "退出评分": float(signal.get("退出评分", 0)),
-                "风险等级": str(signal.get("风险等级", "LOW")),
-                "止损价": float(signal.get("止损价", 0) or 0),
-                "综合评分": float(signal.get("score", 0)),
-            })
+    # write kline_df to parquet once for workers to read
+    kline_path = os.path.join(tmpdir, "kline.parquet")
+    kline_df.to_parquet(kline_path, index=False)
 
-    if not result_rows:
+    batches = [symbols[i:i + batch_size] for i in range(0, total, batch_size)]
+    for bidx, batch_syms in enumerate(batches):
+        batch_rows: list[list[dict]] = []
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_stock_worker, sym, kline_path, params): sym
+                for sym in batch_syms
+            }
+            for future in as_completed(futures):
+                try:
+                    rows = future.result()
+                    if rows:
+                        batch_rows.append(rows)
+                except Exception:
+                    pass
+                pbar.update(1)
+
+        if batch_rows:
+            flat = [r for sub in batch_rows for r in sub]
+            batch_df = pd.DataFrame(flat)
+            batch_file = os.path.join(tmpdir, f"batch_{bidx}.parquet")
+            batch_df.to_parquet(batch_file, index=False)
+            result_files.append(batch_file)
+
+    pbar.close()
+
+    if not result_files:
+        logger.warning("所有信号计算失败，返回原始 K 线")
         return kline_df
 
-    signal_df = pd.DataFrame(result_rows)
-    result = kline_df.merge(
-        signal_df, on=["symbol", "trade_date"], how="left"
-    )
+    signal_parts = [pd.read_parquet(f) for f in result_files]
+    signal_df = pd.concat(signal_parts, ignore_index=True)
+
+    # cleanup
+    for f in result_files:
+        os.remove(f)
+    os.remove(kline_path)
+    os.rmdir(tmpdir)
+
+    result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
     for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
         result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
     result["风险等级"] = result["风险等级"].fillna("LOW")
     return result
 
 
+def _stock_worker(
+    symbol: str,
+    kline_path: str,
+    params: dict[str, Any],
+) -> list[dict[str, Any]]:
+    df = pd.read_parquet(kline_path)
+    stock_df = (
+        df[df["symbol"] == symbol].sort_values("trade_date").copy()
+    )
+    if len(stock_df) < 60:
+        return []
+
+    _compute_indicators(stock_df)
+    analyzer = MACDAnalyzer()
+    rows: list[dict[str, Any]] = []
+
+    for i in range(len(stock_df)):
+        bar = stock_df.iloc[: i + 1].reset_index(drop=True)
+        try:
+            signal = _compute_signal(analyzer, bar, params)
+        except Exception:
+            continue
+        rows.append({
+            "symbol": symbol,
+            "trade_date": bar["trade_date"].iloc[-1],
+            "进场评分": float(signal.get("进场评分", 0)),
+            "退出评分": float(signal.get("退出评分", 0)),
+            "风险等级": str(signal.get("风险等级", "LOW")),
+            "止损价": float(signal.get("止损价", 0) or 0),
+            "综合评分": float(signal.get("score", 0)),
+        })
+    return rows
+
+
 def _compute_indicators(df: pd.DataFrame) -> None:
-    """计算技术指标（就地修改 df）。"""
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -96,7 +135,6 @@ def _compute_indicators(df: pd.DataFrame) -> None:
     atr_series = ta.atr(high, low, close, length=14)
     df["ATR"] = atr_series if atr_series is not None else 0.0
 
-    # ScoringRules 依赖的金叉/死叉信号列
     if "DIF" in df.columns and "DEA" in df.columns:
         dif = df["DIF"]
         dea = df["DEA"]
@@ -130,11 +168,9 @@ def _compute_signal(
     bar: pd.DataFrame,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """对单根 K 线（含历史）计算管线信号。"""
     result = analyzer.pipeline_analysis(bar, params=params)
     exit_strategy = result.get("exit_strategy", {})
     risk_level = result.get("risk_level", "LOW")
-
     entry_score = float(result.get("score", 0))
     exit_score = _calc_exit_score(bar, exit_strategy, risk_level)
     return {
@@ -151,7 +187,6 @@ def _calc_exit_score(
     exit_strategy: dict[str, Any],
     risk_level: str,
 ) -> float:
-    """计算退出评分。"""
     if risk_level in ("HIGH", "D"):
         return 100.0
     stop_loss = exit_strategy.get("stop_loss")
@@ -163,7 +198,6 @@ def _calc_exit_score(
 
 
 def _build_params(cfg: Config) -> dict[str, Any]:
-    """从 Config 构建 pipeline_analysis 需要的参数字典。"""
     ac = cfg.app_config
     return {
         "regime": ac.regime_detection.model_dump(),
