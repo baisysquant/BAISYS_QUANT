@@ -32,6 +32,15 @@ CREATE INDEX IF NOT EXISTS idx_{TABLE}_run_time ON {TABLE} (run_time DESC);
 def ensure_table(engine: Any) -> None:
     with engine.begin() as conn:
         conn.execute(text(CREATE_TABLE_SQL))
+    # 迁移：兼容旧表 lookback_days INT → backtest_start_date VARCHAR(8)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {TABLE} RENAME COLUMN lookback_days TO lookback_days_old"))
+            conn.execute(text(f"ALTER TABLE {TABLE} ADD COLUMN backtest_start_date VARCHAR(8)"))
+            conn.execute(text(f"UPDATE {TABLE} SET backtest_start_date = lookback_days_old::TEXT"))
+            conn.execute(text(f"ALTER TABLE {TABLE} DROP COLUMN lookback_days_old"))
+    except Exception:
+        pass
 
 
 def get_last_run(engine: Any) -> dict[str, Any] | None:
