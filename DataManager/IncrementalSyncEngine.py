@@ -32,8 +32,9 @@ RETRY_SLEEP = 15
 
 
 class IncrementalSyncEngine:
-    def __init__(self, db_engine: Any) -> None:
+    def __init__(self, db_engine: Any, default_start: str | None = None) -> None:
         self._engine = db_engine
+        self._default_start = default_start
         self._cache_dir = os.path.join(
             os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
         )
@@ -242,7 +243,7 @@ class IncrementalSyncEngine:
         self, pure_code: str, start: str | None = None
     ) -> pd.DataFrame | None:
         prefixed = CodeNormalizer.add_market_prefix(pure_code)
-        start_str = (start or "20000101").replace("-", "")
+        start_str = (start or self._default_start or "20000101").replace("-", "")
         end_str = self._trade_date_str
 
         max_attempts = 3

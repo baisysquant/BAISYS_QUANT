@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -66,7 +66,7 @@ def run_backtest_pipeline(
     logger.info("=" * 50)
     logger.info("开始回测管线 ...")
     logger.info(f"  优化频率: {bt.OPTIMIZE_FREQUENCY}")
-    logger.info(f"  回看天数: {bt.LOOKBACK_DAYS}")
+    logger.info(f"  数据起始日期: {bt.BACKTEST_START_DATE}")
     logger.info(f"  样本外天数: {bt.OUT_OF_SAMPLE_DAYS}")
     logger.info(f"  初始资金: {bt.INITIAL_CASH:,.0f}")
 
@@ -74,12 +74,16 @@ def run_backtest_pipeline(
         symbols = _resolve_symbols(engine)
         logger.info(f"  股票数量: {len(symbols)}")
 
-        kline_df = _fetch_kline(engine, symbols, bt.LOOKBACK_DAYS, config)
+        kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE, config)
         if kline_df.empty:
             logger.warning("K 线数据为空，跳过回测")
             return None
 
         logger.info(f"  K 线行数: {len(kline_df)}")
+
+        total_trading_days = int(kline_df["trade_date"].nunique())
+        train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
+        logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
 
         prepared = prepare_backtest_data(kline_df)
         signal_prefixes = ('进场', '退出', '风险', '止损', '综合')
@@ -88,7 +92,7 @@ def run_backtest_pipeline(
 
         wf_result = run_walk_forward(
             kline_df=prepared,
-            train_period=bt.LOOKBACK_DAYS,
+            train_period=train_period,
             test_period=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
             show_progress=True,
@@ -117,7 +121,7 @@ def run_backtest_pipeline(
         record_run(
             engine=engine,
             frequency=bt.OPTIMIZE_FREQUENCY,
-            lookback_days=bt.LOOKBACK_DAYS,
+            backtest_start_date=bt.BACKTEST_START_DATE,
             out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
             params=best_params,
@@ -140,7 +144,7 @@ def run_backtest_pipeline(
             record_run(
                 engine=engine,
                 frequency=bt.OPTIMIZE_FREQUENCY,
-                lookback_days=bt.LOOKBACK_DAYS,
+                backtest_start_date=bt.BACKTEST_START_DATE,
                 out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
                 initial_cash=bt.INITIAL_CASH,
                 params={},
@@ -184,20 +188,18 @@ def _resolve_symbols(engine: Any) -> list[str]:
 def _fetch_kline(
     engine: Any,
     symbols: list[str],
-    lookback_days: int,
+    backtest_start_date: str,
     config: Config,
 ) -> pd.DataFrame:
-    from datetime import timedelta
-
     from Backtesting.sync import ensure_table
 
     ensure_table(engine)
 
     # 补齐缺失股票的历史 K 线
-    _sync_missing_stocks(engine, symbols, config)
+    _sync_missing_stocks(engine, symbols, config, backtest_start_date)
 
     end = date.today()
-    start = end - timedelta(days=lookback_days * 3)
+    start = datetime.strptime(backtest_start_date, "%Y%m%d").date()
 
     provider = BacktestDataProvider(engine)
     df = provider.get_kline(symbols, start_date=start.isoformat(), end_date=end.isoformat())
@@ -207,11 +209,11 @@ def _fetch_kline(
     return df
 
 
-def _sync_missing_stocks(engine: Any, symbols: list[str], config: Config) -> None:
+def _sync_missing_stocks(engine: Any, symbols: list[str], config: Config, backtest_start_date: str) -> None:
     """补齐 + 刷新 stock_daily_kline 数据。检查每只股票数据是否齐全，检测除权除息并重拉。"""
     from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 
-    syncer = IncrementalSyncEngine(engine)
+    syncer = IncrementalSyncEngine(engine, default_start=backtest_start_date)
 
     # 检查哪些股票完全缺失
     with engine.connect() as conn:

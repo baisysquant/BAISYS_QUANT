@@ -362,7 +362,7 @@ class BacktestConfig(BaseModel):
 
     ENABLED: bool = True
     OPTIMIZE_FREQUENCY: str = "monthly"
-    LOOKBACK_DAYS: int = Field(default=120, ge=30, le=500)
+    BACKTEST_START_DATE: str = Field(default="20200101", pattern=r"^\d{8}$")
     OUT_OF_SAMPLE_DAYS: int = Field(default=20, ge=5, le=120)
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
     FULL_A_SHARE_MODE: bool = Field(default=False)

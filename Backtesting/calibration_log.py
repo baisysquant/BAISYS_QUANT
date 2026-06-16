@@ -15,8 +15,8 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     id              SERIAL PRIMARY KEY,
     run_time        TIMESTAMP   NOT NULL DEFAULT NOW(),
     frequency       VARCHAR(16) NOT NULL,
-    lookback_days   INT         NOT NULL,
-    out_of_sample_days INT      NOT NULL,
+    backtest_start_date VARCHAR(8) NOT NULL,
+    out_of_sample_days INT        NOT NULL,
     initial_cash    NUMERIC(14,2) NOT NULL,
     params          JSONB       NOT NULL DEFAULT '{{}}'::jsonb,
     sharpe          NUMERIC(8,4),
@@ -36,7 +36,7 @@ def ensure_table(engine: Any) -> None:
 
 def get_last_run(engine: Any) -> dict[str, Any] | None:
     sql = text(f"""
-        SELECT run_time, frequency, lookback_days, out_of_sample_days,
+        SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
                initial_cash, params, sharpe, total_return, max_drawdown, status
         FROM {TABLE}
         WHERE status = 'success'
@@ -91,7 +91,7 @@ def should_rerun(last_run: dict[str, Any] | None, frequency: str, today: date | 
 def record_run(
     engine: Any,
     frequency: str,
-    lookback_days: int,
+    backtest_start_date: str,
     out_of_sample_days: int,
     initial_cash: float,
     params: dict[str, float],
@@ -102,16 +102,16 @@ def record_run(
 ) -> None:
     sql = text(f"""
         INSERT INTO {TABLE}
-            (run_time, frequency, lookback_days, out_of_sample_days,
+            (run_time, frequency, backtest_start_date, out_of_sample_days,
              initial_cash, params, sharpe, total_return, max_drawdown, status)
         VALUES
-            (NOW(), :frequency, :lookback_days, :out_of_sample_days,
+            (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, :params::jsonb, :sharpe, :total_return, :max_drawdown, :status)
     """)
     with engine.begin() as conn:
         conn.execute(sql, {
             "frequency": frequency,
-            "lookback_days": lookback_days,
+            "backtest_start_date": backtest_start_date,
             "out_of_sample_days": out_of_sample_days,
             "initial_cash": initial_cash,
             "params": json.dumps(params, ensure_ascii=False),
