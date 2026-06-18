@@ -19,7 +19,7 @@ from Backtesting.calibration import (
     write_calibration_to_ini,
 )
 from Backtesting.calibration_log import ensure_table, get_last_run, record_run, should_rerun
-from Backtesting.data_provider import BacktestDataProvider
+from UtilsManager.IDataProvider import BacktestDataProvider
 from Backtesting.prepare import prepare_backtest_data
 from ConfigParser import Config
 from DataManager.DbEngine import get_engine
@@ -85,7 +85,8 @@ def run_backtest_pipeline(
         train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
         logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
 
-        prepared = prepare_backtest_data(kline_df)
+        from Backtesting.prepare import _build_params
+        prepared = prepare_backtest_data(kline_df, params=_build_params(config))
         signal_prefixes = ('进场', '退出', '风险', '止损', '综合')
         signal_cols = [c for c in prepared.columns if c.startswith(signal_prefixes)]
         logger.info(f"  预计算信号列: {signal_cols}")
@@ -153,8 +154,8 @@ def run_backtest_pipeline(
                 max_drawdown=0,
                 status="failed",
             )
-        except Exception:
-            pass
+        except Exception as log_err:
+            logger.warning(f"回测失败记录写入异常: {log_err}")
         alert.on_failure(exc)
         return None
 
@@ -167,7 +168,7 @@ def _resolve_symbols(engine: Any) -> list[str]:
         rows = conn.execute(text("""
             SELECT DISTINCT stock_code FROM stock_basic_info_sw
             ORDER BY stock_code
-        """)).fetchmany(6000)
+        """)).fetchall()
     if rows:
         normalized = sorted({
             CodeNormalizer.add_market_prefix(str(r[0]).strip().zfill(6))
@@ -181,7 +182,7 @@ def _resolve_symbols(engine: Any) -> list[str]:
     with engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT DISTINCT symbol FROM stock_daily_kline
-        """)).fetchmany(5000)
+        """)).fetchall()
     return sorted({r[0] for r in rows})
 
 
@@ -191,14 +192,18 @@ def _fetch_kline(
     backtest_start_date: str,
 ) -> pd.DataFrame:
     from Backtesting.sync import ensure_table
+    from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+
+    # 将配置日期对齐到首个交易日，与 IncrementalSyncEngine 内部逻辑一致
+    aligned_start = IncrementalSyncEngine.align_to_trading_day(backtest_start_date)
 
     ensure_table(engine)
 
     # 补齐缺失股票的历史 K 线
-    _sync_missing_stocks(engine, symbols, backtest_start_date)
+    _sync_missing_stocks(engine, symbols, aligned_start)
 
     end = date.today()
-    start = datetime.strptime(backtest_start_date, "%Y%m%d").date()
+    start = datetime.strptime(aligned_start, "%Y%m%d").date()
 
     provider = BacktestDataProvider(engine)
     df = provider.get_kline(symbols, start_date=start.isoformat(), end_date=end.isoformat())
@@ -226,10 +231,12 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
         n = syncer.sync_all(missing)
         logger.info(f"  补齐完成，新增 {n} 行")
 
-    # 对所有股票执行增量刷新：检查最新日期、除权除息检测
-    logger.info(f"  检查 {len(symbols)} 只股票数据完整性...")
-    total = syncer.sync_all(symbols)
-    logger.info(f"  刷新完成，新增 {total} 行")
+    # 对已有数据的股票执行增量刷新：检查最新日期、除权除息检测
+    existing_symbols = [s for s in symbols if s not in missing]
+    if existing_symbols:
+        logger.info(f"  检查 {len(existing_symbols)} 只股票数据完整性...")
+        total = syncer.sync_all(existing_symbols)
+        logger.info(f"  刷新完成，新增 {total} 行")
 
 
 def _extract_best_params(wf_result: pd.DataFrame) -> dict[str, float]:
@@ -262,7 +269,13 @@ def start_scheduler(config: Config | None = None) -> None:
 
     def job() -> None:
         logger.info("调度触发：检查回测条件 ...")
-        run_backtest_pipeline(config)
+        tmp_engine = get_engine(config)
+        last = get_last_run(tmp_engine)
+        should_run, reason = should_rerun(last, bt.OPTIMIZE_FREQUENCY)
+        if should_run:
+            run_backtest_pipeline(config, force=True)
+        else:
+            logger.info(f"调度跳过: {reason}")
 
     _schedule.every().day.at("02:00").do(job)
     logger.info("  每日 02:00 检查回测条件")

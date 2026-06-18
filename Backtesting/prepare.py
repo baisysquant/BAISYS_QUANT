@@ -14,6 +14,18 @@ from ConfigParser import Config
 from LogicAnalyzer.pipeline import MACDAnalyzer
 
 
+def _adjust_signal_workers(max_workers: int, watermark: float = 0.8) -> int:
+    """信号计算时根据 CPU 负载动态调整进程数。"""
+    try:
+        import psutil
+        load = psutil.cpu_percent(interval=0.2) / 100.0
+        if load > watermark:
+            return max(1, max_workers - 1)
+    except Exception:
+        pass
+    return max_workers
+
+
 def prepare_backtest_data(
     kline_df: pd.DataFrame,
     params: dict[str, Any] | None = None,
@@ -22,7 +34,8 @@ def prepare_backtest_data(
         cfg = Config()
         params = _build_params(cfg)
 
-    max_workers = max(1, os.cpu_count() or 4)
+    cpu_count = os.cpu_count() or 4
+    max_workers = max(1, cpu_count // 2)
     batch_size = 200
     tmpdir = tempfile.mkdtemp(prefix="bprep_")
     symbols = kline_df["symbol"].unique()
@@ -40,7 +53,8 @@ def prepare_backtest_data(
     batches = [symbols[i:i + batch_size] for i in range(0, total, batch_size)]
     for bidx, batch_syms in enumerate(batches):
         batch_rows: list[list[dict]] = []
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        workers = _adjust_signal_workers(max_workers)
+        with ProcessPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(_stock_worker, sym, kline_path, params): sym
                 for sym in batch_syms

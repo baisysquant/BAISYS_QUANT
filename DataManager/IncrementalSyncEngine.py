@@ -32,13 +32,23 @@ RETRY_SLEEP = 15
 
 
 class IncrementalSyncEngine:
-    def __init__(self, db_engine: Any, default_start: str | None = None) -> None:
+    def __init__(
+        self,
+        db_engine: Any,
+        default_start: str | None = None,
+        max_workers: int = MAX_WORKERS,
+        cpu_watermark: float = 0.8,
+    ) -> None:
         self._engine = db_engine
-        self._default_start = default_start
+        self._default_start = self.align_to_trading_day(default_start) if default_start else None
+        self._max_workers = max_workers
+        self._cpu_watermark = cpu_watermark
+        self._current_workers = max_workers
         self._cache_dir = os.path.join(
             os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
         )
         os.makedirs(self._cache_dir, exist_ok=True)
+        self._cleanup_old_cache()
         # 使用最新交易日而非 date.today()，避免周末/节假日误判
         try:
             _cal = TradingCalendarAnalyzer()
@@ -49,6 +59,36 @@ class IncrementalSyncEngine:
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
 
     # ── public API ──────────────────────────────────────────────
+
+    def _cleanup_old_cache(self) -> None:
+        """清理超过 7 天的缓存文件。"""
+        try:
+            now = datetime.now()
+            for fname in os.listdir(self._cache_dir):
+                fpath = os.path.join(self._cache_dir, fname)
+                age = now - datetime.fromtimestamp(os.path.getmtime(fpath))
+                if age.days > 7:
+                    os.remove(fpath)
+        except Exception:
+            pass
+
+    def _adjust_workers(self) -> int:
+        """根据当前 CPU 负载动态调整并发数，水位默认 80%，最低 1 个 worker。"""
+        try:
+            import psutil
+            # 仅上次水位接近时才检测，否则沿用当前值
+            ratio = self._current_workers / self._max_workers
+            if self._current_workers == self._max_workers or ratio > 0.6:
+                load = psutil.cpu_percent(interval=0.3) / 100.0
+            else:
+                load = 0.0
+        except Exception:
+            return self._current_workers
+        if load > self._cpu_watermark:
+            self._current_workers = max(1, self._current_workers - 1)
+        elif load < self._cpu_watermark * 0.7 and self._current_workers < self._max_workers:
+            self._current_workers = min(self._max_workers, self._current_workers + 1)
+        return self._current_workers
 
     def sync_all(self, symbols_prefixed: list[str]) -> int:
         from tqdm import tqdm
@@ -80,8 +120,10 @@ class IncrementalSyncEngine:
             f"本次需处理 {len(remaining)} 只"
         )
         if not remaining:
-            self._merge_and_write()
             return 0
+
+        # 一次性加载回填确认缓存到内存
+        self._backfill_cache = self._load_backfill_checked()
 
         total_new_batches = (len(remaining) + BATCH_SIZE - 1) // BATCH_SIZE
         pbar = tqdm(
@@ -99,7 +141,8 @@ class IncrementalSyncEngine:
             batch_success: list[pd.DataFrame] = []
             batch_failed: list[str] = []
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            workers = self._adjust_workers()
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     pool.submit(self._sync_one, sym): sym for sym in batch_symbols
                 }
@@ -112,7 +155,6 @@ class IncrementalSyncEngine:
                             all_success.append(sym)
                             total_inserted += n
                         else:
-                            # None return means full skip (no data / error)
                             pass
                     except Exception:
                         batch_failed.append(sym)
@@ -120,15 +162,13 @@ class IncrementalSyncEngine:
                     finally:
                         pbar.update(1)
 
-            # write this batch to DB + cache
+            # write this batch to DB
             if batch_success:
                 merged = pd.concat(batch_success, ignore_index=True)
                 self._write_batch(merged)
-                cache_file = os.path.join(
-                    self._cache_dir,
-                    f"kline_batch_{self._trade_date_str}_{batch_idx}.csv",
-                )
-                merged.to_csv(cache_file, sep="|", index=False, encoding="utf-8-sig")
+                # 每批次完成后立即增量保存已成功的股票，支持崩溃恢复
+                batch_symbols = [df["symbol"].iloc[0] for df in batch_success]
+                self._save_success(batch_symbols)
 
             if batch_failed:
                 self._save_failed(batch_failed)
@@ -145,12 +185,29 @@ class IncrementalSyncEngine:
             )
         else:
             self._clear_failed()
-            self._save_success(all_success)
             logger.info(f"\n[统计] 全部 {len(remaining)} 只股票同步完成 ✓")
 
         return total_inserted
 
     # ── single stock sync ───────────────────────────────────────
+
+    @staticmethod
+    def align_to_trading_day(date_str: str) -> str:
+        """将 YYYYMMDD 对齐到当天或之后的首个交易日，返回 YYYYMMDD。"""
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            cal = TradingCalendarAnalyzer()
+            dates = sorted(cal.get_official_trading_dates())
+            dt = datetime.strptime(date_str, "%Y%m%d")
+            formatted = dt.strftime("%Y-%m-%d")
+            for d in dates:
+                if d >= formatted:
+                    return d.replace("-", "")
+        except Exception:
+            pass
+        return date_str
+
+    _align_to_trading_day = align_to_trading_day
 
     def _sync_one(self, symbol: str) -> tuple[int, pd.DataFrame | None]:
         pure = _strip_prefix(symbol)
@@ -159,6 +216,39 @@ class IncrementalSyncEngine:
         if latest is None:
             return self._full_refresh(symbol, pure)
 
+        # 如果 default_start 比股票最早日期还早，先拉取确认是否有更早的历史数据
+        if self._default_start:
+            earliest = self._get_earliest_date(symbol)
+            default_date = datetime.strptime(self._default_start, "%Y%m%d").date()
+            if earliest is not None and earliest > default_date:
+                # 已确认过后上市股票，跳过全量拉取检查
+                if symbol in self._backfill_cache:
+                    df = self._fetch_from_tx(
+                        pure, (latest - timedelta(days=OVERLAP_DAYS * 2)).isoformat()
+                    )
+                    if df is None or df.empty:
+                        return 0, None
+                    new = df[df["trade_date"] > latest.isoformat()]
+                    if new.empty:
+                        return 0, None
+                    return len(new), new
+
+                df = self._fetch_from_tx(pure)
+                if df is None or df.empty:
+                    return 0, None
+                df_earliest = datetime.strptime(df["trade_date"].min(), "%Y-%m-%d").date()
+                if df_earliest < earliest:
+                    logger.info(f"  {symbol} 发现更早数据 {df_earliest}，全量替换")
+                    self._delete_stock(symbol)
+                    return len(df), df
+                # 没有更早数据（后上市股票），记录到缓存，下次跳过拉取检查
+                self._backfill_cache.add(symbol)
+                self._save_backfill_checked([symbol])
+                new = df[df["trade_date"] > latest.isoformat()]
+                if new.empty:
+                    return 0, None
+                return len(new), new
+
         df = self._fetch_from_tx(
             pure, (latest - timedelta(days=OVERLAP_DAYS * 2)).isoformat()
         )
@@ -166,8 +256,9 @@ class IncrementalSyncEngine:
             return 0, None
 
         if self._detect_split(symbol, df, latest):
-            logger.info(f"  {symbol} 检测到除权除息，全量重拉")
-            return self._full_refresh(symbol, pure)
+            logger.info(f"  {symbol} 检测到除权除息，全量替换")
+            self._delete_stock(symbol)
+            return len(df), df
 
         new = df[df["trade_date"] > latest.isoformat()]
         if new.empty:
@@ -188,6 +279,14 @@ class IncrementalSyncEngine:
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(f"SELECT MAX(trade_date::date) FROM {TABLE} WHERE symbol = :sym"),
+                {"sym": symbol},
+            ).scalar()
+        return row if row is not None else None
+
+    def _get_earliest_date(self, symbol: str) -> date | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                text(f"SELECT MIN(trade_date::date) FROM {TABLE} WHERE symbol = :sym"),
                 {"sym": symbol},
             ).scalar()
         return row if row is not None else None
@@ -220,22 +319,6 @@ class IncrementalSyncEngine:
                 """),
                 df.rename(columns={}).to_dict("records"),
             )
-
-    def _merge_and_write(self) -> None:
-        """加载今日缓存文件并写入 DB（重跑或增量场景）"""
-        dfs = []
-        for fname in sorted(os.listdir(self._cache_dir)):
-            if not fname.endswith(".csv"):
-                continue
-            dfs.append(
-                pd.read_csv(
-                    os.path.join(self._cache_dir, fname), sep="|", encoding="utf-8-sig"
-                )
-            )
-        if dfs:
-            merged = pd.concat(dfs, ignore_index=True)
-            self._write_batch(merged)
-            logger.info(f"合并写入 {len(merged)} 条记录")
 
     # ── Tencent API ────────────────────────────────────────────
 
@@ -352,6 +435,11 @@ class IncrementalSyncEngine:
     def _success_file(self) -> str:
         return os.path.join(self._cache_dir, f"success_{self._trade_date_str}.json")
 
+    @property
+    def _backfill_file(self) -> str:
+        key = self._default_start or "default"
+        return os.path.join(self._cache_dir, f"backfill_checked_{key}.json")
+
     def _load_failed(self) -> list[str]:
         if not os.path.exists(self._failed_file):
             return []
@@ -379,3 +467,15 @@ class IncrementalSyncEngine:
         all_s = existing | set(symbols)
         with open(self._success_file, "w", encoding="utf-8") as f:
             json.dump(list(all_s), f, ensure_ascii=False)
+
+    def _load_backfill_checked(self) -> set[str]:
+        if not os.path.exists(self._backfill_file):
+            return set()
+        with open(self._backfill_file, encoding="utf-8") as f:
+            return set(json.load(f))
+
+    def _save_backfill_checked(self, symbols: list[str]) -> None:
+        existing = self._load_backfill_checked()
+        all_c = existing | set(symbols)
+        with open(self._backfill_file, "w", encoding="utf-8") as f:
+            json.dump(list(all_c), f, ensure_ascii=False)

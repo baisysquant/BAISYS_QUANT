@@ -34,7 +34,10 @@ def write_calibration_to_ini(params: dict[str, float]) -> None:
     updated_keys: set[str] = set()
 
     def _format_val(key: str, val: float) -> str:
-        return str(int(val)) if key.endswith("_days") else f"{val:g}"
+        if key.endswith("_days"):
+            return str(int(val))
+        s = f"{val:.6f}".rstrip("0").rstrip(".")
+        return s if s else "0"
 
     for i, line in enumerate(lines):
         # 检测 section 头
@@ -157,10 +160,11 @@ def load_calibration() -> CalibrationResult | None:
         return None
 
 
-def apply_calibration_to_config(config: Any) -> None:
+def apply_calibration_to_config(config: object) -> None:
     from ConfigParser import Config
 
-    cfg: Config = config
+    assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
+    cfg = config
     result = load_calibration()
     if result is None:
         return

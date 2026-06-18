@@ -8,6 +8,10 @@ from ConfigParser import Config
 from LogicAnalyzer.PipelineScoring import calc_entry_signal
 from LogicAnalyzer.PipelineState import should_exit
 
+# 注意: PipelineAdapter 当前仅在测试中引用。
+# 生产回测使用 Backtesting.akquant_strategy.QuantPipelineStrategy。
+# 如果决定淘汰 PipelineAdapter，删除本文件和 tests/test_backtest_strategy.py 中对它的引用。
+
 _RISK_MAP: dict[str, float] = {
     "NONE": 1.0, "LOW": 1.5, "MEDIUM": 3.0, "HIGH": 5.0, "D": 8.0, "E": 10.0,
 }
@@ -42,7 +46,7 @@ class PipelineAdapter:
         }
 
     def on_bar(self, df: pd.DataFrame) -> list[dict[str, Any]]:
-        self._state["date"] = df.get("trade_date", pd.Timestamp.today())
+        self._state["date"] = df["trade_date"].iloc[0] if "trade_date" in df.columns else pd.Timestamp.today()
 
         exit_mask = should_exit(df)
         entry_mask = calc_entry_signal(df)

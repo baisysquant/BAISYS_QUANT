@@ -115,7 +115,7 @@ def record_run(
              initial_cash, params, sharpe, total_return, max_drawdown, status)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
-             :initial_cash, :params::jsonb, :sharpe, :total_return, :max_drawdown, :status)
+             :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status)
     """)
     with engine.begin() as conn:
         conn.execute(sql, {

@@ -62,7 +62,7 @@ class LiveDataProvider(IDataProvider):
 class BacktestDataProvider(IDataProvider):
     """回测模式 — 从 stock_daily_kline 读取，end_date 截断到 replay_date。"""
 
-    def __init__(self, db_engine: Engine, replay_date: str) -> None:
+    def __init__(self, db_engine: Engine, replay_date: str | None = None) -> None:
         self._db_engine = db_engine
         self._replay_date = replay_date
 
@@ -72,9 +72,9 @@ class BacktestDataProvider(IDataProvider):
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> pd.DataFrame:
-        actual_end = self._replay_date
-        if end_date is not None:
-            actual_end = min(end_date, self._replay_date)
+        actual_end = end_date
+        if self._replay_date is not None:
+            actual_end = self._replay_date if end_date is None else min(end_date, self._replay_date)
 
         where = ["symbol = ANY(:symbols)"]
         if start_date:
