@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shutil
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -13,9 +18,12 @@ from loguru import logger
 from ConfigParser import Config
 from LogicAnalyzer.pipeline import MACDAnalyzer
 
+CACHE_DIR = Path("Backtesting/data/signal_cache")
+CACHE_GROUP_SIZE = 500
+PROCESS_BATCH_SIZE = 200
+
 
 def _adjust_signal_workers(max_workers: int, watermark: float = 0.8) -> int:
-    """信号计算时根据 CPU 负载动态调整进程数。"""
     try:
         import psutil
         load = psutil.cpu_percent(interval=0.2) / 100.0
@@ -26,6 +34,47 @@ def _adjust_signal_workers(max_workers: int, watermark: float = 0.8) -> int:
     return max_workers
 
 
+def _make_param_hash(params: dict[str, Any]) -> str:
+    return hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()
+
+
+def _cache_meta_path() -> Path:
+    return CACHE_DIR / "meta.json"
+
+
+def _check_cache_valid(symbols: list[str], params: dict[str, Any]) -> bool:
+    meta_file = _cache_meta_path()
+    if not meta_file.exists():
+        return False
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return False
+
+    if meta.get("date") != date.today().isoformat():
+        return False
+    if meta.get("symbol_count") != len(symbols):
+        return False
+    if meta.get("param_hash") != _make_param_hash(params):
+        return False
+
+    for gidx in range(meta.get("num_groups", 0)):
+        if not (CACHE_DIR / f"cache_{gidx}.parquet").exists():
+            return False
+    return True
+
+
+def _save_cache_meta(symbols: list[str], params: dict[str, Any], num_groups: int) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "date": date.today().isoformat(),
+        "symbol_count": len(symbols),
+        "param_hash": _make_param_hash(params),
+        "num_groups": num_groups,
+    }
+    _cache_meta_path().write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
 def prepare_backtest_data(
     kline_df: pd.DataFrame,
     params: dict[str, Any] | None = None,
@@ -34,61 +83,92 @@ def prepare_backtest_data(
         cfg = Config()
         params = _build_params(cfg)
 
-    cpu_count = os.cpu_count() or 4
-    max_workers = max(1, cpu_count // 2)
-    batch_size = 200
-    tmpdir = tempfile.mkdtemp(prefix="bprep_")
-    symbols = kline_df["symbol"].unique()
+    symbols = sorted(kline_df["symbol"].unique())
     total = len(symbols)
 
+    # ── 缓存命中：直接加载合并 ──
+    if _check_cache_valid(symbols, params):
+        cache_files = sorted(CACHE_DIR.glob("cache_*.parquet"), key=lambda p: int(p.stem.split("_")[1]))
+        if cache_files:
+            logger.info(f"信号缓存有效（{len(cache_files)} 个文件），跳过计算")
+            signal_parts = [pd.read_parquet(f) for f in cache_files]
+            signal_df = pd.concat(signal_parts, ignore_index=True)
+            result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
+            for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
+                result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
+            result["风险等级"] = result["风险等级"].fillna("LOW")
+            return result
+
+    # ── 缓存无效/不存在：重新计算 ──
+    logger.info("信号缓存无效或不存在，开始计算...")
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    max_workers = 2
+    tmpdir = tempfile.mkdtemp(prefix="bprep_")
+
     from tqdm import tqdm
-
     pbar = tqdm(total=total, desc="预计算信号", unit="只", ncols=80)
-    result_files: list[str] = []
 
-    # write kline_df to parquet once for workers to read
-    kline_path = os.path.join(tmpdir, "kline.parquet")
-    kline_df.to_parquet(kline_path, index=False)
+    # 按股票分割写入独立 parquet
+    stock_dir = os.path.join(tmpdir, "stocks")
+    os.mkdir(stock_dir)
+    for sym, grp in kline_df.groupby("symbol"):
+        grp.sort_values("trade_date").to_parquet(
+            os.path.join(stock_dir, f"{sym}.parquet"), index=False
+        )
 
-    batches = [symbols[i:i + batch_size] for i in range(0, total, batch_size)]
-    for bidx, batch_syms in enumerate(batches):
-        batch_rows: list[list[dict]] = []
-        workers = _adjust_signal_workers(max_workers)
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(_stock_worker, sym, kline_path, params): sym
-                for sym in batch_syms
-            }
-            for future in as_completed(futures):
-                try:
-                    rows = future.result()
-                    if rows:
-                        batch_rows.append(rows)
-                except Exception:
-                    pass
-                pbar.update(1)
+    # 每 CACHE_GROUP_SIZE 只股票为一个缓存组
+    cache_groups = [symbols[i:i + CACHE_GROUP_SIZE] for i in range(0, total, CACHE_GROUP_SIZE)]
 
-        if batch_rows:
-            flat = [r for sub in batch_rows for r in sub]
-            batch_df = pd.DataFrame(flat)
-            batch_file = os.path.join(tmpdir, f"batch_{bidx}.parquet")
-            batch_df.to_parquet(batch_file, index=False)
-            result_files.append(batch_file)
+    for gidx, group_syms in enumerate(cache_groups):
+        group_rows: list[list[dict]] = []
+
+        # 组内按 PROCESS_BATCH_SIZE 分批并行
+        group_batches = [
+            group_syms[i:i + PROCESS_BATCH_SIZE]
+            for i in range(0, len(group_syms), PROCESS_BATCH_SIZE)
+        ]
+        for batch_syms in group_batches:
+            batch_rows: list[list[dict]] = []
+            workers = _adjust_signal_workers(max_workers)
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_stock_worker, sym, stock_dir, params): sym
+                    for sym in batch_syms
+                }
+                for future in as_completed(futures):
+                    try:
+                        rows = future.result()
+                        if rows:
+                            batch_rows.append(rows)
+                    except Exception:
+                        pass
+                    pbar.update(1)
+
+            if batch_rows:
+                group_rows.append([r for sub in batch_rows for r in sub])
+
+        # 每 500 只写一次持久化缓存
+        if group_rows:
+            flat = [r for sub in group_rows for r in sub]
+            pd.DataFrame(flat).to_parquet(CACHE_DIR / f"cache_{gidx}.parquet", index=False)
+
+        # 每次缓存组写入后更新元信息（支持中断恢复）
+        _save_cache_meta(symbols, params, gidx + 1)
 
     pbar.close()
+    shutil.rmtree(stock_dir, ignore_errors=True)
+    shutil.rmtree(tmpdir, ignore_errors=True)
 
-    if not result_files:
+    # ── 加载缓存合并 ──
+    cache_files = sorted(CACHE_DIR.glob("cache_*.parquet"), key=lambda p: int(p.stem.split("_")[1]))
+    if not cache_files:
         logger.warning("所有信号计算失败，返回原始 K 线")
         return kline_df
 
-    signal_parts = [pd.read_parquet(f) for f in result_files]
+    signal_parts = [pd.read_parquet(f) for f in cache_files]
     signal_df = pd.concat(signal_parts, ignore_index=True)
-
-    # cleanup
-    for f in result_files:
-        os.remove(f)
-    os.remove(kline_path)
-    os.rmdir(tmpdir)
 
     result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
     for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
@@ -99,13 +179,10 @@ def prepare_backtest_data(
 
 def _stock_worker(
     symbol: str,
-    kline_path: str,
+    stock_dir: str,
     params: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    df = pd.read_parquet(kline_path)
-    stock_df = (
-        df[df["symbol"] == symbol].sort_values("trade_date").copy()
-    )
+    df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"))
     if len(stock_df) < 60:
         return []
 
