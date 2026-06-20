@@ -211,7 +211,6 @@ class FullBullScoringConfig(BaseModel):
 
     WEIGHT_ZERO_AXIS: int = Field(default=20, ge=0, le=100)
     WEIGHT_STRATEGY_GOLDEN: int = Field(default=15, ge=0, le=100)
-    WEIGHT_TACTICAL_GOLDEN: int = Field(default=10, ge=0, le=100)
     WEIGHT_MOMENTUM: int = Field(default=15, ge=0, le=100)
     WEIGHT_DIF_SLOPE: int = Field(default=10, ge=0, le=100)
     WEIGHT_DIVERGENCE: int = Field(default=10, ge=0, le=100)
@@ -229,18 +228,6 @@ class FullBullScoringConfig(BaseModel):
     RULE_PRICE_NEW_HIGH_DAYS: int = Field(default=20, ge=5, le=120)
 
 
-class KlineDataConfig(BaseModel):
-    """K线数据获取配置"""
-
-    KLINE_HISTORY_DAYS: int = Field(default=200, ge=1)
-
-    @field_validator("KLINE_HISTORY_DAYS")
-    @classmethod
-    def validate_days(cls, v: int) -> int:
-        if v > 1000:
-            warnings.warn(f"警告：KLINE_HISTORY_DAYS 设置为 {v} 天，数值较大可能导致获取数据时间过长。", UserWarning)
-        return v
-
 
 class UserFocusStocksConfig(BaseModel):
     """用户关注股池配置"""
@@ -253,30 +240,16 @@ class AShareHubConfig(BaseModel):
 
     API_KEY: str = Field(default="")
     ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
-    CHIP_LIMIT: int = Field(default=1, ge=1, le=200)
     MONEYFLOW_RETRY: int = Field(default=3, ge=0, le=10,
                                    description="资金流向 API 429 重试次数")
     MONEYFLOW_PAGE_DELAY: float = Field(default=1.0, ge=0.0, le=30.0,
                                           description="资金流分页间隔秒数")
-    @field_validator("CHIP_LIMIT")
-    @classmethod
-    def validate_limit(cls, v: int) -> int:
-        if v > 50:
-            import warnings
-            warnings.warn("CHIP_LIMIT>50 会拉取多日历史快照，通常用 limit=1（最新快照）即可。", UserWarning)
-        return v
 
 
 class MacroFilterConfig(BaseModel):
     """宏观过滤器配置"""
 
     ENABLE_MACRO_FILTER: bool = Field(default=True)
-    INDEX_SYMBOL: str = Field(default="sh000001")
-    TREND_LOOKBACK_DAYS: int = Field(default=250, ge=60, le=500)
-    VOLUME_LOOKBACK_DAYS: int = Field(default=20, ge=5, le=120)
-    ADVANCE_RATIO_ICE: float = Field(default=0.25, ge=0, le=1.0)
-    ADVANCE_RATIO_WEAK: float = Field(default=0.35, ge=0, le=1.0)
-    ADVANCE_RATIO_HOT: float = Field(default=0.70, ge=0, le=1.0)
 
 
 class RegimeDetectionConfig(BaseModel):
@@ -420,9 +393,7 @@ class PositionSizingConfig(BaseModel):
     MAX_INDUSTRY_EXPOSURE: float = Field(default=0.30, ge=0.0, le=1.0,
                                          description="最大行业集中度")
     RISK_BUDGET: float = Field(default=0.02, ge=0.001, le=0.10,
-                               description="波动率风险预算")
-    MAX_DRAWDOWN_REDUCTION: float = Field(default=0.50, ge=0.0, le=1.0,
-                                          description="最大回撤缩减系数")
+                                description="波动率风险预算")
 
 
 class AppConfig(BaseSettings):
@@ -443,7 +414,6 @@ class AppConfig(BaseSettings):
     research_report_filter: ResearchReportFilterConfig
     full_bull_scoring: FullBullScoringConfig
     user_focus_stocks: UserFocusStocksConfig
-    kline_data: KlineDataConfig
     asharehub: AShareHubConfig
     macro_filter: MacroFilterConfig
     regime_detection: RegimeDetectionConfig
@@ -519,7 +489,6 @@ class Config:
             column_aliases=ColumnAliasesConfig(**col_raw),
             research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
             full_bull_scoring=FullBullScoringConfig(**self._section_upper("FULL_BULL_SCORING")),
-            kline_data=KlineDataConfig(**self._section_upper("KLINE_DATA")),
             user_focus_stocks=UserFocusStocksConfig(**self._section_upper("USER_FOCUS_STOCKS")),
             asharehub=AShareHubConfig(**ah_raw),
             macro_filter=MacroFilterConfig(**self._section_upper("MACRO_FILTER")),
@@ -643,9 +612,6 @@ class Config:
     def ENABLE_CHIP_DISTRIBUTION(self) -> bool: return self.app_config.asharehub.ENABLE_CHIP_DISTRIBUTION
 
     @property
-    def CHIP_LIMIT(self) -> int: return self.app_config.asharehub.CHIP_LIMIT
-
-    @property
     def MONEYFLOW_RETRY(self) -> int: return self.app_config.asharehub.MONEYFLOW_RETRY
 
     @property
@@ -654,13 +620,6 @@ class Config:
     # 宏观过滤
     @property
     def ENABLE_MACRO_FILTER(self) -> bool: return self.app_config.macro_filter.ENABLE_MACRO_FILTER
-
-    @property
-    def MACRO_FILTER_INDEX_SYMBOL(self) -> str: return self.app_config.macro_filter.INDEX_SYMBOL
-
-    # K线
-    @property
-    def KLINE_HISTORY_DAYS(self) -> int: return self.app_config.kline_data.KLINE_HISTORY_DAYS
 
     # ── Dict 聚合属性（供 SignalManager / DataProcessingService 等使用） ──
 
@@ -766,7 +725,6 @@ class Config:
             "position_d": p.POSITION_D,
             "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": p.RISK_BUDGET,
-            "max_drawdown_reduction": p.MAX_DRAWDOWN_REDUCTION,
             "liq_w_section": f.LIQ_W_SECTION,
             "liq_w_timeseries": f.LIQ_W_TIMESERIES,
             "liq_w_marketcap": f.LIQ_W_MARKETCAP,

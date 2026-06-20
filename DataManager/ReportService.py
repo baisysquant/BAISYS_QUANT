@@ -148,7 +148,7 @@ class ReportService:
         base_cols = ReportService.get_base_columns()
         signal_cols = ReportService.get_signal_columns()
         report_cols = ReportService.get_report_columns(fund_flow_periods)
-        tail_cols = [ColumnNames.LIQUIDITY_SCORE, ColumnNames.LIQUIDITY_LEVEL, ColumnNames.SUGGESTED_POSITION, ColumnNames.STOCK_LINK]
+        tail_cols = [ColumnNames.LIQUIDITY_SCORE, ColumnNames.LIQUIDITY_LEVEL, ColumnNames.STOCK_LINK]
         return base_cols + signal_cols + report_cols + tail_cols
 
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
@@ -229,9 +229,7 @@ class ReportService:
                     max_len = max(df[col].astype(str).str.len().max(), len(col))
                     col_width = min(max_len + 2, 30)
 
-                    if col == ColumnNames.SUGGESTED_POSITION:
-                        worksheet.set_column(i, i, col_width, workbook.add_format({"num_format": "0.0%"}))
-                    elif col == ColumnNames.LATEST_PRICE or "价格" in col or "价" in col or "线" in col or "均线" in col:
+                    if col == ColumnNames.LATEST_PRICE or "价格" in col or "价" in col or "线" in col or "均线" in col:
                         worksheet.set_column(i, i, col_width, currency_format)
                     elif "代码" in col:
                         worksheet.set_column(i, i, 10, code_format)

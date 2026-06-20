@@ -78,6 +78,8 @@ class MacroFilter:
             recent_60_low = index_df["low"].iloc[-60:].min()
             close, ma60, ma120 = last["close"], last["MA60"], last["MA120"]
 
+            logger.info(f"  [L1] close={close:.0f} MA60={ma60:.0f} MA120={ma120:.0f} 近60日最低={recent_60_low:.0f}")
+
             # Level 1
             if pd.notna(close) and pd.notna(ma60) and pd.notna(ma120):
                 if close < ma60 and ma60 < ma120:
@@ -91,23 +93,30 @@ class MacroFilter:
                     result.l1_reason = f"趋势正常 close({close:.0f}) MA60({ma60:.0f}) MA120({ma120:.0f})"
 
                 if close < recent_60_low * 1.02:
+                    logger.info(f"  [L1] close({close:.0f}) < 近60日最低×1.02({recent_60_low*1.02:.0f}) → 上调至HIGH_RISK")
                     result.l1_level = "HIGH_RISK"
                     result.l1_reason += f" | 接近阶段新低({recent_60_low:.0f})"
 
             # Level 2
             if len(index_df) >= 20:
-                change_pct = (last["close"] - index_df.iloc[-2]["close"]) / index_df.iloc[-2]["close"] * 100
+                prev_close = index_df.iloc[-2]["close"]
+                change_pct = (close - prev_close) / prev_close * 100
                 amount_ma5 = index_df["amount"].iloc[-5:].mean()
                 amount_ma20 = index_df["amount"].iloc[-20:].mean()
-                if change_pct < -1 and amount_ma5 <= amount_ma20 * 0.8:
+                amount_ratio = amount_ma5 / amount_ma20 if amount_ma20 > 0 else 0
+                logger.info(f"  [L2] 涨跌幅={change_pct:.2f}% MA5均额={amount_ma5:.0f} MA20均额={amount_ma20:.0f} MA5/MA20={amount_ratio:.2f}")
+                if change_pct < -1 and amount_ratio <= 0.8:
                     result.l2_level = "HIGH_RISK"
-                    result.l2_reason = f"缩量下跌 {change_pct:.1f}% | 均额不足"
-                elif change_pct < -2 and amount_ma5 >= amount_ma20 * 1.5:
+                    result.l2_reason = f"缩量下跌 {change_pct:.1f}% | MA5均额不足MA20的80%"
+                    logger.info(f"  [L2] → HIGH_RISK: 跌幅{change_pct:.1f}%>1% 且 缩量{amount_ratio:.0%}")
+                elif change_pct < -2 and amount_ratio >= 1.5:
                     result.l2_level = "MEDIUM_RISK"
                     result.l2_reason = f"放量下跌 可能见底 {change_pct:.1f}%"
-                elif change_pct > 1 and amount_ma5 <= amount_ma20 * 0.7:
+                    logger.info(f"  [L2] → MEDIUM_RISK: 跌幅{change_pct:.1f}%>2% 且 放量{amount_ratio:.0%}")
+                elif change_pct > 1 and amount_ratio <= 0.7:
                     result.l2_level = "HIGH_RISK"
                     result.l2_reason = f"缩量反弹 {change_pct:.1f}% | 无量"
+                    logger.info(f"  [L2] → HIGH_RISK: 涨幅{change_pct:.1f}%>1% 但 缩量{amount_ratio:.0%}")
                 else:
                     result.l2_level = "NORMAL"
                     result.l2_reason = f"量价正常 {change_pct:.1f}%"
@@ -123,32 +132,40 @@ class MacroFilter:
             total = len(spot_df)
             up = (spot_df["涨跌幅"] > 0).sum()
             ratio = up / total
+            logger.info(f"  [L3] 全A共{total}只 上涨{up}只 下跌{total-up}只 上涨比例={ratio:.2%}")
             if ratio < 0.25:
                 result.l3_level = "HIGH_RISK"
                 result.l3_reason = f"情绪冰点 上涨比例{ratio*100:.1f}%"
+                logger.info(f"  [L3] → HIGH_RISK: 上涨比例{ratio:.1%}<25%")
             elif ratio < 0.35:
                 result.l3_level = "MEDIUM_RISK"
                 result.l3_reason = f"偏弱 上涨比例{ratio*100:.1f}%"
+                logger.info(f"  [L3] → MEDIUM_RISK: 上涨比例{ratio:.1%}<35%")
             elif ratio > 0.70:
                 result.l3_level = "MEDIUM_RISK"
                 result.l3_reason = f"过热 上涨比例{ratio*100:.1f}%"
+                logger.info(f"  [L3] → MEDIUM_RISK: 上涨比例{ratio:.1%}>70%")
             else:
                 result.l3_level = "NORMAL"
                 result.l3_reason = f"正常 上涨比例{ratio*100:.1f}%"
+                logger.info(f"  [L3] → NORMAL: 上涨比例{ratio:.1%}在正常范围")
 
         # ── 综合决策 ──
         all_levels = [result.l1_level, result.l2_level, result.l3_level]
         if "HIGH_RISK" in all_levels:
             result.risk_level = "HIGH_RISK"
             result.decision = "SKIP_ALL"
+            logger.info(f"  → SKIP_ALL: 存在HIGH_RISK级别 (L1={result.l1_level} L2={result.l2_level} L3={result.l3_level})")
         elif "MEDIUM_RISK" in all_levels:
             result.risk_level = "MEDIUM_RISK"
             result.decision = "CAUTION"
             result.score_adjust = 0.85
+            logger.info(f"  → CAUTION: 存在MEDIUM_RISK级别，评分阈值上浮15% (L1={result.l1_level} L2={result.l2_level} L3={result.l3_level})")
         else:
             result.risk_level = "NORMAL"
             result.decision = "NORMAL"
             result.score_adjust = 1.0
+            logger.info(f"  → NORMAL: 三级过滤全部通过 (L1={result.l1_level} L2={result.l2_level} L3={result.l3_level})")
 
         result.detail = (
             f"L1={result.l1_level}({result.l1_reason}); "

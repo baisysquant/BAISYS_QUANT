@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
+import akshare as ak
 import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -224,8 +225,23 @@ class StockAnalysisCoordinator:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
         from UtilsManager.PriceExtractor import PriceExtractor
-        latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
-        self.logger.info(f"[INFO] 从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
+
+        # 优先从接口获取实时行情（最新价不是复权价）
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            if spot_df is not None and not spot_df.empty:
+                from UtilsManager.CodeNormalizer import CodeNormalizer
+                spot_prices = spot_df[["代码", "最新价"]].copy()
+                spot_prices.columns = ["股票代码", "最新价"]
+                spot_prices["股票代码"] = CodeNormalizer.normalize_series(spot_prices["股票代码"])
+                latest_prices_df = spot_prices
+                self.logger.info(f"[INFO] 从接口获取了 {len(latest_prices_df)} 只股票的实时最新价")
+            else:
+                latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
+                self.logger.info(f"[INFO] 接口无数据，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
+        except Exception as e:
+            latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
+            self.logger.info(f"[INFO] 接口失败({e})，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
 
         ctx.set("hist_df", hist_df_all)
         ctx.set("spot_data", latest_prices_df)

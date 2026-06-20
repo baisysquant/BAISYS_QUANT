@@ -62,8 +62,7 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
     ],
     "TECHNICAL_INDICATORS": [
         "[TECHNICAL_INDICATORS]",
-        "macd_standard_params = 12,26,9",
-        "macd_second_params = 6,13,5",
+        "macd_params = 12,26,9",
     ],
     "COLUMN_ALIASES": [
         "[COLUMN_ALIASES]",
@@ -76,10 +75,6 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "enable_research_report_filter = false",
         "research_report_min_count = 1",
     ],
-    "KLINE_DATA": [
-        "[KLINE_DATA]",
-        "kline_history_days = 200",
-    ],
     "USER_FOCUS_STOCKS": [
         "[USER_FOCUS_STOCKS]",
         "user_focus_stocks = ",
@@ -88,7 +83,6 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "[FULL_BULL_SCORING]",
         "weight_zero_axis = 20",
         "weight_strategy_golden = 15",
-        "weight_tactical_golden = 10",
         "weight_momentum = 15",
         "weight_dif_slope = 10",
         "weight_divergence = 10",
@@ -108,17 +102,10 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "[ASHAREHUB]",
         "api_key = (请设置 AShareHub API 密钥)",
         "enable_chip_distribution = false",
-        "chip_limit = 1",
     ],
     "MACRO_FILTER": [
         "[MACRO_FILTER]",
         "enable_macro_filter = true",
-        "index_symbol = sh000001",
-        "trend_lookback_days = 250",
-        "volume_lookback_days = 20",
-        "advance_ratio_ice = 0.25",
-        "advance_ratio_weak = 0.35",
-        "advance_ratio_hot = 0.70",
     ],
 }
 
@@ -243,26 +230,6 @@ def _check_fund_flow_periods(value: str, issues: list[Issue], section: str) -> N
                             message=f"组合 {parts} 不被允许", actual_value=value))
 
 
-def _check_macd_second_params(value: str, issues: list[Issue], section: str) -> None:
-    try:
-        parts = [int(x.strip()) for x in value.split(",")]
-    except ValueError:
-        issues.append(Issue(section=section, field="macd_second_params", severity=Severity.ERROR,
-                            message="无法解析为整数列表", actual_value=value))
-        return
-    if len(parts) != 3:
-        issues.append(Issue(section=section, field="macd_second_params", severity=Severity.ERROR,
-                            message=f"必须三个参数（当前 {len(parts)} 个）", actual_value=value))
-        return
-    if parts == [0, 0, 0]:
-        issues.append(Issue(section=section, field="macd_second_params", severity=Severity.ERROR,
-                            message="不能为 0,0,0", actual_value=value))
-        return
-    if parts[0] >= parts[1]:
-        issues.append(Issue(section=section, field="macd_second_params", severity=Severity.WARNING,
-                            message=f"快线({parts[0]}) >= 慢线({parts[1]})", actual_value=value))
-
-
 def _check_moving_average_periods(value: str, issues: list[Issue], section: str) -> None:
     try:
         parts = [int(x.strip()) for x in value.split(",")]
@@ -282,7 +249,7 @@ def _check_moving_average_periods(value: str, issues: list[Issue], section: str)
 
 def _check_full_bull_weights(section_data: dict[str, str], issues: list[Issue], section: str) -> None:
     weight_fields = [
-        "weight_zero_axis", "weight_strategy_golden", "weight_tactical_golden",
+        "weight_zero_axis", "weight_strategy_golden",
         "weight_momentum", "weight_dif_slope", "weight_divergence",
         "weight_volume_price", "weight_kline_pattern",
     ]
@@ -295,9 +262,9 @@ def _check_full_bull_weights(section_data: dict[str, str], issues: list[Issue], 
             total += int(raw)
         except ValueError:
             pass
-    if total != 0 and total != 100:
+    if total != 0 and total != 90:
         issues.append(Issue(section=section, field="(权重合计)", severity=Severity.WARNING,
-                            message=f"8 个权重总和 {total}，建议 100", actual_value=str(total)))
+                            message=f"7 个权重总和 {total}，建议 90", actual_value=str(total)))
 
 
 def _check_full_bull_thresholds(section_data: dict[str, str], issues: list[Issue], section: str) -> None:
@@ -349,9 +316,7 @@ SECTION_RULES: list[SectionRule] = [
                    custom_validator="_check_fund_flow_periods"),
     ]),
     SectionRule(name="TECHNICAL_INDICATORS", description="技术指标信号配置", fields=[
-        FieldRule("macd_standard_params", "str", required=False, default="12,26,9"),
-        FieldRule("macd_second_params", "str", required=False, default="6,13,5",
-                   custom_validator="_check_macd_second_params"),
+        FieldRule("macd_params", "str", required=False, default="12,26,9"),
     ]),
     SectionRule(name="COLUMN_ALIASES", description="列名别名配置", optional=True, fields=[
         FieldRule("code_aliases", "str", required=False, default="代码=股票代码,证券代码=股票代码,股票代码=股票代码"),
@@ -361,9 +326,6 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="RESEARCH_REPORT_FILTER", description="研报过滤配置", optional=True, fields=[
         FieldRule("enable_research_report_filter", "bool", required=False, default="false"),
         FieldRule("research_report_min_count", "int", required=False, default="1", min_value=1, max_value=100),
-    ]),
-    SectionRule(name="KLINE_DATA", description="K线数据获取配置", optional=True, fields=[
-        FieldRule("kline_history_days", "int", required=False, default="200", min_value=60, max_value=1000),
     ]),
     SectionRule(name="USER_FOCUS_STOCKS", description="用户关注股池配置", optional=True, fields=[
         FieldRule("user_focus_stocks", "str", required=False, default=""),
@@ -394,38 +356,54 @@ SECTION_RULES: list[SectionRule] = [
     ]),
     SectionRule(name="MACRO_FILTER", description="宏观过滤器配置", optional=True, fields=[
         FieldRule("enable_macro_filter", "bool", required=False, default="true"),
-        FieldRule("index_symbol", "str", required=False, default="sh000001"),
-        FieldRule("trend_lookback_days", "int", required=False, default="250", min_value=60, max_value=500),
-        FieldRule("volume_lookback_days", "int", required=False, default="20", min_value=5, max_value=120),
-        FieldRule("advance_ratio_ice", "float", required=False, default="0.25", min_value=0, max_value=1),
-        FieldRule("advance_ratio_weak", "float", required=False, default="0.35", min_value=0, max_value=1),
-        FieldRule("advance_ratio_hot", "float", required=False, default="0.70", min_value=0, max_value=1),
     ]),
     SectionRule(name="REGIME_DETECTION", description="市场状态分类参数", optional=True, fields=[
         FieldRule("boll_narrow_ratio", "float", required=False, default="0.8", min_value=0.3, max_value=2.0),
-        FieldRule("volume_shrink_ratio", "float", required=False, default="0.6", min_value=0.1, max_value=1.0),
+        FieldRule("oscillation_hist_std_ratio", "float", required=False, default="0.1", min_value=0.01, max_value=1.0),
+        FieldRule("top_risk_ma20_deviation", "float", required=False, default="0.15", min_value=0.01, max_value=0.5),
+        FieldRule("oscillation_min_bars", "int", required=False, default="30", min_value=10, max_value=120),
+        FieldRule("reversal_lookback", "int", required=False, default="10", min_value=5, max_value=60),
     ]),
     SectionRule(name="DIVERGENCE", description="背离检测参数", optional=True, fields=[
-        FieldRule("div_lookback", "int", required=False, default="30", min_value=5, max_value=120),
-        FieldRule("div_threshold", "float", required=False, default="0.02", min_value=0, max_value=0.1),
+        FieldRule("base_distance", "int", required=False, default="10", min_value=5, max_value=60),
+        FieldRule("strength_threshold", "float", required=False, default="0.15", min_value=0.01, max_value=1.0),
+        FieldRule("decay_half_life", "int", required=False, default="8", min_value=2, max_value=60),
+        FieldRule("slope_window", "int", required=False, default="5", min_value=3, max_value=30),
     ]),
     SectionRule(name="SCORING_PARAMS", description="评分计算参数", optional=True, fields=[
         FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
         FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
+        FieldRule("atr_t2_mult", "float", required=False, default="5.0", min_value=2.0, max_value=20.0),
         FieldRule("cross_decay_days", "int", required=False, default="30", min_value=5, max_value=120),
+        FieldRule("cross_decay_min", "float", required=False, default="0.3", min_value=0.1, max_value=1.0),
+        FieldRule("kline_decay_days", "int", required=False, default="10", min_value=2, max_value=60),
+        FieldRule("kline_decay_min", "float", required=False, default="0.2", min_value=0.05, max_value=1.0),
+        FieldRule("vol_norm_denominator", "float", required=False, default="0.15", min_value=0.01, max_value=1.0),
+        FieldRule("trailing_stop_high_ratio", "float", required=False, default="0.98", min_value=0.9, max_value=1.0),
+        FieldRule("trailing_stop_lookback", "int", required=False, default="10", min_value=5, max_value=60),
+        FieldRule("trailing_stop_high_lookback", "int", required=False, default="20", min_value=10, max_value=120),
+        FieldRule("expected_return_lookback", "int", required=False, default="20", min_value=5, max_value=120),
     ]),
     SectionRule(name="TECHNICAL_CONSTANTS", description="标准技术指标参数", optional=True, fields=[
-        FieldRule("ma_periods", "int_list", required=False, default="5,10,20,30,60"),
-        FieldRule("atr_period", "int", required=False, default="14", min_value=5, max_value=60),
-        FieldRule("bb_period", "int", required=False, default="20", min_value=5, max_value=60),
-        FieldRule("bb_std", "float", required=False, default="2.0", min_value=1.0, max_value=4.0),
+        FieldRule("atr_length", "int", required=False, default="14", min_value=5, max_value=60),
+        FieldRule("adx_length", "int", required=False, default="14", min_value=5, max_value=60),
+        FieldRule("rsi_length", "int", required=False, default="14", min_value=5, max_value=60),
+        FieldRule("boll_length", "int", required=False, default="20", min_value=5, max_value=60),
+        FieldRule("boll_std", "float", required=False, default="2.0", min_value=1.0, max_value=4.0),
+        FieldRule("stoch_k", "int", required=False, default="9", min_value=3, max_value=30),
+        FieldRule("stoch_d", "int", required=False, default="3", min_value=2, max_value=15),
+        FieldRule("kline_scan_window", "int", required=False, default="60", min_value=20, max_value=200),
     ]),
     SectionRule(name="POSITION_SIZING", description="仓位管理配置", optional=True, fields=[
-        FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
-        FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
+        FieldRule("max_single_position", "float", required=False, default="0.33", min_value=0.0, max_value=1.0),
         FieldRule("kelly_fraction", "float", required=False, default="0.25", min_value=0.0, max_value=1.0),
-        FieldRule("position_a", "float", required=False, default="0.3", min_value=0.0, max_value=1.0),
-        FieldRule("liq_veto_ratio", "float", required=False, default="0.05", min_value=0.01, max_value=0.2),
+        FieldRule("default_win_rate", "float", required=False, default="0.50", min_value=0.0, max_value=1.0),
+        FieldRule("position_a", "float", required=False, default="0.30", min_value=0.0, max_value=1.0),
+        FieldRule("position_b", "float", required=False, default="0.15", min_value=0.0, max_value=1.0),
+        FieldRule("position_c", "float", required=False, default="0.05", min_value=0.0, max_value=1.0),
+        FieldRule("position_d", "float", required=False, default="0.00", min_value=0.0, max_value=1.0),
+        FieldRule("max_industry_exposure", "float", required=False, default="0.30", min_value=0.0, max_value=1.0),
+        FieldRule("risk_budget", "float", required=False, default="0.02", min_value=0.001, max_value=0.10),
     ]),
     SectionRule(name="BACKTEST", description="回测系统配置", optional=True, fields=[
         FieldRule("enabled", "bool", required=False, default="false"),
@@ -446,7 +424,6 @@ SECTION_RULES: list[SectionRule] = [
 
 _CUSTOM_VALIDATORS = {
     "_check_fund_flow_periods": _check_fund_flow_periods,
-    "_check_macd_second_params": _check_macd_second_params,
     "_check_moving_average_periods": _check_moving_average_periods,
     "_check_full_bull_weights": _check_full_bull_weights,
     "_check_full_bull_thresholds": _check_full_bull_thresholds,
