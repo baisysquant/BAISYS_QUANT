@@ -6,9 +6,22 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 
-from Backtesting.akquant_strategy import QuantPipelineStrategy
+def _project_root() -> Path:
+    p = Path(__file__).resolve().parent  # Backtesting/
+    for _ in range(10):
+        if (p / "config.ini").exists():
+            return p
+        parent = p.parent
+        if parent == p:
+            break
+        p = parent
+    return Path.cwd()
+
+
+PROJECT_ROOT = _project_root()
+
+import pandas as pd
 
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
@@ -21,7 +34,7 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "cross_decay_days": ("SCORING_PARAMS", "cross_decay_days"),
 }
 
-CONFIG_INI = Path("config.ini")
+CONFIG_INI = PROJECT_ROOT / "config.ini"
 
 
 def write_calibration_to_ini(params: dict[str, float]) -> None:
@@ -76,8 +89,18 @@ class CalibrationResult:
     params: dict[str, float] = field(default_factory=dict)
     score: float = 0.0
     sharpe: float = 0.0
+    sortino: float = 0.0
+    calmar: float = 0.0
     max_drawdown: float = 0.0
+    max_drawdown_duration: int = 0
     total_return: float = 0.0
+    annual_return: float = 0.0
+    annual_vol: float = 0.0
+    var_95: float = 0.0
+    cvar_95: float = 0.0
+    win_rate: float = 0.0
+    profit_factor: float = 0.0
+    total_trades: int = 0
     timestamp: str = ""
 
     @classmethod
@@ -85,7 +108,7 @@ class CalibrationResult:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
-CALIBRATION_FILE = Path("calibration_result.json")
+CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
 
 
 def run_grid_search(
@@ -93,24 +116,22 @@ def run_grid_search(
     param_grid: dict[str, list[float]] | None = None,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from akquant import run_grid_search as _ak_grid
+    from Backtesting.engine import EngineConfig, grid_search as _gs
 
+    cfg = _build_engine_config(backtest_kwargs)
     if param_grid is None:
         param_grid = {
             "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
             "kelly_fraction": [0.1, 0.25, 0.5],
             "position_a": [0.2, 0.3, 0.4],
         }
-    result_df = _ak_grid(
-        strategy=QuantPipelineStrategy,
-        param_grid=param_grid,
+    results = _gs(
         data=kline_df,
-        sort_by="sharpe_ratio",
-        ascending=False,
-        return_df=True,
-        **backtest_kwargs,
+        param_grid=param_grid,
+        engine_cfg=cfg,
+        show_progress=backtest_kwargs.get("show_progress", False),
     )
-    return result_df
+    return pd.DataFrame(results)
 
 
 def run_walk_forward(
@@ -121,26 +142,45 @@ def run_walk_forward(
     initial_cash: float = 1_000_000.0,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from akquant import run_walk_forward as _ak_wf
+    from Backtesting.engine import EngineConfig, walk_forward as _wf
 
+    cfg = _build_engine_config(initial_cash, backtest_kwargs)
     if param_grid is None:
         param_grid = {
             "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
             "kelly_fraction": [0.1, 0.25, 0.5],
         }
 
-    result_df = _ak_wf(
-        strategy=QuantPipelineStrategy,
-        param_grid=param_grid,
+    results = _wf(
         data=kline_df,
+        engine_cfg=cfg,
         train_period=train_period,
         test_period=test_period,
-        initial_cash=initial_cash,
-        metric="sharpe_ratio",
-        ascending=False,
-        **backtest_kwargs,
+        param_grid=param_grid,
+        show_progress=backtest_kwargs.get("show_progress", False),
     )
-    return result_df
+    return pd.DataFrame(results)
+
+
+def _build_engine_config(initial_cash_or_kwargs: float | dict[str, Any], kwargs: dict[str, Any] | None = None) -> Any:
+    from Backtesting.engine import EngineConfig
+
+    if isinstance(initial_cash_or_kwargs, dict):
+        kwargs = initial_cash_or_kwargs
+        initial_cash = kwargs.get("initial_cash", 1_000_000)
+    else:
+        initial_cash = initial_cash_or_kwargs
+        kwargs = kwargs or {}
+
+    return EngineConfig(
+        initial_cash=initial_cash,
+        commission_rate=kwargs.get("commission", 0.0003),
+        stamp_tax_rate=kwargs.get("stamp_tax", 0.001),
+        slippage=kwargs.get("slippage", 0.001),
+        max_position_pct=kwargs.get("max_position_pct", 0.1),
+        portfolio_method=kwargs.get("portfolio_method", "score_weighted"),
+        point_in_time=kwargs.get("point_in_time", True),
+    )
 
 
 def save_calibration(result: CalibrationResult) -> None:

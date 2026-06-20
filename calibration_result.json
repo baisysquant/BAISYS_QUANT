@@ -1,10 +1,18 @@
 {
-  "params": {
-    "atr_stop_mult": 1.0
-  },
-  "score": 0.0,
-  "sharpe": 0.0,
-  "max_drawdown": 0.0,
-  "total_return": 0.0,
-  "timestamp": ""
+  "params": {},
+  "score": -11.0425,
+  "sharpe": -10.3508,
+  "sortino": -9.4807,
+  "calmar": -1.0,
+  "max_drawdown": -0.068025,
+  "max_drawdown_duration": 834,
+  "total_return": -0.068025,
+  "annual_return": -0.021258,
+  "annual_vol": 0.002054,
+  "var_95": -0.000349,
+  "cvar_95": -0.000498,
+  "win_rate": 0.4888,
+  "profit_factor": 1.0034,
+  "total_trades": 1818,
+  "timestamp": "2026-06-19T23:55:38.699771"
 }

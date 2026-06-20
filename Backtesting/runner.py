@@ -9,6 +9,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from Backtesting.alert import BacktestAlert
+from Backtesting.analytics import compute_risk_metrics, compute_trade_metrics
 from Backtesting.calibration import (
     CALIB_PARAM_MAP,
     CalibrationResult,
@@ -20,7 +21,7 @@ from Backtesting.calibration import (
 )
 from Backtesting.calibration_log import ensure_table, get_last_run, record_run, should_rerun
 from UtilsManager.IDataProvider import BacktestDataProvider
-from Backtesting.prepare import prepare_backtest_data
+from Backtesting.prepare import _build_params, prepare_backtest_data
 from ConfigParser import Config
 from DataManager.DbEngine import get_engine
 
@@ -73,6 +74,7 @@ def run_backtest_pipeline(
     try:
         symbols = _resolve_symbols(engine)
         logger.info(f"  股票数量: {len(symbols)}")
+        logger.warning("生存偏差: 股票池仅含当前存活股票，已退市/ST 股票的历史负收益未被计入")
 
         kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
         if kline_df.empty:
@@ -85,7 +87,6 @@ def run_backtest_pipeline(
         train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
         logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
 
-        from Backtesting.prepare import _build_params
         prepared = prepare_backtest_data(kline_df, params=_build_params(config))
         signal_prefixes = ('进场', '退出', '风险', '止损', '综合')
         signal_cols = [c for c in prepared.columns if c.startswith(signal_prefixes)]
@@ -96,23 +97,64 @@ def run_backtest_pipeline(
             train_period=train_period,
             test_period=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
+            commission=bt.COMMISSION_RATE,
+            stamp_tax=bt.STAMP_TAX_RATE,
+            slippage=bt.SLIPPAGE,
+            max_position_pct=bt.MAX_POSITION_PCT,
+            portfolio_method=bt.PORTFOLIO_METHOD,
+            point_in_time=bt.POINT_IN_TIME,
             show_progress=True,
         )
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
 
-        best_params = _extract_best_params(wf_result)
-        logger.info(f"  最佳参数: {best_params}")
+        if not wf_result.empty and wf_result["sharpe_ratio"].max() > 3.0:
+            logger.warning(f"akquant 结果异常: Sharpe={wf_result['sharpe_ratio'].max():.2f}>3.0，可能存在前瞻偏差")
 
-        sharpe = float(wf_result.iloc[0].get("sharpe_ratio", 0))
-        total_return = float(wf_result.iloc[0].get("total_return", 0))
-        max_dd = float(wf_result.iloc[0].get("max_drawdown", 0))
+        best_params = _extract_best_params(wf_result)
+        logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
+
+        from Backtesting.engine import EngineConfig, run_full_backtest
+
+        ecfg = EngineConfig(
+            initial_cash=bt.INITIAL_CASH,
+            commission_rate=bt.COMMISSION_RATE,
+            stamp_tax_rate=bt.STAMP_TAX_RATE,
+            slippage=bt.SLIPPAGE,
+            max_position_pct=bt.MAX_POSITION_PCT,
+            portfolio_method=bt.PORTFOLIO_METHOD,
+            point_in_time=bt.POINT_IN_TIME,
+        )
+        trade_log, equity_curve = run_full_backtest(prepared, best_params, ecfg)
+        risk = compute_risk_metrics(equity_curve) or {}
+        trade = compute_trade_metrics(trade_log) or {}
+
+        logger.info(f"  ── 绩效分析 ──")
+        logger.info(f"  Sharpe={risk.get('sharpe_ratio', 0):.2f} | Sortino={risk.get('sortino_ratio', 0):.2f} | Calmar={risk.get('calmar_ratio', 0):.2f}")
+        logger.info(f"  VaR(95%)={risk.get('var_95', 0):.2%} | CVaR(95%)={risk.get('cvar_95', 0):.2%} | MaxDD={risk.get('max_drawdown', 0):.2%}")
+        logger.info(f"  交易={trade.get('total_trades', 0)} | 胜率={trade.get('win_rate', 0):.1%} | 盈亏比={trade.get('profit_factor', 0):.2f}")
+        logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
+
+        top = wf_result.dropna(subset=["sharpe_ratio"]).sort_values("sharpe_ratio", ascending=False).head(5)
+        sharpe_avg = float(top["sharpe_ratio"].mean())
+        total_return_avg = float(top["total_return"].mean())
+        max_dd_avg = float(top["max_drawdown"].mean())
 
         cal_result = CalibrationResult(
             params=best_params,
-            score=sharpe,
-            sharpe=sharpe,
-            max_drawdown=max_dd,
-            total_return=total_return,
+            score=sharpe_avg,
+            sharpe=risk.get("sharpe_ratio", sharpe_avg),
+            sortino=risk.get("sortino_ratio", 0),
+            calmar=risk.get("calmar_ratio", 0),
+            max_drawdown=risk.get("max_drawdown", max_dd_avg),
+            max_drawdown_duration=risk.get("max_drawdown_duration", 0),
+            total_return=risk.get("total_return", total_return_avg),
+            annual_return=risk.get("annual_return", 0),
+            annual_vol=risk.get("annual_vol", 0),
+            var_95=risk.get("var_95", 0),
+            cvar_95=risk.get("cvar_95", 0),
+            win_rate=trade.get("win_rate", 0),
+            profit_factor=trade.get("profit_factor", 0),
+            total_trades=trade.get("total_trades", 0),
             timestamp=datetime.now().isoformat(),
         )
         save_calibration(cal_result)
@@ -126,9 +168,10 @@ def run_backtest_pipeline(
             out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
             params=best_params,
-            sharpe=sharpe,
-            total_return=total_return,
-            max_drawdown=max_dd,
+            sharpe=cal_result.sharpe,
+            total_return=cal_result.total_return,
+            max_drawdown=cal_result.max_drawdown,
+            extra_metrics=risk | trade,
         )
 
         updated_sections = set()
@@ -239,13 +282,35 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
         logger.info(f"  刷新完成，新增 {total} 行")
 
 
-def _extract_best_params(wf_result: pd.DataFrame) -> dict[str, float]:
+def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5) -> dict[str, float]:
     if wf_result.empty or "params" not in wf_result.columns:
         return {}
-    best_row = wf_result.iloc[0]
-    if isinstance(best_row["params"], dict):
-        return {k: float(v) for k, v in best_row["params"].items()}
-    return {}
+
+    rows = wf_result.dropna(subset=["sharpe_ratio"])
+    if rows.empty:
+        return {}
+
+    # 按 sharpe 降序，取 top-N 加权平均
+    rows = rows.sort_values("sharpe_ratio", ascending=False).head(top_n)
+    weights = rows["sharpe_ratio"].values
+    total_weight = weights.sum()
+    if total_weight <= 0:
+        return {}
+
+    all_params: list[dict[str, float]] = []
+    for _, r in rows.iterrows():
+        if isinstance(r["params"], dict):
+            all_params.append({k: float(v) for k, v in r["params"].items()})
+
+    if not all_params:
+        return {}
+
+    keys = all_params[0].keys()
+    weighted: dict[str, float] = {}
+    for k in keys:
+        vals = [p[k] for p in all_params]
+        weighted[k] = sum(v * w for v, w in zip(vals, weights)) / total_weight
+    return weighted
 
 
 def start_scheduler(config: Config | None = None) -> None:

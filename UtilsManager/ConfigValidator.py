@@ -401,6 +401,47 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("advance_ratio_weak", "float", required=False, default="0.35", min_value=0, max_value=1),
         FieldRule("advance_ratio_hot", "float", required=False, default="0.70", min_value=0, max_value=1),
     ]),
+    SectionRule(name="REGIME_DETECTION", description="市场状态分类参数", optional=True, fields=[
+        FieldRule("boll_narrow_ratio", "float", required=False, default="0.8", min_value=0.3, max_value=2.0),
+        FieldRule("volume_shrink_ratio", "float", required=False, default="0.6", min_value=0.1, max_value=1.0),
+    ]),
+    SectionRule(name="DIVERGENCE", description="背离检测参数", optional=True, fields=[
+        FieldRule("div_lookback", "int", required=False, default="30", min_value=5, max_value=120),
+        FieldRule("div_threshold", "float", required=False, default="0.02", min_value=0, max_value=0.1),
+    ]),
+    SectionRule(name="SCORING_PARAMS", description="评分计算参数", optional=True, fields=[
+        FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
+        FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
+        FieldRule("cross_decay_days", "int", required=False, default="30", min_value=5, max_value=120),
+    ]),
+    SectionRule(name="TECHNICAL_CONSTANTS", description="标准技术指标参数", optional=True, fields=[
+        FieldRule("ma_periods", "int_list", required=False, default="5,10,20,30,60"),
+        FieldRule("atr_period", "int", required=False, default="14", min_value=5, max_value=60),
+        FieldRule("bb_period", "int", required=False, default="20", min_value=5, max_value=60),
+        FieldRule("bb_std", "float", required=False, default="2.0", min_value=1.0, max_value=4.0),
+    ]),
+    SectionRule(name="POSITION_SIZING", description="仓位管理配置", optional=True, fields=[
+        FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
+        FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
+        FieldRule("kelly_fraction", "float", required=False, default="0.25", min_value=0.0, max_value=1.0),
+        FieldRule("position_a", "float", required=False, default="0.3", min_value=0.0, max_value=1.0),
+        FieldRule("liq_veto_ratio", "float", required=False, default="0.05", min_value=0.01, max_value=0.2),
+    ]),
+    SectionRule(name="BACKTEST", description="回测系统配置", optional=True, fields=[
+        FieldRule("enabled", "bool", required=False, default="false"),
+        FieldRule("optimize_frequency", "str", required=False, default="monthly",
+                   allowed_values=["initial", "monthly", "quarterly"]),
+        FieldRule("backtest_start_date", "str", required=False, default="20230101"),
+        FieldRule("out_of_sample_days", "int", required=False, default="60", min_value=10, max_value=500),
+        FieldRule("initial_cash", "float", required=False, default="1000000", min_value=10000),
+        FieldRule("commission_rate", "float", required=False, default="0.0003", min_value=0, max_value=0.01),
+        FieldRule("stamp_tax_rate", "float", required=False, default="0.001", min_value=0, max_value=0.01),
+        FieldRule("slippage", "float", required=False, default="0.001", min_value=0, max_value=0.01),
+        FieldRule("max_position_pct", "float", required=False, default="0.1", min_value=0.01, max_value=1.0),
+        FieldRule("portfolio_method", "str", required=False, default="score_weighted",
+                   allowed_values=["score_weighted", "risk_parity", "min_variance", "mean_variance"]),
+        FieldRule("point_in_time", "bool", required=False, default="true"),
+    ]),
 ]
 
 _CUSTOM_VALIDATORS = {

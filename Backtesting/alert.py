@@ -7,22 +7,22 @@ from typing import Any
 
 from loguru import logger
 
-from Backtesting.calibration import CalibrationResult, load_calibration
+from Backtesting.calibration import PROJECT_ROOT, CalibrationResult, load_calibration
 
 
 class BacktestAlert:
     """回测告警 — 失败通知 + 参数漂移检测。"""
 
     DRIFT_THRESHOLD = 0.15  # 单参数相对变化 > 15% 触发漂移告警
-    DRIFT_LOG = Path("backtest_drift.json")
+    DRIFT_LOG = PROJECT_ROOT / "backtest_drift.json"
 
     def __init__(self, config: Any) -> None:
         self.config = config
 
     def on_success(self, result: CalibrationResult) -> None:
-        logger.info(f"回测成功: Sharpe={result.sharpe:.2f}, "
-                    f"Return={result.total_return:.2%}, "
-                    f"DD={result.max_drawdown:.2%}")
+        logger.info(f"回测成功: Sharpe={result.sharpe:.2f}, Sortino={result.sortino:.2f}, "
+                    f"Return={result.total_return:.2%}, DD={result.max_drawdown:.2%}, "
+                    f"VaR={result.var_95:.2%}, 交易={result.total_trades}笔")
         self._check_drift(result.params)
 
     def on_failure(self, exc: Exception) -> None:

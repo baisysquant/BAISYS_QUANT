@@ -6,6 +6,26 @@ from akquant import Bar, Strategy
 from akquant.params import FloatParam, IntParam, ParamModel
 
 
+_trade_log: list[dict[str, Any]] = []
+_equity_curve: list[dict[str, Any]] = []
+
+
+def get_trade_log() -> list[dict[str, Any]]:
+    return list(_trade_log)
+
+
+def clear_trade_log() -> None:
+    _trade_log.clear()
+
+
+def get_equity_curve() -> list[dict[str, Any]]:
+    return list(_equity_curve)
+
+
+def clear_equity_curve() -> None:
+    _equity_curve.clear()
+
+
 
 class QuantPipelineParams(ParamModel):
     """回测策略可寻优参数。"""
@@ -35,9 +55,17 @@ class QuantPipelineStrategy(Strategy):
         param_kwargs = {k: v for k, v in kwargs.items() if k in model_fields}
         self.params = QuantPipelineParams(**param_kwargs)
         self._entry_cache: dict[str, float] = {}
+        self._cost = {
+            "commission": float(kwargs.get("commission", 0.0003)),
+            "stamp_tax": float(kwargs.get("stamp_tax", 0.001)),
+            "slippage": float(kwargs.get("slippage", 0.001)),
+            "max_position_pct": float(kwargs.get("max_position_pct", 0.1)),
+        }
 
     def on_start(self) -> None:
         self._entry_cache.clear()
+        _trade_log.clear()
+        _equity_curve.clear()
 
     def on_bar(self, bar: Bar) -> None:
         symbol = bar.symbol
@@ -48,11 +76,36 @@ class QuantPipelineStrategy(Strategy):
         if exit_signal:
             self.sell(symbol)
             self._entry_cache.pop(symbol, None)
+            _trade_log.append({
+                "time": str(getattr(bar, "trade_date", "")),
+                "symbol": symbol,
+                "action": "sell",
+                "price": float(bar.close),
+            })
         elif entry_signal:
             if symbol not in self._entry_cache:
                 weight = self._calc_weight(bar)
                 self.order_target_percent(symbol, weight)
                 self._entry_cache[symbol] = weight
+                _trade_log.append({
+                    "time": str(getattr(bar, "trade_date", "")),
+                    "symbol": symbol,
+                    "action": "buy",
+                    "price": float(bar.close) * (1 + self._cost["slippage"]),
+                    "weight": weight,
+                })
+
+        pv = getattr(self, "portfolio_value", None)
+        if pv is None:
+            cash = getattr(self, "cash", 0)
+            pos_val = 0
+            for s, w in self._entry_cache.items():
+                pos_val += w * getattr(self, "portfolio_value", 0) if hasattr(self, "portfolio_value") else 0
+            pv = cash + pos_val if cash else 0
+        _equity_curve.append({
+            "time": str(getattr(bar, "trade_date", "")),
+            "portfolio_value": float(pv or 0),
+        })
 
     def _check_exit(self, bar: Bar) -> bool:
         risk = str(getattr(bar, "风险等级", "LOW")).upper()
@@ -79,4 +132,6 @@ class QuantPipelineStrategy(Strategy):
     def _calc_weight(self, bar: Bar) -> float:
         risk_str = str(getattr(bar, "风险等级", "MEDIUM")).upper()
         risk_map = {"NONE": 1.0, "LOW": 1.5, "MEDIUM": 3.0, "HIGH": 5.0, "D": 8.0}
-        return 1.0 / risk_map.get(risk_str, 3.0)
+        base = 1.0 / risk_map.get(risk_str, 3.0)
+        capped = min(base, self._cost["max_position_pct"])
+        return capped

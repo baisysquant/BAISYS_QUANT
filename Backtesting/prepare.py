@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import shutil
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -18,20 +19,23 @@ from loguru import logger
 from ConfigParser import Config
 from LogicAnalyzer.pipeline import MACDAnalyzer
 
-CACHE_DIR = Path("Backtesting/data/signal_cache")
+CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
 CACHE_GROUP_SIZE = 500
 PROCESS_BATCH_SIZE = 200
+CACHE_MAX_AGE_DAYS = 7
 
 
-def _adjust_signal_workers(max_workers: int, watermark: float = 0.8) -> int:
+def _adjust_signal_workers(current: int, max_workers: int, watermark: float = 0.8) -> int:
     try:
         import psutil
         load = psutil.cpu_percent(interval=0.2) / 100.0
-        if load > watermark:
-            return max(1, max_workers - 1)
+        if load > watermark and current > 1:
+            return current - 1
+        if load < watermark * 0.7 and current < max_workers:
+            return current + 1
     except Exception:
         pass
-    return max_workers
+    return current
 
 
 def _make_param_hash(params: dict[str, Any]) -> str:
@@ -75,6 +79,29 @@ def _save_cache_meta(symbols: list[str], params: dict[str, Any], num_groups: int
     _cache_meta_path().write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
 
 
+def _cleanup_stale_cache() -> None:
+    if not CACHE_DIR.exists():
+        return
+    cutoff = date.today().isoformat()
+    for f in CACHE_DIR.iterdir():
+        if f.is_file():
+            try:
+                mtime = date.fromtimestamp(f.stat().st_mtime).isoformat()
+                if mtime < cutoff:
+                    f.unlink()
+            except (OSError, ValueError):
+                pass
+    # 如果清理后 meta.json 已经不在，重建空目录
+    if CACHE_DIR.exists() and not (CACHE_DIR / "meta.json").exists():
+        for f in CACHE_DIR.iterdir():
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        CACHE_DIR.rmdir()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def prepare_backtest_data(
     kline_df: pd.DataFrame,
     params: dict[str, Any] | None = None,
@@ -83,8 +110,14 @@ def prepare_backtest_data(
         cfg = Config()
         params = _build_params(cfg)
 
+    # 锁定随机种子使回测可复现
+    random.seed(42)
+    np.random.seed(42)
+
     symbols = sorted(kline_df["symbol"].unique())
     total = len(symbols)
+
+    _cleanup_stale_cache()
 
     # ── 缓存命中：直接加载合并 ──
     if _check_cache_valid(symbols, params):
@@ -121,6 +154,7 @@ def prepare_backtest_data(
     # 每 CACHE_GROUP_SIZE 只股票为一个缓存组
     cache_groups = [symbols[i:i + CACHE_GROUP_SIZE] for i in range(0, total, CACHE_GROUP_SIZE)]
 
+    workers = max_workers
     for gidx, group_syms in enumerate(cache_groups):
         group_rows: list[list[dict]] = []
 
@@ -131,7 +165,7 @@ def prepare_backtest_data(
         ]
         for batch_syms in group_batches:
             batch_rows: list[list[dict]] = []
-            workers = _adjust_signal_workers(max_workers)
+            workers = _adjust_signal_workers(workers, max_workers)
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 futures = {
                     pool.submit(_stock_worker, sym, stock_dir, params): sym
@@ -182,16 +216,22 @@ def _stock_worker(
     stock_dir: str,
     params: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"))
+    stock_df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"))
     if len(stock_df) < 60:
         return []
 
-    _compute_indicators(stock_df)
+    # 数据质量检查
+    _validate_stock_data(stock_df, symbol)
+
+    # 所有滚动指标（MA, MACD, ATR, BBANDS 等）只向后看，不存在前瞻偏差。
+    # 在全量数据上一次性计算，避免每根 bar 重复 800 次。
+    stock_df = _compute_indicators(stock_df)
+
     analyzer = MACDAnalyzer()
     rows: list[dict[str, Any]] = []
 
     for i in range(len(stock_df)):
-        bar = stock_df.iloc[: i + 1].reset_index(drop=True)
+        bar = stock_df.iloc[: i + 1]
         try:
             signal = _compute_signal(analyzer, bar, params)
         except Exception:
@@ -208,7 +248,19 @@ def _stock_worker(
     return rows
 
 
-def _compute_indicators(df: pd.DataFrame) -> None:
+def _validate_stock_data(df: pd.DataFrame, symbol: str) -> None:
+    """数据质量检查：零价格、缺失值、涨跌停。仅 warn 不阻断。"""
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
+        logger.warning(f"[{symbol}] 存在非正价格，可能停牌或数据异常")
+    nan_frac = df[["open", "high", "low", "close", "volume"]].isna().sum().sum() / (
+        len(df) * 5
+    )
+    if nan_frac > 0.01:
+        logger.warning(f"[{symbol}] 缺失值比例 {nan_frac:.1%} > 1%")
+
+
+def _compute_indicators(df_raw: pd.DataFrame) -> pd.DataFrame:
+    df = df_raw.copy()
     close = df["close"]
     high = df["high"]
     low = df["low"]
@@ -252,6 +304,32 @@ def _compute_indicators(df: pd.DataFrame) -> None:
         df["BBM_20_2.0"] = bb.iloc[:, 1].values
         df["BBL_20_2.0"] = bb.iloc[:, 2].values
         df["BOLL_BANDWIDTH"] = (bb.iloc[:, 0] - bb.iloc[:, 2]) / close
+
+    # 以下指标供 pipeline_analysis._precompute_rule_indicators 使用，
+    # 列名必须与 guards 的检查前缀完全匹配，避免每根 bar 重算。
+    adx_series = ta.adx(high, low, close, length=14)
+    if adx_series is not None:
+        df["ADX"] = adx_series.get("ADX_14", 0.0).values
+
+    df["MA_200"] = close.rolling(200).mean()
+
+    rsi_s = ta.rsi(close, length=14)
+    if rsi_s is not None:
+        df["RSI_14"] = rsi_s.values if isinstance(rsi_s, pd.Series) else rsi_s
+
+    stoch_df = ta.stoch(high, low, close, k=9, d=3)
+    if stoch_df is not None:
+        for c in stoch_df.columns:
+            df[c] = stoch_df[c].to_numpy()
+
+    df["AMOUNT"] = close * df["volume"]
+    df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean()
+    df["AMPLITUDE_PCT"] = (high - low) / close
+
+    cci_s = ta.cci(high, low, close, length=20)
+    if cci_s is not None:
+        df["CCI_20"] = cci_s.values if isinstance(cci_s, pd.Series) else cci_s
+    return df
 
 
 def _compute_signal(

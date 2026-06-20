@@ -411,19 +411,8 @@ class IncrementalSyncEngine:
     # ── delisted filter ─────────────────────────────────────────
 
     def _load_delisted(self) -> set[str]:
-        """从 stock_basic_info_sw 查出已退市股票，避免浪费 API 调用。"""
-        try:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        "SELECT stock_code FROM stock_basic_info_sw "
-                        "WHERE delist_date IS NOT NULL"
-                    )
-                ).fetchall()
-            codes = {_strip_prefix(CodeNormalizer.add_market_prefix(r[0])) for r in rows}
-            return {CodeNormalizer.add_market_prefix(c) for c in codes}
-        except Exception:
-            return set()
+        """占位：stock_basic_info_sw 不含退市日期字段，暂无法过滤。"""
+        return set()
 
     # ── resume helpers ──────────────────────────────────────────
 

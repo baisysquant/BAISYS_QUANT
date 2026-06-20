@@ -366,6 +366,12 @@ class BacktestConfig(BaseModel):
     OUT_OF_SAMPLE_DAYS: int = Field(default=20, ge=5, le=120)
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
     FULL_A_SHARE_MODE: bool = Field(default=False)
+    COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01)
+    STAMP_TAX_RATE: float = Field(default=0.001, ge=0, le=0.01)
+    SLIPPAGE: float = Field(default=0.001, ge=0, le=0.01)
+    MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
+    PORTFOLIO_METHOD: str = Field(default="score_weighted")
+    POINT_IN_TIME: bool = Field(default=True)
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
