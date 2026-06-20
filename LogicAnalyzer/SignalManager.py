@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -16,6 +17,132 @@ from LogicAnalyzer.ProfessionalIndicators import (
     analyze_rsi,
 )
 from LogicAnalyzer.SignalConstants import KLineDirection, KLineLevels
+
+
+# ── 多进程并行处理股票信号 ──────────────────────────────────────────────
+_SIGNAL_PARQUET_PATH: str = ""
+_SIGNAL_CONFIG: dict[str, Any] = {}
+_SIGNAL_CHIP: dict[str, Any] = {}
+_SIGNAL_MONEYFLOW: dict[str, Any] = {}
+_SIGNAL_FORECAST: dict[str, Any] = {}
+
+
+def _init_signal_worker(parquet_path: str, config: dict[str, Any],
+                         chip: dict[str, Any], mf: dict[str, Any], fc: dict[str, Any]) -> None:
+    global _SIGNAL_PARQUET_PATH, _SIGNAL_CONFIG, _SIGNAL_CHIP, _SIGNAL_MONEYFLOW, _SIGNAL_FORECAST
+    _SIGNAL_PARQUET_PATH = parquet_path
+    _SIGNAL_CONFIG = config
+    _SIGNAL_CHIP = chip
+    _SIGNAL_MONEYFLOW = mf
+    _SIGNAL_FORECAST = fc
+
+
+def _process_stock_worker(code: str) -> dict[str, Any] | None:
+    global _SIGNAL_PARQUET_PATH, _SIGNAL_CONFIG, _SIGNAL_CHIP, _SIGNAL_MONEYFLOW, _SIGNAL_FORECAST
+    cfg = _SIGNAL_CONFIG
+    # 规范化股票代码（与 _process_single_stock 逻辑一致）
+    _cs = str(code).lower()
+    if _cs.startswith(('sh', 'sz', 'bj')):
+        _cs = _cs[2:]
+    _m = re.search(r'(\d{6})', _cs)
+    pure_code = _m.group(1) if _m else _cs.zfill(6)
+
+    hist_df = pd.read_parquet(_SIGNAL_PARQUET_PATH)
+    df = hist_df[hist_df['股票代码'] == pure_code].copy()
+    if df.empty or len(df) < 30:
+        return None
+
+    for col in ['close', 'open', 'high', 'low', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.dropna(subset=['close', 'open', 'high', 'low'], inplace=True)
+    if df.empty:
+        return None
+    if 'date' in df.columns:
+        df.sort_values('date', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+    from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
+    macd_an = MACDAnalyzer()
+    try:
+        df = macd_an._custom_macd(df)
+    except Exception:
+        return None
+
+    result: dict[str, Any] = {'code': code, 'pure_code': pure_code}
+
+    # K线形态检测（@staticmethod，模块级类名在调用时已定义）
+    try:
+        kp = TASignalProcessor._detect_kline_patterns(df, scan_window=60)
+        if kp:
+            result['kline_pattern'] = kp['signal']
+            result['kline_pattern_score'] = kp['score']
+            df.attrs['kline_pattern_score'] = kp['score']
+            df.attrs['_kline_pattern_details'] = {'details': kp['details']}
+    except Exception:
+        pass
+
+    # 附加筹码/资金流/业绩预告（使用 pure_code 直接查）
+    if pure_code in _SIGNAL_CHIP:
+        cd = _SIGNAL_CHIP[pure_code]
+        df.attrs['chip_data'] = cd
+        result['cost_95pct'] = cd.get('cost_95pct', None)
+    if pure_code in _SIGNAL_MONEYFLOW:
+        mfd = _SIGNAL_MONEYFLOW[pure_code]
+        df.attrs['moneyflow_data'] = mfd
+        result['net_mf_amount'] = mfd.get('net_mf_amount', 0)
+    if pure_code in _SIGNAL_FORECAST:
+        fcd = _SIGNAL_FORECAST[pure_code]
+        df.attrs['forecast_data'] = fcd
+        result['forecast_type'] = fcd.get('type', '')
+
+    # pipeline_analysis
+    try:
+        weights = cfg.get('weights')
+        thresholds = cfg.get('thresholds')
+        adj_thresholds = None
+        macro_adjust = cfg.get('macro_adjust', 1.0)
+        if thresholds and macro_adjust < 1.0:
+            adj_thresholds = {k: int(v * macro_adjust) for k, v in thresholds.items()}
+        pipeline_params = {
+            "regime": cfg.get('regime', {}),
+            "divergence": cfg.get('divergence', {}),
+            "scoring": cfg.get('scoring', {}),
+            "technical": cfg.get('technical', {}),
+        }
+        pipeline_result = macd_an.pipeline_analysis(
+            df,
+            weights=weights,
+            thresholds=adj_thresholds or thresholds,
+            rule_thresholds=cfg.get('rule_thresholds'),
+            params=pipeline_params,
+        )
+        result['pipeline'] = pipeline_result
+        result['details'] = pipeline_result.get('details', {})
+        result['stop_loss'] = pipeline_result.get('stop_loss')
+        result['divergence_days'] = pipeline_result.get('divergence_days')
+        result['divergence_price'] = pipeline_result.get('divergence_price')
+        result['_current_dif'] = pipeline_result.get('current_dif')
+        result['t1_target'] = pipeline_result.get('t1_target')
+        result['t2_target'] = pipeline_result.get('t2_target')
+        result['trailing_stop'] = pipeline_result.get('trailing_stop')
+        result['exit_rrr'] = pipeline_result.get('exit_rrr')
+        result['position_adjust'] = pipeline_result.get('position_adjust', 0.0)
+        result['macd_trend_raw'] = pipeline_result.get('macd_trend', '')
+        result['amount'] = float(df['AMOUNT'].iloc[-1]) if 'AMOUNT' in df.columns else 0
+        result['amount_ma20'] = float(df['AMOUNT_MA20'].iloc[-1]) if 'AMOUNT_MA20' in df.columns else 0
+    except Exception:
+        pass
+
+    try:
+        detail_col = 'MACD_SIGNAL_DETAIL'
+        if detail_col in df.columns:
+            val = df[detail_col].iloc[-1]
+            if pd.notna(val) and val != '':
+                result['macd_signal'] = val
+    except Exception:
+        pass
+    return result
 
 
 class TASignalProcessor:
@@ -491,30 +618,50 @@ class TASignalProcessor:
                 else:
                     logger.info(f"[MacroFilter] {macro_result.detail} → NORMAL")
 
-        # ── 并行处理所有股票 ──────────────────────────────────────────────
-        max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
+        # ── 并行处理所有股票（多进程） ────────────────────────────────────
+        import tempfile
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 4)
+
+        # 写入临时 parquet 供子进程独立读取
+        _tmp_sig = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+        _sig_path = _tmp_sig.name
+        _tmp_sig.close()
+        valid_hist_df.to_parquet(_sig_path)
+
+        _sig_config = {
+            "weights": getattr(self.config, 'FULL_BULL_WEIGHTS', None),
+            "thresholds": getattr(self.config, 'FULL_BULL_THRESHOLDS', None),
+            "rule_thresholds": getattr(self.config, 'RULE_THRESHOLDS', None),
+            "regime": getattr(self.config, 'REGIME_DETECTION', {}),
+            "divergence": getattr(self.config, 'DIVERGENCE_PARAMS', {}),
+            "scoring": getattr(self.config, 'SCORING_PARAMS', {}),
+            "technical": getattr(self.config, 'TECHNICAL_CONSTANTS', {}),
+            "macro_adjust": macro_adjust,
+        }
 
         results: list[dict[str, Any]] = []
-        exec_signal = self.executor or ThreadPoolExecutor(max_workers=max_workers)
         try:
-            futures = {
-                exec_signal.submit(
-                    self._process_single_stock, code, valid_hist_df, macro_adjust,
-                    _chip_lookup, _moneyflow_lookup, _forecast_lookup,
-                ): code
-                for code in set(all_codes)
-            }
-            for future in as_completed(futures):
-                code = futures[future]
-                try:
-                    r = future.result()
-                    if r:
-                        results.append(r)
-                except (KeyError, ValueError, TypeError, AttributeError) as e:
-                    logger.warning("股票 %s 管线线程异常: %s", code, e)
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_init_signal_worker,
+                initargs=(_sig_path, _sig_config, _chip_lookup, _moneyflow_lookup, _forecast_lookup),
+            ) as pool:
+                codes = sorted(set(all_codes))
+                futures = {pool.submit(_process_stock_worker, c): c for c in codes}
+                for future in as_completed(futures):
+                    try:
+                        r = future.result()
+                        if r:
+                            results.append(r)
+                    except Exception as e:
+                        logger.warning("股票 %s 管线进程异常: %s", futures[future], e)
         finally:
-            if self.executor is None:
-                exec_signal.shutdown(wait=True)
+            try:
+                os.unlink(_sig_path)
+            except Exception:
+                pass
 
         # ── 从结果列表构建信号 DataFrame（避免逐行 O(n²) concat）─────────
         bull_rows: list[dict] = []
