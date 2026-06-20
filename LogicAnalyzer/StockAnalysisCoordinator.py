@@ -126,6 +126,10 @@ class StockAnalysisCoordinator:
         self.logger.info(f"[INFO] 股票分析程序启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"[INFO] 最后一个交易日为: {self.today_str}")
 
+        print(f"\n{'='*50}")
+        print(f"  股票分析流水线启动 | 交易日: {self.today_str}")
+        print(f"{'='*50}")
+
         ctx = PipelineContext()
 
         pipeline = [
@@ -144,16 +148,27 @@ class StockAnalysisCoordinator:
             ("同步结果到数据库", self._step_13_sync_to_database, False),
         ]
 
-        for step_name, step_fn, fatal in pipeline:
+        total = len(pipeline)
+        for i, (step_name, step_fn, fatal) in enumerate(pipeline, 1):
+            print(f"\n[{i}/{total}] {step_name}...", end="", flush=True)
+            step_start = time.time()
             ok = self._run_single_step(step_name, step_fn, ctx)
+            elapsed = time.time() - step_start
+            if ok:
+                print(f" ✓ ({elapsed:.1f}s)", flush=True)
+            else:
+                print(f" ✗ ({elapsed:.1f}s)", flush=True)
             if not ok and fatal:
+                print(f"\n  ⚠ 致命步骤失败，流程终止。")
                 self.logger.critical(f"[流水线终止] 致命步骤 '{step_name}' 失败，结束流程")
                 self._shutdown()
                 return
 
-        self.logger.info(
-            f"\n>>> 流程结束。总耗时: {timedelta(seconds=time.time() - self.start_time)}"
-        )
+        total_elapsed = timedelta(seconds=time.time() - self.start_time)
+        print(f"\n{'='*50}")
+        print(f"  流水线完成 | 总耗时: {total_elapsed}")
+        print(f"{'='*50}\n")
+        self.logger.info(f"\n>>> 流程结束。总耗时: {total_elapsed}")
         self._shutdown()
 
     def _run_single_step(self, name: str, fn: Callable[[PipelineContext], bool], ctx: PipelineContext) -> bool:
@@ -189,6 +204,7 @@ class StockAnalysisCoordinator:
         stock_codes_pure = sorted(filtered_pure_codes)
         ctx.set("stock_codes_prefixed", stock_codes_prefixed)
         ctx.set("stock_codes_pure", stock_codes_pure)
+        print(f"  待分析股票: {len(stock_codes_pure)} 只", flush=True)
         self.logger.info(
             f">>> HistDataWatchDog 成功同步 {len(stock_codes_prefixed)} 只股票数据到数据库，并作为分析基础。"
         )
@@ -229,17 +245,24 @@ class StockAnalysisCoordinator:
         # 优先从接口获取实时行情（最新价不是复权价）
         try:
             spot_df = ak.stock_zh_a_spot_em()
+            self.logger.info(f"[DEBUG] ak.stock_zh_a_spot_em() 返回 {type(spot_df).__name__}, shape={spot_df.shape if hasattr(spot_df,'shape') else '?'}")
             if spot_df is not None and not spot_df.empty:
+                self.logger.info(f"[DEBUG] 列名: {list(spot_df.columns)[:10]}")
+                if "代码" in spot_df.columns and "最新价" in spot_df.columns:
+                    self.logger.info(f"[DEBUG] 示例: {spot_df[['代码','最新价']].head(3).to_string()}")
                 from UtilsManager.CodeNormalizer import CodeNormalizer
                 spot_prices = spot_df[["代码", "最新价"]].copy()
                 spot_prices.columns = ["股票代码", "最新价"]
                 spot_prices["股票代码"] = CodeNormalizer.normalize_series(spot_prices["股票代码"])
                 latest_prices_df = spot_prices
                 self.logger.info(f"[INFO] 从接口获取了 {len(latest_prices_df)} 只股票的实时最新价")
+                self.logger.info(f"[DEBUG] 标准化后示例: {latest_prices_df.head(3).to_string()}")
             else:
+                self.logger.info(f"[DEBUG] 可用列: {list(hist_df_all.columns)}")
                 latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
                 self.logger.info(f"[INFO] 接口无数据，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
         except Exception as e:
+            self.logger.info(f"[DEBUG] 可用列: {list(hist_df_all.columns)}")
             latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
             self.logger.info(f"[INFO] 接口失败({e})，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
 
@@ -620,7 +643,7 @@ class StockAnalysisCoordinatorFactory:
         data_acquisition = DataAcquisitionService(config, calendar_mgr, logger, cache_manager, executor=executor)
         fund_momentum_analyzer = FundMomentumAnalyzer()
         data_processing = DataProcessingService(config, logger, fund_momentum_analyzer, calendar_mgr)
-        analysis_service = AnalysisService(config, logger, db_engine, executor=executor)
+        analysis_service = AnalysisService(config, logger, db_engine, executor=executor, today_str=today_str)
         report_service = ReportService(config, logger)
 
         return StockAnalysisCoordinator(

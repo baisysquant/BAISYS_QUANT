@@ -10,43 +10,53 @@ import pandas as pd
 from loguru import logger
 
 
+def _get_last_trading_day() -> str:
+    """从交易日历获取最后一个交易日 YYYYMMDD。"""
+    from DataCollection.CalendarManager import TradingCalendarAnalyzer
+    try:
+        cal = TradingCalendarAnalyzer()
+        raw = cal.get_last_trading_day()
+        return raw.replace("-", "")
+    except Exception:
+        return datetime.now().strftime("%Y%m%d")
+
+
 class SignalDataLoader:
     """加载 TASignalProcessor 所需的辅助数据（筹码分布、资金流向、业绩预告）。"""
 
     @staticmethod
-    def load_chip_distribution(config: Any) -> dict[str, dict]:  # noqa: ANN401
-        """加载筹码分布 CSV，返回 {纯6位代码: row_dict}。"""
+    def load_chip_distribution(config: Any, today_str: str | None = None) -> dict[str, dict]:  # noqa: ANN401
+        """加载筹码分布数据，返回 {纯6位代码: row_dict}。"""
         lookup: dict[str, dict] = {}
-        today_str = datetime.now().strftime('%Y%m%d')
-        chip_path = os.path.join(
-            getattr(config, 'HOME_DIRECTORY', '~/Downloads/CoreNews_Reports'),
-            f"chip_distribution_{today_str}.csv",
-        )
-        chip_path = os.path.expanduser(chip_path)
-        if not os.path.exists(chip_path):
-            return lookup
+        if today_str is None:
+            today_str = _get_last_trading_day()
         try:
-            chip_df = pd.read_csv(chip_path)
-            for _, row in chip_df.iterrows():
-                pure = str(row['symbol'])
-                for prefix in ('sh', 'sz', 'bj'):
-                    if pure.startswith(prefix):
-                        pure = pure[len(prefix):]
-                        break
-                lookup[pure] = row.to_dict()
-            logger.info(f"[SignalDataLoader] 已加载 {len(lookup)} 条筹码数据")
+            from DataCollection.ChipDistributionFetcher import ChipDistributionFetcher
+            fetcher = ChipDistributionFetcher(config)
+            chip_df = fetcher.fetch_chip_data(date=today_str)
+            if chip_df is not None and not chip_df.empty:
+                for _, row in chip_df.iterrows():
+                    pure = str(row.get('symbol', ''))
+                    for prefix in ('sh', 'sz', 'bj'):
+                        if pure.startswith(prefix):
+                            pure = pure[len(prefix):]
+                            break
+                    lookup[pure] = row.to_dict()
+                logger.info(f"[SignalDataLoader] 已加载 {len(lookup)} 条筹码数据")
         except Exception as e:
             logger.info(f"[SignalDataLoader] 加载筹码数据失败: {e}")
         return lookup
 
     @staticmethod
-    def load_moneyflow_data(config: Any) -> dict[str, dict]:  # noqa: ANN401
+    def load_moneyflow_data(config: Any, today_str: str | None = None) -> dict[str, dict]:  # noqa: ANN401
         """加载资金流向数据，返回 {纯6位代码: row_dict}。"""
         lookup: dict[str, dict] = {}
+        if today_str is None:
+            today_str = _get_last_trading_day()
         try:
             from DataCollection.MoneyFlowFetcher import MoneyFlowFetcher
             mf_fetcher = MoneyFlowFetcher(config)
-            mf_df = mf_fetcher.fetch_all()
+            mf_df = mf_fetcher.fetch_all(date=today_str)
             if mf_df is not None and not mf_df.empty:
                 for _, row in mf_df.iterrows():
                     ts_code = str(row.get('ts_code', ''))
@@ -58,13 +68,15 @@ class SignalDataLoader:
         return lookup
 
     @staticmethod
-    def load_forecast_data(config: Any) -> dict[str, dict]:  # noqa: ANN401
+    def load_forecast_data(config: Any, today_str: str | None = None) -> dict[str, dict]:  # noqa: ANN401
         """加载业绩预告数据，返回 {纯6位代码: row_dict}。"""
         lookup: dict[str, dict] = {}
+        if today_str is None:
+            today_str = _get_last_trading_day()
         try:
             from DataCollection.FinancialForecastFetcher import FinancialForecastFetcher
             fc_fetcher = FinancialForecastFetcher(config)
-            fc_df = fc_fetcher.fetch_all()
+            fc_df = fc_fetcher.fetch_all(date=today_str)
             if fc_df is not None and not fc_df.empty:
                 for _, row in fc_df.iterrows():
                     ts_code = str(row.get('ts_code', ''))
@@ -76,10 +88,12 @@ class SignalDataLoader:
         return lookup
 
     @staticmethod
-    def load_all(config: Any) -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:  # noqa: ANN401
+    def load_all(config: Any, today_str: str | None = None) -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:  # noqa: ANN401
         """一次性加载全部辅助数据，返回 (chip_lookup, moneyflow_lookup, forecast_lookup)。"""
+        if today_str is None:
+            today_str = _get_last_trading_day()
         return (
-            SignalDataLoader.load_chip_distribution(config),
-            SignalDataLoader.load_moneyflow_data(config),
-            SignalDataLoader.load_forecast_data(config),
+            SignalDataLoader.load_chip_distribution(config, today_str=today_str),
+            SignalDataLoader.load_moneyflow_data(config, today_str=today_str),
+            SignalDataLoader.load_forecast_data(config, today_str=today_str),
         )

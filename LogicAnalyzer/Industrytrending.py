@@ -19,9 +19,17 @@ warnings.filterwarnings('ignore')
 class SWIndustryDataPipeline:
     """模块一：数据管道（负责拉取、清洗与本地缓存）"""
     
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
         self.config = config or Config()
-        self.today_str = datetime.datetime.now().strftime("%Y%m%d")
+        if today_str:
+            self.today_str = today_str.replace("-", "")
+        else:
+            try:
+                from DataCollection.CalendarManager import TradingCalendarAnalyzer
+                cal = TradingCalendarAnalyzer()
+                self.today_str = cal.get_last_trading_day().replace("-", "")
+            except Exception:
+                self.today_str = datetime.datetime.now().strftime("%Y%m%d")
         self.cache_dir = os.path.join(self.config.HOME_DIRECTORY, "sw_data_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.parquet")
@@ -113,6 +121,7 @@ class SWIndustryDataPipeline:
         codes = df_val['code'].astype(str).tolist()
         names = df_val['name'].astype(str).tolist()
         
+        print(f"  ↓ 拉取 {len(codes)} 个行业K线数据...", flush=True)
         logger.info(f"开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
         all_hist_data = []
 
@@ -144,9 +153,11 @@ class SWIndustryDataPipeline:
                 if result is not None:
                     all_hist_data.append(result)
                 if (idx + 1) % 5 == 0 or idx == len(codes) - 1:
+                    print(f"  \r  行业进度: {len(all_hist_data)}/{len(codes)}", end="", flush=True)
                     logger.info(f"进度: {len(all_hist_data)}/{len(codes)}")
                 time.sleep(0.1)
 
+        print(f"\r  行业进度: {len(all_hist_data)}/{len(codes)} (完成)", flush=True)
         if not all_hist_data:
             logger.error("未能获取任何历史数据。")
             return None
@@ -268,9 +279,9 @@ class SWMultiFactorModel:
 class IndustryFlowAnalyzer:
     """兼容主程序调用链的行业分析适配器。"""
 
-    def __init__(self, config: Config | None = None) -> None:
+    def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
         self.config = config
-        self.pipeline = SWIndustryDataPipeline(config=config)
+        self.pipeline = SWIndustryDataPipeline(config=config, today_str=today_str)
         self.model = SWMultiFactorModel(self.pipeline)
 
     @staticmethod

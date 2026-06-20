@@ -35,6 +35,8 @@ class FinancialForecastFetcher:
 
     @property
     def _today(self) -> str:
+        if hasattr(self, '_override_today') and self._override_today:
+            return self._override_today
         from datetime import datetime
         return datetime.now().strftime("%Y%m%d")
 
@@ -63,7 +65,11 @@ class FinancialForecastFetcher:
             logger.info("[Forecast] API 密钥未配置，跳过。")
             return pd.DataFrame()
 
-        target_date = str(date).replace("-", "") if date else self._today
+        if date:
+            target_date = str(date).replace("-", "")
+            self._override_today = target_date
+        else:
+            target_date = self._today
         cache_path = os.path.join(self._cache_dir, f"forecast_{target_date}.csv")
 
         if target_date == self._today and os.path.exists(cache_path):

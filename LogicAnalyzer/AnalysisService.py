@@ -30,11 +30,12 @@ class AnalysisService:
         db_engine: 数据库引擎
     """
 
-    def __init__(self, config: Any, logger: Any, db_engine: Any, executor: ThreadPoolExecutor | None = None) -> None:  # noqa: ANN401
+    def __init__(self, config: Any, logger: Any, db_engine: Any, executor: ThreadPoolExecutor | None = None, today_str: str | None = None) -> None:  # noqa: ANN401
         self.config = config
         self.logger = logger
         self.db_engine = db_engine
         self.executor = executor
+        self.today_str = today_str
 
     def process_technical_signals(
         self, stock_codes: list[str], hist_df: pd.DataFrame, spot_data: pd.DataFrame
@@ -55,7 +56,7 @@ class AnalysisService:
 
         self.logger.info(">>> 正在处理技术指标信号...")
 
-        chip_lookup, moneyflow_lookup, forecast_lookup = SignalDataLoader.load_all(self.config)
+        chip_lookup, moneyflow_lookup, forecast_lookup = SignalDataLoader.load_all(self.config, today_str=self.today_str)
         signal_processor = TASignalProcessor(None, config=self.config, executor=self.executor)
         ta_signals = signal_processor.process_signals(
             stock_codes, hist_df, spot_data,
@@ -78,10 +79,13 @@ class AnalysisService:
         from LogicAnalyzer.Industrytrending import IndustryFlowAnalyzer
 
         self.logger.info(">>> 正在执行行业深度分析...")
+        print("  行业深度分析: 加载行业数据...", end="", flush=True)
 
-        industry_analyzer = IndustryFlowAnalyzer(self.config)
+        industry_analyzer = IndustryFlowAnalyzer(self.config, today_str=self.today_str)
         industry_analysis_df = industry_analyzer.run_analysis()
 
+        status = "✓" if not industry_analysis_df.empty else "✗ (空)"
+        print(f" {status} {len(industry_analysis_df)} 个行业", flush=True)
         self.logger.info(f">>> 行业分析完成，共 {len(industry_analysis_df)} 个行业")
 
         return industry_analysis_df

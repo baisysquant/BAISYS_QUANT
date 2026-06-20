@@ -185,8 +185,20 @@ class StockSyncEngine:
         # 标准化列名
         if "股票代码" not in report_df.columns:
             report_df.rename(columns={"代码": "股票代码"}, inplace=True)
-        if "机构投资评级(近六个月)-买入" not in report_df.columns:
-            report_df.rename(columns={"买入 (次)": "机构投资评级(近六个月)-买入"}, inplace=True)
+        logger.info(f"[DEBUG] 研报原始列名: {list(report_df.columns)}")
+
+        # 买入评级列：尝试多个可能的列名
+        rating_col_candidates = ["机构投资评级(近六个月)-买入", "买入 (次)", "买入评级次数", "买入评级", "买入次数", "机构买入评级"]
+        found_rating_col = None
+        for col in rating_col_candidates:
+            if col in report_df.columns:
+                found_rating_col = col
+                break
+        if found_rating_col and found_rating_col != "机构投资评级(近六个月)-买入":
+            report_df.rename(columns={found_rating_col: "机构投资评级(近六个月)-买入"}, inplace=True)
+        elif not found_rating_col:
+            logger.warning(f"[WARNING] 无法识别研报买入评级列，可用列: {list(report_df.columns)}")
+            return pd.DataFrame()
 
         # 清洗
         report_df = report_df.drop_duplicates(subset=["股票代码"])
@@ -228,8 +240,10 @@ class StockSyncEngine:
             after_count = len(stock_pool_df)
             filtered_count = before_count - after_count
             if filtered_count > 0:
+                print(f"  过滤: 剔除 {filtered_count} 只ST → {after_count} 只", flush=True)
                 logger.info(f"[FILTER] 已过滤 {filtered_count} 只ST股票，剩余 {after_count} 只正常股票。")
             else:
+                print(f"  过滤: 无ST股票 ({after_count} 只)", flush=True)
                 logger.info("[INFO] 无ST股票需要过滤。")
 
         pure_codes = set(stock_pool_df["股票代码"].unique().tolist())
@@ -252,17 +266,21 @@ class StockSyncEngine:
         full_a_share = self.config.app_config.backtest.FULL_A_SHARE_MODE
         if full_a_share:
             final_codes = pure_codes
+            print(f"  过滤: 全A模式，跳过所有过滤 → {len(final_codes)} 只", flush=True)
             logger.info(f"[INFO] 全 A 股模式，跳过主板/研报过滤，分析池包含 {len(final_codes)} 只股票。")
         else:
             if self.config.MAIN_BOARD_ONLY:
                 final_codes = {code for code in pure_codes if code.startswith(("60", "00"))}
+                print(f"  过滤: 仅主板 → {len(final_codes)} 只", flush=True)
                 logger.info(f"[INFO] 已开启主板过滤，分析池包含 {len(final_codes)} 只主板股票。")
             else:
                 final_codes = pure_codes
+                print(f"  过滤: 全市场 → {len(final_codes)} 只", flush=True)
                 logger.info(f"[INFO] 全市场模式，分析池包含 {len(final_codes)} 只股票。")
 
             # 研报过滤（全 A 股模式下跳过）
             if self.config.ENABLE_RESEARCH_REPORT_FILTER and not report_df.empty:
+                print(f"\n  [研报过滤] 启用 (阈值>{self.config.RESEARCH_REPORT_MIN_COUNT}次买入)", flush=True)
                 logger.info(f"\n[研报过滤] 启用研报二次过滤，阈值: {self.config.RESEARCH_REPORT_MIN_COUNT} 次买入评级")
                 filtered_report_df = report_df[
                     report_df["机构投资评级(近六个月)-买入"] > self.config.RESEARCH_REPORT_MIN_COUNT
@@ -271,11 +289,15 @@ class StockSyncEngine:
                 before_count = len(final_codes)
                 final_codes = final_codes.intersection(report_filtered_codes)
                 after_count = len(final_codes)
+                msg = f"  [研报过滤] {before_count} → {after_count} (过滤掉 {before_count - after_count} 只)"
+                print(msg, flush=True)
                 logger.info(f"[研报过滤] 原始股票数: {before_count}, 过滤后: {after_count}, 过滤掉: {before_count - after_count}")
                 if after_count == 0:
+                    print("  [研报过滤] 过滤后无股票剩余，终止", flush=True)
                     logger.info("[警告] 研报过滤后无股票剩余")
                     return set()
             elif self.config.ENABLE_RESEARCH_REPORT_FILTER:
+                print("  [研报过滤] 已启用但无研报数据，跳过过滤", flush=True)
                 logger.info("[警告] 研报过滤已启用，但未获取到研报数据，跳过研报过滤")
 
         # 【统一数据同步】使用 IncrementalSyncEngine 做增量同步

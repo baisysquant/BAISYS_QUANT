@@ -39,6 +39,8 @@ class MoneyFlowFetcher:
 
     @property
     def _today(self) -> str:
+        if hasattr(self, '_override_today') and self._override_today:
+            return self._override_today
         from datetime import datetime
         return datetime.now().strftime("%Y%m%d")
 
@@ -73,6 +75,7 @@ class MoneyFlowFetcher:
 
         if date is not None:
             target_date = str(date).replace("-", "")
+            self._override_today = target_date
         else:
             target_date = self._today
 

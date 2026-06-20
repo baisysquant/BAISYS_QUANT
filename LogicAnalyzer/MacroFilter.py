@@ -59,6 +59,7 @@ class MacroFilter:
         result = MacroFilterResult()
 
         # ── Level 1 + 2：上证指数分析 ──
+        print("\n  宏观过滤[L1] 获取上证指数数据...", end="", flush=True)
         if index_df is None:
             try:
                 index_df = ak.stock_zh_index_daily_tx(
@@ -97,7 +98,10 @@ class MacroFilter:
                     result.l1_level = "HIGH_RISK"
                     result.l1_reason += f" | 接近阶段新低({recent_60_low:.0f})"
 
+            print(f" L1={result.l1_level} close={close:.0f}/{ma60:.0f}/{ma120:.0f}", flush=True)
+
             # Level 2
+            print("  宏观过滤[L2] 量价验证...", end="", flush=True)
             if len(index_df) >= 20:
                 prev_close = index_df.iloc[-2]["close"]
                 change_pct = (close - prev_close) / prev_close * 100
@@ -120,8 +124,10 @@ class MacroFilter:
                 else:
                     result.l2_level = "NORMAL"
                     result.l2_reason = f"量价正常 {change_pct:.1f}%"
+            print(f" L2={result.l2_level} {change_pct:.2f}%", flush=True)
 
         # ── Level 3：市场广度 ──
+        print("  宏观过滤[L3] 市场广度...", end="", flush=True)
         if spot_df is None:
             try:
                 spot_df = ak.stock_zh_a_spot_em()
@@ -149,6 +155,7 @@ class MacroFilter:
                 result.l3_level = "NORMAL"
                 result.l3_reason = f"正常 上涨比例{ratio*100:.1f}%"
                 logger.info(f"  [L3] → NORMAL: 上涨比例{ratio:.1%}在正常范围")
+        print(f" L3={result.l3_level}", flush=True)
 
         # ── 综合决策 ──
         all_levels = [result.l1_level, result.l2_level, result.l3_level]
@@ -172,4 +179,5 @@ class MacroFilter:
             f"L2={result.l2_level}({result.l2_reason}); "
             f"L3={result.l3_level}({result.l3_reason})"
         )
+        print(f"  宏观过滤结果: {result.decision} (L1={result.l1_level} L2={result.l2_level} L3={result.l3_level})", flush=True)
         return result

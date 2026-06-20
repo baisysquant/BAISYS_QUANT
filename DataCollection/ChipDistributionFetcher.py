@@ -58,6 +58,8 @@ class ChipDistributionFetcher:
 
     @property
     def _today(self) -> str:
+        if hasattr(self, '_override_today') and self._override_today:
+            return self._override_today
         return datetime.now().strftime("%Y%m%d")
 
     @property
@@ -71,16 +73,19 @@ class ChipDistributionFetcher:
             self._client = AShareHub(api_key=self.api_key)
         return self._client
 
-    def fetch_chip_data(self, symbols: list[str] | None = None) -> pd.DataFrame:
+    def fetch_chip_data(self, symbols: list[str] | None = None, date: str | None = None) -> pd.DataFrame:
         """获取全市场筹码分布数据（最新快照），带日级缓存。
 
         Args:
             symbols: 保留参数，不再使用。API 全局返回所有股票。
+            date: 日期字符串 YYYYMMDD，用于缓存键，默认当天。
 
         Returns:
             DataFrame with columns: ts_code, trade_date, winner_rate, weight_avg,
                                      cost_5pct, cost_25pct, cost_50pct, cost_75pct, cost_95pct
         """
+        if date:
+            self._override_today = str(date).replace("-", "")
         if not self.enabled or not self.api_key:
             logger.info("[ChipDist] 筹码分布获取未启用或 API 密钥未配置，跳过。")
             return pd.DataFrame()

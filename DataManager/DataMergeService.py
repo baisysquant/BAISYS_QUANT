@@ -155,15 +155,20 @@ class DataMergeService:
         if not spot_df.empty and ColumnNames.STOCK_CODE in spot_df.columns:
             spot_df = self._normalize_stock_code_in_df(spot_df)
             if ColumnNames.LATEST_PRICE in spot_df.columns:
+                self.logger.info(f"[DEBUG] spot_data_all 行数={len(spot_df)} 价格列存在")
+                self.logger.info(f"[DEBUG] spot 样本: {spot_df.head(2).to_string()}")
                 final_df = pd.merge(
                     final_df,
                     spot_df[[ColumnNames.STOCK_CODE, ColumnNames.LATEST_PRICE]].drop_duplicates(subset=[ColumnNames.STOCK_CODE]),
                     on=ColumnNames.STOCK_CODE,
                     how="left",
                 )
+                self.logger.info(f"[DEBUG] merge 后 final_df 行数={len(final_df)} 价格样本: {final_df[[ColumnNames.STOCK_CODE, ColumnNames.LATEST_PRICE]].head(3).to_string()}")
             else:
+                self.logger.warning(f"[DEBUG] spot_data_all 无最新价列，列名: {list(spot_df.columns)}")
                 final_df[ColumnNames.LATEST_PRICE] = "N/A"
         else:
+            self.logger.warning("[DEBUG] spot_data_all 为空或无股票代码列")
             final_df[ColumnNames.LATEST_PRICE] = "N/A"
 
         # 获取行业信息
