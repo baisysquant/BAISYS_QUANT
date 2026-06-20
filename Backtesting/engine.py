@@ -289,7 +289,7 @@ def walk_forward(
 
         _gdesc = f"窗口{win_idx+1}网格搜索"
         try:
-            with ProcessPoolExecutor(max_workers=3, initializer=_init_eval_worker, initargs=(_tmp_path, param_keys, engine_cfg)) as pool:
+            with ProcessPoolExecutor(max_workers=2, initializer=_init_eval_worker, initargs=(_tmp_path, param_keys, engine_cfg)) as pool:
                 futures = {pool.submit(_eval_one_combo, c): c for c in _gcombos}
                 _giter = _tqdm(as_completed(futures), desc=_gdesc, ncols=80, total=len(_gcombos), leave=False) if show_progress else as_completed(futures)
                 for f in _giter:
@@ -346,7 +346,7 @@ def grid_search(
     param_grid: dict[str, list[Any]],
     engine_cfg: EngineConfig | None = None,
     show_progress: bool = False,
-    max_workers: int = 3,
+    max_workers: int = 2,
 ) -> list[dict[str, Any]]:
     if engine_cfg is None:
         engine_cfg = EngineConfig()
