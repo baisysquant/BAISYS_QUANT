@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-import akshare as ak
 import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
@@ -242,29 +241,25 @@ class StockAnalysisCoordinator:
 
         from UtilsManager.PriceExtractor import PriceExtractor
 
-        # 优先从接口获取实时行情（最新价不是复权价）
-        try:
-            spot_df = ak.stock_zh_a_spot_em()
-            self.logger.info(f"[DEBUG] ak.stock_zh_a_spot_em() 返回 {type(spot_df).__name__}, shape={spot_df.shape if hasattr(spot_df,'shape') else '?'}")
-            if spot_df is not None and not spot_df.empty:
-                self.logger.info(f"[DEBUG] 列名: {list(spot_df.columns)[:10]}")
-                if "代码" in spot_df.columns and "最新价" in spot_df.columns:
-                    self.logger.info(f"[DEBUG] 示例: {spot_df[['代码','最新价']].head(3).to_string()}")
-                from UtilsManager.CodeNormalizer import CodeNormalizer
-                spot_prices = spot_df[["代码", "最新价"]].copy()
-                spot_prices.columns = ["股票代码", "最新价"]
-                spot_prices["股票代码"] = CodeNormalizer.normalize_series(spot_prices["股票代码"])
-                latest_prices_df = spot_prices
-                self.logger.info(f"[INFO] 从接口获取了 {len(latest_prices_df)} 只股票的实时最新价")
-                self.logger.info(f"[DEBUG] 标准化后示例: {latest_prices_df.head(3).to_string()}")
-            else:
-                self.logger.info(f"[DEBUG] 可用列: {list(hist_df_all.columns)}")
-                latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
-                self.logger.info(f"[INFO] 接口无数据，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
-        except Exception as e:
-            self.logger.info(f"[DEBUG] 可用列: {list(hist_df_all.columns)}")
-            latest_prices_df = PriceExtractor.extract_latest_prices(hist_df_all)
-            self.logger.info(f"[INFO] 接口失败({e})，从K线数据获取了 {len(latest_prices_df)} 只股票的最新收盘价")
+        # 从 DB close_normal 列获取实际收盘价（不复权，由同步引擎写入）
+        from UtilsManager.CodeNormalizer import CodeNormalizer
+
+        if "close_normal" in hist_df_all.columns and hist_df_all["close_normal"].notna().any():
+            latest_normal = (
+                hist_df_all.dropna(subset=["close_normal"])
+                .sort_values("trade_date")
+                .groupby("symbol", as_index=False)
+                .tail(1)
+                [["symbol", "close_normal"]]
+                .copy()
+            )
+            latest_normal.columns = ["股票代码", "最新价"]
+            latest_normal["股票代码"] = CodeNormalizer.normalize_series(latest_normal["股票代码"])
+            latest_prices_df = latest_normal
+            self.logger.info(f"[INFO] 从DB close_normal 获取了 {len(latest_prices_df)} 只股票的实际收盘价")
+        else:
+            self.logger.warning("[WARN] DB close_normal 无数据，最新价留空")
+            latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
 
         ctx.set("hist_df", hist_df_all)
         ctx.set("spot_data", latest_prices_df)

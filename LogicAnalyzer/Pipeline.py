@@ -49,6 +49,8 @@ class MACDAnalyzer:
     def _custom_macd(self, df: pd.DataFrame, params: tuple[int, int, int] = (12, 26, 9)) -> pd.DataFrame:
         if "close" not in df.columns:
             return df
+        if 'DIF' in df.columns and 'DEA' in df.columns and 'MACD_HIST' in df.columns:
+            return df
         fast, slow, signal = params
         close = df["close"]
         ema_fast = close.ewm(span=fast, adjust=False).mean()
@@ -150,13 +152,15 @@ class MACDAnalyzer:
             except Exception as e:
                 logger.warning(f"STOCH 计算失败: {e}")
 
-        if 'AMOUNT' not in df.columns and 'close' in df.columns and 'volume' in df.columns:
-            df['AMOUNT'] = df['close'] * df['volume']
+        if 'AMOUNT' not in df.columns or df['AMOUNT'].isna().all():
+            if 'close' in df.columns and 'volume' in df.columns:
+                df['AMOUNT'] = df['close'] * df['volume']
         if 'AMOUNT_MA20' not in df.columns and 'AMOUNT' in df.columns:
             df['AMOUNT_MA20'] = df['AMOUNT'].rolling(20, min_periods=5).mean()
 
-        if 'AMPLITUDE_PCT' not in df.columns and 'close' in df.columns and len(df) >= 2:
-            df['AMPLITUDE_PCT'] = (df['high'] - df['low']) / df['close'].shift(1) * 100
+        if 'AMPLITUDE_PCT' not in df.columns or df['AMPLITUDE_PCT'].isna().all():
+            if 'close' in df.columns and len(df) >= 2:
+                df['AMPLITUDE_PCT'] = (df['high'] - df['low']) / df['close'].shift(1) * 100
 
         if not any(c.startswith('CCI_') for c in df.columns):
             try:
@@ -227,7 +231,7 @@ class MACDAnalyzer:
                                "golden_cross_stagnant_pct": 0.02,
                                "liq_veto_ratio": 0.05}
 
-        if 'MA_5' not in df.columns:
+        if 'MA_60' not in df.columns:
             for p in [5, 10, 20, 30, 60]:
                 df[f'MA_{p}'] = df['close'].rolling(p).mean()
 

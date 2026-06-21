@@ -189,6 +189,82 @@ class IncrementalSyncEngine:
 
         return total_inserted
 
+    def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> int:
+        """回填 close_normal：为已有数据的股票补充不复权收盘价。
+
+        优先读取当天缓存文件，避免重复调接口。
+
+        Args:
+            symbols_prefixed: 待回填的股票列表（带前缀），None 表示全部。
+        Returns:
+            成功回填的股票数量。
+        """
+        if symbols_prefixed is None:
+            with self._engine.connect() as conn:
+                rows = conn.execute(text(f"SELECT DISTINCT symbol FROM {TABLE} WHERE close_normal IS NULL")).fetchall()
+                symbols_prefixed = [r[0] for r in rows]
+        if not symbols_prefixed:
+            logger.info("[close_normal] 全部股票已有 close_normal，无需回填")
+            return 0
+
+        # 优先加载当天缓存
+        cache_file = self._close_normal_cache_path()
+        cached = {}
+        if os.path.exists(cache_file):
+            try:
+                cache_df = pd.read_csv(cache_file, dtype={"symbol": str, "close_normal": float})
+                cached = dict(zip(cache_df["symbol"], cache_df["close_normal"]))
+                logger.info(f"[close_normal] 从缓存加载 {len(cached)} 只股票实际收盘价")
+            except Exception:
+                pass
+
+        todo = [s for s in symbols_prefixed if s not in self._load_success() and s not in cached]
+        if not todo and not cached:
+            return 0
+        self._trade_date_str = date.today().strftime("%Y%m%d")
+
+        # 调接口获取缺失的
+        results = dict(cached)
+        if todo:
+            with ThreadPoolExecutor(max_workers=min(self._max_workers, 10)) as pool:
+                futures = {pool.submit(self._fetch_close_normal, sym): sym for sym in todo}
+                for future in as_completed(futures):
+                    try:
+                        sym, val = future.result()
+                        if val is not None:
+                            results[sym] = val
+                    except Exception:
+                        pass
+            # 保存缓存
+            pd.DataFrame({"symbol": list(results.keys()), "close_normal": list(results.values())}).to_csv(cache_file, index=False)
+            logger.info(f"[close_normal] 缓存已保存: {cache_file}")
+
+        # 批量写入 DB
+        success_count = 0
+        with self._engine.begin() as conn:
+            for sym, val in results.items():
+                try:
+                    conn.execute(
+                        text(f"UPDATE {TABLE} SET close_normal = :val WHERE symbol = :sym AND trade_date = (SELECT MAX(trade_date) FROM {TABLE} WHERE symbol = :sym)"),
+                        {"sym": sym, "val": val},
+                    )
+                    success_count += 1
+                except Exception:
+                    pass
+        logger.info(f"[close_normal] 写入完成: {success_count}/{len(results)} 只")
+        self._save_success([s for s in results if s not in self._load_success()])
+        return success_count
+
+    def _fetch_close_normal(self, symbol: str) -> tuple[str, float | None]:
+        """获取单只股票最新不复权收盘价。"""
+        try:
+            raw = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self._trade_date_str, end_date=self._trade_date_str, adjust="", timeout=15)
+            if raw is not None and not raw.empty:
+                return symbol, pd.to_numeric(raw.iloc[-1]["close"], errors="coerce")
+        except Exception:
+            pass
+        return symbol, None
+
     # ── single stock sync ───────────────────────────────────────
 
     @staticmethod
@@ -314,8 +390,8 @@ class IncrementalSyncEngine:
             conn.execute(
                 text(f"""
                     INSERT INTO {TABLE}
-                        (symbol, trade_date, open, close, high, low, volume, amount, adj_factor)
-                    VALUES (:symbol, :trade_date, :open, :close, :high, :low, :volume, :amount, :adj_factor)
+                        (symbol, trade_date, open, close, high, low, volume, amount, adj_factor, close_normal)
+                    VALUES (:symbol, :trade_date, :open, :close, :high, :low, :volume, :amount, :adj_factor, :close_normal)
                 """),
                 df.rename(columns={}).to_dict("records"),
             )
@@ -373,6 +449,27 @@ class IncrementalSyncEngine:
         )
         df["amount"] = df["close"] * df["volume"]
         df["adj_factor"] = 1.0
+        df["close_normal"] = None
+
+        # 额外拉取不复权收盘价（仅最新交易日）— 用于报表展示
+        try:
+            raw_raw = ak.stock_zh_a_hist_tx(
+                symbol=prefixed,
+                start_date=end_str,
+                end_date=end_str,
+                adjust="",
+                timeout=15,
+            )
+            if raw_raw is not None and not raw_raw.empty:
+                last = raw_raw.iloc[-1]
+                raw_date = str(last["date"]) if not hasattr(last["date"], "strftime") else last["date"].strftime("%Y-%m-%d")
+                raw_close = pd.to_numeric(last["close"], errors="coerce")
+                mask = df["trade_date"].astype(str) == raw_date
+                if mask.any() and pd.notna(raw_close):
+                    df.loc[mask, "close_normal"] = raw_close
+        except Exception:
+            pass
+
         return df
 
     # ── split detection ─────────────────────────────────────────
@@ -415,6 +512,9 @@ class IncrementalSyncEngine:
         return set()
 
     # ── resume helpers ──────────────────────────────────────────
+
+    def _close_normal_cache_path(self) -> str:
+        return os.path.join(self._cache_dir, f"close_normal_{self._trade_date_str}.csv")
 
     @property
     def _failed_file(self) -> str:

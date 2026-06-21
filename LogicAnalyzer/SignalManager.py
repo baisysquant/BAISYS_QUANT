@@ -233,6 +233,107 @@ class TASignalProcessor:
 
         return result
 
+    # ── 全量向量化指标预计算 ────────────────────────────────────────────────────
+    @staticmethod
+    def _vectorized_compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """在全部股票上一次性向量化计算所有技术指标，避免 per-stock 重复计算。"""
+        import pandas_ta as ta
+        import numpy as np
+
+        needed = ['close', 'high', 'low', 'volume', 'open']
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            logger.warning(f"[向量化] 缺少列 {missing}，跳过预计算")
+            return df
+
+        # 按股票分组，每组的索引位置
+        def _apply_indicators(grp: pd.DataFrame) -> pd.DataFrame:
+            grp = grp.sort_values('date')
+            c, h, l, v, o = grp['close'], grp['high'], grp['low'], grp['volume'], grp['open']
+
+            # MACD
+            ema_fast = c.ewm(span=12, adjust=False).mean()
+            ema_slow = c.ewm(span=26, adjust=False).mean()
+            dif = ema_fast - ema_slow
+            dea = dif.ewm(span=9, adjust=False).mean()
+            grp['DIF'] = dif
+            grp['DEA'] = dea
+            grp['MACD_HIST'] = 2 * (dif - dea)
+            prev_dif = dif.shift(1).fillna(dea.shift(1).fillna(0))
+            prev_dea = dea.shift(1).fillna(0)
+            golden = (dif > dea) & (prev_dif <= prev_dea)
+            dead = (dif < dea) & (prev_dif >= prev_dea)
+            grp['MACD_CROSS'] = np.where(golden, 1, np.where(dead, -1, 0))
+            grp['MACD_SIGNAL_DETAIL'] = np.where(
+                golden, '金叉', np.where(dead, '死叉', '')
+            )
+
+            # 均线
+            for p in [5, 10, 20, 30, 60, 200]:
+                grp[f'MA_{p}'] = c.rolling(p, min_periods=1).mean()
+
+            # ATR
+            try:
+                atr_vals = ta.atr(h, l, c, length=14)
+                if atr_vals is not None:
+                    grp['ATR'] = atr_vals.to_numpy()
+            except Exception:
+                grp['ATR'] = float('nan')
+
+            # ADX
+            try:
+                adx_df = ta.adx(h, l, c, length=14)
+                if adx_df is not None:
+                    for col in adx_df.columns:
+                        grp[col] = adx_df[col].to_numpy()
+            except Exception:
+                pass
+
+            # RSI
+            try:
+                rsi_vals = ta.rsi(c, length=14)
+                if rsi_vals is not None:
+                    grp['RSI_14'] = rsi_vals.to_numpy()
+            except Exception:
+                pass
+
+            # STOCH (KDJ)
+            try:
+                stoch_df = ta.stoch(h, l, c, k=9, d=3)
+                if stoch_df is not None:
+                    for col in stoch_df.columns:
+                        grp[col] = stoch_df[col].to_numpy()
+            except Exception:
+                pass
+
+            # CCI
+            try:
+                cci_vals = ta.cci(h, l, c, length=20)
+                if cci_vals is not None:
+                    grp['CCI_20'] = cci_vals.to_numpy()
+            except Exception:
+                pass
+
+            # BOLL
+            try:
+                bbands = ta.bbands(c, length=20, std=2)
+                if bbands is not None:
+                    for col in bbands.columns:
+                        grp[col] = bbands[col].to_numpy()
+            except Exception:
+                pass
+
+            # AMOUNT / AMOUNT_MA20 / AMPLITUDE
+            grp['AMOUNT'] = c * v
+            grp['AMOUNT_MA20'] = grp['AMOUNT'].rolling(20, min_periods=5).mean()
+            grp['AMPLITUDE_PCT'] = (h - l) / c.shift(1) * 100
+
+            return grp
+
+        # 对每只股票应用（groupby 内是向量化操作）
+        df = df.groupby('股票代码', group_keys=False).apply(_apply_indicators)
+        return df
+
     # ── K线形态检测 ─────────────────────────────────────────────────────────────
     @staticmethod
     def _detect_kline_patterns(df: pd.DataFrame, scan_window: int = 60) -> dict | None:
@@ -471,8 +572,13 @@ class TASignalProcessor:
         # 过滤出有效的股票数据
         valid_hist_df = hist_df_all[hist_df_all['股票代码'].isin(code_set) & (hist_df_all['股票代码'] != '')].copy()
 
-        # ── 预分组：一次 O(n) 扫描构建股票 dict，避免每只股票 O(n) 扫全表 ──
-        logger.info("预分组 {} 只股票数据...", len(code_set))
+        # ── 全量向量化预计算指标（避免每只股票重复算 MACD/KDJ/RSI/CCI/BOLL） ──
+        logger.info("全量向量化预计算技术指标 ({} 只股票)...", len(code_set))
+        print(f"  ↓ 预计算 MACD/KDJ/RSI/CCI/BOLL/ATR...", end="", flush=True)
+        valid_hist_df = self._vectorized_compute_indicators(valid_hist_df)
+        print(f" ✓ {len(valid_hist_df)} 行", flush=True)
+
+        # ── 预分组：一次 O(n) 扫描构建股票 dict ──
         _stock_dict: dict[str, pd.DataFrame] = {
             code: grp.sort_values('date').copy()
             for code, grp in valid_hist_df.groupby('股票代码')

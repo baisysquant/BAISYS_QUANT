@@ -40,7 +40,7 @@ class LiveDataProvider(IDataProvider):
             where.append("trade_date <= :end_date")
 
         sql = text(f"""
-            SELECT symbol, trade_date, open, high, low, close, volume, amount
+            SELECT symbol, trade_date, open, high, low, close, volume, amount, close_normal
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date
@@ -82,7 +82,7 @@ class BacktestDataProvider(IDataProvider):
         where.append("trade_date <= :end_date")
 
         sql = text(f"""
-            SELECT symbol, trade_date, open, high, low, close, volume, amount
+            SELECT symbol, trade_date, open, high, low, close, volume, amount, close_normal
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date

@@ -310,6 +310,9 @@ class StockSyncEngine:
         inserted = engine.sync_all(akshare_symbols)
         logger.info(f"[INFO] 同步完成，新增 {inserted} 行")
 
+        # 回填 close_normal（不复权收盘价，供报表展示）
+        engine.backfill_close_normal(akshare_symbols)
+
         # 保存最终股票列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")
         try:
