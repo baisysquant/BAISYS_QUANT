@@ -26,8 +26,9 @@ def _strip_prefix(symbol: str) -> str:
 
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 15
-BATCH_SIZE = 200
-MAX_WORKERS = 5
+SYNC_BATCH_SIZE = 500
+SYNC_WORKERS = 10
+STAGGER_DELAY = 1.0
 RETRY_SLEEP = 15
 
 
@@ -36,21 +37,15 @@ class IncrementalSyncEngine:
         self,
         db_engine: Any,
         default_start: str | None = None,
-        max_workers: int = MAX_WORKERS,
-        cpu_watermark: float = 0.8,
         asharehub_api_key: str | None = None,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
-        self._max_workers = max_workers
-        self._cpu_watermark = cpu_watermark
-        self._current_workers = max_workers
         self._asharehub_api_key = asharehub_api_key
         self._cache_dir = os.path.join(
             os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
         )
         os.makedirs(self._cache_dir, exist_ok=True)
-        self._cleanup_old_cache()
         # 使用最新交易日而非 date.today()，避免周末/节假日误判
         try:
             _cal = TradingCalendarAnalyzer()
@@ -59,6 +54,7 @@ class IncrementalSyncEngine:
         except Exception:
             self._trade_date = date.today()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
+        self._cleanup_old_cache()
 
     # ── public API ──────────────────────────────────────────────
 
@@ -80,24 +76,6 @@ class IncrementalSyncEngine:
                         os.remove(fpath)
         except Exception as e:
             logger.warning(f"缓存清理失败: {e}")
-
-    def _adjust_workers(self) -> int:
-        """根据当前 CPU 负载动态调整并发数，水位默认 80%，最低 1 个 worker。"""
-        try:
-            import psutil
-            # 仅上次水位接近时才检测，否则沿用当前值
-            ratio = self._current_workers / self._max_workers
-            if self._current_workers == self._max_workers or ratio > 0.6:
-                load = psutil.cpu_percent(interval=0.3) / 100.0
-            else:
-                load = 0.0
-        except Exception:
-            return self._current_workers
-        if load > self._cpu_watermark:
-            self._current_workers = max(1, self._current_workers - 1)
-        elif load < self._cpu_watermark * 0.7 and self._current_workers < self._max_workers:
-            self._current_workers = min(self._max_workers, self._current_workers + 1)
-        return self._current_workers
 
     def sync_all(self, symbols_prefixed: list[str]) -> int:
         from tqdm import tqdm
@@ -134,7 +112,7 @@ class IncrementalSyncEngine:
         # 一次性加载回填确认缓存到内存
         self._backfill_cache = self._load_backfill_checked()
 
-        total_new_batches = (len(remaining) + BATCH_SIZE - 1) // BATCH_SIZE
+        total_batches = (len(remaining) + SYNC_BATCH_SIZE - 1) // SYNC_BATCH_SIZE
         pbar = tqdm(
             total=len(remaining),
             desc="增量同步 K 线",
@@ -142,25 +120,33 @@ class IncrementalSyncEngine:
             ncols=80,
         )
 
-        for batch_idx in range(total_new_batches):
-            start = batch_idx * BATCH_SIZE
-            end = min(start + BATCH_SIZE, len(remaining))
+        for batch_idx in range(total_batches):
+            start = batch_idx * SYNC_BATCH_SIZE
+            end = min(start + SYNC_BATCH_SIZE, len(remaining))
             batch_symbols = remaining[start:end]
 
-            batch_success: list[pd.DataFrame] = []
+            cache_files: list[str] = []
             batch_failed: list[str] = []
 
-            workers = self._adjust_workers()
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(self._sync_one, sym): sym for sym in batch_symbols
-                }
+            # 错峰提交：每提交一个任务间隔 STAGGER_DELAY 秒，避免同时打 API
+            with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
+                futures = {}
+                for i, sym in enumerate(batch_symbols):
+                    cache_path = os.path.join(
+                        self._cache_dir,
+                        f"_sync_{batch_idx}_{i}_{sym.replace('/', '_')}.pkl",
+                    )
+                    fut = pool.submit(self._sync_one_to_cache, sym, cache_path)
+                    futures[fut] = (sym, cache_path)
+                    if i < len(batch_symbols) - 1:
+                        time.sleep(STAGGER_DELAY)
+
                 for future in as_completed(futures):
-                    sym = futures[future]
+                    sym, cache_path = futures[future]
                     try:
-                        n, df = future.result()
-                        if n > 0 and df is not None:
-                            batch_success.append(df)
+                        n = future.result()
+                        if n > 0:
+                            cache_files.append(cache_path)
                             all_success.append(sym)
                             total_inserted += n
                         else:
@@ -171,18 +157,34 @@ class IncrementalSyncEngine:
                     finally:
                         pbar.update(1)
 
-            # write this batch to DB
-            if batch_success:
-                merged = pd.concat(batch_success, ignore_index=True)
-                self._write_batch(merged)
-                # 每批次完成后立即增量保存已成功的股票，支持崩溃恢复
-                batch_symbols = [df["symbol"].iloc[0] for df in batch_success]
-                self._save_success(batch_symbols)
+            # 从本地缓存文件合并写入 DB
+            if cache_files:
+                import pickle
+                dfs = []
+                valid_files = [f for f in cache_files if os.path.exists(f)]
+                for f in valid_files:
+                    try:
+                        with open(f, "rb") as _fh:
+                            dfs.append(pickle.load(_fh))
+                    except Exception:
+                        pass
+                if dfs:
+                    merged = pd.concat(dfs, ignore_index=True)
+                    self._write_batch(merged)
+                # 清理缓存文件
+                for f in valid_files:
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+                # 增量保存成功列表（崩溃恢复）
+                batch_ok = [sym for sym in batch_symbols if sym not in batch_failed]
+                self._save_success(batch_ok)
 
             if batch_failed:
                 self._save_failed(batch_failed)
 
-            if batch_idx < total_new_batches - 1:
+            if batch_idx < total_batches - 1:
                 time.sleep(RETRY_SLEEP)
 
         pbar.close()
@@ -197,6 +199,19 @@ class IncrementalSyncEngine:
             logger.info(f"\n[统计] 全部 {len(remaining)} 只股票同步完成 ✓")
 
         return total_inserted
+
+    def _sync_one_to_cache(self, symbol: str, cache_path: str) -> int:
+        """同步一只股票，结果写入本地 pickle 缓存文件。返回插入行数。"""
+        try:
+            n, df = self._sync_one(symbol)
+            if n > 0 and df is not None:
+                import pickle
+                with open(cache_path, "wb") as f:
+                    pickle.dump(df, f, protocol=4)
+            return n
+        except Exception as e:
+            logger.warning(f"  {symbol} 同步失败: {e}")
+            raise
 
     def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> int:
         """回填 close_normal：为已有数据的股票补充不复权收盘价。
