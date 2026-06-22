@@ -29,7 +29,13 @@ def setup_logger(log_dir: str | None = None, log_filename: str | None = None, le
     """
     # 配置参数
     log_dir = log_dir or os.path.join(os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
-    log_filename = log_filename or f"Corenews_Main_{datetime.now().strftime('%Y%m%d')}.log"
+    if log_filename is None:
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            _trade_day = TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+        except Exception:
+            _trade_day = datetime.now().strftime('%Y%m%d')
+        log_filename = f"Corenews_Main_{_trade_day}.log"
     log_path = os.path.join(log_dir, log_filename)
 
     # 确保日志目录存在

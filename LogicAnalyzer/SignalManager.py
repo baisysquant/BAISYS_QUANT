@@ -331,8 +331,11 @@ class TASignalProcessor:
             return grp
 
         # 对每只股票应用（groupby 内是向量化操作）
-        df = df.groupby('股票代码', group_keys=False).apply(_apply_indicators)
-        return df
+        # NOTE: pandas 3.x group_keys=False 可能丢失分组列；用 True + reset_index 保证列存在
+        result = df.groupby('股票代码', group_keys=True).apply(_apply_indicators)
+        if '股票代码' not in result.columns and '股票代码' in (result.index.names or []):
+            result = result.reset_index(level='股票代码', drop=False)
+        return result
 
     # ── K线形态检测 ─────────────────────────────────────────────────────────────
     @staticmethod

@@ -138,10 +138,14 @@ class UnifiedCacheManager:
     # ── CSV 文件缓存方法 ──────────────────────────────────────────────────
 
     def _resolve_today(self) -> str:
-        """获取用于文件命名的日期字符串（纯数字 YYYYMMDD）"""
+        """获取用于文件命名的日期字符串（纯数字 YYYYMMDD，交易日优先）"""
         if self._today_str:
             return self._today_str.replace("-", "")
-        return datetime.now().strftime("%Y%m%d")
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            return TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+        except Exception:
+            return datetime.now().strftime("%Y%m%d")
 
     def _compat_file_path(self, base_name: str, cleaned: bool = False, suffix: str = ".txt") -> str:
         """

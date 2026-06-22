@@ -168,8 +168,8 @@ class ReportService:
         from UtilsManager.Exceptions import ReportGenerationError
 
         self.logger.info("\n>>> 正在生成 Excel 报告...")
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{timestamp}.xlsx")
+        trade_date = today_str.replace("-", "") if today_str else datetime.datetime.now().strftime("%Y%m%d")
+        report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{trade_date}.xlsx")
 
         # Get user focus stocks once for all sheets
         user_focus_stocks = self._get_user_focus_stocks()

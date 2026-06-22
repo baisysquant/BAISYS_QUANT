@@ -41,8 +41,12 @@ class MoneyFlowFetcher:
     def _today(self) -> str:
         if hasattr(self, '_override_today') and self._override_today:
             return self._override_today
-        from datetime import datetime
-        return datetime.now().strftime("%Y%m%d")
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            return TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+        except Exception:
+            from datetime import datetime
+            return datetime.now().strftime("%Y%m%d")
 
     @property
     def _cache_path(self) -> str:

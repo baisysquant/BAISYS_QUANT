@@ -224,6 +224,14 @@ class StockAnalysisCoordinator:
             ctx.set("spot_data", pd.DataFrame())
             return True
 
+        # 延迟执行 close_normal 回填（不阻塞 Step 1），
+        # 确保 K 线查询时 close_normal 列已填充
+        self.logger.info("  [close_normal] 按需回填不复权收盘价...")
+        try:
+            self.stock_sync_engine.backfill_close_normal(stock_codes_prefixed)
+        except Exception as e:
+            self.logger.warning(f"  [close_normal] 回填异常: {e}，后续走降级路径")
+
         try:
             hist_df_all = self.data_provider.get_kline(stock_codes_prefixed)
             if not hist_df_all.empty:
@@ -240,10 +248,9 @@ class StockAnalysisCoordinator:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
         from UtilsManager.PriceExtractor import PriceExtractor
-
-        # 从 DB close_normal 列获取实际收盘价（不复权，由同步引擎写入）
         from UtilsManager.CodeNormalizer import CodeNormalizer
 
+        # 从 DB close_normal 列获取实际收盘价（不复权，由同步引擎写入）
         if "close_normal" in hist_df_all.columns and hist_df_all["close_normal"].notna().any():
             latest_normal = (
                 hist_df_all.dropna(subset=["close_normal"])
@@ -258,8 +265,32 @@ class StockAnalysisCoordinator:
             latest_prices_df = latest_normal
             self.logger.info(f"[INFO] 从DB close_normal 获取了 {len(latest_prices_df)} 只股票的实际收盘价")
         else:
-            self.logger.warning("[WARN] DB close_normal 无数据，最新价留空")
-            latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
+            # 降级路径：单独查询 DB 中最近的 close_normal（容错）
+            self.logger.warning("[WARN] close_normal 列无数据，尝试单独查询降级...")
+            try:
+                from sqlalchemy import text
+                fallback = pd.read_sql(
+                    text("""
+                        SELECT DISTINCT ON (symbol) symbol, close_normal
+                        FROM stock_daily_kline
+                        WHERE symbol = ANY(:symbols)
+                          AND close_normal IS NOT NULL
+                        ORDER BY symbol, trade_date DESC
+                    """),
+                    self.db_engine,
+                    params={"symbols": stock_codes_prefixed},
+                )
+                if not fallback.empty:
+                    fallback.columns = ["股票代码", "最新价"]
+                    fallback["股票代码"] = CodeNormalizer.normalize_series(fallback["股票代码"])
+                    latest_prices_df = fallback
+                    self.logger.info(f"[INFO] 降级路径: 从 DB 获取了 {len(latest_prices_df)} 只股票 close_normal")
+                else:
+                    self.logger.warning("[WARN] DB 中无任何 close_normal 记录，最新价留空")
+                    latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
+            except Exception as e2:
+                self.logger.warning(f"[WARN] 降级查询失败: {e2}")
+                latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
 
         ctx.set("hist_df", hist_df_all)
         ctx.set("spot_data", latest_prices_df)

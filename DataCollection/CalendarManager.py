@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime, timedelta
+from typing import Any
 
 import akshare as ak
 import pandas as pd
@@ -12,7 +13,18 @@ from loguru import logger
 
 
 class TradingCalendarAnalyzer:
+    _instance = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> TradingCalendarAnalyzer:  # noqa: ANN401
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self, cache_dir: str = "./cache") -> None:
+        if self._initialized:
+            return
+        self._initialized = True
         self.beijing_tz = pytz.timezone("Asia/Shanghai")
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)

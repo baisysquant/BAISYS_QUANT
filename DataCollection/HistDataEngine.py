@@ -212,6 +212,13 @@ class StockSyncEngine:
         logger.info(f"[INFO] 获取到 {len(report_df)} 只股票的研报数据。")
         return report_df[["股票代码", "机构投资评级(近六个月)-买入"]]
 
+    def backfill_close_normal(self, symbols: list[str] | None = None) -> int:
+        """回填 close_normal（不复权收盘价），委托给 IncrementalSyncEngine。"""
+        if not hasattr(self, '_sync_engine') or self._sync_engine is None:
+            logger.info("[close_normal] 尚未初始化同步引擎，跳过回填")
+            return 0
+        return self._sync_engine.backfill_close_normal(symbols)
+
     def run_engine(self, target_date: str | None = None) -> set[str] | None:
         """主运行函数：研报过滤 + K线数据同步"""
 
@@ -304,14 +311,14 @@ class StockSyncEngine:
         from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
         from UtilsManager.CodeNormalizer import CodeNormalizer
 
-        engine = IncrementalSyncEngine(self.db)
-        akshare_symbols = [CodeNormalizer.add_market_prefix(code) for code in sorted(final_codes)]
-        logger.info(f"[INFO] 同步 {len(akshare_symbols)} 只股票到 stock_daily_kline...")
-        inserted = engine.sync_all(akshare_symbols)
+        self._sync_engine = IncrementalSyncEngine(self.db, asharehub_api_key=getattr(self.config, 'ASHAREHUB_API_KEY', None))
+        self._sync_symbols = [CodeNormalizer.add_market_prefix(code) for code in sorted(final_codes)]
+        logger.info(f"[INFO] 同步 {len(self._sync_symbols)} 只股票到 stock_daily_kline...")
+        inserted = self._sync_engine.sync_all(self._sync_symbols)
         logger.info(f"[INFO] 同步完成，新增 {inserted} 行")
 
-        # 回填 close_normal（不复权收盘价，供报表展示）
-        engine.backfill_close_normal(akshare_symbols)
+        # close_normal 回填推迟到 Step 4（不阻塞研报过滤等后续步骤），
+        # 由 StockAnalysisCoordinator._step_4_get_kline_and_prices 按需触发
 
         # 保存最终股票列表
         final_output_path = os.path.join(self.base_data_dir, f"final_filtered_stocks_{self.today}.txt")

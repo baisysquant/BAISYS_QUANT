@@ -166,10 +166,10 @@ class DataMergeService:
                 self.logger.info(f"[DEBUG] merge 后 final_df 行数={len(final_df)} 价格样本: {final_df[[ColumnNames.STOCK_CODE, ColumnNames.LATEST_PRICE]].head(3).to_string()}")
             else:
                 self.logger.warning(f"[DEBUG] spot_data_all 无最新价列，列名: {list(spot_df.columns)}")
-                final_df[ColumnNames.LATEST_PRICE] = ""
+                final_df[ColumnNames.LATEST_PRICE] = float('nan')
         else:
             self.logger.warning("[DEBUG] spot_data_all 为空或无股票代码列")
-            final_df[ColumnNames.LATEST_PRICE] = ""
+            final_df[ColumnNames.LATEST_PRICE] = float('nan')
 
         # 获取行业信息
         self.logger.info("正在获取行业信息...")

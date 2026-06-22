@@ -56,11 +56,19 @@ class ChipDistributionFetcher:
         self._client = None
         self._cache_dir = getattr(config, 'TEMP_DATA_DIRECTORY', os.path.expanduser("~/Downloads/CoreNews_Reports"))
 
+    @staticmethod
+    def _get_trading_day() -> str:
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            return TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+        except Exception:
+            return datetime.now().strftime("%Y%m%d")
+
     @property
     def _today(self) -> str:
         if hasattr(self, '_override_today') and self._override_today:
             return self._override_today
-        return datetime.now().strftime("%Y%m%d")
+        return self._get_trading_day()
 
     @property
     def _cache_path(self) -> str:

@@ -25,7 +25,7 @@ def _strip_prefix(symbol: str) -> str:
 
 
 TABLE = "stock_daily_kline"
-OVERLAP_DAYS = 20
+OVERLAP_DAYS = 15
 BATCH_SIZE = 200
 MAX_WORKERS = 5
 RETRY_SLEEP = 15
@@ -38,12 +38,14 @@ class IncrementalSyncEngine:
         default_start: str | None = None,
         max_workers: int = MAX_WORKERS,
         cpu_watermark: float = 0.8,
+        asharehub_api_key: str | None = None,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
         self._max_workers = max_workers
         self._cpu_watermark = cpu_watermark
         self._current_workers = max_workers
+        self._asharehub_api_key = asharehub_api_key
         self._cache_dir = os.path.join(
             os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
         )
@@ -61,16 +63,23 @@ class IncrementalSyncEngine:
     # ── public API ──────────────────────────────────────────────
 
     def _cleanup_old_cache(self) -> None:
-        """清理超过 7 天的缓存文件。"""
+        """清理超过 7 天的缓存文件，以及脏 close_normal_*.csv（日期不匹配当前交易日）。"""
         try:
             now = datetime.now()
+            today_tag = f"close_normal_{self._trade_date_str}.csv"
             for fname in os.listdir(self._cache_dir):
+                # 清理脏 close_normal 缓存（日期与当前交易日不一致）
+                if fname.startswith("close_normal_") and fname != today_tag:
+                    os.remove(os.path.join(self._cache_dir, fname))
+                    continue
+                # 清理超过 7 天的旧缓存
                 fpath = os.path.join(self._cache_dir, fname)
-                age = now - datetime.fromtimestamp(os.path.getmtime(fpath))
-                if age.days > 7:
-                    os.remove(fpath)
-        except Exception:
-            pass
+                if os.path.isfile(fpath):
+                    age = now - datetime.fromtimestamp(os.path.getmtime(fpath))
+                    if age.days > 7:
+                        os.remove(fpath)
+        except Exception as e:
+            logger.warning(f"缓存清理失败: {e}")
 
     def _adjust_workers(self) -> int:
         """根据当前 CPU 负载动态调整并发数，水位默认 80%，最低 1 个 worker。"""
@@ -207,37 +216,81 @@ class IncrementalSyncEngine:
             logger.info("[close_normal] 全部股票已有 close_normal，无需回填")
             return 0
 
-        # 优先加载当天缓存
+        # 查询 DB 中真正 close_normal 为空的股票
+        with self._engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT symbol FROM {TABLE}
+                WHERE symbol = ANY(:symbols)
+                GROUP BY symbol
+                HAVING MAX(close_normal) IS NULL
+            """), {"symbols": list(symbols_prefixed)}).fetchall()
+        need_backfill = {r[0] for r in rows}
+        if not need_backfill:
+            logger.info("[close_normal] 全部股票已有 close_normal，无需回填")
+            return 0
+
+        # 优先加载缓存（用已有 self._trade_date_str，即最后交易日）
         cache_file = self._close_normal_cache_path()
         cached = {}
         if os.path.exists(cache_file):
             try:
                 cache_df = pd.read_csv(cache_file, dtype={"symbol": str, "close_normal": float})
-                cached = dict(zip(cache_df["symbol"], cache_df["close_normal"]))
-                logger.info(f"[close_normal] 从缓存加载 {len(cached)} 只股票实际收盘价")
-            except Exception:
-                pass
+                cached = {row["symbol"]: row["close_normal"] for _, row in cache_df.iterrows()}
+                cached = {k: v for k, v in cached.items() if k in need_backfill}
+                logger.info(f"[close_normal] 从缓存加载 {len(cached)} 只")
+            except Exception as e:
+                logger.warning(f"[close_normal] 缓存加载失败: {e}")
 
-        todo = [s for s in symbols_prefixed if s not in self._load_success() and s not in cached]
-        if not todo and not cached:
-            return 0
-        self._trade_date_str = date.today().strftime("%Y%m%d")
-
-        # 调接口获取缺失的
+        todo = list(need_backfill - cached.keys())
         results = dict(cached)
+
         if todo:
-            with ThreadPoolExecutor(max_workers=min(self._max_workers, 10)) as pool:
-                futures = {pool.submit(self._fetch_close_normal, sym): sym for sym in todo}
-                for future in as_completed(futures):
-                    try:
-                        sym, val = future.result()
-                        if val is not None:
-                            results[sym] = val
-                    except Exception:
-                        pass
-            # 保存缓存
+            today_iso = self._trade_date.isoformat()
+
+            if not self._asharehub_api_key:
+                logger.warning("[close_normal] ASHAREHUB_API_KEY 未配置，跳过 close_normal 回填")
+                return 0
+
+            logger.info("[close_normal] AShareHub 批量获取全市场最新收盘价...")
+            try:
+                from asharehub import AShareHub
+                client = AShareHub(api_key=self._asharehub_api_key)
+
+                offset = 0
+                limit = 5000
+                all_rows = []
+                while True:
+                    resp = client.daily(start_date=today_iso, end_date=today_iso, limit=limit, offset=offset)
+                    if isinstance(resp, list):
+                        batch = resp
+                    elif isinstance(resp, pd.DataFrame):
+                        batch = resp.to_dict("records")
+                    else:
+                        break
+                    if not batch:
+                        break
+                    all_rows.extend(batch)
+                    if len(batch) < limit:
+                        break
+                    offset += limit
+
+                for row in all_rows:
+                    ts_code = row.get("ts_code", "")
+                    close_val = pd.to_numeric(row.get("close"), errors="coerce")
+                    if pd.notna(close_val) and ts_code:
+                        parts = ts_code.split(".")
+                        if len(parts) == 2:
+                            symbol = f"{parts[1].lower()}{parts[0]}"
+                            if symbol in need_backfill:
+                                results[symbol] = close_val
+                matched = sum(1 for s in need_backfill if s in results)
+                logger.info(f"[close_normal] AShareHub 获取 {len(all_rows)} 条, 匹配 {matched} 只")
+            except Exception as e:
+                logger.warning(f"[close_normal] AShareHub 批量请求失败: {e}，跳过 close_normal 回填")
+                return 0
+            # 保存缓存（合并现有）
             pd.DataFrame({"symbol": list(results.keys()), "close_normal": list(results.values())}).to_csv(cache_file, index=False)
-            logger.info(f"[close_normal] 缓存已保存: {cache_file}")
+            logger.info(f"[close_normal] 缓存已保存 ({len(results)} 只)")
 
         # 批量写入 DB
         success_count = 0
@@ -245,25 +298,14 @@ class IncrementalSyncEngine:
             for sym, val in results.items():
                 try:
                     conn.execute(
-                        text(f"UPDATE {TABLE} SET close_normal = :val WHERE symbol = :sym AND trade_date = (SELECT MAX(trade_date) FROM {TABLE} WHERE symbol = :sym)"),
+                        text(f"UPDATE {TABLE} SET close_normal = :val WHERE symbol = :sym AND trade_date = (SELECT MAX(trade_date) FROM {TABLE} WHERE symbol = :sym) AND close_normal IS NULL"),
                         {"sym": sym, "val": val},
                     )
                     success_count += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[close_normal] {sym} 写入失败: {e}")
         logger.info(f"[close_normal] 写入完成: {success_count}/{len(results)} 只")
-        self._save_success([s for s in results if s not in self._load_success()])
         return success_count
-
-    def _fetch_close_normal(self, symbol: str) -> tuple[str, float | None]:
-        """获取单只股票最新不复权收盘价。"""
-        try:
-            raw = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=self._trade_date_str, end_date=self._trade_date_str, adjust="", timeout=15)
-            if raw is not None and not raw.empty:
-                return symbol, pd.to_numeric(raw.iloc[-1]["close"], errors="coerce")
-        except Exception:
-            pass
-        return symbol, None
 
     # ── single stock sync ───────────────────────────────────────
 
@@ -300,7 +342,7 @@ class IncrementalSyncEngine:
                 # 已确认过后上市股票，跳过全量拉取检查
                 if symbol in self._backfill_cache:
                     df = self._fetch_from_tx(
-                        pure, (latest - timedelta(days=OVERLAP_DAYS * 2)).isoformat()
+                        pure, (latest - timedelta(days=OVERLAP_DAYS)).isoformat()
                     )
                     if df is None or df.empty:
                         return 0, None
@@ -326,7 +368,7 @@ class IncrementalSyncEngine:
                 return len(new), new
 
         df = self._fetch_from_tx(
-            pure, (latest - timedelta(days=OVERLAP_DAYS * 2)).isoformat()
+            pure, (latest - timedelta(days=OVERLAP_DAYS)).isoformat()
         )
         if df is None or df.empty:
             return 0, None
@@ -451,25 +493,7 @@ class IncrementalSyncEngine:
         df["adj_factor"] = 1.0
         df["close_normal"] = None
 
-        # 额外拉取不复权收盘价（仅最新交易日）— 用于报表展示
-        try:
-            raw_raw = ak.stock_zh_a_hist_tx(
-                symbol=prefixed,
-                start_date=end_str,
-                end_date=end_str,
-                adjust="",
-                timeout=15,
-            )
-            if raw_raw is not None and not raw_raw.empty:
-                last = raw_raw.iloc[-1]
-                raw_date = str(last["date"]) if not hasattr(last["date"], "strftime") else last["date"].strftime("%Y-%m-%d")
-                raw_close = pd.to_numeric(last["close"], errors="coerce")
-                mask = df["trade_date"].astype(str) == raw_date
-                if mask.any() and pd.notna(raw_close):
-                    df.loc[mask, "close_normal"] = raw_close
-        except Exception:
-            pass
-
+        # close_normal 不再在此拉取，由 backfill_close_normal（AShareHub 批量）统一写入 DB
         return df
 
     # ── split detection ─────────────────────────────────────────

@@ -27,6 +27,14 @@ class MainCostDataManager:
         if cache_enabled and not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
 
+    def _today_str(self) -> str:
+        try:
+            from DataCollection.CalendarManager import TradingCalendarAnalyzer
+            return TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+        except Exception:
+            from datetime import datetime
+            return datetime.now().strftime("%Y%m%d")
+
     def get_main_cost_data(self) -> pd.DataFrame:
         """
         获取主力成本数据
@@ -35,7 +43,7 @@ class MainCostDataManager:
             DataFrame: 包含代码、主力成本、机构参与度等字段的数据
         """
         cache_file = (
-            os.path.join(self.cache_dir, f"main_cost_data_{pd.Timestamp.now().date()}.csv")
+            os.path.join(self.cache_dir, f"main_cost_data_{self._today_str()}.csv")
             if self.cache_enabled
             else None
         )
