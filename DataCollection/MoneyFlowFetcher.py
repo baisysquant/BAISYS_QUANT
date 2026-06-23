@@ -32,7 +32,7 @@ class MoneyFlowFetcher:
         if hasattr(config, 'TEMP_DATA_DIRECTORY'):
             self._cache_dir = config.TEMP_DATA_DIRECTORY
         else:
-            self._cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports")
+            self._cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports/cache")
         self._client = None
         self._retry = getattr(config, 'MONEYFLOW_RETRY', 3)
         self._page_delay = getattr(config, 'MONEYFLOW_PAGE_DELAY', 1.0)

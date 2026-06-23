@@ -38,13 +38,20 @@ class IncrementalSyncEngine:
         db_engine: Any,
         default_start: str | None = None,
         asharehub_api_key: str | None = None,
+        cache_dir: str | None = None,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
         self._asharehub_api_key = asharehub_api_key
-        self._cache_dir = os.path.join(
-            os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
-        )
+        self._cache_dir = cache_dir
+        if not self._cache_dir:
+            try:
+                from ConfigParser import Config
+                self._cache_dir = os.path.join(Config().CACHE_DIRECTORY, "kline_batches")
+            except Exception:
+                self._cache_dir = os.path.join(
+                    os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
+                )
         os.makedirs(self._cache_dir, exist_ok=True)
         # 使用最新交易日而非 date.today()，避免周末/节假日误判
         try:

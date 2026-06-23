@@ -30,7 +30,7 @@ class SWIndustryDataPipeline:
                 self.today_str = cal.get_last_trading_day().replace("-", "")
             except Exception:
                 self.today_str = datetime.datetime.now().strftime("%Y%m%d")
-        self.cache_dir = os.path.join(self.config.HOME_DIRECTORY, "sw_data_cache")
+        self.cache_dir = os.path.join(self.config.CACHE_DIRECTORY, "sw_data_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         self.cache_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.parquet")
         self.cache_csv_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.csv")

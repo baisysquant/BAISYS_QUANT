@@ -21,9 +21,15 @@ class TradingCalendarAnalyzer:
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self, cache_dir: str = "./cache") -> None:
+    def __init__(self, cache_dir: str | None = None) -> None:
         if self._initialized:
             return
+        if cache_dir is None:
+            try:
+                from ConfigParser import Config
+                cache_dir = os.path.join(Config().CACHE_DIRECTORY, "calendar")
+            except Exception:
+                cache_dir = "./cache"
         self._initialized = True
         self.beijing_tz = pytz.timezone("Asia/Shanghai")
         self.cache_dir = cache_dir

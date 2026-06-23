@@ -14,7 +14,13 @@ class MainCostDataManager:
     提供主力成本、机构参与度等相关数据的获取、分析和管理功能
     """
 
-    def __init__(self, cache_enabled: bool = True, cache_dir: str = "~/Downloads/CoreNews_Reports") -> None:
+    def __init__(self, cache_enabled: bool = True, cache_dir: str | None = None) -> None:
+        if cache_dir is None:
+            try:
+                from ConfigParser import Config
+                cache_dir = os.path.join(Config().CACHE_DIRECTORY, "cost_data_cache")
+            except Exception:
+                cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports/cache/cost_data_cache")
         """
         初始化主力成本数据管理器
 

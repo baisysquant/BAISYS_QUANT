@@ -50,7 +50,7 @@ class Config:
         system = config["SYSTEM"]
         home_dir = system.get("HOME_DIRECTORY", "~/Downloads/CoreNews_Reports")
         self.HOME_DIRECTORY = os.path.expanduser(home_dir)
-        temp_dir = system.get("TEMP_DATA_DIR", "ShareData")
+        temp_dir = system.get("TEMP_DATA_DIR", "cache")
         self.TEMP_DATA_DIRECTORY = os.path.join(self.HOME_DIRECTORY, temp_dir)
 
         self.MAX_WORKERS = system.getint("MAX_WORKERS", fallback=15)
@@ -1175,7 +1175,7 @@ def export_results_to_excel(results: list, buy_signals: list, config: Config) ->
     # 保存文件
     current_time = datetime.now().strftime("%Y%m%d%H%M")
     filename = f"双谷探底机会点_{current_time}.xlsx"
-    filepath = os.path.join(config.HOME_DIRECTORY, filename)
+    filepath = os.path.join(config.HOME_DIRECTORY, "cache", "reports", filename)
     wb.save(filepath)
     print(f"分析结果已保存到: {filepath}")
 

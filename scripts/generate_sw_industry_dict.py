@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 import akshare as ak
 import pandas as pd
@@ -99,7 +100,10 @@ def save_stock_dict(df: pd.DataFrame, output_dir: str = "output") -> pd.DataFram
     保存股票字典到 CSV 和 TXT 文件
     """
     os.makedirs(output_dir, exist_ok=True)
-    today = datetime.now().strftime("%Y%m%d")
+    try:
+        today = TradingCalendarAnalyzer().get_last_trading_day().replace("-", "")
+    except Exception:
+        today = datetime.now().strftime("%Y%m%d")
 
     # --- 输出去重后的全量股票列表 ---
     final_cols = ["证券代码", "证券名称", "行业代码", "行业名称", "更新时间"]

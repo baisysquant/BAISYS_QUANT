@@ -54,7 +54,7 @@ class ChipDistributionFetcher:
         self.api_key = config.ASHAREHUB_API_KEY
         self.enabled = config.ENABLE_CHIP_DISTRIBUTION
         self._client = None
-        self._cache_dir = getattr(config, 'TEMP_DATA_DIRECTORY', os.path.expanduser("~/Downloads/CoreNews_Reports"))
+        self._cache_dir = getattr(config, 'TEMP_DATA_DIRECTORY', os.path.expanduser("~/Downloads/CoreNews_Reports/cache"))
 
     @staticmethod
     def _get_trading_day() -> str:

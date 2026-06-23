@@ -311,7 +311,12 @@ class StockSyncEngine:
         from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
         from UtilsManager.CodeNormalizer import CodeNormalizer
 
-        self._sync_engine = IncrementalSyncEngine(self.db, asharehub_api_key=getattr(self.config, 'ASHAREHUB_API_KEY', None))
+        cache_dir = os.path.join(self.config.CACHE_DIRECTORY, "kline_batches")
+        self._sync_engine = IncrementalSyncEngine(
+            self.db,
+            asharehub_api_key=getattr(self.config, 'ASHAREHUB_API_KEY', None),
+            cache_dir=cache_dir,
+        )
         self._sync_symbols = [CodeNormalizer.add_market_prefix(code) for code in sorted(final_codes)]
         logger.info(f"[INFO] 同步 {len(self._sync_symbols)} 只股票到 stock_daily_kline...")
         inserted = self._sync_engine.sync_all(self._sync_symbols)

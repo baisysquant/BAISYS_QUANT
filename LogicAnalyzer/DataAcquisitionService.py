@@ -252,7 +252,7 @@ class DataAcquisitionService:
 
             cost_manager = MainCostDataManager(
                 cache_enabled=True,
-                cache_dir=os.path.join(self.config.TEMP_DATA_DIRECTORY, "cost_data_cache"),
+                cache_dir=os.path.join(self.config.CACHE_DIRECTORY, "cost_data_cache"),
             )
             main_cost_df = cost_manager.get_main_cost_data()
 

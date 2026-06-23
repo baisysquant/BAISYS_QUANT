@@ -526,6 +526,10 @@ class Config:
     def HOME_DIRECTORY(self) -> str: return self.app_config.system.HOME_DIRECTORY
 
     @property
+    def CACHE_DIRECTORY(self) -> str:
+        return os.path.join(self.HOME_DIRECTORY, "cache")
+
+    @property
     def TEMP_DATA_DIRECTORY(self) -> str:
         return os.path.join(self.app_config.system.HOME_DIRECTORY, self.app_config.system.TEMP_DATA_DIR)
 
@@ -734,7 +738,7 @@ class Config:
     # ── 工具方法 ────────────────────────────────────────────────────────
 
     def _ensure_directories(self) -> None:
-        for d in (self.HOME_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR):
+        for d in (self.HOME_DIRECTORY, self.CACHE_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR):
             os.makedirs(d, exist_ok=True)
 
     def get_db_connection_string(self) -> str:

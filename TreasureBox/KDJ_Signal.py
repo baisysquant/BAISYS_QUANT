@@ -40,7 +40,7 @@ if __name__ == "__main__":
 
     # --- 3. 报告路径设置 ---
     # 读取配置文件中的 home_directory 并展开 ~
-    REPORT_OUTPUT_DIR = os.path.expanduser(config.HOME_DIRECTORY)
+    REPORT_OUTPUT_DIR = os.path.join(os.path.expanduser(config.HOME_DIRECTORY), "cache", "reports")
     os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)  # 确保路径存在
     print(f"[DIR] 报告将保存至: {REPORT_OUTPUT_DIR}")
 

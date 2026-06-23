@@ -629,7 +629,7 @@ class StockAnalysisCoordinatorFactory:
             level=config.LOG_LEVEL,
         )
 
-        cache_dir = os.path.join(config.TEMP_DATA_DIRECTORY, "cache")
+        cache_dir = os.path.join(config.CACHE_DIRECTORY, "unified_cache")
         cache_manager = UnifiedCacheManager(
             cache_dir=cache_dir, default_strategy=CacheStrategy.DAILY, auto_cleanup=True
         )

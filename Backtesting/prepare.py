@@ -11,6 +11,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from DataCollection.CalendarManager import TradingCalendarAnalyzer
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -19,10 +21,21 @@ from loguru import logger
 from ConfigParser import Config
 from LogicAnalyzer.pipeline import MACDAnalyzer
 
-CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
+try:
+    from ConfigParser import Config
+    CACHE_DIR = Path(Config().CACHE_DIRECTORY) / "backtest_signal_cache"
+except Exception:
+    CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
 CACHE_GROUP_SIZE = 500
 PROCESS_BATCH_SIZE = 200
 CACHE_MAX_AGE_DAYS = 7
+
+
+def _trade_day_str() -> str:
+    try:
+        return TradingCalendarAnalyzer().get_last_trading_day().isoformat()
+    except Exception:
+        return date.today().isoformat()
 
 
 def _adjust_signal_workers(current: int, max_workers: int, watermark: float = 0.8) -> int:
@@ -55,7 +68,7 @@ def _check_cache_valid(symbols: list[str], params: dict[str, Any]) -> bool:
     except (json.JSONDecodeError, OSError, ValueError):
         return False
 
-    if meta.get("date") != date.today().isoformat():
+    if meta.get("date") != _trade_day_str():
         return False
     if meta.get("symbol_count") != len(symbols):
         return False
@@ -71,7 +84,7 @@ def _check_cache_valid(symbols: list[str], params: dict[str, Any]) -> bool:
 def _save_cache_meta(symbols: list[str], params: dict[str, Any], num_groups: int) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     meta = {
-        "date": date.today().isoformat(),
+        "date": _trade_day_str(),
         "symbol_count": len(symbols),
         "param_hash": _make_param_hash(params),
         "num_groups": num_groups,
@@ -82,7 +95,7 @@ def _save_cache_meta(symbols: list[str], params: dict[str, Any], num_groups: int
 def _cleanup_stale_cache() -> None:
     if not CACHE_DIR.exists():
         return
-    cutoff = date.today().isoformat()
+    cutoff = _trade_day_str()
     for f in CACHE_DIR.iterdir():
         if f.is_file():
             try:

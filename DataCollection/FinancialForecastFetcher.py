@@ -30,7 +30,7 @@ class FinancialForecastFetcher:
         if hasattr(config, 'TEMP_DATA_DIRECTORY'):
             self._cache_dir = config.TEMP_DATA_DIRECTORY
         else:
-            self._cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports")
+            self._cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports/cache")
         self._client = None
 
     @property
