@@ -7,6 +7,4 @@
 
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataCollection.GetStockBasicinfo import StockBasicInfoService
-from DataCollection.HistDataEngine import StockSyncEngine
-
-__all__ = ["StockBasicInfoService", "StockSyncEngine", "TradingCalendarAnalyzer"]
+__all__ = ["StockBasicInfoService", "TradingCalendarAnalyzer"]

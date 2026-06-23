@@ -16,9 +16,8 @@ import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 from sqlalchemy.engine import Engine
@@ -26,8 +25,8 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-from DataCollection.HistDataEngine import StockSyncEngine
 from DataManager.DataProcessingService import DataProcessingService
+from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 from DataManager.ReportService import ReportService
 from LogicAnalyzer.AnalysisService import AnalysisService
 from LogicAnalyzer.DataAcquisitionService import DataAcquisitionService
@@ -36,18 +35,32 @@ from UtilsManager.IDataProvider import IDataProvider
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 
 
-@dataclass
+class PipelineData(TypedDict, total=False):
+    filtered_pure_codes: set[str]
+    stock_codes_prefixed: list[str]
+    stock_codes_pure: list[str]
+    raw_data: dict[str, Any]
+    hist_df: Any
+    spot_data: Any
+    ta_signals: dict[str, Any]
+    industry_df: Any
+    processed_xstp_df: Any
+    processed_data: dict[str, Any]
+    consolidated_report: Any
+
+
 class PipelineContext:
     """流水线上下文：步骤之间通过此对象交换数据，解除顺序耦合"""
 
-    data: dict[str, Any] = field(default_factory=dict)
-    errors: dict[str, str] = field(default_factory=dict)
+    def __init__(self) -> None:
+        self.data: PipelineData = {}
+        self.errors: dict[str, str] = {}
 
     def set(self, key: str, value: Any) -> None:  # noqa: ANN401
-        self.data[key] = value
+        self.data[key] = value  # type: ignore[literal-required]
 
     def get(self, key: str, default: Any = None) -> Any:  # noqa: ANN401
-        return self.data.get(key, default)
+        return self.data.get(key, default)  # type: ignore[return-value]
 
     def has(self, *keys: str) -> bool:
         return all(k in self.data for k in keys)
@@ -87,7 +100,7 @@ class StockAnalysisCoordinator:
         calendar_mgr: TradingCalendarAnalyzer,
         logger: Any,  # noqa: ANN401
         cache_manager: UnifiedCacheManager,
-        stock_sync_engine: StockSyncEngine,
+        incremental_sync_engine: IncrementalSyncEngine,
         db_engine: Engine,
         executor: ThreadPoolExecutor,
         data_provider: IDataProvider,
@@ -101,7 +114,7 @@ class StockAnalysisCoordinator:
         self.calendar_mgr = calendar_mgr
         self.logger = logger
         self.cache_manager = cache_manager
-        self.stock_sync_engine = stock_sync_engine
+        self.incremental_sync_engine = incremental_sync_engine
         self.db_engine = db_engine
         self.executor = executor
         self.data_provider = data_provider
@@ -188,12 +201,18 @@ class StockAnalysisCoordinator:
 
     def _step_1_sync_data(self, ctx: PipelineContext) -> bool:
         self.logger.info(">>> 正在同步历史数据到数据库...")
-        filtered_pure_codes = self.stock_sync_engine.run_engine(target_date=self.today_str)
-        if not filtered_pure_codes:
-            self.logger.critical("同步历史数据后无有效股票代码，流程终止")
+        try:
+            filtered_pure_codes = self.incremental_sync_engine.sync_stock_pool_and_kline(
+                target_date=self.today_str
+            )
+            if not filtered_pure_codes:
+                self.logger.critical("同步历史数据后无有效股票代码，流程终止")
+                return False
+            ctx.set("filtered_pure_codes", filtered_pure_codes)
+            return True
+        except Exception as e:
+            self.logger.error(f"同步失败: {e}")
             return False
-        ctx.set("filtered_pure_codes", filtered_pure_codes)
-        return True
 
     def _step_2_format_codes(self, ctx: PipelineContext) -> bool:
         from UtilsManager.CodeNormalizer import CodeNormalizer
@@ -224,11 +243,9 @@ class StockAnalysisCoordinator:
             ctx.set("spot_data", pd.DataFrame())
             return True
 
-        # 延迟执行 close_normal 回填（不阻塞 Step 1），
-        # 确保 K 线查询时 close_normal 列已填充
         self.logger.info("  [close_normal] 按需回填不复权收盘价...")
         try:
-            self.stock_sync_engine.backfill_close_normal(stock_codes_prefixed)
+            self.incremental_sync_engine.backfill_close_normal(stock_codes_prefixed)
         except Exception as e:
             self.logger.warning(f"  [close_normal] 回填异常: {e}，后续走降级路径")
 
@@ -249,9 +266,8 @@ class StockAnalysisCoordinator:
 
         from UtilsManager.CodeNormalizer import CodeNormalizer
 
-        # 从 AShareHub 缓存文件获取最新收盘价（ts_code, close）
         try:
-            close_normal_df = self.stock_sync_engine.backfill_close_normal()
+            close_normal_df = self.incremental_sync_engine.backfill_close_normal()
             if not close_normal_df.empty:
                 close_map = {}
                 for _, row in close_normal_df.iterrows():
@@ -519,12 +535,10 @@ class StockAnalysisCoordinator:
 
     def _load_research_report_data(self) -> pd.DataFrame:
         try:
-            report_cache_path = self.stock_sync_engine.cache_manager.get_cache_path(
-                "研报买入次数", cleaned=True
-            )
-            if os.path.exists(report_cache_path):
+            cache_path = os.path.join(self.config.CACHE_DIRECTORY, f"研报买入次数_经清洗_{self.today_str.replace('-', '')}.csv")
+            if os.path.exists(cache_path):
                 report_df = pd.read_csv(
-                    report_cache_path, sep="|", encoding="utf-8-sig", dtype={"股票代码": str}
+                    cache_path, sep="|", encoding="utf-8-sig", dtype={"股票代码": str}
                 )
                 self.logger.info(f"  - 已加载研报数据: {len(report_df)} 条记录")
                 return report_df
@@ -640,7 +654,12 @@ class StockAnalysisCoordinatorFactory:
             from DataManager.DbEngine import get_engine as _get_engine
 
             db_engine = _get_engine(config)
-            stock_sync_engine = StockSyncEngine(executor=executor, db_engine=db_engine)
+            from UtilsManager.CodeNormalizer import CodeNormalizer
+            incremental_sync_engine = IncrementalSyncEngine(
+                db_engine,
+                asharehub_api_key=getattr(config, 'ASHAREHUB_API_KEY', None),
+                main_board_only=config.MAIN_BOARD_ONLY,
+            )
 
             from DataCollection.GetStockBasicinfo import StockBasicInfoService
             basic_info_service = StockBasicInfoService(config)
@@ -667,7 +686,7 @@ class StockAnalysisCoordinatorFactory:
             calendar_mgr=calendar_mgr,
             logger=logger,
             cache_manager=cache_manager,
-            stock_sync_engine=stock_sync_engine,
+            incremental_sync_engine=incremental_sync_engine,
             db_engine=db_engine,
             executor=executor,
             data_provider=data_provider,

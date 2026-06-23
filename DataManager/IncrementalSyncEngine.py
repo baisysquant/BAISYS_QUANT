@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import date, datetime, timedelta
@@ -39,10 +40,12 @@ class IncrementalSyncEngine:
         default_start: str | None = None,
         asharehub_api_key: str | None = None,
         cache_dir: str | None = None,
+        main_board_only: bool = False,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
         self._asharehub_api_key = asharehub_api_key
+        self._main_board_only = main_board_only
         self._cache_dir = cache_dir
         if not self._cache_dir:
             try:
@@ -53,6 +56,7 @@ class IncrementalSyncEngine:
                     os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
                 )
         os.makedirs(self._cache_dir, exist_ok=True)
+        self._backfill_lock = threading.Lock()
         # 使用最新交易日而非 date.today()，避免周末/节假日误判
         try:
             _cal = TradingCalendarAnalyzer()
@@ -114,6 +118,12 @@ class IncrementalSyncEngine:
             f"本次需处理 {len(remaining)} 只"
         )
         if not remaining:
+            return 0
+
+        # P0-1: 跳过已有最新交易日数据的股票，减少 API 调用
+        remaining = self._get_stale_symbols(remaining)
+        if not remaining:
+            logger.info("所有股票已有最新交易日数据，无需同步")
             return 0
 
         # 一次性加载回填确认缓存到内存
@@ -302,6 +312,82 @@ class IncrementalSyncEngine:
             logger.warning(f"[close_normal] AShareHub 批量请求失败: {e}")
             return pd.DataFrame()
 
+    # ── stock pool (merged from StockSyncEngine) ──────────────
+
+    def get_stock_pool_from_db(self) -> pd.DataFrame:
+        query = """
+            SELECT stock_code AS ts_code, stock_code AS 股票代码,
+                   stock_name AS name, industry_name AS industry
+            FROM stock_basic_info_sw ORDER BY stock_code
+        """
+        with self._engine.connect() as conn:
+            df = pd.read_sql(text(query), conn)
+        if "股票代码" in df.columns:
+            df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
+        for col in ("ts_code", "name", "industry", "股票代码"):
+            df.setdefault(col, "N/A")
+        return df[["ts_code", "name", "industry", "股票代码"]]
+
+    @staticmethod
+    def filter_st_stocks(df: pd.DataFrame) -> pd.DataFrame:
+        if "name" not in df.columns:
+            return df
+        st = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
+        return df[~df["name"].astype(str).str.contains(st, na=False)].copy()
+
+    def filter_main_board(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self._main_board_only:
+            return df
+        return df[df["股票代码"].astype(str).str.match(r"^(60|00)")].copy()
+
+    def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
+        from UtilsManager.CodeNormalizer import CodeNormalizer
+
+        if target_date is None:
+            target_date = TradingCalendarAnalyzer().get_last_trading_day()
+        today_tag = target_date.replace("-", "")
+
+        pool = self.get_stock_pool_from_db()
+        before = len(pool)
+        pool = self.filter_st_stocks(pool)
+        pool = self.filter_main_board(pool)
+        logger.info(f"股票池: {before} → {len(pool)}（过滤ST/板块）")
+
+        pure_codes = set(pool["股票代码"].unique())
+        symbols = [CodeNormalizer.add_market_prefix(c) for c in sorted(pure_codes)]
+        inserted = self.sync_all(symbols)
+        logger.info(f"K线同步完成，新增 {inserted} 行")
+
+        save_dir = os.path.dirname(self._cache_dir) if os.path.isdir(self._cache_dir) else os.getcwd()
+        out = os.path.join(save_dir, f"final_filtered_stocks_{today_tag}.txt")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            for c in sorted(pure_codes):
+                f.write(f"{c}\n")
+        logger.info(f"最终股票列表已保存: {out}")
+        return pure_codes
+
+    # ── stale filter (P0-1) ─────────────────────────────────────
+
+    def _get_stale_symbols(self, symbols: list[str]) -> list[str]:
+        if not symbols:
+            return []
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT symbol FROM {TABLE}
+                    WHERE symbol = ANY(:symbols)
+                      AND trade_date::date = :trade_date
+                """),
+                {"symbols": symbols, "trade_date": self._trade_date.isoformat()},
+            ).fetchall()
+        up_to_date = {row[0] for row in rows}
+        stale = [s for s in symbols if s not in up_to_date]
+        skipped = len(symbols) - len(stale)
+        if skipped:
+            logger.info(f"跳过 {skipped} 只（已有 {self._trade_date_str} 数据），需处理 {len(stale)} 只")
+        return stale
+
     # ── single stock sync ───────────────────────────────────────
 
     @staticmethod
@@ -355,8 +441,9 @@ class IncrementalSyncEngine:
                     self._delete_stock(symbol)
                     return len(df), df
                 # 没有更早数据（后上市股票），记录到缓存，下次跳过拉取检查
-                self._backfill_cache.add(symbol)
-                self._save_backfill_checked([symbol])
+                with self._backfill_lock:
+                    self._backfill_cache.add(symbol)
+                    self._save_backfill_checked([symbol])
                 new = df[df["trade_date"] > latest.isoformat()]
                 if new.empty:
                     return 0, None

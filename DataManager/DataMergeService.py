@@ -35,14 +35,14 @@ def get_stock_industry_mapping(
         return pd.DataFrame(columns=[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY])
 
     try:
-        from DataCollection.HistDataEngine import StockSyncEngine
         from DataManager.DbEngine import get_engine as _get_engine
+        from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 
         if engine is None:
             from ConfigParser import Config
             engine = _get_engine(Config())
 
-        sync = StockSyncEngine(db_engine=engine)
+        sync = IncrementalSyncEngine(db_engine=engine)
         pool = sync.get_stock_pool_from_db()
 
         formatted = [CodeNormalizer.normalize(c) for c in stock_codes]
@@ -104,9 +104,9 @@ class DataMergeService:
 
     def _get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
         if self._industry_cache is None:
-            from DataCollection.HistDataEngine import StockSyncEngine
             from DataManager.DbEngine import get_engine as _get_engine
-            sync = StockSyncEngine(db_engine=_get_engine(self.config))
+            from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+            sync = IncrementalSyncEngine(db_engine=_get_engine(self.config))
             pool = sync.get_stock_pool_from_db()
             industry = pool[["ts_code", "name", "industry"]].copy()
             industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
