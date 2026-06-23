@@ -247,50 +247,40 @@ class StockAnalysisCoordinator:
         if hist_df_all.empty:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
-        from UtilsManager.PriceExtractor import PriceExtractor
         from UtilsManager.CodeNormalizer import CodeNormalizer
 
-        # 从 DB close_normal 列获取实际收盘价（不复权，由同步引擎写入）
-        if "close_normal" in hist_df_all.columns and hist_df_all["close_normal"].notna().any():
-            latest_normal = (
-                hist_df_all.dropna(subset=["close_normal"])
-                .sort_values("trade_date")
-                .groupby("symbol", as_index=False)
-                .tail(1)
-                [["symbol", "close_normal"]]
-                .copy()
-            )
-            latest_normal.columns = ["股票代码", "最新价"]
-            latest_normal["股票代码"] = CodeNormalizer.normalize_series(latest_normal["股票代码"])
-            latest_prices_df = latest_normal
-            self.logger.info(f"[INFO] 从DB close_normal 获取了 {len(latest_prices_df)} 只股票的实际收盘价")
-        else:
-            # 降级路径：单独查询 DB 中最近的 close_normal（容错）
-            self.logger.warning("[WARN] close_normal 列无数据，尝试单独查询降级...")
-            try:
-                from sqlalchemy import text
-                fallback = pd.read_sql(
-                    text("""
-                        SELECT DISTINCT ON (symbol) symbol, close_normal
-                        FROM stock_daily_kline
-                        WHERE symbol = ANY(:symbols)
-                          AND close_normal IS NOT NULL
-                        ORDER BY symbol, trade_date DESC
-                    """),
-                    self.db_engine,
-                    params={"symbols": stock_codes_prefixed},
-                )
-                if not fallback.empty:
-                    fallback.columns = ["股票代码", "最新价"]
-                    fallback["股票代码"] = CodeNormalizer.normalize_series(fallback["股票代码"])
-                    latest_prices_df = fallback
-                    self.logger.info(f"[INFO] 降级路径: 从 DB 获取了 {len(latest_prices_df)} 只股票 close_normal")
+        # 从 AShareHub 缓存文件获取最新收盘价（ts_code, close）
+        try:
+            close_normal_df = self.stock_sync_engine.backfill_close_normal()
+            if not close_normal_df.empty:
+                close_map = {}
+                for _, row in close_normal_df.iterrows():
+                    ts_code = str(row.get("ts_code", ""))
+                    close_val = row.get("close")
+                    if ts_code and pd.notna(close_val):
+                        parts = ts_code.split(".")
+                        if len(parts) == 2:
+                            symbol = f"{parts[1].lower()}{parts[0]}"
+                            close_map[symbol] = close_val
+
+                records = []
+                for sym in stock_codes_prefixed:
+                    if sym in close_map:
+                        pure = CodeNormalizer.normalize_series(pd.Series([sym])).iloc[0]
+                        records.append({"股票代码": pure, "最新价": close_map[sym]})
+
+                if records:
+                    latest_prices_df = pd.DataFrame(records)
+                    self.logger.info(f"[INFO] 从 AShareHub 缓存获取了 {len(latest_prices_df)} 只股票的实际收盘价")
                 else:
-                    self.logger.warning("[WARN] DB 中无任何 close_normal 记录，最新价留空")
+                    self.logger.warning("[WARN] AShareHub 缓存无匹配数据，最新价留空")
                     latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
-            except Exception as e2:
-                self.logger.warning(f"[WARN] 降级查询失败: {e2}")
+            else:
+                self.logger.warning("[WARN] AShareHub 缓存为空，最新价留空")
                 latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
+        except Exception as e:
+            self.logger.warning(f"[WARN] 读取 close_normal 缓存失败: {e}")
+            latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
 
         ctx.set("hist_df", hist_df_all)
         ctx.set("spot_data", latest_prices_df)

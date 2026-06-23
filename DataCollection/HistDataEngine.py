@@ -212,11 +212,11 @@ class StockSyncEngine:
         logger.info(f"[INFO] 获取到 {len(report_df)} 只股票的研报数据。")
         return report_df[["股票代码", "机构投资评级(近六个月)-买入"]]
 
-    def backfill_close_normal(self, symbols: list[str] | None = None) -> int:
-        """回填 close_normal（不复权收盘价），委托给 IncrementalSyncEngine。"""
+    def backfill_close_normal(self, symbols: list[str] | None = None) -> pd.DataFrame:
+        """获取全市场最新不复权收盘价，委托给 IncrementalSyncEngine。"""
         if not hasattr(self, '_sync_engine') or self._sync_engine is None:
             logger.info("[close_normal] 尚未初始化同步引擎，跳过回填")
-            return 0
+            return pd.DataFrame()
         return self._sync_engine.backfill_close_normal(symbols)
 
     def run_engine(self, target_date: str | None = None) -> set[str] | None:

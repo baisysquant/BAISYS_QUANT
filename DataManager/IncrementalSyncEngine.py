@@ -4,7 +4,7 @@ import json
 import os
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -27,9 +27,9 @@ def _strip_prefix(symbol: str) -> str:
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 15
 SYNC_BATCH_SIZE = 500
-SYNC_WORKERS = 10
-STAGGER_DELAY = 1.0
-RETRY_SLEEP = 15
+SYNC_WORKERS = 5
+STAGGER_DELAY = 0.5
+RETRY_SLEEP = 10
 
 
 class IncrementalSyncEngine:
@@ -128,33 +128,56 @@ class IncrementalSyncEngine:
             cache_files: list[str] = []
             batch_failed: list[str] = []
 
-            # 错峰提交：每提交一个任务间隔 STAGGER_DELAY 秒，避免同时打 API
+            # 初始错峰：前 SYNC_WORKERS 个任务间隔提交，避免 10 线程同时打 API
             with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
                 futures = {}
-                for i, sym in enumerate(batch_symbols):
+                for i, sym in enumerate(batch_symbols[:SYNC_WORKERS]):
                     cache_path = os.path.join(
                         self._cache_dir,
                         f"_sync_{batch_idx}_{i}_{sym.replace('/', '_')}.pkl",
                     )
                     fut = pool.submit(self._sync_one_to_cache, sym, cache_path)
-                    futures[fut] = (sym, cache_path)
-                    if i < len(batch_symbols) - 1:
-                        time.sleep(STAGGER_DELAY)
+                    futures[fut] = (sym, cache_path, time.time())
+                    time.sleep(STAGGER_DELAY)
+                # 后续任务自然排队（线程数固定即限流）
+                for i, sym in enumerate(batch_symbols[SYNC_WORKERS:], SYNC_WORKERS):
+                    cache_path = os.path.join(
+                        self._cache_dir,
+                        f"_sync_{batch_idx}_{i}_{sym.replace('/', '_')}.pkl",
+                    )
+                    futures[pool.submit(self._sync_one_to_cache, sym, cache_path)] = (sym, cache_path, time.time())
 
-                for future in as_completed(futures):
-                    sym, cache_path = futures[future]
-                    try:
-                        n = future.result()
-                        if n > 0:
-                            cache_files.append(cache_path)
-                            all_success.append(sym)
-                            total_inserted += n
-                        else:
-                            pass
-                    except Exception:
+                # 轮询等待，单任务 120s 超时
+                STOCK_TIMEOUT = 120
+                pending = set(futures.keys())
+                while pending:
+                    done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                    now = time.time()
+                    for future in done:
+                        sym, cache_path, _ = futures[future]
+                        try:
+                            n = future.result()
+                            if n > 0:
+                                cache_files.append(cache_path)
+                                all_success.append(sym)
+                                total_inserted += n
+                        except Exception:
+                            batch_failed.append(sym)
+                            all_failed.append(sym)
+                        finally:
+                            pbar.update(1)
+                    # 超时检查：超过 120s 未完成的任务强制取消
+                    expired = [
+                        f for f in pending
+                        if now - futures[f][2] > STOCK_TIMEOUT
+                    ]
+                    for future in expired:
+                        sym, cache_path, _ = futures[future]
+                        logger.warning(f"  {sym} 同步超时 (>120s)，取消")
+                        future.cancel()
+                        pending.discard(future)
                         batch_failed.append(sym)
                         all_failed.append(sym)
-                    finally:
                         pbar.update(1)
 
             # 从本地缓存文件合并写入 DB
@@ -213,114 +236,64 @@ class IncrementalSyncEngine:
             logger.warning(f"  {symbol} 同步失败: {e}")
             raise
 
-    def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> int:
-        """回填 close_normal：为已有数据的股票补充不复权收盘价。
+    def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> pd.DataFrame:
+        """获取全市场最新不复权收盘价，写入本地缓存文件。
 
-        优先读取当天缓存文件，避免重复调接口。
+        AShareHub 批量获取后写入 ``close_normal_{YYYYMMDD}.csv``（ts_code, close 两列），
+        各模块从此缓存文件读取，不再写 DB。
 
         Args:
-            symbols_prefixed: 待回填的股票列表（带前缀），None 表示全部。
+            symbols_prefixed: 忽略（为了兼容旧调用签名）。
         Returns:
-            成功回填的股票数量。
+            DataFrame 包含 ts_code, close 两列；失败返回空 DataFrame。
         """
-        if symbols_prefixed is None:
-            with self._engine.connect() as conn:
-                rows = conn.execute(text(f"SELECT DISTINCT symbol FROM {TABLE} WHERE close_normal IS NULL")).fetchall()
-                symbols_prefixed = [r[0] for r in rows]
-        if not symbols_prefixed:
-            logger.info("[close_normal] 全部股票已有 close_normal，无需回填")
-            return 0
-
-        # 查询 DB 中真正 close_normal 为空的股票
-        with self._engine.connect() as conn:
-            rows = conn.execute(text(f"""
-                SELECT symbol FROM {TABLE}
-                WHERE symbol = ANY(:symbols)
-                GROUP BY symbol
-                HAVING MAX(close_normal) IS NULL
-            """), {"symbols": list(symbols_prefixed)}).fetchall()
-        need_backfill = {r[0] for r in rows}
-        if not need_backfill:
-            logger.info("[close_normal] 全部股票已有 close_normal，无需回填")
-            return 0
-
-        # 优先加载缓存（用已有 self._trade_date_str，即最后交易日）
         cache_file = self._close_normal_cache_path()
-        cached = {}
+        today_iso = self._trade_date.isoformat()
+
+        # 当天缓存已存在，直接读取
         if os.path.exists(cache_file):
             try:
-                cache_df = pd.read_csv(cache_file, dtype={"symbol": str, "close_normal": float})
-                cached = {row["symbol"]: row["close_normal"] for _, row in cache_df.iterrows()}
-                cached = {k: v for k, v in cached.items() if k in need_backfill}
-                logger.info(f"[close_normal] 从缓存加载 {len(cached)} 只")
+                df = pd.read_csv(cache_file)
+                logger.info(f"[close_normal] 从缓存加载 {len(df)} 只 → {os.path.basename(cache_file)}")
+                return df
             except Exception as e:
-                logger.warning(f"[close_normal] 缓存加载失败: {e}")
+                logger.warning(f"[close_normal] 缓存读取失败: {e}，重新拉取")
 
-        todo = list(need_backfill - cached.keys())
-        results = dict(cached)
+        if not self._asharehub_api_key:
+            logger.warning("[close_normal] ASHAREHUB_API_KEY 未配置，跳过")
+            return pd.DataFrame()
 
-        if todo:
-            today_iso = self._trade_date.isoformat()
+        logger.info("[close_normal] AShareHub 批量获取全市场最新收盘价...")
+        try:
+            from asharehub import AShareHub
+            client = AShareHub(api_key=self._asharehub_api_key)
 
-            if not self._asharehub_api_key:
-                logger.warning("[close_normal] ASHAREHUB_API_KEY 未配置，跳过 close_normal 回填")
-                return 0
+            offset = 0
+            limit = 5000
+            all_rows = []
+            while True:
+                batch = client.market_daily(start_date=today_iso, end_date=today_iso, limit=limit, offset=offset)
+                if batch is None or batch.empty:
+                    break
+                all_rows.extend(batch.to_dict("records"))
+                if len(batch) < limit:
+                    break
+                offset += limit
 
-            logger.info("[close_normal] AShareHub 批量获取全市场最新收盘价...")
-            try:
-                from asharehub import AShareHub
-                client = AShareHub(api_key=self._asharehub_api_key)
+            if not all_rows:
+                logger.warning("[close_normal] AShareHub 返回空数据")
+                return pd.DataFrame()
 
-                offset = 0
-                limit = 5000
-                all_rows = []
-                while True:
-                    resp = client.daily(start_date=today_iso, end_date=today_iso, limit=limit, offset=offset)
-                    if isinstance(resp, list):
-                        batch = resp
-                    elif isinstance(resp, pd.DataFrame):
-                        batch = resp.to_dict("records")
-                    else:
-                        break
-                    if not batch:
-                        break
-                    all_rows.extend(batch)
-                    if len(batch) < limit:
-                        break
-                    offset += limit
-
-                for row in all_rows:
-                    ts_code = row.get("ts_code", "")
-                    close_val = pd.to_numeric(row.get("close"), errors="coerce")
-                    if pd.notna(close_val) and ts_code:
-                        parts = ts_code.split(".")
-                        if len(parts) == 2:
-                            symbol = f"{parts[1].lower()}{parts[0]}"
-                            if symbol in need_backfill:
-                                results[symbol] = close_val
-                matched = sum(1 for s in need_backfill if s in results)
-                logger.info(f"[close_normal] AShareHub 获取 {len(all_rows)} 条, 匹配 {matched} 只")
-            except Exception as e:
-                logger.warning(f"[close_normal] AShareHub 批量请求失败: {e}，跳过 close_normal 回填")
-                return 0
-            # 保存缓存（合并现有）
-            pd.DataFrame({"symbol": list(results.keys()), "close_normal": list(results.values())}).to_csv(cache_file, index=False)
-            logger.info(f"[close_normal] 缓存已保存 ({len(results)} 只)")
-
-        # 批量写入 DB
-        success_count = 0
-        with self._engine.begin() as conn:
-            for sym, val in results.items():
-                try:
-                    conn.execute(
-                        text(f"UPDATE {TABLE} SET close_normal = :val WHERE symbol = :sym AND trade_date = (SELECT MAX(trade_date) FROM {TABLE} WHERE symbol = :sym) AND close_normal IS NULL"),
-                        {"sym": sym, "val": val},
-                    )
-                    success_count += 1
-                except Exception as e:
-                    logger.warning(f"[close_normal] {sym} 写入失败: {e}")
-        logger.info(f"[close_normal] 写入完成: {success_count}/{len(results)} 只")
-        return success_count
+            df = pd.DataFrame(all_rows)[["ts_code", "close"]].copy()
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df.dropna(subset=["close"])
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            df.to_csv(cache_file, index=False)
+            logger.info(f"[close_normal] 缓存已保存: {len(df)} 只 → {os.path.basename(cache_file)}")
+            return df
+        except Exception as e:
+            logger.warning(f"[close_normal] AShareHub 批量请求失败: {e}")
+            return pd.DataFrame()
 
     # ── single stock sync ───────────────────────────────────────
 
