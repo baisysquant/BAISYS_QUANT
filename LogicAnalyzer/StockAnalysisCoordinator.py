@@ -654,11 +654,12 @@ class StockAnalysisCoordinatorFactory:
             from DataManager.DbEngine import get_engine as _get_engine
 
             db_engine = _get_engine(config)
-            from UtilsManager.CodeNormalizer import CodeNormalizer
             incremental_sync_engine = IncrementalSyncEngine(
                 db_engine,
                 asharehub_api_key=getattr(config, 'ASHAREHUB_API_KEY', None),
                 main_board_only=config.MAIN_BOARD_ONLY,
+                enable_research_report_filter=config.ENABLE_RESEARCH_REPORT_FILTER,
+                research_report_min_count=config.RESEARCH_REPORT_MIN_COUNT,
             )
 
             from DataCollection.GetStockBasicinfo import StockBasicInfoService

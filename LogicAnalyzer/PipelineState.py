@@ -130,7 +130,7 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     """
     if params is None:
         params = {}
-    close = df['close'].iloc[-1]
+    close = df.attrs.get('latest_price', df['close'].iloc[-1])
     atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else float('nan')
 
     if pd.isna(atr) or atr <= 0:

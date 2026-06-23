@@ -41,11 +41,15 @@ class IncrementalSyncEngine:
         asharehub_api_key: str | None = None,
         cache_dir: str | None = None,
         main_board_only: bool = False,
+        enable_research_report_filter: bool = False,
+        research_report_min_count: int = 1,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
         self._asharehub_api_key = asharehub_api_key
         self._main_board_only = main_board_only
+        self._enable_research_report_filter = enable_research_report_filter
+        self._research_report_min_count = research_report_min_count
         self._cache_dir = cache_dir
         if not self._cache_dir:
             try:
@@ -325,7 +329,8 @@ class IncrementalSyncEngine:
         if "股票代码" in df.columns:
             df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
         for col in ("ts_code", "name", "industry", "股票代码"):
-            df.setdefault(col, "N/A")
+            if col not in df.columns:
+                df[col] = "N/A"
         return df[["ts_code", "name", "industry", "股票代码"]]
 
     @staticmethod
@@ -339,6 +344,40 @@ class IncrementalSyncEngine:
         if not self._main_board_only:
             return df
         return df[df["股票代码"].astype(str).str.match(r"^(60|00)")].copy()
+
+    def _filter_by_research_report(self, pure_codes: set[str]) -> set[str]:
+        if not self._enable_research_report_filter:
+            return pure_codes
+        try:
+            for attempt in range(3):
+                try:
+                    raw = ak.stock_profit_forecast_em()
+                    break
+                except Exception:
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    else:
+                        return pure_codes
+            if raw is None or raw.empty:
+                return pure_codes
+            df = raw.copy()
+            if "代码" in df.columns and "股票代码" not in df.columns:
+                df.rename(columns={"代码": "股票代码"}, inplace=True)
+            df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
+            for col in df.columns:
+                if "买入" in col:
+                    rating_col = col
+                    break
+            else:
+                return pure_codes
+            df[rating_col] = pd.to_numeric(df[rating_col], errors="coerce").fillna(0)
+            qualified = set(df.loc[df[rating_col] > self._research_report_min_count, "股票代码"].unique())
+            before = len(pure_codes)
+            pure_codes &= qualified
+            logger.info(f"研报过滤: {before} → {len(pure_codes)}（买入>{self._research_report_min_count}次）")
+        except Exception as e:
+            logger.warning(f"研报过滤异常: {e}，跳过研报过滤")
+        return pure_codes
 
     def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
         from UtilsManager.CodeNormalizer import CodeNormalizer
@@ -354,18 +393,22 @@ class IncrementalSyncEngine:
         logger.info(f"股票池: {before} → {len(pool)}（过滤ST/板块）")
 
         pure_codes = set(pool["股票代码"].unique())
+        # K 线同步覆盖全 A 股（已过滤 ST/板块），保持数据完整供回测使用
         symbols = [CodeNormalizer.add_market_prefix(c) for c in sorted(pure_codes)]
         inserted = self.sync_all(symbols)
         logger.info(f"K线同步完成，新增 {inserted} 行")
+
+        # 研报过滤仅影响分析池，不影响 K 线数据完整性
+        analysis_pool = self._filter_by_research_report(pure_codes)
 
         save_dir = os.path.dirname(self._cache_dir) if os.path.isdir(self._cache_dir) else os.getcwd()
         out = os.path.join(save_dir, f"final_filtered_stocks_{today_tag}.txt")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
-            for c in sorted(pure_codes):
+            for c in sorted(analysis_pool):
                 f.write(f"{c}\n")
-        logger.info(f"最终股票列表已保存: {out}")
-        return pure_codes
+        logger.info(f"最终股票列表已保存: {len(analysis_pool)} 只 → {out}")
+        return analysis_pool
 
     # ── stale filter (P0-1) ─────────────────────────────────────
 

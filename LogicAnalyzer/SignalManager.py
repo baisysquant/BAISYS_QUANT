@@ -76,6 +76,7 @@ class TASignalProcessor:
         chip_lookup: dict | None = None,
         moneyflow_lookup: dict | None = None,
         forecast_lookup: dict | None = None,
+        spot_lookup: dict[str, float] | None = None,
     ) -> dict[str, Any] | None:
         code_str = str(code).lower()
         if code_str.startswith(('sh', 'sz', 'bj')):
@@ -111,6 +112,10 @@ class TASignalProcessor:
         if 'date' in df.columns:
             df.sort_values('date', inplace=True)
             df.reset_index(drop=True, inplace=True)
+
+        # 注入最新市场价（AShareHub），供止损/目标价计算使用
+        if spot_lookup and pure_code in spot_lookup:
+            df.attrs['latest_price'] = spot_lookup[pure_code]
 
         try:
             df = self.macd_analyzer._custom_macd(df)
@@ -613,6 +618,15 @@ class TASignalProcessor:
                 else:
                     logger.info(f"[MacroFilter] {macro_result.detail} → NORMAL")
 
+        # ── 构建 spot_lookup（最新市场价，用于止损/目标价计算） ─────────────
+        spot_lookup: dict[str, float] = {}
+        if spot_df is not None and not spot_df.empty:
+            for _, row in spot_df.iterrows():
+                code_str = str(row.get('股票代码', '') or '').zfill(6)
+                price = row.get('最新价')
+                if code_str and pd.notna(price):
+                    spot_lookup[code_str] = float(price)
+
         # ── 并行处理所有股票（线程共享内存，避免多进程内存溢出） ────────────
         max_workers = getattr(self.config, 'SIGNAL_PROCESSING_PROCESSES', 2)
 
@@ -622,7 +636,7 @@ class TASignalProcessor:
             futures = {
                 exec_signal.submit(
                     self._process_single_stock, code, _stock_dict, macro_adjust,
-                    _chip_lookup, _moneyflow_lookup, _forecast_lookup,
+                    _chip_lookup, _moneyflow_lookup, _forecast_lookup, spot_lookup,
                 ): code
                 for code in set(all_codes)
             }
