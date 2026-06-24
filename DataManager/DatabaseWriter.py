@@ -120,8 +120,8 @@ class QuantDBManager:
 
     def truncate_and_insert(self, df: pd.DataFrame, table_name: str) -> None:
         """
-        清表覆盖写入模式：先清空全表，再写入新数据
-        适用于基础信息表等只需要保留一份最新数据的场景
+        清表覆盖写入模式：先清空全表，再写入新数据（同事务，崩溃安全）。
+        适用于基础信息表等只需要保留一份最新数据的场景。
 
         Args:
             df: DataFrame数据
@@ -131,20 +131,17 @@ class QuantDBManager:
             logger.info(f"  - 表 {table_name} 无有效数据，跳过写入。")
             return
 
-        # 步骤1: 清空全表
-        with self.engine.connect() as conn:
-            trans = conn.begin()
-            try:
-                conn.execute(text(f"DELETE FROM {table_name}"))
-                trans.commit()
-                logger.info(f"  - {table_name} 表已清空。")
-            except (DBAPIError, OperationalError) as e:
-                trans.rollback()
-                logger.error(f"  - {table_name} 清空失败: {e}")
-                raise DatabaseError("清空表", str(e)) from e
-
-        # 步骤2: 使用 COPY 协议快速写入
-        self._fast_pg_copy(df, table_name)
+        with self.engine.begin() as conn:
+            conn.execute(text(f"DELETE FROM {table_name}"))
+            logger.info(f"  - {table_name} 表已清空。")
+            output = io.StringIO()
+            df.to_csv(output, sep="\t", header=False, index=False, encoding="utf-8")
+            output.seek(0)
+            raw_conn = conn.connection.connection
+            with raw_conn.cursor() as cursor:
+                columns = [f'"{col}"' for col in df.columns]
+                copy_sql = f"COPY {table_name} ({', '.join(columns)}) FROM STDIN WITH CSV DELIMITER '\t'"
+                cursor.copy_expert(copy_sql, output)
         logger.info(f"  - {table_name} 成功插入新数据: {len(df)} 条。")
 
     def _fast_pg_copy(self, df: pd.DataFrame, table_name: str, batch_size: int = 500) -> None:

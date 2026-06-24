@@ -7,6 +7,10 @@ import akshare as ak
 import pandas as pd
 from loguru import logger
 
+from UtilsManager.AkshareConfig import ensure_akshare_timeout
+
+ensure_akshare_timeout()
+
 
 class MainCostDataManager:
     """

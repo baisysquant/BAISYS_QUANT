@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -9,12 +11,18 @@ import akshare as ak
 import pandas as pd
 from loguru import logger
 from sqlalchemy import text
+from tqdm import tqdm
 
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
+from UtilsManager.AkshareConfig import ensure_akshare_timeout
+
+ensure_akshare_timeout()
 
 
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 15
+BATCH_SIZE = 500
+BATCH_INTERVAL = 10
 
 
 class IncrementalSyncEngine:
@@ -22,7 +30,6 @@ class IncrementalSyncEngine:
         self,
         db_engine: Any,
         default_start: str | None = None,
-        asharehub_api_key: str | None = None,
         cache_dir: str | None = None,
         main_board_only: bool = False,
         enable_research_report_filter: bool = False,
@@ -30,7 +37,6 @@ class IncrementalSyncEngine:
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
-        self._asharehub_api_key = asharehub_api_key
         self._main_board_only = main_board_only
         self._enable_research_report_filter = enable_research_report_filter
         self._research_report_min_count = research_report_min_count
@@ -76,85 +82,156 @@ class IncrementalSyncEngine:
             logger.warning(f"缓存清理失败: {e}")
 
     def sync_all(self, symbols_prefixed: list[str]) -> int:
-        # 跳过已有最新交易日数据的股票
         remaining = self._get_stale_symbols(symbols_prefixed)
+
+        cached = self._load_failed_set()
+        if cached:
+            old_len = len(remaining)
+            remaining = sorted(set(remaining) | cached)
+            added = len(remaining) - old_len
+            if added:
+                logger.info(f"加载 {len(cached)} 只缓存失败股票，待同步 {len(remaining)} 只（新增 {added} 只）")
+
         if not remaining:
             logger.info("所有股票已有最新交易日数据，无需同步")
             return 0
 
-        from asharehub import AShareHub
-        client = AShareHub(api_key=self._asharehub_api_key)
+        start_iso = self._calc_start_iso(remaining)
+        end_iso = self._trade_date.isoformat()
+        logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}")
 
-        # 确定 date range：从最老的缺失日期开始（含 overlap，用于除权检测）
-        min_latest = self._get_min_latest_date(remaining)
+        # 均分到双管道（均用 Sina stock_zh_a_daily，确保 HFQ 基准一致）
+        mid = len(remaining) // 2
+        half_a = remaining[:mid]
+        half_b = remaining[mid:]
+        logger.info(f"管道A: {len(half_a)} 只 | 管道B: {len(half_b)} 只")
+
+        totals: list[int] = []
+        all_failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = {
+                pool.submit(self._run_pipeline, half_a, start_iso, end_iso, stagger=0, label="A"): "A",
+                pool.submit(self._run_pipeline, half_b, start_iso, end_iso, stagger=BATCH_INTERVAL, label="B"): "B",
+            }
+            for f in as_completed(futs):
+                inserted, failures = f.result()
+                totals.append(inserted)
+                all_failures.extend(failures)
+
+        self._save_failed_set(set(all_failures))
+        total = sum(totals)
+        logger.info(f"同步完成，总写入 {total} 行")
+        return total
+
+    def _calc_start_iso(self, symbols: list[str]) -> str:
+        min_latest = self._get_min_latest_date(symbols)
         if min_latest is None:
-            daily_start = (
+            return (
                 datetime.strptime(self._default_start, "%Y%m%d").strftime("%Y-%m-%d")
                 if self._default_start else "2000-01-01"
             )
-        else:
-            daily_start = (min_latest - timedelta(days=OVERLAP_DAYS)).isoformat()
+        return (min_latest - timedelta(days=OVERLAP_DAYS)).isoformat()
 
-        end_iso = self._trade_date.isoformat()
-        adj_start = (
-            datetime.strptime(self._default_start, "%Y%m%d").strftime("%Y-%m-%d")
-            if self._default_start else "2000-01-01"
+    # ── Dual Pipeline ───────────────────────────────────────────
+
+    def _run_pipeline(self, symbols: list[str], start_iso: str, end_iso: str, stagger: int = 0, label: str = "") -> tuple[int, list[str]]:
+        if stagger:
+            logger.info(f"  错峰启动，延迟 {stagger}s")
+            time.sleep(stagger)
+
+        start = start_iso.replace("-", "")
+        end = end_iso.replace("-", "")
+        total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
+        inserted = 0
+        all_failures: list[str] = []
+
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i:i + BATCH_SIZE]
+            batch_no = i // BATCH_SIZE + 1
+            desc = f"  P{label} batch {batch_no}/{total_batches}"
+            logger.info(f"  {desc}: {len(batch)} 只")
+            df, failures = self._process_batch(batch, start, end, desc=desc)
+            all_failures.extend(failures)
+            if df is not None and not df.empty:
+                inserted += self._write_with_split_detection(df)
+            if i + BATCH_SIZE < len(symbols):
+                time.sleep(BATCH_INTERVAL)
+
+        return inserted, all_failures
+
+    def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[pd.DataFrame | None, list[str]]:
+        results: list[pd.DataFrame] = []
+        failed: list[str] = []
+        max_workers = min(5, len(symbols))
+        with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futs = {pool.submit(self._fetch_kline, sym, start, end): sym for sym in symbols}
+                for f in as_completed(futs):
+                    sym = futs[f]
+                    df = f.result()
+                    if df is not None and not df.empty:
+                        results.append(df)
+                    else:
+                        failed.append(sym)
+                    pbar.update(1)
+        if not results:
+            return None, failed
+        return pd.concat(results, ignore_index=True), failed
+
+    # ── Per-stock fetchers ──────────────────────────────────────
+
+    def _fetch_kline(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
+        """Sina stock_zh_a_daily: raw + hfq, volume=股, amount=元.
+        内置退避重试，失败则跳过。
+        """
+        time.sleep(random.uniform(0.05, 0.3))
+
+        raw: pd.DataFrame | None = None
+        hfq: pd.DataFrame | None = None
+        for attempt in range(2):
+            try:
+                raw = ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust="")
+                hfq = ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust="hfq")
+                if raw is not None and not raw.empty and hfq is not None and not hfq.empty:
+                    break
+            except Exception as e:
+                logger.warning(f"  {symbol} Sina 第{attempt+1}次尝试失败: {e}")
+            if attempt == 0:
+                time.sleep(random.uniform(1, 3))
+
+        if raw is None or raw.empty or hfq is None or hfq.empty:
+            logger.warning(f"  {symbol} 连续 2 次失败，跳过")
+            return None
+
+        raw = raw.rename(columns={"date": "trade_date", "close": "close_raw", "volume": "vol_sina"})
+        hfq = hfq.rename(columns={"date": "trade_date"})
+        merged = raw[["trade_date", "close_raw", "vol_sina", "amount"]].merge(
+            hfq[["trade_date", "open", "high", "low", "close"]], on="trade_date", how="inner"
         )
-
-        # 批量获取原始日线（仅需缺失日期范围 + overlap）
-        logger.info("AShareHub 批量获取 market_daily...")
-        raw_df = self._batch_fetch(client.market_daily, daily_start, end_iso)
-        if raw_df.empty:
-            logger.warning("market_daily 返回空")
-            return 0
-
-        # 只保留需要的股票
-        prefixed_set = set(remaining)
-        raw_df = raw_df[raw_df['ts_code'].apply(self._tscode_to_symbol).isin(prefixed_set)]
-        if raw_df.empty:
-            return 0
-
-        # 批量获取复权因子（全历史，用于 max_factor）
-        logger.info("AShareHub 批量获取 adj_factor...")
-        adj_df = self._batch_fetch(client.adj_factor, adj_start, end_iso)
-        if adj_df.empty:
-            logger.warning("adj_factor 返回空")
-            return 0
-
-        # 合并 → 向量化计算 HFQ
-        logger.info("合并数据并计算后复权...")
-        merged = raw_df.merge(adj_df, on=['ts_code', 'trade_date'], how='left')
-        merged = merged.dropna(subset=['adj_factor'])
-        if merged.empty:
-            return 0
-
-        max_factors = adj_df.groupby('ts_code', group_keys=True)['adj_factor'].max().reset_index()
-        max_factors.columns = ['ts_code', 'max_factor']
-        merged = merged.merge(max_factors, on='ts_code', how='left')
-
-        for col in ('open', 'high', 'low', 'close'):
-            merged[col] = pd.to_numeric(merged[col], errors='coerce') * merged['max_factor'] / merged['adj_factor']
-
-        merged['symbol'] = merged['ts_code'].apply(self._tscode_to_symbol)
-        # vol: 手 → 股（×100）；amount: 千元 → 元（×1000）
-        merged['volume'] = pd.to_numeric(merged['vol'], errors='coerce').fillna(0).astype('int64') * 100
-        merged['amount'] = pd.to_numeric(merged['amount'], errors='coerce').fillna(0) * 1000
-        merged['trade_date'] = merged['trade_date'].apply(
-            lambda d: d.isoformat() if hasattr(d, 'isoformat') else str(d)
+        for col in ("open", "high", "low", "close", "close_raw"):
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
+        merged["volume"] = pd.to_numeric(merged["vol_sina"], errors="coerce").fillna(0).astype("int64")
+        merged["amount"] = pd.to_numeric(merged["amount"], errors="coerce").fillna(0)
+        merged["close_normal"] = merged["close_raw"]
+        merged["symbol"] = symbol
+        merged["trade_date"] = merged["trade_date"].apply(
+            lambda d: d.isoformat() if hasattr(d, "isoformat") else str(d)
         )
-        merged['close_normal'] = merged['close'] * merged['adj_factor'] / merged['max_factor']
-        merged['adj_factor'] = merged['adj_factor'].astype(float)
+        merged["adj_factor"] = merged["close"] / merged["close_normal"].replace(0, float("nan"))
+        merged["adj_factor"] = merged["adj_factor"].replace([float("inf")], 1.0).fillna(1.0)
+        return merged[["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]]
 
-        # 逐只股票：除权检测 + 增量写入
+    def _write_with_split_detection(self, df: pd.DataFrame) -> int:
+        """逐只股票：除权检测 + 增量写入。"""
         total_inserted = 0
         to_write: list[pd.DataFrame] = []
         full_refresh_symbols: list[str] = []
 
-        for sym, grp in merged.groupby('symbol'):
-            grp = grp.sort_values('trade_date')
+        for sym, grp in df.groupby("symbol"):
+            grp = grp.sort_values("trade_date")
             latest = self._get_latest_date(sym)
 
-            if latest is None or self._is_tencent_data(sym):
+            if latest is None or self._has_no_close_normal(sym):
                 full_refresh_symbols.append(sym)
                 to_write.append(grp)
                 total_inserted += len(grp)
@@ -164,7 +241,7 @@ class IncrementalSyncEngine:
                 to_write.append(grp)
                 total_inserted += len(grp)
             else:
-                new = grp[grp['trade_date'] > latest.isoformat()]
+                new = grp[grp["trade_date"] > latest.isoformat()]
                 if not new.empty:
                     to_write.append(new)
                     total_inserted += len(new)
@@ -173,7 +250,6 @@ class IncrementalSyncEngine:
             return 0
 
         final = pd.concat(to_write, ignore_index=True)
-
         if full_refresh_symbols:
             with self._engine.begin() as conn:
                 conn.execute(
@@ -181,26 +257,21 @@ class IncrementalSyncEngine:
                     {"symbols": full_refresh_symbols},
                 )
             logger.info(f"全量替换 {len(full_refresh_symbols)} 只")
-
         self._write_batch(final)
         logger.info(f"同步完成，写入 {total_inserted} 行")
         return total_inserted
 
     def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> pd.DataFrame:
-        """获取全市场最新不复权收盘价，写入本地缓存文件。
+        """双管道获取全市场最新不复权收盘价，写入本地缓存文件。
 
-        AShareHub 批量获取后写入 ``close_normal_{YYYYMMDD}.csv``（ts_code, close 两列），
-        各模块从此缓存文件读取，不再写 DB。
-
+        通过 Tencent（stock_zh_a_hist_tx）双管道并行获取原始 close，
+        写入 ``close_normal_{YYYYMMDD}.csv``（symbol, close 两列）。
         Args:
-            symbols_prefixed: 忽略（为了兼容旧调用签名）。
+            symbols_prefixed: 股票代码列表（带前缀），None 表示从 DB 获取全部。
         Returns:
-            DataFrame 包含 ts_code, close 两列；失败返回空 DataFrame。
+            DataFrame 包含 symbol, close 两列；失败返回空 DataFrame。
         """
         cache_file = self._close_normal_cache_path()
-        today_iso = self._trade_date.isoformat()
-
-        # 当天缓存已存在，直接读取
         if os.path.exists(cache_file):
             try:
                 df = pd.read_csv(cache_file)
@@ -209,41 +280,64 @@ class IncrementalSyncEngine:
             except Exception as e:
                 logger.warning(f"[close_normal] 缓存读取失败: {e}，重新拉取")
 
-        if not self._asharehub_api_key:
-            logger.warning("[close_normal] ASHAREHUB_API_KEY 未配置，跳过")
+        if symbols_prefixed is None:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    text(f"SELECT DISTINCT symbol FROM {TABLE}")
+                ).fetchall()
+                symbols_prefixed = [r[0] for r in rows]
+
+        if not symbols_prefixed:
             return pd.DataFrame()
 
-        logger.info("[close_normal] AShareHub 批量获取全市场最新收盘价...")
-        try:
-            from asharehub import AShareHub
-            client = AShareHub(api_key=self._asharehub_api_key)
+        mid = len(symbols_prefixed) // 2
+        half_a = symbols_prefixed[:mid]
+        half_b = symbols_prefixed[mid:]
+        end = self._trade_date_str
+        results: dict[str, float] = {}
 
-            offset = 0
-            limit = 5000
-            all_rows = []
-            while True:
-                batch = client.market_daily(start_date=today_iso, end_date=today_iso, limit=limit, offset=offset)
-                if batch is None or batch.empty:
-                    break
-                all_rows.extend(batch.to_dict("records"))
-                if len(batch) < limit:
-                    break
-                offset += limit
+        def _fetch_one(sym: str) -> tuple[str, float | None]:
+            try:
+                r = ak.stock_zh_a_daily(symbol=sym, start_date=end, end_date=end, adjust="")
+                if r is not None and not r.empty:
+                    close_val = pd.to_numeric(r["close"].iloc[-1], errors="coerce")
+                    if pd.notna(close_val):
+                        return sym, float(close_val)
+            except Exception:
+                pass
+            return sym, None
 
-            if not all_rows:
-                logger.warning("[close_normal] AShareHub 返回空数据")
-                return pd.DataFrame()
+        def _fetch_backfill_half(syms: list[str]) -> dict[str, float]:
+            local: dict[str, float] = {}
+            for i in range(0, len(syms), BATCH_SIZE):
+                batch = syms[i:i + BATCH_SIZE]
+                with ThreadPoolExecutor(max_workers=min(5, len(batch))) as inner_pool:
+                    futs = {inner_pool.submit(_fetch_one, sym): sym for sym in batch}
+                    for f in as_completed(futs):
+                        sym, val = f.result()
+                        if val is not None:
+                            local[sym] = val
+                if i + BATCH_SIZE < len(syms):
+                    time.sleep(BATCH_INTERVAL)
+            return local
 
-            df = pd.DataFrame(all_rows)[["ts_code", "close"]].copy()
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
-            df = df.dropna(subset=["close"])
-            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-            df.to_csv(cache_file, index=False)
-            logger.info(f"[close_normal] 缓存已保存: {len(df)} 只 → {os.path.basename(cache_file)}")
-            return df
-        except Exception as e:
-            logger.warning(f"[close_normal] AShareHub 批量请求失败: {e}")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = {
+                pool.submit(_fetch_backfill_half, half_a): "A",
+                pool.submit(_fetch_backfill_half, half_b): "B",
+            }
+            for f in as_completed(futs):
+                results.update(f.result())
+
+        if not results:
+            logger.warning("[close_normal] 双管道均无数据")
             return pd.DataFrame()
+
+        df = pd.DataFrame(list(results.items()), columns=["symbol", "close"])
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        df.to_csv(cache_file, index=False)
+        logger.info(f"[close_normal] 双管道获取完成: {len(df)} 只 → {os.path.basename(cache_file)}")
+        return df
 
     # ── stock pool (merged from StockSyncEngine) ──────────────
 
@@ -339,18 +433,7 @@ class IncrementalSyncEngine:
         logger.info(f"最终股票列表已保存: {len(analysis_pool)} 只 → {out}")
         return analysis_pool
 
-    # ── batch helpers (AShareHub) ─────────────────────────────
-
-    @staticmethod
-    def _tscode_to_symbol(ts_code: str) -> str:
-        """将 AShareHub ts_code 格式转为内部 symbol 格式（000001.SZ → sz000001）。"""
-        parts = ts_code.split(".")
-        if len(parts) == 2:
-            return f"{parts[1].lower()}{parts[0]}"
-        return ts_code
-
     def _get_min_latest_date(self, symbols: list[str]) -> date | None:
-        """返回一组股票中最老的缺失日期——即最小 latest_date。"""
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(f"""
@@ -363,25 +446,8 @@ class IncrementalSyncEngine:
             ).scalar()
         return rows
 
-    def _batch_fetch(self, fetch_fn: Any, start_date: str, end_date: str) -> pd.DataFrame:  # noqa: ANN401
-        """分页批量获取 AShareHub 数据（market_daily 或 adj_factor），自动翻页。"""
-        limit = 5000
-        offset = 0
-        all_parts = []
-        while True:
-            batch = fetch_fn(start_date=start_date, end_date=end_date, limit=limit, offset=offset)
-            if batch is None or batch.empty:
-                break
-            all_parts.append(batch)
-            if len(batch) < limit:
-                break
-            offset += limit
-        if not all_parts:
-            return pd.DataFrame()
-        return pd.concat(all_parts, ignore_index=True) if len(all_parts) > 1 else all_parts[0]
-
     def _detect_split_from_adj(self, symbol: str, new_df: pd.DataFrame, latest: date) -> bool:
-        """对比 DB 中最新的 adj_factor 与 AShareHub 新数据是否一致。"""
+        """对比 DB 中最新的 adj_factor 与新批次数据是否一致。"""
         with self._engine.connect() as conn:
             old = conn.execute(
                 text(f"SELECT adj_factor FROM {TABLE} WHERE symbol = :sym AND trade_date::date = :date"),
@@ -416,14 +482,14 @@ class IncrementalSyncEngine:
             logger.info(f"跳过 {skipped} 只（已有 {self._trade_date_str} 数据），需处理 {len(stale)} 只")
         return stale
 
-    def _is_tencent_data(self, symbol: str) -> bool:
-        """判断 DB 中股票是否为 Tencent 旧数据（close_normal IS NULL 表示从未写入原始价）。"""
+    def _has_no_close_normal(self, symbol: str) -> bool:
+        """DB 中 close_normal 为 NULL（从未写入原始不复权收盘价），需全量刷新。"""
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(f"SELECT close_normal FROM {TABLE} WHERE symbol = :sym ORDER BY trade_date DESC LIMIT 1"),
                 {"sym": symbol},
             ).scalar()
-        return row is None  # close_normal IS NULL → Tencent era data
+        return row is None
 
     # ── trading day alignment ────────────────────────────────────
 
@@ -476,6 +542,33 @@ class IncrementalSyncEngine:
                 """),
                 df.rename(columns={}).to_dict("records"),
             )
+
+    # ── failed-symbols cache ─────────────────────────────────────
+
+    def _failed_cache_path(self) -> str:
+        return os.path.join(self._cache_dir, f"failed_symbols_{self._trade_date_str}.txt")
+
+    def _load_failed_set(self) -> set[str]:
+        path = self._failed_cache_path()
+        if not os.path.exists(path):
+            return set()
+        try:
+            with open(path, encoding="utf-8") as f:
+                return {line.strip() for line in f if line.strip()}
+        except Exception as e:
+            logger.warning(f"读取失败股票缓存异常: {e}")
+            return set()
+
+    def _save_failed_set(self, symbols: set[str]) -> None:
+        path = self._failed_cache_path()
+        if not symbols:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            for sym in sorted(symbols):
+                f.write(f"{sym}\n")
+        logger.warning(f"缓存 {len(symbols)} 只失败股票 → {os.path.basename(path)}")
 
     # ── helpers ─────────────────────────────────────────────────
 

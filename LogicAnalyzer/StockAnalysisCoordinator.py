@@ -656,7 +656,7 @@ class StockAnalysisCoordinatorFactory:
             db_engine = _get_engine(config)
             incremental_sync_engine = IncrementalSyncEngine(
                 db_engine,
-                asharehub_api_key=getattr(config, 'ASHAREHUB_API_KEY', None),
+                default_start=config.BACKTEST_START_DATE,
                 main_board_only=config.MAIN_BOARD_ONLY,
                 enable_research_report_filter=config.ENABLE_RESEARCH_REPORT_FILTER,
                 research_report_min_count=config.RESEARCH_REPORT_MIN_COUNT,

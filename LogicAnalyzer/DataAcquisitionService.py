@@ -14,6 +14,10 @@ import akshare as ak
 import pandas as pd
 from loguru import logger
 
+from UtilsManager.AkshareConfig import ensure_akshare_timeout
+
+ensure_akshare_timeout()
+
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.ColumnNames import ColumnNames

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -12,7 +13,10 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DatabaseWriter import QuantDBManager
+from UtilsManager.AkshareConfig import ensure_akshare_timeout
 from UtilsManager.Exceptions import DatabaseConnectionError, DatabaseError
+
+ensure_akshare_timeout()
 
 
 class StockBasicInfoService:
@@ -159,62 +163,50 @@ class StockBasicInfoService:
                 else:
                     raise
 
-        all_stocks = []
-        total = len(industry_df)
+        all_stocks: list[dict[str, Any]] = []
         
         # 获取计入日期，并强制转换为 PostgreSQL 认识的 'YYYY-MM-DD' 格式
         raw_record_date = str(self.trading_calendar.get_last_trading_day()).replace("-", "")
         record_date = f"{raw_record_date[:4]}-{raw_record_date[4:6]}-{raw_record_date[6:8]}"
         
-        # 2. 遍历每个行业获取成分股
-        for idx, row in industry_df.iterrows():
+        def _fetch_one(row: dict) -> tuple[str, str, pd.DataFrame | None]:
             raw_code = str(row["行业代码"]).strip()
             ind_name = str(row["行业名称"]).strip()
-            
             symbol = raw_code.replace(".SI", "").replace(".si", "")
-            self.logger.info(f"[{idx + 1}/{total}] 正在获取: {ind_name} ({symbol})")
-            
-            component_df = None
-            # 为获取单个行业成分股增加更强的重试逻辑
             for attempt in range(max_retries):
                 try:
-                    # 在每次请求前增加一个基础延迟，避免请求过快
                     time.sleep(base_delay)
-                    component_df = ak.index_component_sw(symbol=symbol)
-                    
-                    # 对获取到的DataFrame做初步校验，看是否有预期的列
-                    if component_df is not None and not component_df.empty and '证券代码' in component_df.columns:
-                        self.logger.debug(f"  成功获取 {ind_name} 的成分股数据，共 {len(component_df)} 条")
-                        break # 如果成功获取且数据结构正确，跳出重试循环
-                    else:
-                        self.logger.warning(f"  第 {attempt + 1} 次获取到的成分股数据结构异常，尝试重试...")
-                        
+                    comp = ak.index_component_sw(symbol=symbol)
+                    if comp is not None and not comp.empty and '证券代码' in comp.columns:
+                        return raw_code, ind_name, comp
+                    logger.warning(f"  {ind_name} 第 {attempt + 1} 次结构异常，重试...")
                 except Exception as e:
-                    self.logger.warning(f"  获取成分股第 {attempt + 1} 次失败: {e!s}")
-                    # 每次失败后增加延迟时间 (指数退避)
+                    logger.warning(f"  {ind_name} 第 {attempt + 1} 次失败: {e!s}")
                     if attempt < max_retries - 1:
                         time.sleep(base_delay * (attempt + 1))
-            
-            # 检查最终是否成功获取
-            if component_df is None or component_df.empty or '证券代码' not in component_df.columns:
-                self.logger.warning(f"  {ind_name} ({symbol}) 成分股数据获取失败或结构异常，跳过此行业。")
-                # 即使失败也休眠一下，保持节奏
-                time.sleep(10)
-                continue # 跳过当前行业，继续下一个
-                
-            # 3. 映射字段
-            for _, stock_row in component_df.iterrows():
-                all_stocks.append({
-                    "industry_code": raw_code,
-                    "industry_name": ind_name,
-                    "stock_code": str(stock_row.get("证券代码", "")).strip(),
-                    "stock_name": str(stock_row.get("证券名称", "")).strip(),
-                    "weight": stock_row.get("最新权重", 0.0),
-                    "record_date": record_date
-                })
-            
-            # 每次读取之间休息，防止请求过快
-            time.sleep(3) 
+            return raw_code, ind_name, None
+        
+        # 2. 多线程并行获取各行业成分股
+        industries = industry_df.to_dict("records")
+        total = len(industries)
+        with ThreadPoolExecutor(max_workers=min(10, total)) as pool:
+            futs = {pool.submit(_fetch_one, row): row for row in industries}
+            done = 0
+            for f in as_completed(futs):
+                done += 1
+                raw_code, ind_name, component_df = f.result()
+                if component_df is None or component_df.empty or '证券代码' not in component_df.columns:
+                    logger.warning(f"  [{done}/{total}] {ind_name} — 成分股获取失败，跳过。")
+                    continue
+                for _, stock_row in component_df.iterrows():
+                    all_stocks.append({
+                        "industry_code": raw_code,
+                        "industry_name": ind_name,
+                        "stock_code": str(stock_row.get("证券代码", "")).strip(),
+                        "stock_name": str(stock_row.get("证券名称", "")).strip(),
+                        "weight": stock_row.get("最新权重", 0.0),
+                        "record_date": record_date
+                    })
 
         # 4. 数据清洗
         df = pd.DataFrame(all_stocks)

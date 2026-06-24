@@ -117,22 +117,31 @@ class ChipDistributionFetcher:
         page = 1
         logger.info("[ChipDist] 正在从 AShareHub 获取全市场筹码分布数据...")
 
+        import time as _time
+
         while True:
-            try:
-                df = self.client.chip_distribution(limit=self.API_PAGE_SIZE, offset=offset)
-                if df is None or df.empty:
+            for attempt in range(3):
+                try:
+                    df = self.client.chip_distribution(limit=self.API_PAGE_SIZE, offset=offset)
+                    if df is not None and not df.empty:
+                        break
+                except Exception as e:
+                    if attempt < 2:
+                        _time.sleep(2 ** attempt)
+                        continue
+                    logger.warning(f"[ChipDist] 获取失败 (已重试3次): {e}")
+                    df = None
                     break
-                df["symbol"] = df["ts_code"].apply(_ts_code_to_akshare_symbol)
-                all_dfs.append(df)
-                row_count = len(df)
-                logger.info(f"  [筹码分页 {page}] offset={offset}, 返回 {row_count} 行")
-                if row_count < self.API_PAGE_SIZE:
-                    break
-                offset += row_count
-                page += 1
-            except Exception as e:
-                logger.info(f"[ChipDist] 获取失败: {e}")
+            if df is None or df.empty:
                 break
+            df["symbol"] = df["ts_code"].apply(_ts_code_to_akshare_symbol)
+            all_dfs.append(df)
+            row_count = len(df)
+            logger.info(f"  [筹码分页 {page}] offset={offset}, 返回 {row_count} 行")
+            if row_count < self.API_PAGE_SIZE:
+                break
+            offset += row_count
+            page += 1
 
         if not all_dfs:
             logger.info("[ChipDist] 未获取到任何筹码分布数据。")

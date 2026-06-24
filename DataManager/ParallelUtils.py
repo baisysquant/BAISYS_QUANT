@@ -76,14 +76,14 @@ def run_with_thread_pool(
     :param desc: 任务描述，用于日志打印
     :return: 包含所有成功结果的列表 (过滤掉 None)
     """
-    results = []
-    total = len(list(items))  # 注意：如果items是生成器，这里会消耗掉，建议传list
+    items_list = list(items)
+    total = len(items_list)
+    results: list[Any] = []
 
     logger.info(f">>> 开始并发执行: {desc} (数量: {total}, 线程: {max_workers})...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交任务
-        future_to_item = {executor.submit(worker_func, item): item for item in items}
+        future_to_item = {executor.submit(worker_func, item): item for item in items_list}
 
         for future in as_completed(future_to_item):
             item = future_to_item[future]

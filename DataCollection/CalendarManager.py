@@ -11,6 +11,10 @@ import pytz
 import requests
 from loguru import logger
 
+from UtilsManager.AkshareConfig import ensure_akshare_timeout
+
+ensure_akshare_timeout()
+
 
 class TradingCalendarAnalyzer:
     _instance = None
@@ -124,13 +128,21 @@ class TradingCalendarAnalyzer:
             except (json.JSONDecodeError, OSError, KeyError):
                 pass
 
-        logger.critical("[Calendar CRITICAL] 缓存和接口均不可用，回退到仅周末逻辑（无法识别法定节假日）。")
+        logger.critical("[Calendar CRITICAL] 缓存和接口均不可用，使用 chinesecalendar 节假日库回退。")
         base = datetime.now() - timedelta(days=30)
         fallback_dates = []
-        for x in range(-30, 365):
-            d = base + timedelta(days=x)
-            if d.weekday() < 5:
-                fallback_dates.append(d.strftime("%Y-%m-%d"))
+        try:
+            from chinese_calendar import is_workday
+            for x in range(-30, 365):
+                d = base + timedelta(days=x)
+                if is_workday(d.date() if hasattr(d, "date") else d):
+                    fallback_dates.append(d.strftime("%Y-%m-%d"))
+        except ImportError:
+            logger.warning("[Calendar WARN] chinesecalendar 未安装，回退到仅周末逻辑（无法识别法定节假日）。")
+            for x in range(-30, 365):
+                d = base + timedelta(days=x)
+                if d.weekday() < 5:
+                    fallback_dates.append(d.strftime("%Y-%m-%d"))
         self._cached_dates = set(fallback_dates)
         self._cache_load_time = datetime.now().timestamp()
         return self._cached_dates
