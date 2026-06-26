@@ -599,6 +599,12 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 | `ShareData/` | 原始数据及清洗后数据缓存 |
 | `failed_symbols_{YYYYMMDD}.txt` | 当日同步失败的股票，下次运行自动重试 |
 
+## ⚠️ 特别提醒
+
+- 回测测试默认使用后复权
+- 复盘中除价格字段之外各因子的计算默认使用后复权
+- 复盘计算后输出的报告中价格字段均采用不复权（以方便用户直接查看）
+
 ## ⚠️ 注意事项
 
 - 请确保 PostgreSQL 服务已启动且 `config.ini` 中数据库连接信息正确
