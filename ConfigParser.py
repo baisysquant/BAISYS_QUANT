@@ -625,6 +625,13 @@ class Config:
     @property
     def ENABLE_MACRO_FILTER(self) -> bool: return self.app_config.macro_filter.ENABLE_MACRO_FILTER
 
+    # 回测
+    @property
+    def BACKTEST_START_DATE(self) -> str: return self.app_config.backtest.BACKTEST_START_DATE
+
+    @property
+    def OUT_OF_SAMPLE_DAYS(self) -> int: return self.app_config.backtest.OUT_OF_SAMPLE_DAYS
+
     # ── Dict 聚合属性（供 SignalManager / DataProcessingService 等使用） ──
 
     @property
