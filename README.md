@@ -130,7 +130,7 @@ FUND_FLOW_PERIODS = [3, 5]        ; 短期资金流
 [FILTER_RULES]
 exempt_levels = 完全主升,趋势加速   ; 仅保留强势股
 
-[BACKTEST]
+[BACKTEST_CALIBRATED]
 atr_stop_mult = 2.0               ; 较宽止损
 kelly_fraction = 0.5              ; 激进仓位
 ```
@@ -147,7 +147,7 @@ FUND_FLOW_PERIODS = [5, 10, 20]   ; 多周期验证
 [FULL_BULL_SCORING]
 conclusion_full_bull = 80         ; 提高完全主升门槛
 
-[POSITION_SIZING]
+[BACKTEST_CALIBRATED]
 kelly_fraction = 0.25             ; 保守仓位
 max_single_position = 0.15        ; 单只上限 15%
 ```
@@ -161,7 +161,7 @@ macd_params = 12,26,9             ; 经典均衡 MACD
 [SYSTEM]
 FUND_FLOW_PERIODS = [10, 20]      ; 中长期资金流
 
-[POSITION_SIZING]
+[BACKTEST_CALIBRATED]
 kelly_fraction = 0.2
 position_a = 0.3                  ; A 级仓位 30%
 max_single_position = 0.2
@@ -354,7 +354,6 @@ cd BAISYS_QUAN
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `boll_narrow_ratio` | 浮点 | <font color="red">`0.8`</font> | 窄布林判定阈值（由回测优化） |
 | `oscillation_hist_std_ratio` | 浮点 | `0.1` | 柱状图标准差比 |
 | `top_risk_ma20_deviation` | 浮点 | `0.15` | 顶风险 MA20 偏离阈值 |
 | `oscillation_min_bars` | 整数 | `30` | 震荡判定最小 K 线数 |
@@ -379,7 +378,6 @@ cd BAISYS_QUAN
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `cross_decay_days` | <font color="red">`30`</font> | 金叉信号衰减半衰期（天，由回测优化） |
 | `cross_decay_min` | `0.3` | 金叉衰减下限（30%） |
 | `kline_decay_days` | `10` | K 线形态衰减半衰期（天） |
 | `kline_decay_min` | `0.2` | K 线衰减下限（20%） |
@@ -394,8 +392,6 @@ cd BAISYS_QUAN
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `atr_stop_mult` | <font color="red">`1.5`</font> | 止损价 = close - ATR × 此值（由回测优化） |
-| `atr_t1_mult` | <font color="red">`3.0`</font> | T1 目标价 = close + ATR × 此值（由回测优化） |
 | `atr_t2_mult` | `5.0` | T2 目标价 = close + ATR × 此值 |
 
 **移动止损：**
@@ -420,7 +416,6 @@ cd BAISYS_QUAN
 |------|------|--------|------|
 | `enable_weak_stock_filter` | 布尔 | `true` | 是否启用弱势股过滤 |
 | `exempt_levels` | 逗号分隔字符串 | `完全主升,趋势加速,趋势震荡,趋势观望` | 豁免级别列表 |
-| `liq_veto_ratio` | 浮点 | <font color="red">`0.05`</font> | 流动性否决比（由回测优化） |
 | `liq_w_section` | 浮点 | `0.4` | 流动性评分截面权重 |
 | `liq_w_timeseries` | 浮点 | `0.4` | 流动性评分时序权重 |
 | `liq_w_marketcap` | 浮点 | `0.2` | 流动性评分规模权重 |
@@ -450,14 +445,28 @@ cd BAISYS_QUAN
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `max_single_position` | `0.33` | 单只股票最大仓位比例 |
-| `kelly_fraction` | <font color="red">`0.25`</font> | Kelly 仓位比例系数（由回测优化） |
 | `default_win_rate` | `0.50` | 默认胜率 |
-| `position_a` | <font color="red">`0.30`</font> | A 级基础仓位（由回测优化） |
 | `position_b` | `0.15` | B 级基础仓位 |
 | `position_c` | `0.05` | C 级基础仓位 |
 | `position_d` | `0.00` | D 级基础仓位 |
 | `max_industry_exposure` | `0.30` | 单行业最大暴露 |
 | `risk_budget` | `0.02` | 风险预算（组合波动率上限） |
+
+---
+
+#### [BACKTEST_CALIBRATED] — 回测自动校准参数
+
+这些参数由 Walk-Forward 寻优引擎在回测期间自动搜索最优值并写回本分区，日常运行无需手动修改。
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `boll_narrow_ratio` | <font color="red">`0.8`</font> | 窄布林判定：带宽/历史均值 < 此值 → 震荡（由回测优化） |
+| `cross_decay_days` | <font color="red">`30`</font> | 金叉信号衰减半衰期，天（由回测优化） |
+| `atr_stop_mult` | <font color="red">`1.5`</font> | ATR 止损倍数：止损价 = close - ATR × 此值（由回测优化） |
+| `atr_t1_mult` | <font color="red">`3.0`</font> | T1 目标价 ATR 倍数（由回测优化） |
+| `liq_veto_ratio` | <font color="red">`0.05`</font> | 流动性否决比（由回测优化） |
+| `kelly_fraction` | <font color="red">`0.25`</font> | Kelly 仓位比例系数（由回测优化） |
+| `position_a` | <font color="red">`0.30`</font> | A 级基础仓位（由回测优化） |
 
 ---
 
