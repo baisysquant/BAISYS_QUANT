@@ -345,6 +345,7 @@ class BacktestConfig(BaseModel):
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
+    SIGNAL_PIPELINES: int = Field(default=3, ge=1, le=8)
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
@@ -631,6 +632,9 @@ class Config:
 
     @property
     def OUT_OF_SAMPLE_DAYS(self) -> int: return self.app_config.backtest.OUT_OF_SAMPLE_DAYS
+
+    @property
+    def SIGNAL_PIPELINES(self) -> int: return self.app_config.backtest.SIGNAL_PIPELINES
 
     # ── Dict 聚合属性（供 SignalManager / DataProcessingService 等使用） ──
 

@@ -4,7 +4,7 @@ import os
 import random
 import shutil
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -31,19 +31,6 @@ def _trade_day_str() -> str:
         return TradingCalendarAnalyzer().get_last_trading_day().isoformat()
     except Exception:
         return date.today().isoformat()
-
-
-def _adjust_signal_workers(current: int, max_workers: int, watermark: float = 0.8) -> int:
-    try:
-        import psutil
-        load = psutil.cpu_percent(interval=0.2) / 100.0
-        if load > watermark and current > 1:
-            return current - 1
-        if load < watermark * 0.7 and current < max_workers:
-            return current + 1
-    except Exception:
-        pass
-    return current
 
 
 # ── 增量缓存（日期后缀 + 每只股票独立写入，支持中断续算） ──
@@ -75,15 +62,6 @@ def _load_signal_cache(trade_date: str) -> pd.DataFrame | None:
     return pd.concat(parts, ignore_index=True)
 
 
-def _cleanup_old_caches(today: str) -> None:
-    if not CACHE_DIR.exists():
-        return
-    prefix = "signal_cache_"
-    for f in CACHE_DIR.iterdir():
-        if f.is_dir() and f.name.startswith(prefix) and f.name != f"{prefix}{today}":
-            shutil.rmtree(f, ignore_errors=True)
-
-
 def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFrame:
     result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
     for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
@@ -105,7 +83,6 @@ def prepare_backtest_data(
 
     trade_date = _trade_day_str()
     cache_dir = _cache_dir_for(trade_date)
-    _cleanup_old_caches(trade_date)
 
     symbols = sorted(kline_df["symbol"].unique())
     done = _completed_symbols(trade_date)
@@ -127,7 +104,6 @@ def prepare_backtest_data(
 
     # ── 需要计算的股票 ──
     logger.info(f"信号缓存无效或不存在，开始计算 {len(missing)} 只...")
-    max_workers = 2
     tmpdir = tempfile.mkdtemp(prefix="bprep_")
     stock_dir = os.path.join(tmpdir, "stocks")
     os.mkdir(stock_dir)
@@ -137,31 +113,33 @@ def prepare_backtest_data(
         )
 
     from tqdm import tqdm
-    pbar = tqdm(total=len(missing), desc="预计算信号", unit="只", ncols=80)
+    signal_pipelines = Config().SIGNAL_PIPELINES
 
-    workers = max_workers
-    compute_batches = [
-        missing[i:i + PROCESS_BATCH_SIZE]
-        for i in range(0, len(missing), PROCESS_BATCH_SIZE)
-    ]
-    for batch_syms in compute_batches:
-        workers = _adjust_signal_workers(workers, max_workers)
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            fut_to_sym = {
-                pool.submit(_stock_worker, sym, stock_dir, params): sym
-                for sym in batch_syms
-            }
-            for future in as_completed(fut_to_sym):
-                sym = fut_to_sym[future]
-                try:
-                    rows = future.result()
-                    if rows:
-                        _save_stock_signal(cache_dir, sym, rows)
-                except Exception:
-                    pass
-                pbar.update(1)
+    def _pipeline(syms: list[str], idx: int) -> None:
+        """单管道：内部自带 ProcessPoolExecutor，逐个 batch 提交。"""
+        pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
+        for i in range(0, len(syms), PROCESS_BATCH_SIZE):
+            batch = syms[i:i + PROCESS_BATCH_SIZE]
+            with ProcessPoolExecutor(max_workers=2) as pool:
+                fut_to_sym = {
+                    pool.submit(_stock_worker, sym, stock_dir, params): sym
+                    for sym in batch
+                }
+                for future in as_completed(fut_to_sym):
+                    sym = fut_to_sym[future]
+                    try:
+                        rows = future.result()
+                        if rows:
+                            _save_stock_signal(cache_dir, sym, rows)
+                    except Exception:
+                        pass
+                    pbar.update(1)
+        pbar.close()
 
-    pbar.close()
+    chunks = [missing[i::signal_pipelines] for i in range(signal_pipelines)]
+    with ThreadPoolExecutor(max_workers=signal_pipelines) as pool:
+        for idx, chunk in enumerate(chunks):
+            pool.submit(_pipeline, chunk, idx)
     shutil.rmtree(tmpdir, ignore_errors=True)
 
     # ── 加载缓存合并 ──

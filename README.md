@@ -430,6 +430,7 @@ cd BAISYS_QUAN
 | `slippage` | `0.001` | 滑点 |
 | `max_position_pct` | `0.1` | 单只上限 |
 | `portfolio_method` | `score_weighted` | 组合权重方法 |
+| `signal_pipelines` | `3` | 信号预计算并行管道数 |
 
 **网格搜索参数范围（逗号分隔 min,max,step）：**
 
@@ -613,7 +614,7 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 - 信号预计算阶段使用 `ProcessPoolExecutor`，需确保 Python 环境支持 multiprocessing spawn
 - 若 `config.ini` 缺少某些节，系统会自动补全默认值（`ConfigValidator`）
 - 敏感信息（数据库密码、API Key）支持 `ENC:` 加密前缀，使用 `ConfigCipher` 工具生成
-- 信号缓存按交易日后缀存储，旧日期的缓存目录在下次运行时自动清理
+- 信号缓存按交易日后缀存储，历史缓存文件永不删除，仅在缺少当前交易日缓存时重新计算
 
 <br />
 
