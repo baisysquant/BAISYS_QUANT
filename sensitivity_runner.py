@@ -39,7 +39,7 @@ from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFacto
 
 def _make_temp_config(base_path: str, overrides: dict, label: str) -> str:
     """复制 base config.ini，应用 overrides，写入临时文件，返回路径。"""
-    cp = configparser.ConfigParser()
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
     cp.read(base_path, encoding="utf-8")
 
     for section, params in overrides.items():

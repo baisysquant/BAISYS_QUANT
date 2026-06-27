@@ -478,7 +478,7 @@ def validate(config_path: str = "config.ini") -> ValidationReport:
                                    message=f"配置文件不存在: {os.path.abspath(config_path)}"))
         return report
 
-    parser = configparser.ConfigParser()
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
     parser.read(config_path, encoding="utf-8")
     known_section_names = {sr.name for sr in SECTION_RULES}
 

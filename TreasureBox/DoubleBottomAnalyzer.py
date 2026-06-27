@@ -31,7 +31,7 @@ class Config:
     def _load_config(self) -> None:
         from UtilsManager.ConfigCipher import ConfigCipher
 
-        config = configparser.ConfigParser()
+        config = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
         config.read(self.config_file, encoding="utf-8")
 
         db = config["DATABASE"]
