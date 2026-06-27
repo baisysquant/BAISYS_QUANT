@@ -66,7 +66,7 @@
 ### Walk-Forward 回测系统
 
 - **Walk-Forward 滚动优化** — 以 in-sample（120 天）做网格搜索选出最优参数，在 out-of-sample（20 天）验证，滚动覆盖全历史
-- **Grid Search 网格搜索** — 多参数组合并行评估：<font color="red">`atr_stop_mult`</font>(1.0~3.0)、<font color="red">`kelly_fraction`</font>(0.1~0.5)、<font color="red">`position_a`</font>(0.2~0.5)、<font color="red">`liq_veto_ratio`</font>(0.03~0.10)、<font color="red">`boll_narrow_ratio`</font>(0.6~1.2)、<font color="red">`cross_decay_days`</font>(15~60)
+- **Grid Search 网格搜索** — 多参数组合并行评估： atr_stop_mult kelly_fraction position_a  liq_veto_ratio boll_narrow_ratio cross_decay_days
 - **多进程并行评估** — 单个参数组合使用 `ProcessPoolExecutor` 并行回测，结果写入 parquet 共享
 - **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比
 - **仓位优化** — 支持风险平价、最小方差、均值-方差、评分加权四种组合权重分配
