@@ -72,9 +72,18 @@ def write_calibration_to_ini(params: dict[str, float]) -> None:
         for param_key, (sec, ini_key) in CALIB_PARAM_MAP.items():
             if sec == current_section and ini_key.lower() == raw_key and param_key in params:
                 new_val = _format_val(param_key, params[param_key])
-                old_val = line.split("=", 1)[1].strip()
+                eq = line.index("=")
+                after = line[eq + 1:]
+                # 分离值部分与 inline comment（保留原始格式向后补）
+                val_only = after
+                for sep in ("#", ";"):
+                    idx = val_only.find(sep)
+                    if idx >= 0 and (idx == 0 or val_only[idx - 1] in (" ", "\t")):
+                        val_only = val_only[:idx].rstrip()
+                old_val = val_only.strip()
                 if old_val != new_val:
-                    lines[i] = line.replace(old_val, new_val, 1)
+                    comment = after[len(val_only):].rstrip()
+                    lines[i] = f"{line[:eq + 1]} {new_val}{comment}\n"
                     updated_keys.add(param_key)
                 break
 

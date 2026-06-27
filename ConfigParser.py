@@ -447,10 +447,19 @@ class Config:
         """读取 INI 节并转大写 key，适配 Pydantic UPPER_CASE 字段。"""
         return {k.upper(): v for k, v in dict(self._raw_section(name)).items()}
 
+    @staticmethod
+    def _strip_inline(v: str) -> str:
+        """递归剥离 # 和 ; inline comment（兼容 Python 3.12+ 默认 inline_comment_prefixes=()）。"""
+        for sep in ("#", ";"):
+            idx = v.find(sep)
+            if idx >= 0 and (idx == 0 or v[idx - 1] in (" ", "\t")):
+                v = v[:idx].rstrip()
+        return v
+
     def _raw_section(self, name: str) -> dict[str, str]:
         """安全读取 INI 节，不存在时返回空 dict。"""
         try:
-            return dict(self._cp[name])
+            return {k: self._strip_inline(v) for k, v in dict(self._cp[name]).items()}
         except KeyError:
             return {}
 
