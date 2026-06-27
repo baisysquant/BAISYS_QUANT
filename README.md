@@ -214,11 +214,14 @@ cd BAISYS_QUAN
 
 ## 🛠️ 配置
 
-所有配置统一存放于项目根目录的 `config.ini` 文件中，支持加密值（`ENC:` 前缀）。以下按 section 逐一说明。
+所有配置统一存放于项目根目录的 `config.ini` 文件中，支持加密值（`ENC:` 前缀）。
+文件按两大分区组织：**⚙️ 系统配置**（基础设施、性能、外部 API）和 **📊 业务配置**（策略参数、评分、风控、回测）。
+
+### ⚙️ 系统配置
 
 ---
 
-### [DATABASE] — 数据库连接
+#### [DATABASE] — 数据库连接
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -228,71 +231,34 @@ cd BAISYS_QUAN
 | `port` | 字符串 | 是 | - | 数据库端口号 |
 | `db_name` | 字符串 | 是 | - | 数据库名称 |
 | `main_board_only` | 布尔 | 否 | `true` | 是否仅获取主板股票（60/00开头） |
-| `encryption_key_path` | 字符串 | 否 | `~/.baisys_quant_key` | 加密密钥文件路径（用于解密 `ENC:` 前缀的密码/密钥） |
+| `encryption_key_path` | 字符串 | 否 | `~/.baisys_quant_key` | 加密密钥文件路径 |
 
 ---
 
-### [SYSTEM] — 系统运行参数
+#### [SYSTEM] — 系统运行参数
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `HOME_DIRECTORY` | 字符串 | 否 | `~/Downloads/CoreNews_Reports` | 报告和缓存输出根目录 |
-| `TEMP_DATA_DIR` | 字符串 | 否 | `.` | 临时数据子目录（相对 HOME_DIRECTORY） |
+| `TEMP_DATA_DIR` | 字符串 | 否 | `cache` | 临时数据子目录（相对 HOME_DIRECTORY） |
 | `max_workers` | 整数 | 否 | `15` | 最大并发数据获取线程数 |
 | `data_fetch_retries` | 整数 | 否 | `3` | 数据获取失败重试次数 |
 | `data_fetch_delay` | 整数 | 否 | `5` | 重试间隔秒数 |
+| `stock_basic_info_expire_days` | 整数 | 否 | `30` | 基础信息缓存过期天数 |
 | `signal_processing_processes` | 整数 | 否 | CPU 核数 | 技术指标信号处理线程数 |
 
 ---
 
-### [LOGGING] — 日志
+#### [LOGGING] — 日志
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `log_level` | 字符串 | 否 | `INFO` | 日志级别 (DEBUG/INFO/WARNING/ERROR/CRITICAL) |
+| `log_level` | 字符串 | 否 | `INFO` | 日志级别 |
 | `log_dir` | 字符串 | 否 | `Logs` | 日志子目录（相对 HOME_DIRECTORY） |
 
 ---
 
-### [MULTI_HEAD_ARRANGEMENT] — 多头排列评分
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `full_bull_threshold` | 整数 | `85` | 完全主升浪阈值：最强多头排列，所有均线向上发散 |
-| `trend_acceleration_threshold` | 整数 | `65` | 趋势加速阈值：较强多头排列，突破加速 |
-| `trend_oscillation_threshold` | 整数 | `45` | 趋势震荡阈值：中等强度，均线收敛/震荡 |
-| `trend_watch_threshold` | 整数 | `45` | 趋势观望阈值：弱/空头排列 |
-| `moving_average_periods` | 逗号分隔整数 | `5,10,20,30,60` | 均线周期（用于本地评分计算，不影响 Akshare 均线突破） |
-
----
-
-### [FILTER_RULES] — 弱势股过滤
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `enable_weak_stock_filter` | 布尔 | `true` | 是否启用弱势股自动剔除 |
-| `exempt_levels` | 逗号分隔字符串 | `完全主升,趋势加速` | 豁免条件：具备这些级别的股票不过滤 |
-| `liq_veto_ratio` | 浮点 | <font color="red">`0.05`</font> | 流动性否决比（由回测优化） |
-
----
-
-### [FUND_FLOW] — 资金流分析
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `fund_flow_periods` | 逗号分隔整数 | `5,10,20` | 资金流统计周期，必须 3 个。可选组合：`3,5,10`（短线）/ `3,5,20` / `5,10,20`（中线，默认）/ `3,10,20` |
-
----
-
-### [TECHNICAL_INDICATORS] — 技术指标
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `macd_params` | 逗号分隔整数 | `12,26,9` | MACD (快线,慢线,信号线)，出厂默认 `12,26,9`，用户可自由修改 |
-
----
-
-### [COLUMN_ALIASES] — 列名映射（一般不动）
+#### [COLUMN_ALIASES] — 列名映射
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
@@ -302,34 +268,67 @@ cd BAISYS_QUAN
 
 ---
 
-### [RESEARCH_REPORT_FILTER] — 研报过滤
+#### [ASHAREHUB] — 外部 API 配置
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `enable_research_report_filter` | 布尔 | `true` | 是否启用研报数据过滤 |
-| `research_report_min_count` | 整数 | `1` | 买入评级最低次数要求 |
+| `api_key` | 字符串 | - | AShareHub API 密钥（支持 ENC 加密） |
+| `enable_chip_distribution` | 布尔 | `true` | 是否获取筹码分布数据 |
+| `moneyflow_retry` | 整数 | `3` | 资金流向 API 重试次数 |
+| `moneyflow_page_delay` | 浮点 | `1.0` | 资金流向分页间隔（秒） |
 
 ---
 
-### [KLINE_DATA] — K线数据获取
+### 📊 业务配置
+
+---
+
+#### [USER_FOCUS_STOCKS] — 用户关注股池
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `kline_history_days` | 整数 | `200` | 历史 K 线获取天数（建议 60～500） |
+| `user_focus_stocks` | 竖线分隔 | 空 | 关注股票列表（`000001\|000002\|600000`），Excel 中高亮置顶 |
 
 ---
 
-### [USER_FOCUS_STOCKS] — 用户关注股池
+#### [TECHNICAL_INDICATORS] — 技术指标
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `user_focus_stocks` | 竖线分隔 | 空 | 关注股票列表（例：`000001\|000002\|600000`），将在 Excel 中高亮置顶 |
+| `macd_params` | 逗号分隔整数 | `12,26,9` | MACD (快线,慢线,信号线) |
 
 ---
 
-### [FULL_BULL_SCORING] — MACD 管线评分权重
+#### [TECHNICAL_CONSTANTS] — 标准技术指标参数
 
-**权重维度（建议合计 90，不含量价配合）：**
+| 参数 | 默认值 | 标准来源 | 说明 |
+|------|--------|----------|------|
+| `atr_length` | `14` | Wilder | ATR 计算周期 |
+| `adx_length` | `14` | Wilder | ADX 计算周期 |
+| `rsi_length` | `14` | Wilder | RSI 计算周期 |
+| `boll_length` | `20` | Bollinger | BOLL 计算周期 |
+| `boll_std` | `2.0` | Bollinger | BOLL 标准差倍数 |
+| `stoch_k` | `9` | Lane | Stoch %K 周期 |
+| `stoch_d` | `3` | Lane | Stoch %D 平滑周期 |
+| `kline_scan_window` | `60` | - | K 线形态扫描窗口（根数） |
+
+---
+
+#### [MULTI_HEAD_ARRANGEMENT] — 多头排列评分
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `full_bull_threshold` | 整数 | `85` | ≥85 → 完全主升浪 |
+| `trend_acceleration_threshold` | 整数 | `65` | 65~84 → 趋势加速 |
+| `trend_oscillation_threshold` | 整数 | `45` | 45~64 → 趋势震荡 |
+| `trend_watch_threshold` | 整数 | `45` | <45 → 趋势观望 |
+| `moving_average_periods` | 逗号分隔整数 | `5,10,20,30,60` | 均线周期 |
+
+---
+
+#### [FULL_BULL_SCORING] — MACD 评分权重
+
+**7 维权重（建议合计 90，不含量价配合）：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -338,132 +337,58 @@ cd BAISYS_QUAN
 | `weight_momentum` | `15` | 柱状动能 |
 | `weight_dif_slope` | `10` | DIF 斜率 |
 | `weight_divergence` | `10` | 背离信号 |
-| `weight_volume_price` | `10` | 量价配合（独立奖励分） |
+| `weight_volume_price` | `10` | 量价配合（奖励分） |
 | `weight_kline_pattern` | `10` | K 线形态 |
 
 **结论阈值：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `conclusion_full_bull` | `80` | 评分 ≥ 此值 → A 级（综合多头） |
-| `conclusion_bullish` | `60` | 评分 ≥ 此值 → B 级（偏多） |
-| `conclusion_oscillate` | `40` | 评分 ≥ 此值 → C 级（多空拉锯），否则 C 级（偏空） |
+| `conclusion_full_bull` | `80` | ≥80 → A 级 |
+| `conclusion_bullish` | `60` | ≥60 → B 级 |
+| `conclusion_oscillate` | `40` | ≥40 → C 级，否则 C 级（偏空） |
 
 ---
 
-### [ASHAREHUB] — 筹码分布 API
+#### [REGIME_DETECTION] — 市场状态分类
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `api_key` | 字符串 | - | AShareHub API 密钥（支持 ENC 加密） |
-| `enable_chip_distribution` | 布尔 | `true` | 是否获取筹码分布数据 |
-| `chip_history_days` | 整数 | `90` | 筹码分布历史天数 |
+| `boll_narrow_ratio` | 浮点 | <font color="red">`0.8`</font> | 窄布林判定阈值（由回测优化） |
+| `oscillation_hist_std_ratio` | 浮点 | `0.1` | 柱状图标准差比 |
+| `top_risk_ma20_deviation` | 浮点 | `0.15` | 顶风险 MA20 偏离阈值 |
+| `oscillation_min_bars` | 整数 | `30` | 震荡判定最小 K 线数 |
+| `reversal_lookback` | 整数 | `10` | 反转检测回溯长度 |
 
 ---
 
-### [MACRO_FILTER] — 宏观过滤器
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `enable_macro_filter` | 布尔 | `true` | 是否启用宏观过滤 |
-| `advance_ratio_ice` | 浮点 | `0.25` | 涨跌比"冰冻"阈值 |
-| `advance_ratio_weak` | 浮点 | `0.35` | 涨跌比"弱势"阈值 |
-| `advance_ratio_hot` | 浮点 | `0.70` | 涨跌比"过热"阈值 |
-
----
-
-### [REGIME_DETECTION] — 市场状态分类参数
-
-> ⚠️ **纯自定义经验值**，需根据回测结果调整。控制 `_detect_market_regime()` 中的市场状态判定阈值。
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `boll_narrow_ratio` | 浮点 | <font color="red">`0.8`</font> | 窄布林判定：近期 BOLL 带宽 < 历史均值 × 此值 → 震荡（由回测优化） |
-| `oscillation_hist_std_ratio` | 浮点 | `0.1` | 震荡模式：柱状图绝对值 < 此值 × close.std() → 震荡 |
-| `top_risk_ma20_deviation` | 浮点 | `0.15` | 顶风险：收盘价偏离 MA20 超过此比例 → 顶部风险 |
-| `oscillation_min_bars` | 整数 | `30` | 震荡判定所需最小 K 线数 |
-| `reversal_lookback` | 整数 | `10` | 底/顶反转检测回溯长度（根） |
-
----
-
-### [DIVERGENCE] — 背离检测参数
-
-> ⚠️ **信号衰减模型为自研**，需根据回测调整。
+#### [DIVERGENCE] — 背离检测
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `base_distance` | 整数 | `10` | 背离检测基础窗口 |
-| `strength_threshold` | 浮点 | `0.15` | 背离有效强度门限，超过才生成信号 |
+| `strength_threshold` | 浮点 | `0.15` | 背离有效强度门限 |
 | `decay_half_life` | 整数 | `8` | 背离信号半衰期（天） |
-| `slope_window` | 整数 | `5` | DIF 斜率线性回归窗口（根） |
+| `slope_window` | 整数 | `5` | DIF 斜率回归窗口 |
 
 ---
 
-### [POSITION_SIZING] — 仓位管理
+#### [SCORING_PARAMS] — 评分计算参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `max_single_position` | `0.25` | 单只股票最大仓位比例 |
-| `kelly_fraction` | <font color="red">`0.25`</font> | Kelly 仓位比例系数（由回测优化） |
-| `default_win_rate` | `0.55` | 默认胜率 |
-| `position_a` | <font color="red">`0.35`</font> | A 级基础仓位（回测优化） |
-| `position_b` | `0.25` | B 级基础仓位 |
-| `position_c` | `0.15` | C 级基础仓位 |
-| `position_d` | `0.05` | D 级基础仓位 |
-| `max_industry_exposure` | `0.30` | 单行业最大暴露 |
-| `risk_budget` | `0.02` | 风险预算（组合波动率上限） |
-
----
-
-### [BACKTEST] — 回测系统
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `enabled` | `true` | 是否启用回测校准 |
-| `optimize_frequency` | `monthly` | 校准频率 |
-| `backtest_start_date` | `20200101` | 回测起始日期 |
-| `out_of_sample_days` | `20` | Walk-Forward 样本外窗口天数 |
-| `initial_cash` | `1000000` | 初始资金 |
-| `full_a_share_mode` | `false` | 是否全 A 股回测 |
-| `commission_rate` | `0.0003` | 佣金费率 |
-| `stamp_tax_rate` | `0.001` | 印花税率 |
-| `slippage` | `0.001` | 滑点 |
-| `max_position_pct` | `0.1` | 单只上限 |
-| `portfolio_method` | `score_weighted` | 组合权重方法 |
-| `signal_pipelines` | `3` | 信号预计算并行管道数 |
-
-**网格搜索参数范围（逗号分隔 min,max,step）：**
-
-| 参数 | 默认值 | 寻优对象 |
-|------|--------|----------|
-| `atr_stop_mult_range` | `1.0,3.0,0.5` | ATR 止损倍数 |
-| `atr_t1_mult_range` | `2.0,6.0,1.0` | T1 目标倍数 |
-| `kelly_fraction_range` | `0.1,0.5,0.1` | Kelly 比例 |
-| `position_a_range` | `0.2,0.5,0.05` | A 级仓位 |
-| `liq_veto_ratio_range` | `0.03,0.10,0.01` | 流动性否决比 |
-| `boll_narrow_ratio_range` | `0.6,1.2,0.1` | 布林窄幅比 |
-| `cross_decay_days_range` | `15,60,5` | 金叉衰减天数 |
-
----
-
-### [SCORING_PARAMS] — 评分计算参数
-
-> ⚠️ **纯自研参数**，控制衰减模型、波动率归一化、退出策略。
-
-**衰减相关：**
+**信号衰减：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `cross_decay_days` | <font color="red">`30`</font> | 金叉信号衰减半衰期（天，由回测优化） |
-| `cross_decay_min` | `0.3` | 金叉衰减下限（原始权重的 30%） |
+| `cross_decay_min` | `0.3` | 金叉衰减下限（30%） |
 | `kline_decay_days` | `10` | K 线形态衰减半衰期（天） |
-| `kline_decay_min` | `0.2` | K 线衰减下限（原始权重的 20%） |
+| `kline_decay_min` | `0.2` | K 线衰减下限（20%） |
 
 **波动率归一化：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `vol_norm_denominator` | `0.15` | 金叉强度波动率归一化分母：(DIF-DEA)/ATR ÷ 此值 → vol_factor |
+| `vol_norm_denominator` | `0.15` | (DIF-DEA)/ATR ÷ 此值 → vol_factor |
 
 **退出策略（ATR 倍数）：**
 
@@ -477,32 +402,88 @@ cd BAISYS_QUAN
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `trailing_stop_high_ratio` | `0.98` | close ≥ 近 N 日最高价 × 此值 → 激活移动止损 |
-| `trailing_stop_high_lookback` | `20` | 参考高点回溯窗口（根） |
-| `trailing_stop_lookback` | `10` | 移动止损价取近 N 日最低价（根） |
+| `trailing_stop_high_ratio` | `0.98` | 近 N 日最高价 × 此值 → 激活移动止损 |
+| `trailing_stop_lookback` | `10` | 移动止损价取近 N 日最低价 |
+| `trailing_stop_high_lookback` | `20` | 参考高点回溯窗口 |
 
 **预期盈亏比：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `expected_return_lookback` | `20` | 计算预期盈亏比时取近 N 日价格区间 |
+| `expected_return_lookback` | `20` | 计算回溯窗口（天） |
 
 ---
 
-### [TECHNICAL_CONSTANTS] — 标准技术指标参数
+#### [FILTER_RULES] — 弱势股过滤
 
-> ✅ **行业标准参数**，一般无需修改。放在此处仅为了统一入口和对比调参。
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enable_weak_stock_filter` | 布尔 | `true` | 是否启用弱势股过滤 |
+| `exempt_levels` | 逗号分隔字符串 | `完全主升,趋势加速,趋势震荡,趋势观望` | 豁免级别列表 |
+| `liq_veto_ratio` | 浮点 | <font color="red">`0.05`</font> | 流动性否决比（由回测优化） |
+| `liq_w_section` | 浮点 | `0.4` | 流动性评分截面权重 |
+| `liq_w_timeseries` | 浮点 | `0.4` | 流动性评分时序权重 |
+| `liq_w_marketcap` | 浮点 | `0.2` | 流动性评分规模权重 |
+| `liq_min_discount` | 浮点 | `0.3` | 流动性最差时仓位最低比例 |
 
-| 参数 | 默认值 | 标准来源 | 说明 |
-|------|--------|----------|------|
-| `atr_length` | `14` | Wilder | ATR 计算周期 |
-| `adx_length` | `14` | Wilder | ADX 计算周期 |
-| `rsi_length` | `14` | Wilder | RSI 计算周期 |
-| `boll_length` | `20` | Bollinger | BOLL 计算周期 |
-| `boll_std` | `2.0` | Bollinger | BOLL 标准差倍数 |
-| `stoch_k` | `9` | Lane | Stoch %K 周期 |
-| `stoch_d` | `3` | Lane | Stoch %D 平滑周期 |
-| `kline_scan_window` | `60` | - | K 线形态扫描窗口（根数） |
+---
+
+#### [FUND_FLOW] — 资金流分析
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `fund_flow_periods` | 逗号分隔整数 | `5,10,20` | 统计周期，可选：`3,5,10` / `3,5,20` / `5,10,20` / `3,10,20` |
+
+---
+
+#### [RESEARCH_REPORT_FILTER] — 研报过滤
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enable_research_report_filter` | 布尔 | `true` | 是否启用研报过滤 |
+| `research_report_min_count` | 整数 | `1` | 买入评级最低次数 |
+
+---
+
+#### [POSITION_SIZING] — 仓位管理
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `max_single_position` | `0.33` | 单只股票最大仓位比例 |
+| `kelly_fraction` | <font color="red">`0.25`</font> | Kelly 仓位比例系数（由回测优化） |
+| `default_win_rate` | `0.50` | 默认胜率 |
+| `position_a` | <font color="red">`0.30`</font> | A 级基础仓位（由回测优化） |
+| `position_b` | `0.15` | B 级基础仓位 |
+| `position_c` | `0.05` | C 级基础仓位 |
+| `position_d` | `0.00` | D 级基础仓位 |
+| `max_industry_exposure` | `0.30` | 单行业最大暴露 |
+| `risk_budget` | `0.02` | 风险预算（组合波动率上限） |
+
+---
+
+#### [BACKTEST] — 回测系统
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `enabled` | `true` | 是否启用回测校准 |
+| `optimize_frequency` | `monthly` | 校准频率 |
+| `backtest_start_date` | `20230101` | 回测起始日期 |
+| `out_of_sample_days` | `60` | Walk-Forward 样本外窗口天数 |
+| `initial_cash` | `1000000` | 初始资金 |
+| `full_a_share_mode` | `false` | 是否全 A 股回测 |
+| `signal_pipelines` | `3` | 信号预计算并行管道数 |
+
+**网格搜索参数范围（逗号分隔 min,max,step）：**
+
+| 参数 | 默认值 | 寻优对象 |
+|------|--------|----------|
+| `atr_stop_mult_range` | `1.0,3.0,0.5` | ATR 止损倍数 |
+| `atr_t1_mult_range` | `2.0,6.0,1.0` | T1 目标倍数 |
+| `kelly_fraction_range` | `0.1,0.5,0.1` | Kelly 比例 |
+| `position_a_range` | `0.2,0.5,0.05` | A 级仓位 |
+| `liq_veto_ratio_range` | `0.03,0.10,0.01` | 流动性否决比 |
+| `boll_narrow_ratio_range` | `0.6,1.2,0.1` | 布林窄幅比 |
+| `cross_decay_days_range` | `15,60,5` | 金叉衰减天数 |
 
 ## 🚀 使用方法
 

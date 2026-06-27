@@ -25,13 +25,13 @@ import pandas as pd
 
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
-    "atr_stop_mult": ("SCORING_PARAMS", "atr_stop_mult"),
-    "atr_t1_mult": ("SCORING_PARAMS", "atr_t1_mult"),
-    "kelly_fraction": ("POSITION_SIZING", "kelly_fraction"),
-    "position_a": ("POSITION_SIZING", "position_a"),
-    "liq_veto_ratio": ("FILTER_RULES", "liq_veto_ratio"),
-    "boll_narrow_ratio": ("REGIME_DETECTION", "boll_narrow_ratio"),
-    "cross_decay_days": ("SCORING_PARAMS", "cross_decay_days"),
+    "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
+    "atr_t1_mult": ("BACKTEST_CALIBRATED", "atr_t1_mult"),
+    "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
+    "position_a": ("BACKTEST_CALIBRATED", "position_a"),
+    "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
+    "boll_narrow_ratio": ("BACKTEST_CALIBRATED", "boll_narrow_ratio"),
+    "cross_decay_days": ("BACKTEST_CALIBRATED", "cross_decay_days"),
 }
 
 CONFIG_INI = PROJECT_ROOT / "config.ini"
@@ -209,22 +209,23 @@ def apply_calibration_to_config(config: object) -> None:
     if result is None:
         return
     overrides = result.params.copy()
-
-    ps = cfg.app_config.position_sizing
-    for key, attr in (
-        ("atr_stop_mult", "ATR_STOP_MULT"),
-        ("atr_t1_mult", "ATR_T1_MULT"),
-        ("kelly_fraction", "KELLY_FRACTION"),
-        ("position_a", "POSITION_A"),
-        ("liq_veto_ratio", "LIQ_VETO_RATIO"),
-    ):
-        if key in overrides:
-            setattr(ps, attr, overrides[key])
+    if not overrides:
+        return
 
     rd = cfg.app_config.regime_detection
-    if "boll_narrow_ratio" in overrides:
-        rd.BOLL_NARROW_RATIO = overrides["boll_narrow_ratio"]
+    sc = cfg.app_config.scoring_params
+    fr = cfg.app_config.filter_rules
+    ps = cfg.app_config.position_sizing
 
-    sp = cfg.app_config.scoring_params
-    if "cross_decay_days" in overrides:
-        sp.CROSS_DECAY_DAYS = int(overrides["cross_decay_days"])
+    for key, val in overrides.items():
+        attr = key.upper()
+        if key == "boll_narrow_ratio":
+            rd.BOLL_NARROW_RATIO = val
+        elif key == "cross_decay_days":
+            sc.CROSS_DECAY_DAYS = int(val)
+        elif key in ("atr_stop_mult", "atr_t1_mult"):
+            setattr(sc, attr, val)
+        elif key == "liq_veto_ratio":
+            fr.LIQ_VETO_RATIO = val
+        elif key in ("kelly_fraction", "position_a"):
+            setattr(ps, attr, val)

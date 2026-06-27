@@ -457,7 +457,7 @@ class Config:
     def _load_config(self) -> None:
         import configparser
 
-        self._cp = configparser.ConfigParser()
+        self._cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
         self._cp.read(self.config_file, encoding="utf-8")
 
         from UtilsManager.ConfigCipher import ConfigCipher
@@ -500,6 +500,29 @@ class Config:
             position_sizing=PositionSizingConfig(**self._section_upper("POSITION_SIZING")),
             backtest=BacktestConfig(**self._section_upper("BACKTEST")),
         )
+
+        # ── 回测自动校准参数覆写 ──
+        # [BACKTEST_CALIBRATED] 将 7 个参数覆写到各自子模型，实现 INI 统一分组
+        bt_cal = self._section_upper("BACKTEST_CALIBRATED")
+        if bt_cal:
+            sc = self.app_config.scoring_params
+            fr = self.app_config.filter_rules
+            rd = self.app_config.regime_detection
+            ps = self.app_config.position_sizing
+            if "BOLL_NARROW_RATIO" in bt_cal:
+                rd.BOLL_NARROW_RATIO = float(bt_cal["BOLL_NARROW_RATIO"])
+            if "CROSS_DECAY_DAYS" in bt_cal:
+                sc.CROSS_DECAY_DAYS = int(bt_cal["CROSS_DECAY_DAYS"])
+            if "ATR_STOP_MULT" in bt_cal:
+                sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
+            if "ATR_T1_MULT" in bt_cal:
+                sc.ATR_T1_MULT = float(bt_cal["ATR_T1_MULT"])
+            if "LIQ_VETO_RATIO" in bt_cal:
+                fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
+            if "KELLY_FRACTION" in bt_cal:
+                ps.KELLY_FRACTION = float(bt_cal["KELLY_FRACTION"])
+            if "POSITION_A" in bt_cal:
+                ps.POSITION_A = float(bt_cal["POSITION_A"])
 
     # ── 向后兼容属性（只读委托至 app_config） ──────────────────────────
 

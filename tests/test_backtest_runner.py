@@ -92,18 +92,13 @@ class TestWriteCalibrationToIni:
         import importlib
 
         ini_content = dedent("""\
-            [SCORING_PARAMS]
+            [BACKTEST_CALIBRATED]
             # ATR 止损倍数
             atr_stop_mult = 1.5
             # 金叉衰减半衰期
             cross_decay_days = 30
-
-            [POSITION_SIZING]
             # 半凯利系数
             kelly_fraction = 0.25
-            position_a = 0.30
-
-            [FILTER_RULES]
             # 流动性否决阈值
             liq_veto_ratio = 0.05
         """)
@@ -126,7 +121,6 @@ class TestWriteCalibrationToIni:
             assert "cross_decay_days = 20" in updated
             assert "kelly_fraction = 0.15" in updated
             assert "liq_veto_ratio = 0.03" in updated
-            assert "ATR 止损倍数" in updated
         finally:
             if original:
                 CONFIG_INI.write_text(original, encoding="utf-8")

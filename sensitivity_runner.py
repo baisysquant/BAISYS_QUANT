@@ -188,7 +188,7 @@ def _build_overrides(combo: dict) -> dict:
         "divergence": ("FULL_BULL_SCORING", "RULE_DIVERGENCE_THRESHOLD"),
         "winner_rate_high": ("FULL_BULL_SCORING", "RULE_WINNER_RATE_HIGH"),
         "winner_rate_low": ("FULL_BULL_SCORING", "RULE_WINNER_RATE_LOW"),
-        "liq_veto_ratio": ("FILTER_RULES", "liq_veto_ratio"),
+        "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
     }
     # TECHNICAL_CONSTANTS 键名映射
     TECH_MAP = {
