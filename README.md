@@ -7,17 +7,22 @@
   <br/>  
 </p>
 <p align="center">
-    <img src="https://img.shields.io/badge/Python-3.8+-blue?logo=python&logoColor=white" />
-    <img src="https://img.shields.io/badge/Data-AkShare-red?logo=databricks&logoColor=white" />
-    <img src="https://img.shields.io/badge/Analysis-Pandas_TA-green?logo=pandas&logoColor=white" />
-<img src="https://img.shields.io/badge/Performance-15_Thread_Parallel-brightgreen?logo=speedtest" />
-    <br />
-    <img src="https://img.shields.io/badge/MACD-Dual_Cycle_&_Momentum-ff4500?style=flat-square" />
-    <img src="https://img.shields.io/badge/KDJ-Divergence_Detection-8a2be2?style=flat-square" />
-    <img src="https://img.shields.io/badge/Output-Auto_Excel_Report-success?logo=microsoftexcel&style=social" />
-    <img src="https://img.shields.io/badge/CCI-Professional_Tiering-7cfc00?style=flat-square" />
-    <img src="https://img.shields.io/badge/Trend-MA_Bullish_Alignment-00ced1?style=flat-square" />
-    
+     <img src="https://img.shields.io/badge/Lib-PostgreSQL-ff4500?style=flat-square" />
+     <img src="https://img.shields.io/badge/Lib-Pydantic-ff4500?style=flat-square" />
+     <img src="https://img.shields.io/badge/Lib-Loguru-ff4500?style=flat-square" />
+    <img src="https://img.shields.io/badge/Lib-TA_LIB-ff4500?style=flat-square" />
+   </br> 
+      <img src="https://img.shields.io/badge/Data-AkShare-red?logo=databricks&logoColor=white" />
+   <img src="https://img.shields.io/badge/Data-Pandera-red?style=flat-square" />
+     <img src="https://img.shields.io/badge/Data-Numpy-red?style=flat-square" />
+     <img src="https://img.shields.io/badge/Data-Akquant-red?style=flat-square" />
+        </br> 
+  <img src="https://img.shields.io/badge/Analysis-WalkForward-green?logo=pandas&logoColor=white" />
+    <img src="https://img.shields.io/badge/Analysis-KDJ-green?logo=pandas&logoColor=white" />
+    <img src="https://img.shields.io/badge/Analysis-MACD-green?logo=pandas&logoColor=white" />
+    <img src="https://img.shields.io/badge/Analysis-BOLL-green?logo=pandas&logoColor=white" />
+    <img src="https://img.shields.io/badge/Analysis-CCI-green?style=flat-square" />
+    <img src="https://img.shields.io/badge/Analysis-ADX-green?style=flat-square" />
 </p>
 <br />
 
@@ -27,7 +32,7 @@
 
 ### 阶段 A — 回测校准
 
-通过 Walk-Forward 滚动窗口优化 + Grid Search 网格搜索，自动寻优 6 个核心策略参数（<font color="red">ATR 止损倍数</font>、<font color="red">Kelly 仓位比例</font>、<font color="red">基础仓位 A</font>、<font color="red">流动性否决比</font>、<font color="red">布林窄幅比</font>、<font color="red">金叉衰减天数</font>），将最优参数写入 `config.ini` 用于日常运行。
+通过 Walk-Forward 滚动窗口优化 + Grid Search 网格搜索，自动寻优 6 个核心策略参数（ATR止损倍数、Kelly仓位比例、基础仓位 流动性否决比、布林窄幅比、金叉衰减天数) 用于日常运行。
 
 ### 阶段 B — 每日分析管线
 
@@ -61,7 +66,7 @@
 ### Walk-Forward 回测系统
 
 - **Walk-Forward 滚动优化** — 以 in-sample（120 天）做网格搜索选出最优参数，在 out-of-sample（20 天）验证，滚动覆盖全历史
-- **Grid Search 网格搜索** — 多参数组合并行评估：<font color="red">`atr_stop_mult`</font>(1.0~3.0)、<font color="red">`kelly_fraction`</font>(0.1~0.5)、<font color="red">`position_a`</font>(0.2~0.5)、<font color="red">`liq_veto_ratio`</font>(0.03~0.10)、<font color="red">`boll_narrow_ratio`</font>(0.6~1.2)、<font color="red">`cross_decay_days`</font>(15~60)
+- **Grid Search 网格搜索** — 多参数组合并行评估： atr_stop_mult kelly_fraction position_a  liq_veto_ratio boll_narrow_ratio cross_decay_days
 - **多进程并行评估** — 单个参数组合使用 `ProcessPoolExecutor` 并行回测，结果写入 parquet 共享
 - **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比
 - **仓位优化** — 支持风险平价、最小方差、均值-方差、评分加权四种组合权重分配
