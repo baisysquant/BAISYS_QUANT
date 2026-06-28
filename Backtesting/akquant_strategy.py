@@ -85,7 +85,7 @@ class QuantPipelineStrategy(Strategy):
         elif entry_signal:
             if symbol not in self._entry_cache:
                 weight = self._calc_weight(bar)
-                self.order_target_percent(symbol, weight)
+                self.order_target_percent(symbol, weight)  # type: ignore[arg-type]
                 self._entry_cache[symbol] = weight
                 _trade_log.append({
                     "time": str(getattr(bar, "trade_date", "")),
@@ -97,10 +97,10 @@ class QuantPipelineStrategy(Strategy):
 
         pv = getattr(self, "portfolio_value", None)
         if pv is None:
-            cash = getattr(self, "cash", 0)
-            pos_val = 0
+            cash = float(getattr(self, "cash", 0))
+            pos_val = 0.0
             for s, w in self._entry_cache.items():
-                pos_val += w * getattr(self, "portfolio_value", 0) if hasattr(self, "portfolio_value") else 0
+                pos_val += w * float(getattr(self, "portfolio_value", 0)) if hasattr(self, "portfolio_value") else 0.0
             pv = cash + pos_val if cash else 0
         _equity_curve.append({
             "time": str(getattr(bar, "trade_date", "")),

@@ -41,13 +41,11 @@ def _ts_code_to_akshare_symbol(ts_code: str) -> str:
 class ChipDistributionFetcher:
     """全市场筹码分布数据获取器。
 
-    通过一次 API 调用（不传 ts_code）获取全市场最新筹码快照。
-    免费版每日 100 次调用充足；如果全市场超过 2000 只，自动分页。
+    通过一次 API 调用（trade_date 参数）获取全市场最新筹码快照。
+    免费版每日 100 次调用充足。
 
     缓存策略：当天首次调用拉取 API → 保存 CSV；当天再次调用直接读取缓存。
     """
-
-    API_PAGE_SIZE = 2000
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -89,8 +87,8 @@ class ChipDistributionFetcher:
             date: 日期字符串 YYYYMMDD，用于缓存键，默认当天。
 
         Returns:
-            DataFrame with columns: ts_code, trade_date, winner_rate, weight_avg,
-                                     cost_5pct, cost_25pct, cost_50pct, cost_75pct, cost_95pct
+            DataFrame with columns: symbol, trade_date, winner_rate, weight_avg,
+                                     cost_5pct, cost_15pct, cost_50pct, cost_85pct, cost_95pct
         """
         if date:
             self._override_today = str(date).replace("-", "")
@@ -112,50 +110,41 @@ class ChipDistributionFetcher:
             logger.info("[ChipDist] 客户端初始化失败，跳过。")
             return pd.DataFrame()
 
-        all_dfs = []
-        offset = 0
-        page = 1
         logger.info("[ChipDist] 正在从 AShareHub 获取全市场筹码分布数据...")
 
         import time as _time
 
-        while True:
-            for attempt in range(3):
-                try:
-                    df = self.client.chip_distribution(limit=self.API_PAGE_SIZE, offset=offset)
-                    if df is not None and not df.empty:
-                        break
-                except Exception as e:
-                    if attempt < 2:
-                        _time.sleep(2 ** attempt)
-                        continue
-                    logger.warning(f"[ChipDist] 获取失败 (已重试3次): {e}")
-                    df = None
+        df: pd.DataFrame | None = None
+        for attempt in range(3):
+            try:
+                df = self.client.chip_distribution(trade_date=self._today)
+                if df is not None and not df.empty:
                     break
-            if df is None or df.empty:
+            except Exception as e:
+                if attempt < 2:
+                    _time.sleep(2 ** attempt)
+                    continue
+                logger.warning(f"[ChipDist] 获取失败 (已重试3次): {e}")
+                df = None
                 break
-            df["symbol"] = df["ts_code"].apply(_ts_code_to_akshare_symbol)
-            all_dfs.append(df)
-            row_count = len(df)
-            logger.info(f"  [筹码分页 {page}] offset={offset}, 返回 {row_count} 行")
-            if row_count < self.API_PAGE_SIZE:
-                break
-            offset += row_count
-            page += 1
 
-        if not all_dfs:
+        if df is None or df.empty:
             logger.info("[ChipDist] 未获取到任何筹码分布数据。")
             return pd.DataFrame()
 
-        combined = pd.concat(all_dfs, ignore_index=True)
-        logger.info(f"[ChipDist] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
+        # ── 统一列名 ──
+        # v2 API 返回 symbol (如 "000001.SZ")，v1 返回 ts_code；统一转为 akshare 格式 sh000001
+        code_col = "symbol" if "symbol" in df.columns else "ts_code"
+        df["symbol"] = df[code_col].astype(str).apply(_ts_code_to_akshare_symbol)
+
+        logger.info(f"[ChipDist] 获取完成，共 {len(df)} 条记录")
 
         # ── 写缓存 ──
         try:
             os.makedirs(self._cache_dir, exist_ok=True)
-            combined.to_csv(self._cache_path, index=False, encoding="utf-8-sig")
+            df.to_csv(self._cache_path, index=False, encoding="utf-8-sig")
             logger.info(f"[ChipDist] 已缓存至: {os.path.basename(self._cache_path)}")
         except Exception as e:
             logger.info(f"[ChipDist] 缓存写入失败: {e}")
 
-        return combined
+        return df

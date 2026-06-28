@@ -533,6 +533,39 @@ class Config:
             if "POSITION_A" in bt_cal:
                 ps.POSITION_A = float(bt_cal["POSITION_A"])
 
+    def reload(self) -> None:
+        """热重载配置文件，保留 config_file 路径。"""
+        self._load_config()
+        self._ensure_directories()
+
+    def watch(self, interval: float = 1.0, callback: callable = None) -> None:
+        """
+        启动配置文件监控（轮询模式，跨平台兼容）。
+
+        Args:
+            interval: 轮询间隔（秒）
+            callback: 文件变更时的回调函数，接收 (config: Config) 参数
+
+        Note:
+            这是一个阻塞调用，通常在单独线程中运行。
+            建议在主线程之外启动：threading.Thread(target=config.watch, daemon=True).start()
+        """
+        import time
+        last_mtime = os.path.getmtime(self.config_file)
+        while True:
+            time.sleep(interval)
+            try:
+                current_mtime = os.path.getmtime(self.config_file)
+                if current_mtime > last_mtime:
+                    last_mtime = current_mtime
+                    self.reload()
+                    if callback:
+                        callback(self)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
     # ── 向后兼容属性（只读委托至 app_config） ──────────────────────────
 
     # 数据库

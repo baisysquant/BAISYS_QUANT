@@ -5,7 +5,7 @@ Pandera 数据合约定义
 """
 
 import pandas as pd
-from pandera.pandas import Column, DataFrameSchema
+from pandera import Column, DataFrameSchema
 
 
 def create_stock_basic_schema() -> DataFrameSchema:

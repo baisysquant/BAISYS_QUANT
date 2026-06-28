@@ -183,6 +183,7 @@ class MACDAnalyzer:
         decay_half_life: int = 8,
         slope_window: int = 5,
         params: dict | None = None,
+        compute_exit_strategy: bool = False,
     ) -> dict:
         """全流水线分析。
 
@@ -452,7 +453,7 @@ class MACDAnalyzer:
             state['_notes'].append(mtf['desc'])
         state['mtf_alignment'] = mtf['alignment']
 
-        state['exit_strategy'] = _calc_exit_strategy(df, params=_score_p)
+        state['exit_strategy'] = _calc_exit_strategy(df, params=_score_p) if compute_exit_strategy else {}
 
         notes = state.get('_notes', [])
         notes_str = '+'.join(notes) if notes else ''

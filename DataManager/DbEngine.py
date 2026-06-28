@@ -29,6 +29,8 @@ def get_engine(config: Any) -> Engine:  # noqa: ANN401
         )
         _engine = create_engine(
             url_object,
+            pool_size=20,
+            max_overflow=10,
             pool_pre_ping=True,
             pool_recycle=3600,
             echo=False,

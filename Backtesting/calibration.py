@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
@@ -91,9 +92,19 @@ def write_calibration_to_ini(params: dict[str, float]) -> None:
         CONFIG_INI.write_text("".join(lines), encoding="utf-8")
 
 
+def _get_git_commit() -> str:
+    """获取当前 git commit hash，用于回测结果追溯。"""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()[:12]
+    except Exception:
+        return "unknown"
+
+
 @dataclass
 class CalibrationResult:
-    """寻优结果数据类。"""
+    """寻优结果数据类（含数据血缘字段，可追溯到 config 版本和代码 commit）。"""
 
     params: dict[str, float] = field(default_factory=dict)
     score: float = 0.0
@@ -111,6 +122,11 @@ class CalibrationResult:
     profit_factor: float = 0.0
     total_trades: int = 0
     timestamp: str = ""
+    git_commit: str = ""
+    config_hash: str = ""
+    pbo: float = 0.0
+    dsr: float = 0.0
+    num_trials: int = 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CalibrationResult:
@@ -125,7 +141,7 @@ def run_grid_search(
     param_grid: dict[str, list[float]] | None = None,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from Backtesting.engine import EngineConfig, grid_search as _gs
+    from Backtesting._engine_legacy import EngineConfig, grid_search as _gs
 
     cfg = _build_engine_config(backtest_kwargs)
     if param_grid is None:
@@ -151,7 +167,7 @@ def run_walk_forward(
     initial_cash: float = 1_000_000.0,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from Backtesting.engine import EngineConfig, walk_forward as _wf
+    from Backtesting._engine_legacy import EngineConfig, walk_forward as _wf
 
     cfg = _build_engine_config(initial_cash, backtest_kwargs)
     if param_grid is None:
@@ -172,7 +188,7 @@ def run_walk_forward(
 
 
 def _build_engine_config(initial_cash_or_kwargs: float | dict[str, Any], kwargs: dict[str, Any] | None = None) -> Any:
-    from Backtesting.engine import EngineConfig
+    from Backtesting._engine_legacy import EngineConfig
 
     if isinstance(initial_cash_or_kwargs, dict):
         kwargs = initial_cash_or_kwargs

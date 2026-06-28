@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from DataManager.ColumnNames import ColumnNames
@@ -113,11 +114,6 @@ class ReportService:
             ColumnNames.COMPREHENSIVE_ANALYSIS,
             ColumnNames.COMPREHENSIVE_SCORE,
             ColumnNames.COMPREHENSIVE_LEVEL,
-            ColumnNames.STOP_LOSS,
-            ColumnNames.T1_TARGET,
-            ColumnNames.T2_TARGET,
-            ColumnNames.TRAILING_STOP,
-            ColumnNames.EXIT_RRR,
             ColumnNames.RESEARCH_REPORT_COUNT,
             ColumnNames.FUND_MOMENTUM,
         ]
@@ -175,6 +171,9 @@ class ReportService:
         user_focus_stocks = self._get_user_focus_stocks()
         if user_focus_stocks:
             self.logger.info(f"  - 用户关注股池: {', '.join(sorted(user_focus_stocks))}")
+
+        # ── 先将所有 sheet 中的 后复权 止损/目标价 转为 不复权 价格 ─────────
+        sheets_data = self._convert_adjusted_to_normal_prices(sheets_data, trade_date)
 
         try:
             writer = pd.ExcelWriter(report_path, engine="xlsxwriter", engine_kwargs={'options': {'nan_inf_to_errors': True}})
@@ -263,6 +262,111 @@ class ReportService:
         except Exception as e:
             # 报告生成失败是不可恢复的致命错误
             raise ReportGenerationError("Excel审计报告", str(e))
+
+    def _convert_adjusted_to_normal_prices(
+        self, sheets_data: dict[str, pd.DataFrame], trade_date: str
+    ) -> dict[str, pd.DataFrame]:
+        """
+        将所有 sheet 中的 后复权 止损/目标价/移动止损 转换为 不复权 价格输出。
+
+        后复权价 = 不复权价 × max_adj_factor / adj_factor
+        → 不复权价 = 后复权价 × adj_factor / max_adj_factor
+
+        Args:
+            sheets_data: sheet名称 -> DataFrame 映射
+            trade_date: 交易日字符串 (YYYYMMDD)
+
+        Returns:
+            转换后的 sheets_data
+        """
+        # 收集所有涉及的股票代码
+        stock_codes = set()
+        price_cols = [
+            ColumnNames.STOP_LOSS,    # "止损价"
+            ColumnNames.T1_TARGET,    # "T1目标价"
+            ColumnNames.T2_TARGET,    # "T2目标价"
+            ColumnNames.TRAILING_STOP,# "移动止损"
+        ]
+
+        for df in sheets_data.values():
+            if df is None or df.empty:
+                continue
+            if ColumnNames.STOCK_CODE in df.columns:
+                stock_codes.update(df[ColumnNames.STOCK_CODE].dropna().astype(str).tolist())
+
+        if not stock_codes:
+            return sheets_data
+
+        # 查询每只股票的 adj_factor 和 max_adj_factor
+        from DataManager.DbEngine import get_engine
+        engine = get_engine(self.config)
+        trade_date_iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+        # 查询当日 adj_factor 及每只股票的历史最大 adj_factor
+        placeholders = ",".join([f":code{i}" for i in range(len(stock_codes))])
+        params = {f"code{i}": code for i, code in enumerate(stock_codes)}
+        params["trade_date"] = trade_date_iso
+
+        sql = f"""
+            SELECT symbol, adj_factor,
+                   MAX(adj_factor) OVER (PARTITION BY symbol) as max_adj_factor
+            FROM stock_daily_kline
+            WHERE symbol IN ({placeholders})
+              AND trade_date = :trade_date
+        """
+
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text(sql), params).fetchall()
+
+            # 构建映射: symbol -> (adj_factor, max_adj_factor)
+            adj_map = {}
+            for row in result:
+                symbol, adj, max_adj = row
+                if max_adj and max_adj > 0:
+                    adj_map[symbol] = (float(adj), float(max_adj))
+        except Exception as e:
+            self.logger.warning(f"获取 adj_factor 失败，将保留原价格: {e}")
+            return sheets_data
+
+        # 转换每个 sheet 中的价格列
+        price_cols = [
+            ColumnNames.STOP_LOSS,
+            ColumnNames.T1_TARGET,
+            ColumnNames.T2_TARGET,
+            ColumnNames.TRAILING_STOP,
+        ]
+
+        converted_sheets = {}
+        for sheet_name, df in sheets_data.items():
+            if df is None or df.empty:
+                converted_sheets[sheet_name] = df
+                continue
+
+            df_copy = df.copy()
+            if ColumnNames.STOCK_CODE not in df_copy.columns:
+                converted_sheets[sheet_name] = df_copy
+                continue
+
+            for col in price_cols:
+                if col not in df_copy.columns:
+                    continue
+
+                # 转换: 不复权价 = 后复权价 × adj_factor / max_adj_factor
+                def _convert_price(row):
+                    code = str(row[ColumnNames.STOCK_CODE]) if ColumnNames.STOCK_CODE in row else None
+                    if code in adj_map:
+                        adj, max_adj = adj_map[code]
+                        val = row[col]
+                        if pd.notna(val) and val > 0 and max_adj > 0:
+                            return round(float(val) * adj / max_adj, 2)
+                    return row[col]
+
+                df_copy[col] = df_copy.apply(_convert_price, axis=1)
+
+            converted_sheets[sheet_name] = df_copy
+
+        return converted_sheets
 
     def save_ta_signals_to_txt(self, ta_signals: dict[str, pd.DataFrame], today_str: str) -> None:
         """

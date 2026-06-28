@@ -1,0 +1,25 @@
+{
+  "params": {
+    "atr_stop_mult": 1.0
+  },
+  "score": 0.0,
+  "sharpe": 0.0,
+  "sortino": 0.0,
+  "calmar": 0.0,
+  "max_drawdown": 0.0,
+  "max_drawdown_duration": 0,
+  "total_return": 0.0,
+  "annual_return": 0.0,
+  "annual_vol": 0.0,
+  "var_95": 0.0,
+  "cvar_95": 0.0,
+  "win_rate": 0.0,
+  "profit_factor": 0.0,
+  "total_trades": 0,
+  "timestamp": "",
+  "git_commit": "",
+  "config_hash": "",
+  "pbo": 0.0,
+  "dsr": 0.0,
+  "num_trials": 0
+}

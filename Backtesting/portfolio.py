@@ -37,7 +37,7 @@ def min_variance_weights(cov: np.ndarray, max_weight: float = 0.1) -> np.ndarray
 
     from scipy.optimize import minimize
 
-    def objective(w):
+    def objective(w: np.ndarray) -> float:
         return w @ cov @ w
 
     constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1}]
@@ -61,7 +61,7 @@ def mean_variance_weights(
 
     from scipy.optimize import minimize
 
-    def objective(w):
+    def objective(w: np.ndarray) -> float:
         port_var = w @ cov @ w
         port_ret = w @ expected_returns
         return -(port_ret - 0.5 * risk_aversion * port_var)

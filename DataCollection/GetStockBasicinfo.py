@@ -1,12 +1,15 @@
 ﻿from __future__ import annotations
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from io import StringIO
 from typing import Any
 
 import akshare as ak
 import pandas as pd
+import requests
 from loguru import logger
 from sqlalchemy.exc import DBAPIError, OperationalError
 
@@ -142,6 +145,42 @@ class StockBasicInfoService:
             self.logger.error(f"[缓存校验] 校验过程发生其他异常: {e!s}，触发全量刷新")
             return False
 
+    # ── 静态工具方法 ──
+
+    _LEGULEGU_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
+
+    @staticmethod
+    def _fetch_sw_industry_cons_from_legulegu(industry_code: str) -> pd.DataFrame:
+        url = f"https://legulegu.com/stockdata/index-composition?industryCode={industry_code}"
+        try:
+            r = requests.get(url, headers=StockBasicInfoService._LEGULEGU_HEADERS, timeout=15)
+            r.raise_for_status()
+        except requests.RequestException:
+            return pd.DataFrame()
+
+        tables = pd.read_html(StringIO(r.text))
+        if not tables:
+            return pd.DataFrame()
+        raw = tables[0]
+        if len(raw.columns) < 3:
+            return pd.DataFrame()
+        code_col = raw.columns[1]
+        name_col = raw.columns[2]
+        codes = raw[code_col].astype(str).str.strip()
+        names = raw[name_col].astype(str).str.strip()
+        def _normalize(code: str) -> str:
+            code = re.sub(r'\..+$', '', code).strip()
+            if code.startswith(('6', '9')):
+                return f"sh{code}"
+            return f"sz{code}"
+        out = pd.DataFrame({
+            "证券代码": codes.apply(_normalize),
+            "证券名称": names,
+        })
+        return out
+
     def fetch_stock_basic_info(self) -> pd.DataFrame:
         """获取申万二级行业成分股（严格对齐 PG 表结构的 6 个字段）"""
         max_retries = self.system_config["data_fetch_retries"]
@@ -172,11 +211,12 @@ class StockBasicInfoService:
         def _fetch_one(row: dict) -> tuple[str, str, pd.DataFrame | None]:
             raw_code = str(row["行业代码"]).strip()
             ind_name = str(row["行业名称"]).strip()
-            symbol = raw_code.replace(".SI", "").replace(".si", "")
+            # legulegu 页面要求含 .SI 后缀的行业代码
+            legulegu_code = raw_code if raw_code.endswith(".SI") else raw_code + ".SI"
             for attempt in range(max_retries):
                 try:
                     time.sleep(base_delay)
-                    comp = ak.index_component_sw(symbol=symbol)
+                    comp = StockBasicInfoService._fetch_sw_industry_cons_from_legulegu(legulegu_code)
                     if comp is not None and not comp.empty and '证券代码' in comp.columns:
                         return raw_code, ind_name, comp
                     logger.warning(f"  {ind_name} 第 {attempt + 1} 次结构异常，重试...")

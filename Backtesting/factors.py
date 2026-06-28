@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -12,8 +12,8 @@ from loguru import logger
 FACTOR_REGISTRY: dict[str, dict[str, Any]] = {}
 
 
-def register_factor(name: str, description: str, min_periods: int = 20):
-    def decorator(func):
+def register_factor(name: str, description: str, min_periods: int = 20) -> Callable:
+    def decorator(func: Callable) -> Callable:
         FACTOR_REGISTRY[name] = {
             "func": func,
             "description": description,

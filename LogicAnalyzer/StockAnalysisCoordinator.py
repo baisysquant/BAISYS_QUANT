@@ -271,13 +271,11 @@ class StockAnalysisCoordinator:
             if not close_normal_df.empty:
                 close_map = {}
                 for _, row in close_normal_df.iterrows():
-                    ts_code = str(row.get("ts_code", ""))
+                    # Cache 文件已有 symbol 列（格式如 sh600000, sz000001），直接使用
+                    symbol = str(row.get("symbol", ""))
                     close_val = row.get("close")
-                    if ts_code and pd.notna(close_val):
-                        parts = ts_code.split(".")
-                        if len(parts) == 2:
-                            symbol = f"{parts[1].lower()}{parts[0]}"
-                            close_map[symbol] = close_val
+                    if symbol and pd.notna(close_val):
+                        close_map[symbol] = float(close_val)
 
                 records = []
                 for sym in stock_codes_prefixed:

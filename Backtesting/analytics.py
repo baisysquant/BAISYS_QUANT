@@ -29,7 +29,7 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
     downside_std = downside.std() * math.sqrt(ann_factor) if len(downside) > 0 else 1e-10
     sortino = mu / downside_std if downside_std > 0 else 0.0
 
-    peak = np.maximum.accumulate(vals)
+    peak = np.maximum.accumulate(vals)  # type: ignore[arg-type]
     dd = (vals - peak) / peak
     max_dd = float(dd.min())
 

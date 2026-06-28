@@ -222,22 +222,19 @@ class IncrementalSyncEngine:
         return merged[["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]]
 
     def _write_with_split_detection(self, df: pd.DataFrame) -> int:
-        """逐只股票：除权检测 + 增量写入。"""
+        """逐只股票：除权检测 + 幂等写入（无需前置 DELETE，(symbol, trade_date) 唯一约束自动处理）。"""
         total_inserted = 0
         to_write: list[pd.DataFrame] = []
-        full_refresh_symbols: list[str] = []
 
         for sym, grp in df.groupby("symbol"):
             grp = grp.sort_values("trade_date")
             latest = self._get_latest_date(sym)
 
             if latest is None or self._has_no_close_normal(sym):
-                full_refresh_symbols.append(sym)
                 to_write.append(grp)
                 total_inserted += len(grp)
             elif self._detect_split_from_adj(sym, grp, latest):
                 logger.info(f"  {sym} 除权除息，全量替换")
-                full_refresh_symbols.append(sym)
                 to_write.append(grp)
                 total_inserted += len(grp)
             else:
@@ -250,15 +247,9 @@ class IncrementalSyncEngine:
             return 0
 
         final = pd.concat(to_write, ignore_index=True)
-        if full_refresh_symbols:
-            with self._engine.begin() as conn:
-                conn.execute(
-                    text(f"DELETE FROM {TABLE} WHERE symbol = ANY(:symbols)"),
-                    {"symbols": full_refresh_symbols},
-                )
-            logger.info(f"全量替换 {len(full_refresh_symbols)} 只")
         self._write_batch(final)
-        logger.info(f"同步完成，写入 {total_inserted} 行")
+        n_full = df["symbol"].nunique()
+        logger.info(f"同步完成，写入 {total_inserted} 行（{n_full} 只）")
         return total_inserted
 
     def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> pd.DataFrame:
@@ -522,25 +513,21 @@ class IncrementalSyncEngine:
         return row if row is not None else None
 
     def _write_batch(self, df: pd.DataFrame) -> None:
+        """幂等写入：(symbol, trade_date) 唯一约束 + ON CONFLICT DO UPDATE。"""
         if df.empty:
             return
-        symbols = df["symbol"].unique().tolist()
+        records = df.rename(columns={}).to_dict("records")
+        columns = ["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]
+        placeholders = ", ".join(f":{c}" for c in columns)
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in ("symbol", "trade_date"))
         with self._engine.begin() as conn:
-            for sym in symbols:
-                sym_dates = df[df["symbol"] == sym]["trade_date"].tolist()
-                conn.execute(
-                    text(
-                        f"DELETE FROM {TABLE} WHERE symbol = :sym AND trade_date IN :dates"
-                    ),
-                    {"sym": sym, "dates": tuple(sym_dates)},
-                )
             conn.execute(
                 text(f"""
-                    INSERT INTO {TABLE}
-                        (symbol, trade_date, open, close, high, low, volume, amount, adj_factor, close_normal)
-                    VALUES (:symbol, :trade_date, :open, :close, :high, :low, :volume, :amount, :adj_factor, :close_normal)
+                    INSERT INTO {TABLE} ({', '.join(columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT (symbol, trade_date) DO UPDATE SET {updates}
                 """),
-                df.rename(columns={}).to_dict("records"),
+                records,
             )
 
     # ── failed-symbols cache ─────────────────────────────────────

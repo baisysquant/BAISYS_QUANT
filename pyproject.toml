@@ -18,6 +18,32 @@ markers = [
 log_cli = false
 addopts = "-v --tb=short"
 
+[tool.coverage.run]
+source = ["Backtesting", "ConfigParser", "DataManager", "UtilsManager"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+precision = 2
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.json]
+output = "coverage.json"
+
+[tool.coverage.paths]
+source = ["Backtesting", "ConfigParser", "DataManager", "UtilsManager"]
+
+# ── 各模块覆盖率门限 ──
+[tool.coverage.report.fail_under]
+Backtesting = 72.00
+ConfigParser = 45.00
+DataManager = 15.00
+UtilsManager = 20.00
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
@@ -89,20 +115,35 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "UtilsManager.*"
-ignore_errors = false
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "DataManager.*"
-ignore_errors = false
-
-[[tool.mypy.overrides]]
-module = "LogicAnalyzer.*"
-ignore_errors = false
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "DataCollection.*"
-ignore_errors = false
+ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "TreasureBox.*"
-ignore_errors = false
+ignore_errors = true
+
+# ── 核心模块：渐进式启用严格类型检查 ──
+
+# Backtesting 模块：全部通过 strict 检查
+[[tool.mypy.overrides]]
+module = "Backtesting.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = false
+
+# LogicAnalyzer 模块：仅已标注的文件开启 strict
+[[tool.mypy.overrides]]
+module = [
+    "LogicAnalyzer.pipeline",
+    "LogicAnalyzer.PipelineState",
+    "LogicAnalyzer.DataValidator",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true

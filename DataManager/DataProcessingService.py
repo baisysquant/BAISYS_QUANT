@@ -111,7 +111,7 @@ class DataProcessingService:
             final_df[ColumnNames.SUGGESTED_POSITION] = None
             final_df[ColumnNames.POSITION_REASON] = ""
 
-        # 步骤7.5：Gate 5 - 运行时仓位约束（行业集中度 + 总仓位上限）
+        # 步骤7.5：Gate 5 - 运行时仓位约束（流动性冲击 + 行业集中度 + 总仓位上限）
         if not final_df.empty:
             self._apply_gate5_position_constraints(final_df)
 
@@ -319,9 +319,90 @@ class DataProcessingService:
         if n_low:
             self.logger.info(f"  - [流动性] 低流动性 {n_low} 只（不足+枯竭），共 {len(df)} 只")
 
+    def _apply_gate5_liquidity_impact(self, df: pd.DataFrame) -> None:
+        """
+        Gate 5: 流动性冲击成本检查。
+        对每只持仓股票，估算买入冲击成本，超限则缩仓或清零。
+
+        R62: 单股冲击成本估计 = impact_base * (participation / threshold)^1.5
+             如果冲击成本 > max_impact_rate（默认 2%），仓位等比缩至安全线。
+        """
+        if df.empty or ColumnNames.SUGGESTED_POSITION not in df.columns:
+            return
+        if ColumnNames.AMOUNT not in df.columns:
+            self.logger.warning("  - [Gate5/R62] 缺少 AMOUNT 列，跳过冲击成本检查")
+            return
+
+        cfg = getattr(self.config, 'POSITION_SIZING', None) or {}
+        max_impact_rate = cfg.get("max_single_impact", 0.02)
+        impact_threshold = cfg.get("impact_threshold", 0.01)
+        impact_base = cfg.get("impact_base", 0.002)
+
+        total_pos = df[ColumnNames.SUGGESTED_POSITION].sum()
+        # 使用 INITIAL_CASH 作为组合参考净值（实际净值每日变动，此处取近似值）
+        portfolio_value = getattr(self.config, 'INITIAL_CASH', None)
+        if portfolio_value is None:
+            bt_cfg = getattr(self.config, 'BACKTEST', None) or {}
+            portfolio_value = bt_cfg.get("initial_cash", 1_000_000)
+
+        n_adjusted = 0
+        for idx, row in df.iterrows():
+            pos = row.get(ColumnNames.SUGGESTED_POSITION, 0) or 0
+            if pos <= 0:
+                continue
+            amount = row.get(ColumnNames.AMOUNT, 0) or 0
+            if amount <= 0:
+                continue
+
+            est_investment = pos * portfolio_value
+            participation = est_investment / amount
+
+            if participation > impact_threshold:
+                impact = impact_base * (participation / impact_threshold) ** 1.5
+                if impact > max_impact_rate:
+                    safe_participation = impact_threshold * (max_impact_rate / impact_base) ** (1 / 1.5)
+                    safe_pos = safe_participation * amount / portfolio_value
+                    safe_pos = min(safe_pos, pos)
+                    df.at[idx, ColumnNames.SUGGESTED_POSITION] = safe_pos
+                    n_adjusted += 1
+                    self.logger.info(
+                        f"  - [Gate5/R62] {row.get(ColumnNames.STOCK_CODE, '')} "
+                        f"冲击成本 {impact:.1%} > {max_impact_rate:.0%}，"
+                        f"仓位 {pos:.1%} → {safe_pos:.1%}"
+                    )
+
+        if n_adjusted:
+            self.logger.info(f"  - [Gate5/R62] 冲击成本超限调整 {n_adjusted} 只")
+
+    def _apply_gate5_turnover_check(self, df: pd.DataFrame) -> None:
+        """
+        Gate 5: 组合换手率检查。
+
+        日换手率 = sum(|新仓位 - 旧仓位|) / 2。由于每日复盘未跟踪昨日持仓，
+        此处估算"单日建仓"场景：当日建仓总仓位 = 总仓位 / 组合杠杆上限。
+        如果总仓位 > 0.5（估算换手率超限），发出告警。
+
+        注：精确换手率需接入昨日持仓快照，当前为保守估算。
+        """
+        if df.empty or ColumnNames.SUGGESTED_POSITION not in df.columns:
+            return
+
+        total_pos = df[ColumnNames.SUGGESTED_POSITION].sum()
+        turnover = total_pos  # 单日建仓场景下，换手率 ≈ 总仓位
+        max_turnover = 0.5
+
+        if turnover > max_turnover:
+            scale = max_turnover / turnover
+            df[ColumnNames.SUGGESTED_POSITION] = df[ColumnNames.SUGGESTED_POSITION] * scale
+            self.logger.info(
+                f"  - [Gate5/R63] 估算日换手率 {turnover:.1%} > {max_turnover:.0%}，"
+                f"等比缩仓至 {max_turnover:.0%}（系数={scale:.3f}）"
+            )
+
     def _apply_gate5_position_constraints(self, df: pd.DataFrame) -> None:
         """
-        Gate 5: 运行时仓位约束（R60 行业集中度 + R61 总仓位上限）。
+        Gate 5: 运行时仓位约束。
+        执行顺序：流动性冲击 → 行业集中度 → 组合换手率 → 总仓位上限。
         直接修改 df[SUGGESTED_POSITION]。
         """
         if df.empty or ColumnNames.SUGGESTED_POSITION not in df.columns:
@@ -329,6 +410,9 @@ class DataProcessingService:
 
         cfg = getattr(self.config, 'POSITION_SIZING', None) or {}
         max_industry_exposure = cfg.get("max_industry_exposure", 0.30)
+
+        # R62: 单股冲击成本检查（先执行，用原始仓位估算）
+        self._apply_gate5_liquidity_impact(df)
 
         # R60: 同一行业集中度 > 30%，仅保留该行业评分最高者
         if ColumnNames.INDUSTRY in df.columns:
@@ -345,6 +429,9 @@ class DataProcessingService:
                     self.logger.info(
                         f"  - [Gate5/R60] 行业 {ind} 超限，仅保留 {df.loc[best_idx, ColumnNames.STOCK_CODE]}"
                     )
+
+        # R63: 组合换手率检查
+        self._apply_gate5_turnover_check(df)
 
         # R61: 总仓位 > 100%，等比缩仓
         total_pos = df[ColumnNames.SUGGESTED_POSITION].sum()

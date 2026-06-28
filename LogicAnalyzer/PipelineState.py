@@ -183,7 +183,7 @@ def _pipeline_output(state: dict) -> dict:
 
     exit_strat = state.get('exit_strategy', {})
 
-    return {
+    output = {
         "score": state.get('score', 0),
         "score_base": state.get('score', 0),
         "conclusion": state.get('conclusion', ''),
@@ -204,14 +204,21 @@ def _pipeline_output(state: dict) -> dict:
         "winrate_ref": '参考 pipeline',
         "expected_return": state.get('expected_return', 0),
         "risk_reward_ratio": state.get('risk_reward_ratio', 0),
-        "stop_loss": exit_strat.get('stop_loss'),
-        "t1_target": exit_strat.get('t1_target'),
-        "t2_target": exit_strat.get('t2_target'),
-        "trailing_stop": exit_strat.get('trailing_stop'),
-        "exit_rrr": exit_strat.get('exit_rrr'),
         "macd_trend": state.get('macd_trend', ''),
         "position_adjust": state.get('position_adjust', 0.0),
     }
+
+    # 仅当 exit_strategy 存在且非空时才包含退出策略字段
+    if exit_strat:
+        output.update({
+            "stop_loss": exit_strat.get('stop_loss'),
+            "t1_target": exit_strat.get('t1_target'),
+            "t2_target": exit_strat.get('t2_target'),
+            "trailing_stop": exit_strat.get('trailing_stop'),
+            "exit_rrr": exit_strat.get('exit_rrr'),
+        })
+
+    return output
 
 
 def should_exit(df: pd.DataFrame, params: dict[str, Any] | None = None) -> pd.Series:

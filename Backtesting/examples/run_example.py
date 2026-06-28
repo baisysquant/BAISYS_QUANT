@@ -54,7 +54,7 @@ def main() -> None:
     print(f"  原始 K 线: {len(raw)} 行, {raw['symbol'].nunique()} 股票")
 
     print("预计算信号列...")
-    prepared = prepare_backtest_data(raw)
+    prepared = prepare_backtest_data(raw, compute_exit_strategy=True)
     signal_cols = [c for c in prepared.columns if c not in raw.columns]
     print(f"  新增信号列: {signal_cols}")
     print(f"  总列数: {len(prepared.columns)}")

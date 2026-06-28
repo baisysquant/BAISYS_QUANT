@@ -26,6 +26,24 @@ from ConfigParser import Config
 from DataManager.DbEngine import get_engine
 
 
+_BACKTEST_LOCK_KEY = 987654321
+
+
+def _acquire_lock(engine: Any) -> None:
+    """获取回测分布式锁（pg_advisory_xact_lock + NOWAIT，失败则 exit）。"""
+    from sqlalchemy import text as _t
+
+    with engine.connect() as conn:
+        locked = conn.execute(
+            _t(f"SELECT pg_try_advisory_xact_lock({_BACKTEST_LOCK_KEY})")
+        ).scalar()
+        if locked:
+            logger.info("  获取回测分布式锁成功")
+        else:
+            logger.warning("回测分布式锁被占用，跳过本次执行（可能有另一个进程正在运行）")
+            sys.exit(0)
+
+
 def run_backtest_pipeline(
     config: Config | None = None,
     force: bool = False,
@@ -52,6 +70,9 @@ def run_backtest_pipeline(
 
     engine = get_engine(config)
     ensure_table(engine)
+
+    # ── 分布式锁（pg_advisory_xact_lock + NOWAIT 防止阻塞） ──
+    _acquire_lock(engine)
 
     last = get_last_run(engine)
     should_run, reason = should_rerun(last, bt.OPTIMIZE_FREQUENCY)
@@ -87,7 +108,7 @@ def run_backtest_pipeline(
         train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
         logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
 
-        prepared = prepare_backtest_data(kline_df, params=_build_params(config))
+        prepared = prepare_backtest_data(kline_df, params=_build_params(config), compute_exit_strategy=True)
         signal_prefixes = ('进场', '退出', '风险', '止损', '综合')
         signal_cols = [c for c in prepared.columns if c.startswith(signal_prefixes)]
         logger.info(f"  预计算信号列: {signal_cols}")
@@ -113,7 +134,7 @@ def run_backtest_pipeline(
         best_params = _extract_best_params(wf_result)
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
-        from Backtesting.engine import EngineConfig, run_full_backtest
+        from Backtesting._engine_legacy import EngineConfig, run_full_backtest
 
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
@@ -139,6 +160,23 @@ def run_backtest_pipeline(
         total_return_avg = float(top["total_return"].mean())
         max_dd_avg = float(top["max_drawdown"].mean())
 
+        from Backtesting.calibration import _get_git_commit
+        from Backtesting.prepare import _compute_config_hash
+
+        from Backtesting.overfitting import compute_pbo, compute_dsr_from_equity_curve
+
+        wf_results_list = wf_result.to_dict("records") if not wf_result.empty else []
+        pbo = compute_pbo(wf_results_list)
+        num_combos = int(wf_result["num_combos"].iloc[0]) if not wf_result.empty and "num_combos" in wf_result.columns else 1
+        num_trials = num_combos * len(wf_result)
+        dsr = compute_dsr_from_equity_curve(equity_curve, num_trials)
+
+        logger.info(f"  Deflated Sharpe Ratio(DSR)={dsr:.2%} | PBO={pbo:.2%} | 试验次数={num_trials}")
+        if pbo > 0.5:
+            logger.warning(f"PBO={pbo:.2%}>50%，过拟合风险较高，建议缩减参数网格或增加数据")
+        if dsr < 0.5:
+            logger.warning(f"DSR={dsr:.2%}<50%，统计显著性不足")
+
         cal_result = CalibrationResult(
             params=best_params,
             score=sharpe_avg,
@@ -146,7 +184,7 @@ def run_backtest_pipeline(
             sortino=risk.get("sortino_ratio", 0),
             calmar=risk.get("calmar_ratio", 0),
             max_drawdown=risk.get("max_drawdown", max_dd_avg),
-            max_drawdown_duration=risk.get("max_drawdown_duration", 0),
+            max_drawdown_duration=int(risk.get("max_drawdown_duration", 0)),
             total_return=risk.get("total_return", total_return_avg),
             annual_return=risk.get("annual_return", 0),
             annual_vol=risk.get("annual_vol", 0),
@@ -156,6 +194,11 @@ def run_backtest_pipeline(
             profit_factor=trade.get("profit_factor", 0),
             total_trades=trade.get("total_trades", 0),
             timestamp=datetime.now().isoformat(),
+            git_commit=_get_git_commit(),
+            config_hash=_compute_config_hash(),
+            pbo=round(pbo, 4),
+            dsr=round(dsr, 4),
+            num_trials=num_trials,
         )
         save_calibration(cal_result)
         write_calibration_to_ini(best_params)
@@ -171,7 +214,9 @@ def run_backtest_pipeline(
             sharpe=cal_result.sharpe,
             total_return=cal_result.total_return,
             max_drawdown=cal_result.max_drawdown,
-            extra_metrics=risk | trade,
+            extra_metrics=risk | trade | {"pbo": cal_result.pbo, "dsr": cal_result.dsr, "num_trials": cal_result.num_trials},
+            git_commit=cal_result.git_commit,
+            config_hash=cal_result.config_hash,
         )
 
         updated_sections = set()
@@ -249,7 +294,7 @@ def _fetch_kline(
     start = datetime.strptime(aligned_start, "%Y%m%d").date()
 
     provider = BacktestDataProvider(engine)
-    df = provider.get_kline(symbols, start_date=start.isoformat(), end_date=end.isoformat())
+    df: pd.DataFrame = provider.get_kline(symbols, start_date=start.isoformat(), end_date=end.isoformat())
     if df.empty:
         return df
     df = df.sort_values(["symbol", "trade_date"])
