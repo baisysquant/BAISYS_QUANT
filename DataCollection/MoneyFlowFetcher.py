@@ -100,8 +100,6 @@ class MoneyFlowFetcher:
 
         fmt_date = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}"
         all_dfs = []
-        offset = 0
-        page = 1
         logger.info(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
 
         done = False
@@ -113,22 +111,14 @@ class MoneyFlowFetcher:
                         wait = min(2 ** attempt, 30)
                         logger.info(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
                         time.sleep(wait)
-                    df = self.client.moneyflow(start_date=fmt_date, end_date=fmt_date,
-                                               limit=self.API_PAGE_SIZE, offset=offset)
+                    df = self.client.moneyflow(trade_date=fmt_date)
                     if df is None or df.empty:
                         last_err = "空响应"
                         break
                     all_dfs.append(df)
                     row_count = len(df)
-                    logger.info(f"  [资金流分页 {page}] offset={offset}, 返回 {row_count} 行")
-                    if row_count < self.API_PAGE_SIZE:
-                        done = True
-                        break
-                    offset += row_count
-                    page += 1
-                    if self._page_delay > 0:
-                        time.sleep(self._page_delay)
-                    last_err = None
+                    logger.info(f"  [资金流] 返回 {row_count} 行")
+                    done = True
                     break
                 except Exception as e:
                     last_err = e
@@ -146,7 +136,7 @@ class MoneyFlowFetcher:
             return pd.DataFrame()
 
         combined = pd.concat(all_dfs, ignore_index=True)
-        logger.info(f"[MoneyFlow] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
+        logger.info(f"[MoneyFlow] 获取完成，共 {len(combined)} 条记录")
 
         # 写缓存（仅当天数据）
         if target_date == self._today:

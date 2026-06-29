@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -17,6 +17,13 @@ from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from UtilsManager.AkshareConfig import ensure_akshare_timeout
 
 ensure_akshare_timeout()
+
+
+# ak.stock_zh_a_daily 内部用 py_mini_racer (V8)，极不稳定
+# 统一放到独立子进程跑，子进程崩了主进程不受影响
+def _sina_daily_worker(symbol: str, start: str, end: str, adjust: str):
+    """子进程执行 ak.stock_zh_a_daily，返回 DataFrame 或抛异常"""
+    return ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
 
 
 TABLE = "stock_daily_kline"
@@ -82,46 +89,51 @@ class IncrementalSyncEngine:
             logger.warning(f"缓存清理失败: {e}")
 
     def sync_all(self, symbols_prefixed: list[str]) -> int:
-        remaining = self._get_stale_symbols(symbols_prefixed)
+        try:
+            remaining = self._get_stale_symbols(symbols_prefixed)
 
-        cached = self._load_failed_set()
-        if cached:
-            old_len = len(remaining)
-            remaining = sorted(set(remaining) | cached)
-            added = len(remaining) - old_len
-            if added:
-                logger.info(f"加载 {len(cached)} 只缓存失败股票，待同步 {len(remaining)} 只（新增 {added} 只）")
+            cached = self._load_failed_set()
+            if cached:
+                old_len = len(remaining)
+                remaining = sorted(set(remaining) | cached)
+                added = len(remaining) - old_len
+                if added:
+                    logger.info(f"加载 {len(cached)} 只缓存失败股票，待同步 {len(remaining)} 只（新增 {added} 只）")
 
-        if not remaining:
-            logger.info("所有股票已有最新交易日数据，无需同步")
-            return 0
+            if not remaining:
+                logger.info("所有股票已有最新交易日数据，无需同步")
+                return 0
 
-        start_iso = self._calc_start_iso(remaining)
-        end_iso = self._trade_date.isoformat()
-        logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}")
+            start_iso = self._calc_start_iso(remaining)
+            end_iso = self._trade_date.isoformat()
+            logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}")
 
-        # 均分到双管道（均用 Sina stock_zh_a_daily，确保 HFQ 基准一致）
-        mid = len(remaining) // 2
-        half_a = remaining[:mid]
-        half_b = remaining[mid:]
-        logger.info(f"管道A: {len(half_a)} 只 | 管道B: {len(half_b)} 只")
-
-        totals: list[int] = []
-        all_failures: list[str] = []
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {
-                pool.submit(self._run_pipeline, half_a, start_iso, end_iso, stagger=0, label="A"): "A",
-                pool.submit(self._run_pipeline, half_b, start_iso, end_iso, stagger=BATCH_INTERVAL, label="B"): "B",
-            }
-            for f in as_completed(futs):
-                inserted, failures = f.result()
+            # 串行下载（已由 _ak_sina_lock 保证 akshare 串行，去掉线程池避免 V8 崩溃）
+            logger.info(f"串行下载 {len(remaining)} 只...")
+            totals: list[int] = []
+            all_failures: list[str] = []
+            mid = len(remaining) // 2
+            half_a = remaining[:mid]
+            half_b = remaining[mid:]
+            logger.info(f"分批: 前半段 {len(half_a)} 只 | 后半段 {len(half_b)} 只")
+            
+            # 顺序处理两半（模拟原双管道，但串行）
+            for label, half in (("A", half_a), ("B", half_b)):
+                logger.info(f"处理批次 {label}: {len(half)} 只")
+                inserted, failures = self._run_pipeline(half, start_iso, end_iso, stagger=0, label=label)
                 totals.append(inserted)
                 all_failures.extend(failures)
+                time.sleep(BATCH_INTERVAL)  # 批次间隔，防频控
 
-        self._save_failed_set(set(all_failures))
-        total = sum(totals)
-        logger.info(f"同步完成，总写入 {total} 行")
-        return total
+            self._save_failed_set(set(all_failures))
+            total = sum(totals)
+            logger.info(f"同步完成，总写入 {total} 行")
+            return total
+        except BaseException as e:
+            import traceback
+            logger.error(f"sync_all 发生致命错误: {type(e).__name__}: {e}")
+            logger.error(traceback.format_exc())
+            raise
 
     def _calc_start_iso(self, symbols: list[str]) -> str:
         min_latest = self._get_min_latest_date(symbols)
@@ -162,18 +174,14 @@ class IncrementalSyncEngine:
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[pd.DataFrame | None, list[str]]:
         results: list[pd.DataFrame] = []
         failed: list[str] = []
-        max_workers = min(5, len(symbols))
         with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futs = {pool.submit(self._fetch_kline, sym, start, end): sym for sym in symbols}
-                for f in as_completed(futs):
-                    sym = futs[f]
-                    df = f.result()
-                    if df is not None and not df.empty:
-                        results.append(df)
-                    else:
-                        failed.append(sym)
-                    pbar.update(1)
+            for sym in symbols:
+                df = self._fetch_kline(sym, start, end)
+                if df is not None and not df.empty:
+                    results.append(df)
+                else:
+                    failed.append(sym)
+                pbar.update(1)
         if not results:
             return None, failed
         return pd.concat(results, ignore_index=True), failed
@@ -182,26 +190,22 @@ class IncrementalSyncEngine:
 
     def _fetch_kline(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
         """Sina stock_zh_a_daily: raw + hfq, volume=股, amount=元.
-        内置退避重试 + 超时保护，超时或失败则跳过。
+        两次调用各自跑在独立子进程 (ProcessPoolExecutor)，15 秒超时，子进程崩溃不影响主进程。
         """
         time.sleep(random.uniform(0.05, 0.3))
 
         FETCH_TIMEOUT = 15
 
-        raw: pd.DataFrame | None = None
-        hfq: pd.DataFrame | None = None
-        _pool = ThreadPoolExecutor(max_workers=2)
-        try:
-            f_raw = _pool.submit(ak.stock_zh_a_daily, symbol=symbol, start_date=start, end_date=end, adjust="")
-            f_hfq = _pool.submit(ak.stock_zh_a_daily, symbol=symbol, start_date=start, end_date=end, adjust="hfq")
-            raw = f_raw.result(timeout=FETCH_TIMEOUT)
-            hfq = f_hfq.result(timeout=FETCH_TIMEOUT)
-        except Exception as e:
-            for f in (f_raw, f_hfq):
-                f.cancel()
-            logger.warning(f"  {symbol} Sina 失败: {e}")
-        finally:
-            _pool.shutdown(wait=False)
+        # 并行跑 raw/hfq 两个子进程
+        with ProcessPoolExecutor(max_workers=2) as pool:
+            f_raw = pool.submit(_sina_daily_worker, symbol, start, end, "")
+            f_hfq = pool.submit(_sina_daily_worker, symbol, start, end, "hfq")
+            try:
+                raw = f_raw.result(timeout=FETCH_TIMEOUT)
+                hfq = f_hfq.result(timeout=FETCH_TIMEOUT)
+            except Exception as e:
+                logger.warning(f"  {symbol} Sina 失败: {e}")
+                return None
 
         if raw is None or raw.empty or hfq is None or hfq.empty:
             logger.warning(f"  {symbol} 无数据，跳过")
@@ -292,42 +296,29 @@ class IncrementalSyncEngine:
         results: dict[str, float] = {}
 
         def _fetch_one(sym: str) -> tuple[str, float | None]:
-            __pool = ThreadPoolExecutor(max_workers=1)
             try:
-                f_one = __pool.submit(ak.stock_zh_a_daily, symbol=sym, start_date=end, end_date=end, adjust="")
-                r = f_one.result(timeout=25)
+                with ProcessPoolExecutor(max_workers=1) as pool:
+                    f = pool.submit(_sina_daily_worker, sym, end, end, "")
+                    r = f.result(timeout=15)
                 if r is not None and not r.empty:
                     close_val = pd.to_numeric(r["close"].iloc[-1], errors="coerce")
                     if pd.notna(close_val):
                         return sym, float(close_val)
             except Exception:
                 pass
-            finally:
-                f_one.cancel()
-                __pool.shutdown(wait=False)
             return sym, None
 
         def _fetch_backfill_half(syms: list[str]) -> dict[str, float]:
             local: dict[str, float] = {}
-            for i in range(0, len(syms), BATCH_SIZE):
-                batch = syms[i:i + BATCH_SIZE]
-                with ThreadPoolExecutor(max_workers=min(5, len(batch))) as inner_pool:
-                    futs = {inner_pool.submit(_fetch_one, sym): sym for sym in batch}
-                    for f in as_completed(futs):
-                        sym, val = f.result()
-                        if val is not None:
-                            local[sym] = val
-                if i + BATCH_SIZE < len(syms):
-                    time.sleep(BATCH_INTERVAL)
+            for sym in syms:
+                sym_val = _fetch_one(sym)
+                if sym_val[1] is not None:
+                    local[sym_val[0]] = sym_val[1]
             return local
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {
-                pool.submit(_fetch_backfill_half, half_a): "A",
-                pool.submit(_fetch_backfill_half, half_b): "B",
-            }
-            for f in as_completed(futs):
-                results.update(f.result())
+        results: dict[str, float] = {}
+        for half in (half_a, half_b):
+            results.update(_fetch_backfill_half(half))
 
         if not results:
             logger.warning("[close_normal] 双管道均无数据")

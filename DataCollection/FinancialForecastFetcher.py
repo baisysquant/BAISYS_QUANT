@@ -89,41 +89,35 @@ class FinancialForecastFetcher:
             return pd.DataFrame()
 
         all_dfs = []
-        offset = 0
-        page = 1
         logger.info("[Forecast] 正在从 AShareHub 获取全市场业绩预告...")
 
         import time as _time
 
-        while True:
-            for attempt in range(3):
-                try:
-                    df = self.client.forecast(limit=self.API_PAGE_SIZE, offset=offset)
-                    if df is not None and not df.empty:
-                        break
-                except Exception as e:
-                    if attempt < 2:
-                        _time.sleep(2 ** attempt)
-                        continue
-                    logger.warning(f"[Forecast] 获取失败 (已重试3次): {e}")
-                    df = None
-                    break
-            if df is None or df.empty:
+        for attempt in range(3):
+            try:
+                # 无分页，一次性拉取（依赖 API 侧限流）
+                df = self.client.forecast(symbol=None)
+                if df is not None and not df.empty:
+                    all_dfs.append(df)
+                    logger.info(f"  [业绩预告] 返回 {len(df)} 行")
                 break
-            all_dfs.append(df)
-            row_count = len(df)
-            logger.info(f"  [业绩预告分页 {page}] offset={offset}, 返回 {row_count} 行")
-            if row_count < self.API_PAGE_SIZE:
+            except Exception as e:
+                if attempt < 2:
+                    _time.sleep(2 ** attempt)
+                    continue
+                logger.warning(f"[Forecast] 获取失败 (已重试3次): {e}")
                 break
-            offset += row_count
-            page += 1
+
+        if not all_dfs:
+            logger.info("[Forecast] 未获取到任何业绩预告数据。")
+            return pd.DataFrame()
 
         if not all_dfs:
             logger.info("[Forecast] 未获取到任何业绩预告数据。")
             return pd.DataFrame()
 
         combined = pd.concat(all_dfs, ignore_index=True)
-        logger.info(f"[Forecast] 获取完成，共 {len(combined)} 条记录（{page-1} 页）")
+        logger.info(f"[Forecast] 获取完成，共 {len(combined)} 条记录")
 
         if target_date == self._today:
             try:
