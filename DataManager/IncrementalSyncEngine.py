@@ -341,7 +341,7 @@ class IncrementalSyncEngine:
         with self._engine.connect() as conn:
             df = pd.read_sql(text(query), conn)
         if "股票代码" in df.columns:
-            df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
+            df["股票代码"] = df["股票代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.zfill(6)
         for col in ("ts_code", "name", "industry", "股票代码"):
             if col not in df.columns:
                 df[col] = "N/A"
@@ -351,13 +351,14 @@ class IncrementalSyncEngine:
     def filter_st_stocks(df: pd.DataFrame) -> pd.DataFrame:
         if "name" not in df.columns:
             return df
-        st = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])"
-        return df[~df["name"].astype(str).str.contains(st, na=False)].copy()
+        pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])|退市"
+        return df[~df["name"].astype(str).str.contains(pattern, na=False)].copy()
 
     def filter_main_board(self, df: pd.DataFrame) -> pd.DataFrame:
         if not self._main_board_only:
             return df
-        return df[df["股票代码"].astype(str).str.match(r"^(60|00)")].copy()
+        codes = df["股票代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
+        return df[codes.str.match(r"^(60|00)", na=False)].copy()
 
     def _filter_by_research_report(self, pure_codes: set[str]) -> set[str]:
         if not self._enable_research_report_filter:

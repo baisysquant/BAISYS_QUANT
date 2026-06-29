@@ -192,15 +192,15 @@ class StockBasicInfoService:
                 if done % 20 == 0 or done == total:
                     self.logger.info(f"  进度: {done}/{total} 个行业")
 
-        # 5. 数据清洗
-        df = pd.DataFrame(all_stocks)
-        if df.empty:
-            self.logger.warning("未获取到任何成分股数据")
-            return df
+        # 5. 过滤 ST / 退市股票（源头保障）
+        st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])|退市"
+        mask = ~df["stock_name"].astype(str).str.contains(st_pattern, na=False)
+        filtered_count = (~mask).sum()
+        df = df[mask].reset_index(drop=True)
 
         df = df.drop_duplicates(subset=["industry_code", "stock_code", "record_date"], keep="first").reset_index(drop=True)
 
-        self.logger.info(f"成功构建 {len(df)} 条成分股记录，覆盖 {total} 个二级行业")
+        self.logger.info(f"成功构建 {len(df)} 条成分股记录，覆盖 {total} 个二级行业（过滤 {filtered_count} 条 ST/退市）")
         cols = ["industry_code", "industry_name", "stock_code", "stock_name", "weight", "record_date"]
         return df[cols]
 
