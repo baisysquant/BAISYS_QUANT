@@ -2,6 +2,7 @@
 
 import re
 import time
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import StringIO
@@ -111,7 +112,7 @@ class StockBasicInfoService:
             industry_df = None
             for attempt in range(max_retries):
                 try:
-                    industry_df = ak.sw_index_second_info()
+                    industry_df = ak.index_realtime_sw(symbol='二级行业')
                     self.logger.info(f"接口校验：成功获取 {len(industry_df)} 个申万二级行业")
                     break
                 except Exception as e:
@@ -152,8 +153,9 @@ class StockBasicInfoService:
     }
 
     @staticmethod
-    def _fetch_sw_industry_cons_from_legulegu(industry_code: str) -> pd.DataFrame:
-        url = f"https://legulegu.com/stockdata/index-composition?industryCode={industry_code}"
+    def _fetch_sw_industry_cons(industry_code: str) -> pd.DataFrame:
+        legulegu_code = industry_code if industry_code.endswith(".SI") else industry_code + ".SI"
+        url = f"https://legulegu.com/stockdata/index-composition?industryCode={legulegu_code}"
         try:
             r = requests.get(url, headers=StockBasicInfoService._LEGULEGU_HEADERS, timeout=15)
             r.raise_for_status()
@@ -170,16 +172,20 @@ class StockBasicInfoService:
         name_col = raw.columns[2]
         codes = raw[code_col].astype(str).str.strip()
         names = raw[name_col].astype(str).str.strip()
+
         def _normalize(code: str) -> str:
             code = re.sub(r'\..+$', '', code).strip()
             if code.startswith(('6', '9')):
                 return f"sh{code}"
             return f"sz{code}"
+
         out = pd.DataFrame({
             "证券代码": codes.apply(_normalize),
             "证券名称": names,
         })
         return out
+
+
 
     def fetch_stock_basic_info(self) -> pd.DataFrame:
         """获取申万二级行业成分股（严格对齐 PG 表结构的 6 个字段）"""
@@ -192,7 +198,11 @@ class StockBasicInfoService:
         industry_df = None
         for attempt in range(max_retries):
             try:
-                industry_df = ak.sw_index_second_info()
+                industry_df = ak.index_realtime_sw(symbol='二级行业')
+                industry_df = industry_df.rename(columns={
+                    "指数代码": "行业代码",
+                    "指数名称": "行业名称",
+                })
                 self.logger.info(f"成功获取 {len(industry_df)} 个申万二级行业")
                 break
             except Exception as e:
@@ -211,12 +221,10 @@ class StockBasicInfoService:
         def _fetch_one(row: dict) -> tuple[str, str, pd.DataFrame | None]:
             raw_code = str(row["行业代码"]).strip()
             ind_name = str(row["行业名称"]).strip()
-            # legulegu 页面要求含 .SI 后缀的行业代码
-            legulegu_code = raw_code if raw_code.endswith(".SI") else raw_code + ".SI"
             for attempt in range(max_retries):
                 try:
                     time.sleep(base_delay)
-                    comp = StockBasicInfoService._fetch_sw_industry_cons_from_legulegu(legulegu_code)
+                    comp = StockBasicInfoService._fetch_sw_industry_cons(raw_code)
                     if comp is not None and not comp.empty and '证券代码' in comp.columns:
                         return raw_code, ind_name, comp
                     logger.warning(f"  {ind_name} 第 {attempt + 1} 次结构异常，重试...")
