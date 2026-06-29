@@ -405,7 +405,7 @@ class IncrementalSyncEngine:
         before = len(pool)
         pool = self.filter_st_stocks(pool)
         pool = self.filter_main_board(pool)
-        logger.info(f"股票池: {before} → {len(pool)}（过滤ST/板块）")
+        logger.info(f"股票池: {before} → {len(pool)}（过滤ST及非主板）")
 
         pure_codes = set(pool["股票代码"].unique())
         # K 线同步覆盖全 A 股（已过滤 ST/板块），保持数据完整供回测使用
