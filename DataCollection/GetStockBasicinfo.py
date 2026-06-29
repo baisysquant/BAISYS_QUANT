@@ -1,30 +1,27 @@
 ﻿from __future__ import annotations
 
-import re
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from io import StringIO
 from typing import Any
 
-import akshare as ak
 import pandas as pd
-import requests
+from asharehub import AShareHub
 from loguru import logger
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DatabaseWriter import QuantDBManager
-from UtilsManager.AkshareConfig import ensure_akshare_timeout
 from UtilsManager.Exceptions import DatabaseConnectionError, DatabaseError
-
-ensure_akshare_timeout()
 
 
 class StockBasicInfoService:
-    """股票基本信息业务服务类 (申万二级行业 - 30天缓存优化版)"""
+    """股票基本信息业务服务类 (申万二级行业 - 30天缓存优化版)
+
+    数据源：AShareHub /v2/reference/industries 接口
+    一次 API 调用获取全量 A 股申万 SW2021 一/二/三级行业分类
+    """
 
     TABLE_NAME = "stock_basic_info_sw"
 
@@ -33,7 +30,7 @@ class StockBasicInfoService:
         self.system_config = self._get_system_config_from_attributes(config_parser)
         self.logger = self._setup_logger()
         self.REFRESH_INTERVAL_DAYS = getattr(config_parser, 'STOCK_BASIC_INFO_EXPIRE_DAYS', 30)
-
+        self.ah_client = AShareHub(api_key=config_parser.ASHAREHUB_API_KEY)
         self.db_manager = None
         self.trading_calendar = TradingCalendarAnalyzer()
 
@@ -48,8 +45,6 @@ class StockBasicInfoService:
         return logger
 
     def _initialize_database(self) -> None:
-        """初始化数据库连接"""
-        # 注入全局共享引擎
         try:
             from DataManager.DbEngine import get_engine as _get_engine
             self.db_manager = QuantDBManager(engine=_get_engine(self.config_parser))
@@ -59,11 +54,9 @@ class StockBasicInfoService:
             raise DatabaseConnectionError(str(e)) from e
 
     def _get_latest_data_date(self) -> Any | None:  # noqa: ANN401
-        """获取表中最新的 record_date"""
         if not self.db_manager:
             self._initialize_database()
         try:
-            # 确认调用方法名与 DatabaseWriter.py 中的一致
             latest_date = self.db_manager.get_latest_record_date(self.TABLE_NAME, "record_date")
             self.logger.debug(f"从数据库获取到的最新日期: {latest_date}")
             return latest_date
@@ -74,73 +67,53 @@ class StockBasicInfoService:
             self.logger.error(f"获取最新数据日期失败: {e!s}")
             return None
 
+    def _get_industry_count_from_api(self) -> int:
+        """从 AShareHub 获取二级行业数量"""
+        df = self.ah_client.industry_list()
+        return df["l2_code"].nunique()
+
     def _is_data_up_to_date(self) -> bool:
         """
         核心校验逻辑：
         1. 超过30天 -> 强制刷新
-        2. 小于30天 -> 校验表是否为空，以及接口行业数量与DB行业数量是否一致
+        2. 小于30天 -> 校验表是否为空，以及二级行业数量是否一致
         """
         latest_date = self._get_latest_data_date()
         today = datetime.now().date()
 
-        # 1. 如果表为空（没有最新日期），直接返回 False 触发全量获取
         if not latest_date:
             self.logger.info(f"[缓存校验] 表 {self.TABLE_NAME} 中无数据，准备执行全量同步")
             return False
 
-        # 兼容 PG 返回的 datetime.date 对象或字符串
         if isinstance(latest_date, str):
             latest_date = datetime.strptime(latest_date.replace("-", "")[:8], "%Y%m%d").date()
-        elif hasattr(latest_date, 'date'): # 如果是 datetime.datetime 对象
-             latest_date = latest_date.date()
-             
+        elif hasattr(latest_date, 'date'):
+            latest_date = latest_date.date()
+
         delta_days = (today - latest_date).days
         self.logger.info(f"[缓存校验] 数据库最新数据日期: {latest_date}，距今 {delta_days} 天")
 
-        # 2. 判断是否超过 30 天
         if delta_days >= self.REFRESH_INTERVAL_DAYS:
             self.logger.info(f"[缓存校验] 数据已过期 (>= {self.REFRESH_INTERVAL_DAYS}天)，触发强制全量刷新")
             return False
 
-        # 3. 小于 30 天，进入第二层校验：比对行业数量
         self.logger.info("[缓存校验] 数据在30天有效期内，开始校验行业数量是否发生变化...")
-        
+
         try:
-            # 获取 AkShare 接口当前的行业总数
-            max_retries = self.system_config["data_fetch_retries"]
-            delay = self.system_config["data_fetch_delay"]
-            industry_df = None
-            for attempt in range(max_retries):
-                try:
-                    industry_df = ak.index_realtime_sw(symbol='二级行业')
-                    self.logger.info(f"接口校验：成功获取 {len(industry_df)} 个申万二级行业")
-                    break
-                except Exception as e:
-                    self.logger.warning(f"接口校验：获取行业列表第 {attempt + 1} 次失败: {e!s}")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-            
-            if industry_df is None or industry_df.empty:
-                self.logger.warning("[缓存校验] 无法从接口获取行业列表，为安全起见触发全量刷新")
-                return False
-                
-            api_industry_count = len(industry_df)
-            
-            # 获取 PostgreSQL 表中去重后的行业总数
-            # 确认调用方法名与 DatabaseWriter.py 中的一致
+            api_industry_count = self._get_industry_count_from_api()
             db_industry_count = self.db_manager.get_distinct_count(self.TABLE_NAME, "industry_code")
-            
-            self.logger.info(f"[缓存校验] 接口行业数量: {api_industry_count} | 数据库行业数量: {db_industry_count}")
-            
+
+            self.logger.info(f"[缓存校验] 接口二级行业数量: {api_industry_count} | 数据库行业数量: {db_industry_count}")
+
             if api_industry_count == db_industry_count:
                 self.logger.info("[缓存校验] [OK] 行业数量一致，数据无需更新，直接使用本地缓存！")
                 return True
             else:
                 self.logger.info("[缓存校验] [WARN] 行业数量发生变化，触发全量刷新")
                 return False
-                
+
         except AttributeError as e:
-            self.logger.error(f"[缓存校验] 数据库管理器方法调用失败 (方法名可能不匹配): {e!s}，触发全量刷新")
+            self.logger.error(f"[缓存校验] 数据库管理器方法调用失败: {e!s}，触发全量刷新")
             return False
         except Exception as e:
             self.logger.error(f"[缓存校验] 校验过程发生其他异常: {e!s}，触发全量刷新")
@@ -148,125 +121,86 @@ class StockBasicInfoService:
 
     # ── 静态工具方法 ──
 
-    _LEGULEGU_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    }
-
     @staticmethod
-    def _fetch_sw_industry_cons(industry_code: str) -> pd.DataFrame:
-        legulegu_code = industry_code if industry_code.endswith(".SI") else industry_code + ".SI"
-        url = f"https://legulegu.com/stockdata/index-composition?industryCode={legulegu_code}"
-        try:
-            r = requests.get(url, headers=StockBasicInfoService._LEGULEGU_HEADERS, timeout=15)
-            r.raise_for_status()
-        except requests.RequestException:
-            return pd.DataFrame()
-
-        tables = pd.read_html(StringIO(r.text))
-        if not tables:
-            return pd.DataFrame()
-        raw = tables[0]
-        if len(raw.columns) < 3:
-            return pd.DataFrame()
-        code_col = raw.columns[1]
-        name_col = raw.columns[2]
-        codes = raw[code_col].astype(str).str.strip()
-        names = raw[name_col].astype(str).str.strip()
-
-        def _normalize(code: str) -> str:
-            code = re.sub(r'\..+$', '', code).strip()
-            if code.startswith(('6', '9')):
-                return f"sh{code}"
-            return f"sz{code}"
-
-        out = pd.DataFrame({
-            "证券代码": codes.apply(_normalize),
-            "证券名称": names,
-        })
-        return out
-
-
+    def _stock_symbol_to_code(symbol: str) -> str:
+        """转换 AShareHub 格式 (000001.SZ) 到内部格式 (sz000001)"""
+        parts = symbol.strip().split(".")
+        if len(parts) == 2:
+            raw_code = parts[0].zfill(6)
+            market = parts[1].lower()
+            return f"sh{raw_code}" if market == "sh" else f"sz{raw_code}"
+        return symbol.strip()
 
     def fetch_stock_basic_info(self) -> pd.DataFrame:
         """获取申万二级行业成分股（严格对齐 PG 表结构的 6 个字段）"""
         max_retries = self.system_config["data_fetch_retries"]
         base_delay = self.system_config["data_fetch_delay"]
 
-        self.logger.info("开始从 AkShare 获取申万二级行业及成分股信息...")
-        
-        # 1. 获取申万二级行业列表
-        industry_df = None
+        self.logger.info("开始从 AShareHub 获取申万二级行业及成分股信息...")
+
+        # 1. 全量获取行业分类数据（一次 API 调用）
+        raw_df = None
         for attempt in range(max_retries):
             try:
-                industry_df = ak.index_realtime_sw(symbol='二级行业')
-                industry_df = industry_df.rename(columns={
-                    "指数代码": "行业代码",
-                    "指数名称": "行业名称",
-                })
-                self.logger.info(f"成功获取 {len(industry_df)} 个申万二级行业")
+                raw_df = self.ah_client.industry_list()
+                self.logger.info(f"成功获取 {len(raw_df)} 条行业分类记录")
                 break
             except Exception as e:
-                self.logger.warning(f"获取行业列表第 {attempt + 1} 次失败: {e!s}")
+                self.logger.warning(f"获取行业数据第 {attempt + 1} 次失败: {e!s}")
                 if attempt < max_retries - 1:
                     time.sleep(base_delay)
                 else:
                     raise
 
-        all_stocks: list[dict[str, Any]] = []
-        
-        # 获取计入日期，并强制转换为 PostgreSQL 认识的 'YYYY-MM-DD' 格式
+        # 2. 提取二级行业列表
+        industries = raw_df[["l2_code", "l2_name"]].drop_duplicates().dropna()
+        total = len(industries)
+        self.logger.info(f"二级行业数量: {total}")
+
+        # 3. 获取计入日期
         raw_record_date = str(self.trading_calendar.get_last_trading_day()).replace("-", "")
         record_date = f"{raw_record_date[:4]}-{raw_record_date[4:6]}-{raw_record_date[6:8]}"
-        
-        def _fetch_one(row: dict) -> tuple[str, str, pd.DataFrame | None]:
-            raw_code = str(row["行业代码"]).strip()
-            ind_name = str(row["行业名称"]).strip()
-            for attempt in range(max_retries):
-                try:
-                    time.sleep(base_delay)
-                    comp = StockBasicInfoService._fetch_sw_industry_cons(raw_code)
-                    if comp is not None and not comp.empty and '证券代码' in comp.columns:
-                        return raw_code, ind_name, comp
-                    logger.warning(f"  {ind_name} 第 {attempt + 1} 次结构异常，重试...")
-                except Exception as e:
-                    logger.warning(f"  {ind_name} 第 {attempt + 1} 次失败: {e!s}")
-                    if attempt < max_retries - 1:
-                        time.sleep(base_delay * (attempt + 1))
-            return raw_code, ind_name, None
-        
-        # 2. 多线程并行获取各行业成分股
-        industries = industry_df.to_dict("records")
-        total = len(industries)
+
+        # 4. 构建成分股记录
+        def _build_one(ind_row: tuple) -> list[dict[str, Any]]:
+            code, name = ind_row
+            group = raw_df[raw_df["l2_code"] == code]
+            if group.empty:
+                return []
+            rows = []
+            for _, stock_row in group.iterrows():
+                rows.append({
+                    "industry_code": code,
+                    "industry_name": name,
+                    "stock_code": StockBasicInfoService._stock_symbol_to_code(str(stock_row["symbol"])),
+                    "stock_name": str(stock_row.get("name", "")).strip(),
+                    "weight": 0.0,
+                    "record_date": record_date,
+                })
+            return rows
+
+        all_stocks: list[dict[str, Any]] = []
+        ind_list = list(zip(industries["l2_code"], industries["l2_name"]))
+
         with ThreadPoolExecutor(max_workers=min(10, total)) as pool:
-            futs = {pool.submit(_fetch_one, row): row for row in industries}
+            futs = {pool.submit(_build_one, ind): ind for ind in ind_list}
             done = 0
             for f in as_completed(futs):
                 done += 1
-                raw_code, ind_name, component_df = f.result()
-                if component_df is None or component_df.empty or '证券代码' not in component_df.columns:
-                    logger.warning(f"  [{done}/{total}] {ind_name} — 成分股获取失败，跳过。")
-                    continue
-                for _, stock_row in component_df.iterrows():
-                    all_stocks.append({
-                        "industry_code": raw_code,
-                        "industry_name": ind_name,
-                        "stock_code": str(stock_row.get("证券代码", "")).strip(),
-                        "stock_name": str(stock_row.get("证券名称", "")).strip(),
-                        "weight": stock_row.get("最新权重", 0.0),
-                        "record_date": record_date
-                    })
+                rows = f.result()
+                all_stocks.extend(rows)
+                if done % 20 == 0 or done == total:
+                    self.logger.info(f"  进度: {done}/{total} 个行业")
 
-        # 4. 数据清洗
+        # 5. 数据清洗
         df = pd.DataFrame(all_stocks)
         if df.empty:
-            self.logger.warning("所有行业均未能成功获取成分股数据")
+            self.logger.warning("未获取到任何成分股数据")
             return df
 
-        # 清洗 weight 列
-        df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0).astype(float)
         df = df.drop_duplicates(subset=["industry_code", "stock_code", "record_date"], keep="first").reset_index(drop=True)
-        
-        self.logger.info(f"成功获取并清洗完毕，共 {len(df)} 条成分股记录")
+
+        self.logger.info(f"成功构建 {len(df)} 条成分股记录，覆盖 {total} 个二级行业")
         cols = ["industry_code", "industry_name", "stock_code", "stock_name", "weight", "record_date"]
         return df[cols]
 
@@ -276,20 +210,16 @@ class StockBasicInfoService:
             if not self.db_manager:
                 self._initialize_database()
 
-            # 核心：执行双重校验
             if self._is_data_up_to_date():
                 self.logger.info("缓存校验通过，无需更新数据。")
-                return True  # 缓存有效，直接返回成功
+                return True
 
-            # 缓存失效，开始抓取
             df = self.fetch_stock_basic_info()
             if df.empty:
                 self.logger.warning("获取到的数据为空")
                 return False
 
             self.logger.info(f"[DB Sync] 开始全量刷新到 PostgreSQL 表 {self.TABLE_NAME}")
-
-            # 清表并写入
             self.db_manager.truncate_and_insert(df, self.TABLE_NAME)
             self.logger.info(f"[DB Sync] 成功写入 {len(df)} 条记录。")
 
@@ -308,5 +238,3 @@ class StockBasicInfoService:
         except (DatabaseError, DBAPIError, OperationalError) as e:
             self.logger.error(f"获取记录总数失败: {e!s}")
             return 0
-
- 

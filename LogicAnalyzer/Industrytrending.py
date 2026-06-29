@@ -10,11 +10,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import akshare as ak
 import numpy as np
 import pandas as pd
+from asharehub import AShareHub
 from loguru import logger
-
-from UtilsManager.AkshareConfig import ensure_akshare_timeout
-
-ensure_akshare_timeout()
 
 from ConfigParser import Config
 
@@ -25,6 +22,7 @@ class SWIndustryDataPipeline:
     
     def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
         self.config = config or Config()
+        self.ah_client = AShareHub(api_key=self.config.ASHAREHUB_API_KEY)
         if today_str:
             self.today_str = today_str.replace("-", "")
         else:
@@ -82,9 +80,9 @@ class SWIndustryDataPipeline:
             cached_val = pd.read_csv(self.valuation_file)
             cached_industry_count = len(cached_val)
             
-            # [KEY] 关键：获取当前接口的行业总数
-            df_info = ak.sw_index_second_info()
-            current_total_industries = len(df_info)
+            # [KEY] 关键：从 AShareHub 获取二级行业总数
+            ah_df = self.ah_client.industry_list()
+            current_total_industries = ah_df["l2_code"].nunique()
             
             # [OK] 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
             if cached_industry_count == current_total_industries:
@@ -96,7 +94,9 @@ class SWIndustryDataPipeline:
 
         logger.info("获取申万二级行业列表及估值数据...")
         try:
-            df_info = ak.sw_index_second_info()
+            ah_df = self.ah_client.industry_list()
+            df_info = ah_df[["l2_code", "l2_name"]].drop_duplicates().dropna().copy()
+            df_info.columns = ["行业代码", "行业名称"]
         except Exception as e:
             logger.error(f"获取行业列表失败: {e}")
             return None
@@ -104,19 +104,19 @@ class SWIndustryDataPipeline:
         valuation_cols_map = {
             '行业代码': 'code',
             '行业名称': 'name',
-            '静态市盈率': 'pe_static',
-            'TTM(滚动)市盈率': 'pe_ttm',
-            '市净率': 'pb',
-            '静态股息率': 'div_yield'
         }
         
-        missing_valuation_cols = [k for k in valuation_cols_map.keys() if k not in df_info.columns]
+        missing_valuation_cols = [k for k in ['静态市盈率', 'TTM(滚动)市盈率', '市净率', '静态股息率'] if k not in df_info.columns]
         if missing_valuation_cols:
-            logger.warning(f"估值接口缺少预期列 {missing_valuation_cols}。")
+            logger.warning(f"估值数据不可用 (AShareHub 未提供)，使用默认值。")
         
         available_valuation_cols = {k: v for k, v in valuation_cols_map.items() if k in df_info.columns}
         df_val = df_info[list(available_valuation_cols.keys())].copy()
         df_val.columns = list(available_valuation_cols.values())
+        df_val['pe_static'] = None
+        df_val['pe_ttm'] = None
+        df_val['pb'] = None
+        df_val['div_yield'] = None
         # --- 智能提取纯数字代码 ---
         # 使用正则表达式，提取字符串开头的连续数字部分
         df_val['code'] = df_val['code'].astype(str).apply(lambda x: re.match(r'^(\d+)', x).group(1) if re.match(r'^(\d+)', x) else x)
