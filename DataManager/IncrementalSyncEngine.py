@@ -182,25 +182,29 @@ class IncrementalSyncEngine:
 
     def _fetch_kline(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
         """Sina stock_zh_a_daily: raw + hfq, volume=股, amount=元.
-        内置退避重试，失败则跳过。
+        内置退避重试 + 超时保护，超时或失败则跳过。
         """
         time.sleep(random.uniform(0.05, 0.3))
 
+        FETCH_TIMEOUT = 15
+
         raw: pd.DataFrame | None = None
         hfq: pd.DataFrame | None = None
-        for attempt in range(2):
-            try:
-                raw = ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust="")
-                hfq = ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust="hfq")
-                if raw is not None and not raw.empty and hfq is not None and not hfq.empty:
-                    break
-            except Exception as e:
-                logger.warning(f"  {symbol} Sina 第{attempt+1}次尝试失败: {e}")
-            if attempt == 0:
-                time.sleep(random.uniform(1, 3))
+        _pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            f_raw = _pool.submit(ak.stock_zh_a_daily, symbol=symbol, start_date=start, end_date=end, adjust="")
+            f_hfq = _pool.submit(ak.stock_zh_a_daily, symbol=symbol, start_date=start, end_date=end, adjust="hfq")
+            raw = f_raw.result(timeout=FETCH_TIMEOUT)
+            hfq = f_hfq.result(timeout=FETCH_TIMEOUT)
+        except Exception as e:
+            for f in (f_raw, f_hfq):
+                f.cancel()
+            logger.warning(f"  {symbol} Sina 失败: {e}")
+        finally:
+            _pool.shutdown(wait=False)
 
         if raw is None or raw.empty or hfq is None or hfq.empty:
-            logger.warning(f"  {symbol} 连续 2 次失败，跳过")
+            logger.warning(f"  {symbol} 无数据，跳过")
             return None
 
         raw = raw.rename(columns={"date": "trade_date", "close": "close_raw", "volume": "vol_sina"})
@@ -288,14 +292,19 @@ class IncrementalSyncEngine:
         results: dict[str, float] = {}
 
         def _fetch_one(sym: str) -> tuple[str, float | None]:
+            __pool = ThreadPoolExecutor(max_workers=1)
             try:
-                r = ak.stock_zh_a_daily(symbol=sym, start_date=end, end_date=end, adjust="")
+                f_one = __pool.submit(ak.stock_zh_a_daily, symbol=sym, start_date=end, end_date=end, adjust="")
+                r = f_one.result(timeout=25)
                 if r is not None and not r.empty:
                     close_val = pd.to_numeric(r["close"].iloc[-1], errors="coerce")
                     if pd.notna(close_val):
                         return sym, float(close_val)
             except Exception:
                 pass
+            finally:
+                f_one.cancel()
+                __pool.shutdown(wait=False)
             return sym, None
 
         def _fetch_backfill_half(syms: list[str]) -> dict[str, float]:

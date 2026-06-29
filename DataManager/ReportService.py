@@ -165,7 +165,7 @@ class ReportService:
 
         self.logger.info("\n>>> 正在生成 Excel 报告...")
         trade_date = today_str.replace("-", "") if today_str else datetime.datetime.now().strftime("%Y%m%d")
-        report_path = os.path.join(self.config.TEMP_DATA_DIRECTORY, f"审计报告_{trade_date}.xlsx")
+        report_path = os.path.join(self.config.HOME_DIRECTORY, f"审计报告_{trade_date}.xlsx")
 
         # Get user focus stocks once for all sheets
         user_focus_stocks = self._get_user_focus_stocks()

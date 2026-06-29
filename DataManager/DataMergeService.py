@@ -111,8 +111,10 @@ class DataMergeService:
             industry = pool[["ts_code", "name", "industry"]].copy()
             industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
             self._industry_cache = industry
-        formatted = [CodeNormalizer.normalize(c) for c in stock_codes]
-        return self._industry_cache[self._industry_cache[ColumnNames.STOCK_CODE].isin(formatted)]
+        formatted = {CodeNormalizer.normalize(c) for c in stock_codes}
+        cache = self._industry_cache.copy()
+        cache["__norm__"] = cache[ColumnNames.STOCK_CODE].apply(CodeNormalizer.normalize)
+        return cache[cache["__norm__"].isin(formatted)].drop(columns="__norm__")
 
     # ── 合并方法 ─────────────────────────────────────────────
 

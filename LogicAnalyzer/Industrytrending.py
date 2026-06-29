@@ -222,8 +222,10 @@ class SWMultiFactorModel:
             df_hist = pd.read_parquet(self.pipeline.cache_file)
         except (ImportError, OSError, ValueError, TypeError):
             df_hist = pd.read_csv(self.pipeline.cache_csv_file, parse_dates=['date'])
-        
+        df_hist['code'] = df_hist['code'].astype(str)
+
         df_val = pd.read_csv(self.pipeline.valuation_file)
+        df_val['code'] = df_val['code'].astype(str)
         
         logger.info("正在执行向量化因子计算...")
         df_factors = self._calculate_vectorized_factors(df_hist)
