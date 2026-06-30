@@ -46,14 +46,14 @@ class SWIndustryDataPipeline:
             return df_hist
 
         mapping = {
-            'code': ['代码'], # 新增映射，处理历史数据的代码列
-            'date': ['日期', 'date', 'trade_date'],
-            'open': ['开盘', 'open', 'O'],
-            'high': ['最高', 'high', 'H'],
-            'low': ['最低', 'low', 'L'],
-            'close': ['收盘', 'close', 'C'],
-            'volume': ['成交量', 'volume', 'vol', 'V'],
-            'amount': ['成交额', 'amount', 'amt', 'A']
+            'code': ['代码', '����'], # 新增映射，处理历史数据的代码列
+            'date': ['日期', 'date', 'trade_date', '����'],
+            'open': ['开盘', 'open', 'O', '����'],
+            'high': ['最高', 'high', 'H', '����'],
+            'low': ['最低', 'low', 'L', '���'],
+            'close': ['收盘', 'close', 'C', '���'],
+            'volume': ['成交量', 'volume', 'vol', 'V', '�ɽ���'],
+            'amount': ['成交额', 'amount', 'amt', 'A', '�ɽ���']
         }
         
         rename_dict = {}
@@ -190,15 +190,23 @@ class SWMultiFactorModel:
 
     def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
+        logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
         df = df_hist.sort_values(['code', 'date']).copy()
+        logger.info("排序完成")
         
         for p in self.ma_periods:
+            logger.info(f"计算 MA{p}...")
             df[f'ma_{p}'] = df.groupby('code')['close'].transform(lambda x: x.rolling(p).mean())
-            
+            logger.info(f"MA{p} 完成")
+             
+        logger.info("计算 vol_ma_20...")
         df['vol_ma_20'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(20).mean())
+        logger.info("计算 amt_ma_60...")
         df['amt_ma_60'] = df.groupby('code')['amount'].transform(lambda x: x.rolling(60).mean())
+        logger.info("均线计算完成")
         
         df_latest = df.groupby('code').tail(1).set_index('code')
+        logger.info(f"取最新行: {len(df_latest)} 行")
         
         bull_score = pd.Series(0, index=df_latest.index)
         mas = [df_latest[f'ma_{p}'] for p in self.ma_periods]
@@ -228,14 +236,29 @@ class SWMultiFactorModel:
         df_val['code'] = df_val['code'].astype(str)
         
         logger.info("正在执行向量化因子计算...")
-        df_factors = self._calculate_vectorized_factors(df_hist)
+        try:
+            df_factors = self._calculate_vectorized_factors(df_hist)
+            logger.info(f"因子计算完成，shape={df_factors.shape}")
+        except Exception as e:
+            import traceback
+            logger.error(f"因子计算崩溃: {type(e).__name__}: {e}")
+            logger.error(traceback.format_exc())
+            raise
         
         # 解决列名冲突：重命名因子数据中的name列为factor_name
         df_factors_renamed = df_factors.copy()
         df_factors_renamed = df_factors_renamed.rename(columns={'name': 'factor_name'})
         
         # 合并数据时指定suffixes来避免重复列名
-        df = df_factors_renamed.join(df_val.set_index('code'), how='left', rsuffix='_val')
+        logger.info("合并因子与估值数据...")
+        try:
+            df = df_factors_renamed.join(df_val.set_index('code'), how='left', rsuffix='_val')
+            logger.info(f"合并完成，shape={df.shape}")
+        except Exception as e:
+            import traceback
+            logger.error(f"合并崩溃: {type(e).__name__}: {e}")
+            logger.error(traceback.format_exc())
+            raise
         
         # 使用估值数据中的name列覆盖因子数据中的name列
         df['name'] = df['name']

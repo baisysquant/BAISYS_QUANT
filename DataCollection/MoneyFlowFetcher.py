@@ -100,37 +100,27 @@ class MoneyFlowFetcher:
 
         fmt_date = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:8]}"
         all_dfs = []
-        logger.info(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向 (date={fmt_date})...")
+        logger.info(f"[MoneyFlow] 正在从 AShareHub 获取全市场资金流向...")
 
-        done = False
-        while not done:
-            last_err = None
-            for attempt in range(1, self._retry + 2):
-                try:
-                    if attempt > 1:
-                        wait = min(2 ** attempt, 30)
-                        logger.info(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
-                        time.sleep(wait)
-                    df = self.client.moneyflow(trade_date=fmt_date)
-                    if df is None or df.empty:
-                        last_err = "空响应"
-                        break
+        for attempt in range(1, self._retry + 2):
+            try:
+                if attempt > 1:
+                    wait = min(2 ** attempt, 30)
+                    logger.info(f"  [资金流 重试 {attempt-1}/{self._retry}] 等待 {wait}s...")
+                    time.sleep(wait)
+                # moneyflow 不带参数返回最新数据
+                df = self.client.moneyflow()
+                if df is not None and not df.empty:
                     all_dfs.append(df)
-                    row_count = len(df)
-                    logger.info(f"  [资金流] 返回 {row_count} 行")
-                    done = True
+                    logger.info(f"  [资金流] 返回 {len(df)} 行")
                     break
-                except Exception as e:
-                    last_err = e
-                    err_str = str(e)
-                    if '429' in err_str or 'Too Many Requests' in err_str:
-                        if attempt <= self._retry:
-                            continue
-                    logger.info(f"[MoneyFlow] 获取失败: {e}")
-                    break
-            if last_err:
+            except Exception as e:
+                last_err = e
+                if attempt <= self._retry:
+                    time.sleep(2 ** attempt)
+                    continue
+                logger.info(f"[MoneyFlow] 获取失败: {e}")
                 break
-
         if not all_dfs:
             logger.info("[MoneyFlow] 未获取到任何资金流向数据。")
             return pd.DataFrame()
