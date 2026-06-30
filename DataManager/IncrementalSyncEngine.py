@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import random
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -19,17 +18,44 @@ from UtilsManager.AkshareConfig import ensure_akshare_timeout
 ensure_akshare_timeout()
 
 
-# ak.stock_zh_a_daily 内部用 py_mini_racer (V8)，极不稳定
-# 统一放到独立子进程跑，子进程崩了主进程不受影响
-def _sina_daily_worker(symbol: str, start: str, end: str, adjust: str):
-    """子进程执行 ak.stock_zh_a_daily，返回 DataFrame 或抛异常"""
-    return ak.stock_zh_a_daily(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
-
-
 TABLE = "stock_daily_kline"
 OVERLAP_DAYS = 15
-BATCH_SIZE = 500
-BATCH_INTERVAL = 10
+BATCH_SIZE = 300          # 每批次处理 300 只
+BATCH_INTERVAL = 10       # 批次间休息 10 秒
+STAGGER_DELAY = 15        # 两管道错峰 15 秒
+
+
+def _fetch_kline(symbol: str, start: str, end: str) -> dict | None:
+    """subprocess 调独立脚本获取 K 线，完全避免 import 冲突。"""
+    import subprocess, json, os, sys
+    script = os.path.join(os.path.dirname(__file__), "_fetch_one.py")
+    try:
+        r = subprocess.run(
+            [sys.executable, script, symbol, start, end],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _sina_daily_worker(symbol: str, start: str, end: str, adjust: str = "") -> pd.DataFrame | None:
+    """子进程 worker：获取日 K 线（腾讯 API，无 V8）。"""
+    try:
+        import akshare as ak  # noqa: F811
+        import time, random
+        time.sleep(random.uniform(0.05, 0.2))
+        df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
+        if df is None or df.empty:
+            return None
+        df["date"] = df["date"].astype(str)
+        return df
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"  [{symbol}] _sina_daily_worker 异常: {e}")
+        return None
 
 
 class IncrementalSyncEngine:
@@ -108,26 +134,33 @@ class IncrementalSyncEngine:
             end_iso = self._trade_date.isoformat()
             logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}")
 
-            # 串行下载（已由 _ak_sina_lock 保证 akshare 串行，去掉线程池避免 V8 崩溃）
-            logger.info(f"串行下载 {len(remaining)} 只...")
-            totals: list[int] = []
-            all_failures: list[str] = []
             mid = len(remaining) // 2
             half_a = remaining[:mid]
             half_b = remaining[mid:]
-            logger.info(f"分批: 前半段 {len(half_a)} 只 | 后半段 {len(half_b)} 只")
-            
-            # 顺序处理两半（模拟原双管道，但串行）
-            for label, half in (("A", half_a), ("B", half_b)):
-                logger.info(f"处理批次 {label}: {len(half)} 只")
-                inserted, failures = self._run_pipeline(half, start_iso, end_iso, stagger=0, label=label)
-                totals.append(inserted)
-                all_failures.extend(failures)
-                time.sleep(BATCH_INTERVAL)  # 批次间隔，防频控
+            logger.info(f"双管道: 前半段 {len(half_a)} 只 | 后半段 {len(half_b)} 只")
 
+            import threading
+            results: dict = {"a": [0, []], "b": [0, []]}
+
+            def run(label: str, half: list[str]):
+                ins, fails = self._run_pipeline(half, start_iso, end_iso, label=label)
+                results[label.lower()] = [ins, fails]
+
+            ta = threading.Thread(target=run, args=("A", half_a), daemon=True)
+            tb = threading.Thread(target=run, args=("B", half_b), daemon=True)
+
+            ta.start()
+            logger.info(f"管道 A 启动，{STAGGER_DELAY}s 后启动管道 B")
+            time.sleep(STAGGER_DELAY)
+            tb.start()
+
+            ta.join()
+            tb.join()
+
+            all_failures = results["a"][1] + results["b"][1]
+            total = results["a"][0] + results["b"][0]
             self._save_failed_set(set(all_failures))
-            total = sum(totals)
-            logger.info(f"同步完成，总写入 {total} 行")
+            logger.info(f"同步完成，总写入 {total} 行（失败 {len(all_failures)} 只）")
             return total
         except BaseException as e:
             import traceback
@@ -146,11 +179,7 @@ class IncrementalSyncEngine:
 
     # ── Dual Pipeline ───────────────────────────────────────────
 
-    def _run_pipeline(self, symbols: list[str], start_iso: str, end_iso: str, stagger: int = 0, label: str = "") -> tuple[int, list[str]]:
-        if stagger:
-            logger.info(f"  错峰启动，延迟 {stagger}s")
-            time.sleep(stagger)
-
+    def _run_pipeline(self, symbols: list[str], start_iso: str, end_iso: str, label: str = "") -> tuple[int, list[str]]:
         start = start_iso.replace("-", "")
         end = end_iso.replace("-", "")
         total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -161,7 +190,7 @@ class IncrementalSyncEngine:
             batch = symbols[i:i + BATCH_SIZE]
             batch_no = i // BATCH_SIZE + 1
             desc = f"  P{label} batch {batch_no}/{total_batches}"
-            logger.info(f"  {desc}: {len(batch)} 只")
+            logger.info(f"管道{label} {desc}: {len(batch)} 只")
             df, failures = self._process_batch(batch, start, end, desc=desc)
             all_failures.extend(failures)
             if df is not None and not df.empty:
@@ -169,6 +198,7 @@ class IncrementalSyncEngine:
             if i + BATCH_SIZE < len(symbols):
                 time.sleep(BATCH_INTERVAL)
 
+        logger.info(f"管道{label} 完成，写入 {inserted} 行（失败 {len(all_failures)} 只）")
         return inserted, all_failures
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[pd.DataFrame | None, list[str]]:
@@ -176,58 +206,16 @@ class IncrementalSyncEngine:
         failed: list[str] = []
         with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
             for sym in symbols:
-                df = self._fetch_kline(sym, start, end)
-                if df is not None and not df.empty:
-                    results.append(df)
+                data = _fetch_kline(sym, start, end)
+                if data is not None:
+                    results.append(pd.DataFrame(data))
                 else:
                     failed.append(sym)
                 pbar.update(1)
+        logger.info(f"  {desc} 完成: 成功 {len(results)} 只, 失败 {len(failed)} 只")
         if not results:
             return None, failed
         return pd.concat(results, ignore_index=True), failed
-
-    # ── Per-stock fetchers ──────────────────────────────────────
-
-    def _fetch_kline(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
-        """Sina stock_zh_a_daily: raw + hfq, volume=股, amount=元.
-        两次调用各自跑在独立子进程 (ProcessPoolExecutor)，15 秒超时，子进程崩溃不影响主进程。
-        """
-        time.sleep(random.uniform(0.05, 0.3))
-
-        FETCH_TIMEOUT = 15
-
-        # 并行跑 raw/hfq 两个子进程
-        with ProcessPoolExecutor(max_workers=2) as pool:
-            f_raw = pool.submit(_sina_daily_worker, symbol, start, end, "")
-            f_hfq = pool.submit(_sina_daily_worker, symbol, start, end, "hfq")
-            try:
-                raw = f_raw.result(timeout=FETCH_TIMEOUT)
-                hfq = f_hfq.result(timeout=FETCH_TIMEOUT)
-            except Exception as e:
-                logger.warning(f"  {symbol} Sina 失败: {e}")
-                return None
-
-        if raw is None or raw.empty or hfq is None or hfq.empty:
-            logger.warning(f"  {symbol} 无数据，跳过")
-            return None
-
-        raw = raw.rename(columns={"date": "trade_date", "close": "close_raw", "volume": "vol_sina"})
-        hfq = hfq.rename(columns={"date": "trade_date"})
-        merged = raw[["trade_date", "close_raw", "vol_sina", "amount"]].merge(
-            hfq[["trade_date", "open", "high", "low", "close"]], on="trade_date", how="inner"
-        )
-        for col in ("open", "high", "low", "close", "close_raw"):
-            merged[col] = pd.to_numeric(merged[col], errors="coerce")
-        merged["volume"] = pd.to_numeric(merged["vol_sina"], errors="coerce").fillna(0).astype("int64")
-        merged["amount"] = pd.to_numeric(merged["amount"], errors="coerce").fillna(0)
-        merged["close_normal"] = merged["close_raw"]
-        merged["symbol"] = symbol
-        merged["trade_date"] = merged["trade_date"].apply(
-            lambda d: d.isoformat() if hasattr(d, "isoformat") else str(d)
-        )
-        merged["adj_factor"] = merged["close"] / merged["close_normal"].replace(0, float("nan"))
-        merged["adj_factor"] = merged["adj_factor"].replace([float("inf")], 1.0).fillna(1.0)
-        return merged[["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]]
 
     def _write_with_split_detection(self, df: pd.DataFrame) -> int:
         """逐只股票：除权检测 + 幂等写入（无需前置 DELETE，(symbol, trade_date) 唯一约束自动处理）。"""
