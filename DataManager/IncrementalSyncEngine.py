@@ -23,22 +23,24 @@ OVERLAP_DAYS = 15
 BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
+FETCH_BATCH = 10          # 每次子进程处理 10 只，降低 V8 踩线崩溃概率
 
 
-def _fetch_kline(symbol: str, start: str, end: str) -> dict | None:
-    """subprocess 调独立脚本获取 K 线，完全避免 import 冲突。"""
+def _fetch_kline_batch(symbols: list[str], start: str, end: str) -> list[dict]:
+    """一批股票一次 subprocess 调用，分摊启动开销。"""
     import subprocess, json, os, sys
     script = os.path.join(os.path.dirname(__file__), "_fetch_one.py")
+    payload = json.dumps({"symbols": symbols, "start": start, "end": end})
     try:
         r = subprocess.run(
-            [sys.executable, script, symbol, start, end],
-            capture_output=True, text=True, timeout=30,
+            [sys.executable, script, payload],
+            capture_output=True, text=True, timeout=60,
         )
         if r.returncode != 0 or not r.stdout.strip():
-            return None
+            return []
         return json.loads(r.stdout)
     except Exception:
-        return None
+        return []
 
 
 def _sina_daily_worker(symbol: str, start: str, end: str, adjust: str = "") -> pd.DataFrame | None:
@@ -191,10 +193,9 @@ class IncrementalSyncEngine:
             batch_no = i // BATCH_SIZE + 1
             desc = f"  P{label} batch {batch_no}/{total_batches}"
             logger.info(f"管道{label} {desc}: {len(batch)} 只")
-            df, failures = self._process_batch(batch, start, end, desc=desc)
+            count, failures = self._process_batch(batch, start, end, desc=desc)
             all_failures.extend(failures)
-            if df is not None and not df.empty:
-                inserted += self._write_with_split_detection(df)
+            inserted += count
             if i + BATCH_SIZE < len(symbols):
                 time.sleep(BATCH_INTERVAL)
 
@@ -202,20 +203,26 @@ class IncrementalSyncEngine:
         return inserted, all_failures
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[pd.DataFrame | None, list[str]]:
-        results: list[pd.DataFrame] = []
+        written_count = 0
         failed: list[str] = []
         with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
-            for sym in symbols:
-                data = _fetch_kline(sym, start, end)
-                if data is not None:
-                    results.append(pd.DataFrame(data))
-                else:
-                    failed.append(sym)
-                pbar.update(1)
-        logger.info(f"  {desc} 完成: 成功 {len(results)} 只, 失败 {len(failed)} 只")
-        if not results:
-            return None, failed
-        return pd.concat(results, ignore_index=True), failed
+            for i in range(0, len(symbols), FETCH_BATCH):
+                chunk = symbols[i:i + FETCH_BATCH]
+                batch_results = _fetch_kline_batch(chunk, start, end)
+                chunk_done: set[str] = set()
+                for item in batch_results:
+                    if item and item.get("symbol"):
+                        df = pd.DataFrame(item)
+                        if not df.empty:
+                            self._write_with_split_detection(df)
+                            written_count += df["symbol"].nunique()
+                            chunk_done.update(df["symbol"].unique())
+                for sym in chunk:
+                    if sym not in chunk_done:
+                        failed.append(sym)
+                    pbar.update(1)
+        logger.info(f"  {desc} 完成: 成功 {written_count} 只, 失败 {len(failed)} 只")
+        return written_count, failed
 
     def _write_with_split_detection(self, df: pd.DataFrame) -> int:
         """逐只股票：除权检测 + 幂等写入（无需前置 DELETE，(symbol, trade_date) 唯一约束自动处理）。"""
