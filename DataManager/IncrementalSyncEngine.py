@@ -36,10 +36,15 @@ def _fetch_kline_batch(symbols: list[str], start: str, end: str) -> list[dict]:
             [sys.executable, script, payload],
             capture_output=True, text=True, timeout=60,
         )
-        if r.returncode != 0 or not r.stdout.strip():
+        if r.returncode != 0:
+            logger.warning(f"子进程退出码 {r.returncode}, stderr={r.stderr[:500]}")
+            return []
+        if not r.stdout.strip():
+            logger.warning(f"子进程无输出, stderr={r.stderr[:500]}")
             return []
         return json.loads(r.stdout)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"_fetch_kline_batch 异常: {e}")
         return []
 
 
@@ -224,6 +229,18 @@ class IncrementalSyncEngine:
         logger.info(f"  {desc} 完成: 成功 {written_count} 只, 失败 {len(failed)} 只")
         return written_count, failed
 
+    def _fetch_full_history(self, symbol: str) -> pd.DataFrame | None:
+        """检测到除权除息时，从配置起始日到今日重新拉取全量数据。"""
+        start = self._default_start.replace("-", "") if self._default_start else "20190101"
+        end = self._trade_date.strftime("%Y%m%d")
+        batch_results = _fetch_kline_batch([symbol], start, end)
+        if not batch_results:
+            return None
+        for item in batch_results:
+            if item and item.get("symbol"):
+                return pd.DataFrame(item)
+        return None
+
     def _write_with_split_detection(self, df: pd.DataFrame) -> int:
         """逐只股票：除权检测 + 幂等写入（无需前置 DELETE，(symbol, trade_date) 唯一约束自动处理）。"""
         total_inserted = 0
@@ -237,9 +254,14 @@ class IncrementalSyncEngine:
                 to_write.append(grp)
                 total_inserted += len(grp)
             elif self._detect_split_from_adj(sym, grp, latest):
-                logger.info(f"  {sym} 除权除息，全量替换")
-                to_write.append(grp)
-                total_inserted += len(grp)
+                logger.info(f"  {sym} 除权除息，全量替换（拉取全量历史）")
+                full = self._fetch_full_history(sym)
+                if full is not None and not full.empty:
+                    to_write.append(full)
+                    total_inserted += len(full)
+                else:
+                    to_write.append(grp)
+                    total_inserted += len(grp)
             else:
                 new = grp[grp["trade_date"] > latest.isoformat()]
                 if not new.empty:
