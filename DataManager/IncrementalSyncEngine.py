@@ -1,21 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
-import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any
 
-import akshare as ak
 import pandas as pd
+import requests
 from loguru import logger
 from sqlalchemy import text
 from tqdm import tqdm
 
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
-from UtilsManager.AkshareConfig import ensure_akshare_timeout
-
-ensure_akshare_timeout()
 
 
 TABLE = "stock_daily_kline"
@@ -23,46 +21,7 @@ OVERLAP_DAYS = 15
 BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
-FETCH_BATCH = 10          # 每次子进程处理 10 只，降低 V8 踩线崩溃概率
-
-
-def _fetch_kline_batch(symbols: list[str], start: str, end: str) -> list[dict]:
-    """一批股票一次 subprocess 调用，分摊启动开销。"""
-    import subprocess, json, os, sys
-    script = os.path.join(os.path.dirname(__file__), "_fetch_one.py")
-    payload = json.dumps({"symbols": symbols, "start": start, "end": end})
-    try:
-        r = subprocess.run(
-            [sys.executable, script, payload],
-            capture_output=True, text=True, timeout=60,
-        )
-        if r.returncode != 0:
-            logger.warning(f"子进程退出码 {r.returncode}, stderr={r.stderr[:500]}")
-            return []
-        if not r.stdout.strip():
-            logger.warning(f"子进程无输出, stderr={r.stderr[:500]}")
-            return []
-        return json.loads(r.stdout)
-    except Exception as e:
-        logger.warning(f"_fetch_kline_batch 异常: {e}")
-        return []
-
-
-def _sina_daily_worker(symbol: str, start: str, end: str, adjust: str = "") -> pd.DataFrame | None:
-    """子进程 worker：获取日 K 线（腾讯 API，无 V8）。"""
-    try:
-        import akshare as ak  # noqa: F811
-        import time, random
-        time.sleep(random.uniform(0.05, 0.2))
-        df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start, end_date=end, adjust=adjust)
-        if df is None or df.empty:
-            return None
-        df["date"] = df["date"].astype(str)
-        return df
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"  [{symbol}] _sina_daily_worker 异常: {e}")
-        return None
+FETCH_WORKERS = 10        # 每管道并发取数线程数
 
 
 class IncrementalSyncEngine:
@@ -90,7 +49,6 @@ class IncrementalSyncEngine:
                     os.environ.get("TEMP", "/tmp"), "opencode", "kline_batches"
                 )
         os.makedirs(self._cache_dir, exist_ok=True)
-        # 使用最新交易日而非 date.today()，避免周末/节假日误判
         try:
             _cal = TradingCalendarAnalyzer()
             _today_str = _cal.get_last_trading_day()
@@ -103,12 +61,12 @@ class IncrementalSyncEngine:
     # ── public API ──────────────────────────────────────────────
 
     def _cleanup_old_cache(self) -> None:
-        """清理超过 7 天的缓存文件，以及脏 close_normal_*.csv（日期不匹配当前交易日）。"""
+        """清理超过 7 天的缓存文件,以及脏 close_normal_*.csv(日期不匹配当前交易日)."""
         try:
             now = datetime.now()
             today_tag = f"close_normal_{self._trade_date_str}.csv"
             for fname in os.listdir(self._cache_dir):
-                # 清理脏 close_normal 缓存（日期与当前交易日不一致）
+                # 清理脏 close_normal 缓存(日期与当前交易日不一致)
                 if fname.startswith("close_normal_") and fname != today_tag:
                     os.remove(os.path.join(self._cache_dir, fname))
                     continue
@@ -131,10 +89,10 @@ class IncrementalSyncEngine:
                 remaining = sorted(set(remaining) | cached)
                 added = len(remaining) - old_len
                 if added:
-                    logger.info(f"加载 {len(cached)} 只缓存失败股票，待同步 {len(remaining)} 只（新增 {added} 只）")
+                    logger.info(f"加载 {len(cached)} 只缓存失败股票,待同步 {len(remaining)} 只(新增 {added} 只)")
 
             if not remaining:
-                logger.info("所有股票已有最新交易日数据，无需同步")
+                logger.info("所有股票已有最新交易日数据,无需同步")
                 return 0
 
             start_iso = self._calc_start_iso(remaining)
@@ -157,7 +115,7 @@ class IncrementalSyncEngine:
             tb = threading.Thread(target=run, args=("B", half_b), daemon=True)
 
             ta.start()
-            logger.info(f"管道 A 启动，{STAGGER_DELAY}s 后启动管道 B")
+            logger.info(f"管道 A 启动,{STAGGER_DELAY}s 后启动管道 B")
             time.sleep(STAGGER_DELAY)
             tb.start()
 
@@ -167,7 +125,7 @@ class IncrementalSyncEngine:
             all_failures = results["a"][1] + results["b"][1]
             total = results["a"][0] + results["b"][0]
             self._save_failed_set(set(all_failures))
-            logger.info(f"同步完成，总写入 {total} 行（失败 {len(all_failures)} 只）")
+            logger.info(f"同步完成,总写入 {total} 行(失败 {len(all_failures)} 只)")
             return total
         except BaseException as e:
             import traceback
@@ -204,88 +162,220 @@ class IncrementalSyncEngine:
             if i + BATCH_SIZE < len(symbols):
                 time.sleep(BATCH_INTERVAL)
 
-        logger.info(f"管道{label} 完成，写入 {inserted} 行（失败 {len(all_failures)} 只）")
+        logger.info(f"管道{label} 完成,写入 {inserted} 行(失败 {len(all_failures)} 只)")
         return inserted, all_failures
 
-    def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[pd.DataFrame | None, list[str]]:
-        written_count = 0
+    def _batch_get_latest_date(self, symbols: list[str]) -> dict[str, date | None]:
+        """批量获取每只股票的最新日期, 一次 DB 查询."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT symbol, MAX(trade_date::date) AS latest
+                    FROM {TABLE}
+                    WHERE symbol = ANY(:symbols)
+                    GROUP BY symbol
+                """),
+                {"symbols": symbols},
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def _batch_get_latest_adj(self, symbols: list[str]) -> dict[str, float | None]:
+        """批量获取每只股票的最新 adj_factor,一次 DB 查询."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT DISTINCT ON (symbol) symbol, adj_factor
+                    FROM {TABLE}
+                    WHERE symbol = ANY(:symbols) AND adj_factor IS NOT NULL
+                    ORDER BY symbol, trade_date DESC
+                """),
+                {"symbols": symbols},
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def _batch_has_close_normal(self, symbols: list[str]) -> set[str]:
+        """批量查询哪些股票已有 close_normal,一次 DB 查询."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT DISTINCT symbol
+                    FROM {TABLE}
+                    WHERE symbol = ANY(:symbols) AND close_normal IS NOT NULL
+                """),
+                {"symbols": symbols},
+            ).fetchall()
+        return {row[0] for row in rows}
+
+    TX_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+
+    def _fetch_one_stock(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
+        """获取一只股票不复权 + 后复权数据,返回合并 DataFrame.
+
+        Tencent API 直调,无 sleep,429/5xx 自动重试最多 3 次.
+        """
+        start_year = int(start[:4])
+        end_year = int(end[:4])
+
+        def _tx_raw(adjust: str) -> list[list]:
+            rows: list[list] = []
+            for year in range(start_year, end_year + 1):
+                key = "hfqday" if adjust == "hfq" else "day"
+                param = f"{symbol},day,{year}-01-01,{year+1}-12-31,640,{adjust}"
+                var = f"kline_day{adjust}{year}"
+                for attempt in range(3):
+                    try:
+                        r = requests.get(
+                            self.TX_URL,
+                            params={"_var": var, "param": param, "r": "0.8205"},
+                            timeout=15,
+                        )
+                        if r.status_code == 429:
+                            time.sleep(2 ** attempt)
+                            continue
+                        r.raise_for_status()
+                        data = json.loads(r.text[r.text.find("={") + 1:])
+                        rows.extend(data["data"][symbol].get(key, []))
+                        break
+                    except Exception:
+                        if attempt < 2:
+                            time.sleep(2 ** attempt)
+                        else:
+                            return None
+            return rows
+
+        raw_rows = _tx_raw("")
+        hfq_rows = _tx_raw("hfq")
+        if not raw_rows or not hfq_rows:
+            return None
+
+        raw_map = {str(r[0]): r for r in raw_rows}
+        hfq_map = {str(h[0]): h for h in hfq_rows}
+        common = sorted(set(raw_map) & set(hfq_map))
+        filtered = [d for d in common if start <= d.replace("-", "") <= end]
+        if not filtered:
+            return None
+
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "volume": [], "amount": [],
+            "adj_factor": [], "close_normal": [],
+        }
+        for d in filtered:
+            raw = raw_map[d]
+            hfq = hfq_map[d]
+            close_raw = float(raw[2])
+            close_hfq = float(hfq[2])
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d)
+            out["open"].append(float(hfq[1]))
+            out["close"].append(close_hfq)
+            out["high"].append(float(hfq[3]))
+            out["low"].append(float(hfq[4]))
+            out["volume"].append(int(float(raw[5]) * 100))
+            out["amount"].append(float(raw[8]) * 10000)
+            out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
+            out["close_normal"].append(close_raw)
+
+        return pd.DataFrame(out)
+
+    def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[int, list[str]]:
+        """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入."""
+        # Step 1: concurrent fetch
+        all_data: dict[str, pd.DataFrame] = {}
         failed: list[str] = []
         with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
-            for i in range(0, len(symbols), FETCH_BATCH):
-                chunk = symbols[i:i + FETCH_BATCH]
-                batch_results = _fetch_kline_batch(chunk, start, end)
-                chunk_done: set[str] = set()
-                for item in batch_results:
-                    if item and item.get("symbol"):
-                        df = pd.DataFrame(item)
-                        if not df.empty:
-                            self._write_with_split_detection(df)
-                            written_count += df["symbol"].nunique()
-                            chunk_done.update(df["symbol"].unique())
-                for sym in chunk:
-                    if sym not in chunk_done:
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+                futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in symbols}
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        df = future.result()
+                        if df is not None:
+                            all_data[sym] = df
+                        else:
+                            failed.append(sym)
+                    except Exception:
                         failed.append(sym)
                     pbar.update(1)
-        logger.info(f"  {desc} 完成: 成功 {written_count} 只, 失败 {len(failed)} 只")
-        return written_count, failed
 
-    def _fetch_full_history(self, symbol: str) -> pd.DataFrame | None:
-        """检测到除权除息时，从配置起始日到今日重新拉取全量数据。"""
-        start = self._default_start.replace("-", "") if self._default_start else "20190101"
-        end = self._trade_date.strftime("%Y%m%d")
-        batch_results = _fetch_kline_batch([symbol], start, end)
-        if not batch_results:
-            return None
-        for item in batch_results:
-            if item and item.get("symbol"):
-                return pd.DataFrame(item)
-        return None
+        if not all_data:
+            logger.info(f"  {desc} 完成: 成功 0 只, 失败 {len(failed)} 只")
+            return 0, failed
 
-    def _write_with_split_detection(self, df: pd.DataFrame) -> int:
-        """逐只股票：除权检测 + 幂等写入（无需前置 DELETE，(symbol, trade_date) 唯一约束自动处理）。"""
-        total_inserted = 0
+        # Step 2: bulk DB reads
+        syms = list(all_data.keys())
+        latest_map = self._batch_get_latest_date(syms)
+        adj_map = self._batch_get_latest_adj(syms)
+        has_cn_set = self._batch_has_close_normal(syms)
+
+        # Step 3: identify split stocks
         to_write: list[pd.DataFrame] = []
+        written_symbols: set[str] = set()
+        split_syms: list[str] = []
 
-        for sym, grp in df.groupby("symbol"):
-            grp = grp.sort_values("trade_date")
-            latest = self._get_latest_date(sym)
+        for sym in syms:
+            grp = all_data[sym].sort_values("trade_date")
+            latest = latest_map.get(sym)
+            has_cn = sym in has_cn_set
 
-            if latest is None or self._has_no_close_normal(sym):
+            if latest is None or not has_cn:
                 to_write.append(grp)
-                total_inserted += len(grp)
-            elif self._detect_split_from_adj(sym, grp, latest):
-                logger.info(f"  {sym} 除权除息，全量替换（拉取全量历史）")
-                full = self._fetch_full_history(sym)
-                if full is not None and not full.empty:
-                    to_write.append(full)
-                    total_inserted += len(full)
-                else:
-                    to_write.append(grp)
-                    total_inserted += len(grp)
-            else:
-                new = grp[grp["trade_date"] > latest.isoformat()]
-                if not new.empty:
-                    to_write.append(new)
-                    total_inserted += len(new)
+                written_symbols.add(sym)
+                continue
 
-        if not to_write:
-            return 0
+            old_adj = adj_map.get(sym)
+            if old_adj is not None:
+                match = grp.loc[grp["trade_date"] == latest.isoformat(), "adj_factor"]
+                if not match.empty:
+                    ratio = match.iloc[0] / old_adj
+                    if ratio > 1.01 or ratio < 0.99:
+                        split_syms.append(sym)
+                        continue
 
-        final = pd.concat(to_write, ignore_index=True)
-        self._write_batch(final)
-        n_full = df["symbol"].nunique()
-        logger.info(f"同步完成，写入 {total_inserted} 行（{n_full} 只）")
-        return total_inserted
+            new = grp[grp["trade_date"] > latest.isoformat()]
+            if not new.empty:
+                to_write.append(new)
+                written_symbols.add(sym)
+
+        # Step 4: concurrent full-history fetch for split stocks
+        if split_syms:
+            full_start = self._default_start.replace("-", "") if self._default_start else "20190101"
+            full_end = self._trade_date.strftime("%Y%m%d")
+            logger.info(f"  {len(split_syms)} 只除权除息,并发拉取全量历史")
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+                futures = {ex.submit(self._fetch_one_stock, sym, full_start, full_end): sym for sym in split_syms}
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        full = future.result()
+                        if full is not None and not full.empty:
+                            to_write.append(full)
+                            written_symbols.add(sym)
+                        else:
+                            to_write.append(all_data[sym])
+                            written_symbols.add(sym)
+                    except Exception:
+                        to_write.append(all_data[sym])
+                        written_symbols.add(sym)
+
+        # Step 5: write all at once
+        if to_write:
+            final = pd.concat(to_write, ignore_index=True)
+            self._write_batch(final)
+
+        written_cnt = len(written_symbols)
+        logger.info(f"  {desc} 完成: 成功 {written_cnt} 只, 失败 {len(failed)} 只")
+        return written_cnt, failed
 
     def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> pd.DataFrame:
-        """双管道获取全市场最新不复权收盘价，写入本地缓存文件。
+        """双管道获取全市场最新不复权收盘价,写入本地缓存文件.
 
-        通过 Tencent（stock_zh_a_hist_tx）双管道并行获取原始 close，
-        写入 ``close_normal_{YYYYMMDD}.csv``（symbol, close 两列）。
+        通过 Tencent(stock_zh_a_hist_tx)双管道并行获取原始 close,
+        写入 ``close_normal_{YYYYMMDD}.csv``(symbol, close 两列).
         Args:
-            symbols_prefixed: 股票代码列表（带前缀），None 表示从 DB 获取全部。
+            symbols_prefixed: 股票代码列表(带前缀),None 表示从 DB 获取全部.
         Returns:
-            DataFrame 包含 symbol, close 两列；失败返回空 DataFrame。
+            DataFrame 包含 symbol, close 两列；失败返回空 DataFrame.
         """
         cache_file = self._close_normal_cache_path()
         if os.path.exists(cache_file):
@@ -294,7 +384,7 @@ class IncrementalSyncEngine:
                 logger.info(f"[close_normal] 从缓存加载 {len(df)} 只 → {os.path.basename(cache_file)}")
                 return df
             except Exception as e:
-                logger.warning(f"[close_normal] 缓存读取失败: {e}，重新拉取")
+                logger.warning(f"[close_normal] 缓存读取失败: {e},重新拉取")
 
         if symbols_prefixed is None:
             with self._engine.connect() as conn:
@@ -381,6 +471,7 @@ class IncrementalSyncEngine:
         if not self._enable_research_report_filter:
             return pure_codes
         try:
+            import akshare as ak
             for attempt in range(3):
                 try:
                     raw = ak.stock_profit_forecast_em()
@@ -406,9 +497,9 @@ class IncrementalSyncEngine:
             qualified = set(df.loc[df[rating_col] > self._research_report_min_count, "股票代码"].unique())
             before = len(pure_codes)
             pure_codes &= qualified
-            logger.info(f"研报过滤: {before} → {len(pure_codes)}（买入>{self._research_report_min_count}次）")
+            logger.info(f"研报过滤: {before} → {len(pure_codes)}(买入>{self._research_report_min_count}次)")
         except Exception as e:
-            logger.warning(f"研报过滤异常: {e}，跳过研报过滤")
+            logger.warning(f"研报过滤异常: {e},跳过研报过滤")
         return pure_codes
 
     def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
@@ -422,15 +513,15 @@ class IncrementalSyncEngine:
         before = len(pool)
         pool = self.filter_st_stocks(pool)
         pool = self.filter_main_board(pool)
-        logger.info(f"股票池: {before} → {len(pool)}（过滤ST及非主板）")
+        logger.info(f"股票池: {before} → {len(pool)}(过滤ST及非主板)")
 
         pure_codes = set(pool["股票代码"].unique())
-        # K 线同步覆盖全 A 股（已过滤 ST/板块），保持数据完整供回测使用
+        # K 线同步覆盖全 A 股(已过滤 ST/板块),保持数据完整供回测使用
         symbols = [CodeNormalizer.add_market_prefix(c) for c in sorted(pure_codes)]
         inserted = self.sync_all(symbols)
-        logger.info(f"K线同步完成，新增 {inserted} 行")
+        logger.info(f"K线同步完成,新增 {inserted} 行")
 
-        # 研报过滤仅影响分析池，不影响 K 线数据完整性
+        # 研报过滤仅影响分析池,不影响 K 线数据完整性
         analysis_pool = self._filter_by_research_report(pure_codes)
 
         save_dir = os.path.dirname(self._cache_dir) if os.path.isdir(self._cache_dir) else os.getcwd()
@@ -455,21 +546,6 @@ class IncrementalSyncEngine:
             ).scalar()
         return rows
 
-    def _detect_split_from_adj(self, symbol: str, new_df: pd.DataFrame, latest: date) -> bool:
-        """对比 DB 中最新的 adj_factor 与新批次数据是否一致。"""
-        with self._engine.connect() as conn:
-            old = conn.execute(
-                text(f"SELECT adj_factor FROM {TABLE} WHERE symbol = :sym AND trade_date::date = :date"),
-                {"sym": symbol, "date": latest},
-            ).scalar()
-        if old is None:
-            return False
-        new_adj = new_df.loc[new_df['trade_date'] == latest.isoformat(), 'adj_factor']
-        if new_adj.empty:
-            return False
-        ratio = new_adj.iloc[0] / old
-        return ratio > 1.01 or ratio < 0.99
-
     # ── stale filter (P0-1) ─────────────────────────────────────
 
     def _get_stale_symbols(self, symbols: list[str]) -> list[str]:
@@ -488,11 +564,11 @@ class IncrementalSyncEngine:
         stale = [s for s in symbols if s not in up_to_date]
         skipped = len(symbols) - len(stale)
         if skipped:
-            logger.info(f"跳过 {skipped} 只（已有 {self._trade_date_str} 数据），需处理 {len(stale)} 只")
+            logger.info(f"跳过 {skipped} 只(已有 {self._trade_date_str} 数据),需处理 {len(stale)} 只")
         return stale
 
     def _has_no_close_normal(self, symbol: str) -> bool:
-        """DB 中 close_normal 为 NULL（从未写入原始不复权收盘价），需全量刷新。"""
+        """DB 中 close_normal 为 NULL(从未写入原始不复权收盘价),需全量刷新."""
         with self._engine.connect() as conn:
             row = conn.execute(
                 text(f"SELECT close_normal FROM {TABLE} WHERE symbol = :sym ORDER BY trade_date DESC LIMIT 1"),
@@ -504,7 +580,7 @@ class IncrementalSyncEngine:
 
     @staticmethod
     def align_to_trading_day(date_str: str) -> str:
-        """将 YYYYMMDD 对齐到当天或之后的首个交易日，返回 YYYYMMDD。"""
+        """将 YYYYMMDD 对齐到当天或之后的首个交易日,返回 YYYYMMDD."""
         try:
             from DataCollection.CalendarManager import TradingCalendarAnalyzer
             cal = TradingCalendarAnalyzer()
@@ -531,7 +607,7 @@ class IncrementalSyncEngine:
         return row if row is not None else None
 
     def _write_batch(self, df: pd.DataFrame) -> None:
-        """幂等写入：(symbol, trade_date) 唯一约束 + ON CONFLICT DO UPDATE。"""
+        """幂等写入：(symbol, trade_date) 唯一约束 + ON CONFLICT DO UPDATE."""
         if df.empty:
             return
         records = df.rename(columns={}).to_dict("records")
