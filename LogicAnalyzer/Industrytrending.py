@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import datetime
 import os
@@ -46,14 +46,14 @@ class SWIndustryDataPipeline:
             return df_hist
 
         mapping = {
-            'code': ['代码', '����'], # 新增映射，处理历史数据的代码列
-            'date': ['日期', 'date', 'trade_date', '����'],
-            'open': ['开盘', 'open', 'O', '����'],
-            'high': ['最高', 'high', 'H', '����'],
-            'low': ['最低', 'low', 'L', '���'],
-            'close': ['收盘', 'close', 'C', '���'],
-            'volume': ['成交量', 'volume', 'vol', 'V', '�ɽ���'],
-            'amount': ['成交额', 'amount', 'amt', 'A', '�ɽ���']
+            'code': ['代码', '^^^^'], # 新增映射，处理历史数据的代码列
+            'date': ['日期', 'date', 'trade_date', '^^^^'],
+            'open': ['开盘', 'open', 'O', '^^^^'],
+            'high': ['最高', 'high', 'H', '^^^^'],
+            'low': ['最低', 'low', 'L', '^^^'],
+            'close': ['收盘', 'close', 'C', '^^^'],
+            'volume': ['成交量', 'volume', 'vol', 'V', '^成交量^'],
+            'amount': ['成交额', 'amount', 'amt', 'A', '^成交额^']
         }
         
         rename_dict = {}
@@ -229,19 +229,17 @@ class SWMultiFactorModel:
     def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
         logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
-        # 完全绕过 pandas sort_values (PyArrow native 路径触发 AV 0xC0000005)
-        # 用 numpy lexsort 排序，再用 iloc 重排，彻底避开 ArrowDtype 代码路径
-        df = pd.concat([df_hist[col].reset_index(drop=True) for col in df_hist.columns], axis=1)
-        df = _ensure_numpy_backend(df)
-        sort_idx = np.lexsort([df['date'].to_numpy(), df['code'].to_numpy()])
-        df = df.iloc[sort_idx].reset_index(drop=True)
+        
+        # 使用标准 pandas sort_values，避免 iloc 内存问题
+        df = _ensure_numpy_backend(df_hist.copy())
+        df = df.sort_values(['code', 'date']).reset_index(drop=True)
         logger.info("排序完成")
         
         for p in self.ma_periods:
             logger.info(f"计算 MA{p}...")
             df[f'ma_{p}'] = df.groupby('code')['close'].transform(lambda x: x.rolling(p).mean())
             logger.info(f"MA{p} 完成")
-             
+              
         logger.info("计算 vol_ma_20...")
         df['vol_ma_20'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(20).mean())
         logger.info("计算 amt_ma_60...")
@@ -404,4 +402,3 @@ class IndustryFlowAnalyzer:
 
         result_df = self.model.run_scoring()
         return self._format_main_output(result_df)
- 
