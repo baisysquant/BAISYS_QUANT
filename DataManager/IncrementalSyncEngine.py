@@ -258,8 +258,9 @@ class IncrementalSyncEngine:
         if raw_rows and hfq_rows:
             return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
 
-        logger.warning(f"腾讯API {symbol} 返回空,尝试 akshare fallback...")
-        return self._fetch_akshare_fallback(symbol, start, end)
+        # 腾讯API 失败时直接返回 None，由批处理器标记为失败股票，下次重试
+        logger.warning(f"腾讯API {symbol} 返回空,标记为失败，将在下次同步时重试")
+        return None
 
     def _build_qq_df(self, symbol: str, start: str, end: str,
                      raw_rows: list[list], hfq_rows: list[list]) -> pd.DataFrame | None:
@@ -290,35 +291,6 @@ class IncrementalSyncEngine:
             out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
             out["close_normal"].append(close_raw)
         return pd.DataFrame(out)
-
-    def _fetch_akshare_fallback(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
-        """akshare stock_zh_a_hist_tx 兜底"""
-        import akshare as ak
-        try:
-            df = ak.stock_zh_a_hist_tx(
-                symbol=symbol,
-                start_date=start.replace("-", ""),
-                end_date=end.replace("-", ""),
-                adjust="hfq",
-            )
-            if df is None or df.empty:
-                logger.warning(f"akshare fallback {symbol} 空数据")
-                return None
-            date_col = "date" if "date" in df.columns else df.columns[0]
-            df = df.rename(columns={date_col: "trade_date"})
-            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
-            required = {"trade_date", "open", "close", "high", "low", "volume", "amount"}
-            if not required.issubset(df.columns):
-                logger.warning(f"akshare fallback {symbol} 缺少列: {required - set(df.columns)}")
-                return None
-            df["symbol"] = symbol
-            df["adj_factor"] = 1.0
-            df["close_normal"] = df["close"]
-            return df[["symbol", "trade_date", "open", "close", "high", "low",
-                       "volume", "amount", "adj_factor", "close_normal"]]
-        except Exception as e:
-            logger.error(f"akshare fallback {symbol} 失败: {type(e).__name__}: {e}")
-            return None
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[int, list[str]]:
         """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入."""
@@ -632,4 +604,3 @@ class IncrementalSyncEngine:
             for sym in sorted(symbols):
                 f.write(f"{sym}\n")
         logger.warning(f"缓存 {len(symbols)} 只失败股票 → {os.path.basename(path)}")
-
