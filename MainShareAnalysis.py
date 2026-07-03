@@ -1,6 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import os
 import sys
+
+# 禁用 pandera 导入警告
+os.environ['DISABLE_PANDERA_IMPORT_WARNING'] = 'True'
 
 import pandas as pd
 # 全局禁用 PyArrow 后端，防止 0xC0000005 访问违例
