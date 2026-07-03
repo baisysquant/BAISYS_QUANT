@@ -74,7 +74,7 @@ class SWIndustryDataPipeline:
             # 先读取缓存，检查其完整性
             try:
                 cached_hist = pd.read_parquet(self.cache_file)
-                cached_hist = self._ensure_numpy_backend(cached_hist)
+                cached_hist = _ensure_numpy_backend(cached_hist)
             except (OSError, ValueError, TypeError, ImportError):
                 cached_hist = pd.read_csv(self.cache_csv_file, dtype={'date': str})
                 cached_hist['date'] = pd.to_datetime(cached_hist['date'])
@@ -205,6 +205,20 @@ class SWIndustryDataPipeline:
         return df_all
 
 
+def _ensure_numpy_backend(df: pd.DataFrame) -> pd.DataFrame:
+    """将 DataFrame 中的 PyArrow 类型列转为 NumPy 类型，避免 sort_values 等操作崩溃"""
+    for col in df.columns:
+        dtype = df[col].dtype
+        if isinstance(dtype, pd.ArrowDtype):
+            if pd.api.types.is_datetime64_any_dtype(dtype):
+                df[col] = df[col].astype('datetime64[ns]')
+            elif pd.api.types.is_string_dtype(dtype):
+                df[col] = df[col].astype(str)
+            else:
+                df[col] = df[col].astype(dtype.numpy_dtype)
+    return df
+
+
 class SWMultiFactorModel:
     """模块二：多因子计算引擎（纯本地向量化计算，极速）"""
     
@@ -212,23 +226,15 @@ class SWMultiFactorModel:
         self.pipeline = pipeline
         self.ma_periods = [10, 20, 30, 60, 90]
 
-    def _ensure_numpy_backend(self, df: pd.DataFrame) -> pd.DataFrame:
-        for col in df.columns:
-            dtype = df[col].dtype
-            if isinstance(dtype, pd.ArrowDtype):
-                if pd.api.types.is_datetime64_any_dtype(dtype):
-                    df[col] = df[col].astype('datetime64[ns]')
-                elif pd.api.types.is_string_dtype(dtype):
-                    df[col] = df[col].astype(str)
-                else:
-                    df[col] = df[col].astype(dtype.numpy_dtype)
-        return df
-
     def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
         logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
-        df_hist = self._ensure_numpy_backend(df_hist)
-        df = df_hist.sort_values(['code', 'date']).copy()
+        # 完全绕过 pandas sort_values (PyArrow native 路径触发 AV 0xC0000005)
+        # 用 numpy lexsort 排序，再用 iloc 重排，彻底避开 ArrowDtype 代码路径
+        df = pd.concat([df_hist[col].reset_index(drop=True) for col in df_hist.columns], axis=1)
+        df = _ensure_numpy_backend(df)
+        sort_idx = np.lexsort([df['date'].to_numpy(), df['code'].to_numpy()])
+        df = df.iloc[sort_idx].reset_index(drop=True)
         logger.info("排序完成")
         
         for p in self.ma_periods:
@@ -269,7 +275,7 @@ class SWMultiFactorModel:
             df_hist = pd.read_csv(self.pipeline.cache_csv_file, dtype={'date': str})
             df_hist['date'] = pd.to_datetime(df_hist['date'])
             df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
-        df_hist = self._ensure_numpy_backend(df_hist)
+        df_hist = _ensure_numpy_backend(df_hist)
         df_hist['code'] = df_hist['code'].astype(str)
 
         df_val = pd.read_csv(self.pipeline.valuation_file)

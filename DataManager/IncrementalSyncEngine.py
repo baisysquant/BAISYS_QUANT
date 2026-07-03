@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -21,7 +22,8 @@ OVERLAP_DAYS = 15
 BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
-FETCH_WORKERS = 10        # 每管道并发取数线程数
+FETCH_WORKERS = 2         # 每管道并发取数线程数
+_STOCK_FETCH_LOCK = threading.Lock()  # 全局锁：Windows SSL 并发必崩，同一时刻只允许一只股票发请求
 
 
 class IncrementalSyncEngine:
@@ -56,6 +58,11 @@ class IncrementalSyncEngine:
         except Exception:
             self._trade_date = date.today()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
+        # 全局共享 Session，限制并发连接数防 Windows SSL 崩溃
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._cleanup_old_cache()
 
     # ── public API ──────────────────────────────────────────────
@@ -209,10 +216,12 @@ class IncrementalSyncEngine:
     TX_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 
     def _fetch_one_stock(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
-        """获取一只股票不复权 + 后复权数据,返回合并 DataFrame.
+        """获取一只股票不复权 + 后复权数据,返回合并 DataFrame."""
+        # Windows SSL 并发必崩 0xC0000005，全局锁确保同一时刻只发一个请求
+        with _STOCK_FETCH_LOCK:
+            return self._do_fetch_one_stock(symbol, start, end)
 
-        Tencent API 直调,无 sleep,429/5xx 自动重试最多 3 次.
-        """
+    def _do_fetch_one_stock(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
         start_year = int(start[:4])
         end_year = int(end[:4])
 
@@ -224,7 +233,7 @@ class IncrementalSyncEngine:
                 var = f"kline_day{adjust}{year}"
                 for attempt in range(3):
                     try:
-                        r = requests.get(
+                        r = self._session.get(
                             self.TX_URL,
                             params={"_var": var, "param": param, "r": "0.8205"},
                             timeout=15,
@@ -236,16 +245,79 @@ class IncrementalSyncEngine:
                         data = json.loads(r.text[r.text.find("={") + 1:])
                         rows.extend(data["data"][symbol].get(key, []))
                         break
-                    except Exception:
+                    except Exception as e:
                         if attempt < 2:
                             time.sleep(2 ** attempt)
                         else:
+                            logger.error(f"腾讯API {symbol} {adjust} 第{year}年 3次重试均失败: {type(e).__name__}: {e}")
                             return None
             return rows
 
         raw_rows = _tx_raw("")
         hfq_rows = _tx_raw("hfq")
-        if not raw_rows or not hfq_rows:
+        if raw_rows and hfq_rows:
+            return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
+
+        logger.warning(f"腾讯API {symbol} 返回空,尝试 akshare fallback...")
+        return self._fetch_akshare_fallback(symbol, start, end)
+
+    def _build_qq_df(self, symbol: str, start: str, end: str,
+                     raw_rows: list[list], hfq_rows: list[list]) -> pd.DataFrame | None:
+        raw_map = {str(r[0]): r for r in raw_rows}
+        hfq_map = {str(h[0]): h for h in hfq_rows}
+        common = sorted(set(raw_map) & set(hfq_map))
+        filtered = [d for d in common if start <= d.replace("-", "") <= end]
+        if not filtered:
+            return None
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "volume": [], "amount": [],
+            "adj_factor": [], "close_normal": [],
+        }
+        for d in filtered:
+            raw = raw_map[d]
+            hfq = hfq_map[d]
+            close_raw = float(raw[2])
+            close_hfq = float(hfq[2])
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d)
+            out["open"].append(float(hfq[1]))
+            out["close"].append(close_hfq)
+            out["high"].append(float(hfq[3]))
+            out["low"].append(float(hfq[4]))
+            out["volume"].append(int(float(raw[5]) * 100))
+            out["amount"].append(float(raw[8]) * 10000)
+            out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
+            out["close_normal"].append(close_raw)
+        return pd.DataFrame(out)
+
+    def _fetch_akshare_fallback(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
+        """akshare stock_zh_a_hist_tx 兜底"""
+        import akshare as ak
+        try:
+            df = ak.stock_zh_a_hist_tx(
+                symbol=symbol,
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+                adjust="hfq",
+            )
+            if df is None or df.empty:
+                logger.warning(f"akshare fallback {symbol} 空数据")
+                return None
+            date_col = "date" if "date" in df.columns else df.columns[0]
+            df = df.rename(columns={date_col: "trade_date"})
+            df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+            required = {"trade_date", "open", "close", "high", "low", "volume", "amount"}
+            if not required.issubset(df.columns):
+                logger.warning(f"akshare fallback {symbol} 缺少列: {required - set(df.columns)}")
+                return None
+            df["symbol"] = symbol
+            df["adj_factor"] = 1.0
+            df["close_normal"] = df["close"]
+            return df[["symbol", "trade_date", "open", "close", "high", "low",
+                       "volume", "amount", "adj_factor", "close_normal"]]
+        except Exception as e:
+            logger.error(f"akshare fallback {symbol} 失败: {type(e).__name__}: {e}")
             return None
 
         raw_map = {str(r[0]): r for r in raw_rows}
@@ -294,7 +366,8 @@ class IncrementalSyncEngine:
                             all_data[sym] = df
                         else:
                             failed.append(sym)
-                    except Exception:
+                    except Exception as e:
+                        logger.error(f"  [{sym}] fetch 异常: {type(e).__name__}: {e}")
                         failed.append(sym)
                     pbar.update(1)
 
@@ -354,7 +427,8 @@ class IncrementalSyncEngine:
                         else:
                             to_write.append(all_data[sym])
                             written_symbols.add(sym)
-                    except Exception:
+                    except Exception as e:
+                        logger.error(f"  [split-refetch {sym}] 异常: {type(e).__name__}: {e}")
                         to_write.append(all_data[sym])
                         written_symbols.add(sym)
 

@@ -2,6 +2,11 @@
 
 import sys
 
+import pandas as pd
+# 全局禁用 PyArrow 后端，防止 0xC0000005 访问违例
+pd.options.future.infer_string = False
+pd.options.mode.string_storage = "python"
+
 from loguru import logger
 
 from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
