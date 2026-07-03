@@ -320,36 +320,6 @@ class IncrementalSyncEngine:
             logger.error(f"akshare fallback {symbol} 失败: {type(e).__name__}: {e}")
             return None
 
-        raw_map = {str(r[0]): r for r in raw_rows}
-        hfq_map = {str(h[0]): h for h in hfq_rows}
-        common = sorted(set(raw_map) & set(hfq_map))
-        filtered = [d for d in common if start <= d.replace("-", "") <= end]
-        if not filtered:
-            return None
-
-        out: dict[str, list] = {
-            "symbol": [], "trade_date": [], "open": [], "close": [],
-            "high": [], "low": [], "volume": [], "amount": [],
-            "adj_factor": [], "close_normal": [],
-        }
-        for d in filtered:
-            raw = raw_map[d]
-            hfq = hfq_map[d]
-            close_raw = float(raw[2])
-            close_hfq = float(hfq[2])
-            out["symbol"].append(symbol)
-            out["trade_date"].append(d)
-            out["open"].append(float(hfq[1]))
-            out["close"].append(close_hfq)
-            out["high"].append(float(hfq[3]))
-            out["low"].append(float(hfq[4]))
-            out["volume"].append(int(float(raw[5]) * 100))
-            out["amount"].append(float(raw[8]) * 10000)
-            out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
-            out["close_normal"].append(close_raw)
-
-        return pd.DataFrame(out)
-
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[int, list[str]]:
         """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入."""
         # Step 1: concurrent fetch
@@ -662,5 +632,4 @@ class IncrementalSyncEngine:
             for sym in sorted(symbols):
                 f.write(f"{sym}\n")
         logger.warning(f"缓存 {len(symbols)} 只失败股票 → {os.path.basename(path)}")
-
 
