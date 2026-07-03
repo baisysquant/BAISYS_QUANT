@@ -16,13 +16,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-import akshare as ak
 import pandas as pd
 from loguru import logger
 
 from UtilsManager.AkshareConfig import ensure_akshare_timeout
-
-ensure_akshare_timeout()
 
 
 @dataclass
@@ -66,6 +63,8 @@ class MacroFilter:
         print("\n  宏观过滤[L1] 获取上证指数数据...", end="", flush=True)
         if index_df is None:
             try:
+                ensure_akshare_timeout()
+                import akshare as ak
                 index_df = ak.stock_zh_index_daily_tx(
                     symbol=MacroFilter.INDEX_SYMBOL,
                     start_date=start_date,
@@ -134,6 +133,7 @@ class MacroFilter:
         print("  宏观过滤[L3] 市场广度...", end="", flush=True)
         if spot_df is None:
             try:
+                import akshare as ak
                 spot_df = ak.stock_zh_a_spot_em()
             except Exception as e:
                 logger.warning("宏观过滤：全A行情获取失败 %s，跳过 Level 3", e)

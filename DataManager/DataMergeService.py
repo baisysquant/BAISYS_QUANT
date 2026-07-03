@@ -114,7 +114,9 @@ class DataMergeService:
         formatted = {CodeNormalizer.normalize(c) for c in stock_codes}
         cache = self._industry_cache.copy()
         cache["__norm__"] = cache[ColumnNames.STOCK_CODE].apply(CodeNormalizer.normalize)
-        return cache[cache["__norm__"].isin(formatted)].drop(columns="__norm__")
+        filtered = cache[cache["__norm__"].isin(formatted)].copy()
+        filtered[ColumnNames.STOCK_CODE] = filtered["__norm__"]
+        return filtered.drop(columns="__norm__")
 
     # ── 合并方法 ─────────────────────────────────────────────
 

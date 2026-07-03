@@ -243,12 +243,6 @@ class StockAnalysisCoordinator:
             ctx.set("spot_data", pd.DataFrame())
             return True
 
-        self.logger.info("  [close_normal] 按需回填不复权收盘价...")
-        try:
-            self.incremental_sync_engine.backfill_close_normal(stock_codes_prefixed)
-        except Exception as e:
-            self.logger.warning(f"  [close_normal] 回填异常: {e}，后续走降级路径")
-
         try:
             hist_df_all = self.data_provider.get_kline(stock_codes_prefixed)
             if not hist_df_all.empty:
@@ -264,36 +258,22 @@ class StockAnalysisCoordinator:
         if hist_df_all.empty:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
-        from UtilsManager.CodeNormalizer import CodeNormalizer
-
+        # 从 hist_df_all 获取每只股票最新的 close_normal 作为 spot_data
         try:
-            close_normal_df = self.incremental_sync_engine.backfill_close_normal()
-            if not close_normal_df.empty:
-                close_map = {}
-                for _, row in close_normal_df.iterrows():
-                    # Cache 文件已有 symbol 列（格式如 sh600000, sz000001），直接使用
-                    symbol = str(row.get("symbol", ""))
-                    close_val = row.get("close")
-                    if symbol and pd.notna(close_val):
-                        close_map[symbol] = float(close_val)
-
-                records = []
-                for sym in stock_codes_prefixed:
-                    if sym in close_map:
-                        pure = CodeNormalizer.normalize_series(pd.Series([sym])).iloc[0]
-                        records.append({"股票代码": pure, "最新价": close_map[sym]})
-
-                if records:
-                    latest_prices_df = pd.DataFrame(records)
-                    self.logger.info(f"[INFO] 从 AShareHub 缓存获取了 {len(latest_prices_df)} 只股票的实际收盘价")
-                else:
-                    self.logger.warning("[WARN] AShareHub 缓存无匹配数据，最新价留空")
-                    latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
+            cn = hist_df_all[hist_df_all["close_normal"].notna()]
+            if not cn.empty:
+                last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
+                from UtilsManager.CodeNormalizer import CodeNormalizer
+                last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
+                latest_prices_df = last_cn[["股票代码", "close_normal"]].rename(
+                    columns={"close_normal": "最新价"}
+                )
+                self.logger.info(f"[INFO] 从 DB 获取 {len(latest_prices_df)} 只股票的最新收盘价")
             else:
-                self.logger.warning("[WARN] AShareHub 缓存为空，最新价留空")
                 latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
+                self.logger.warning("[WARN] 数据库 close_normal 为空，最新价留空")
         except Exception as e:
-            self.logger.warning(f"[WARN] 读取 close_normal 缓存失败: {e}")
+            self.logger.warning(f"[WARN] 构建最新价失败: {e}")
             latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
 
         ctx.set("hist_df", hist_df_all)

@@ -7,9 +7,9 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import akshare as ak
 import numpy as np
 import pandas as pd
+import requests
 from asharehub import AShareHub
 from loguru import logger
 
@@ -74,9 +74,12 @@ class SWIndustryDataPipeline:
             # 先读取缓存，检查其完整性
             try:
                 cached_hist = pd.read_parquet(self.cache_file)
+                cached_hist = self._ensure_numpy_backend(cached_hist)
             except (OSError, ValueError, TypeError, ImportError):
-                cached_hist = pd.read_csv(self.cache_csv_file, parse_dates=['date'])
-            
+                cached_hist = pd.read_csv(self.cache_csv_file, dtype={'date': str})
+                cached_hist['date'] = pd.to_datetime(cached_hist['date'])
+            cached_hist = cached_hist.loc[:, ~cached_hist.columns.duplicated()]
+
             cached_val = pd.read_csv(self.valuation_file)
             cached_industry_count = len(cached_val)
             
@@ -131,7 +134,26 @@ class SWIndustryDataPipeline:
 
         def fetch_one(code: str, name: str) -> pd.DataFrame | None:
             try:
-                df_hist = ak.index_hist_sw(symbol=code, period="day")
+                url = "https://www.swsresearch.com/institute-sw/api/index_publish/trend/"
+                params = {"swindexcode": code, "period": "DAY"}
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                r = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
+                r.raise_for_status()
+                data_json = r.json()
+                df_hist = pd.DataFrame(data_json["data"])
+                df_hist.rename(
+                    columns={
+                        "swindexcode": "代码",
+                        "bargaindate": "日期",
+                        "openindex": "开盘",
+                        "maxindex": "最高",
+                        "minindex": "最低",
+                        "closeindex": "收盘",
+                        "bargainamount": "成交量",
+                        "bargainsum": "成交额",
+                    },
+                    inplace=True,
+                )
                 if df_hist is not None and not df_hist.empty:
                     df_hist_mapped = self._map_hist_columns(df_hist)
                     required_core_cols = ['date', 'close', 'volume', 'amount']
@@ -168,16 +190,18 @@ class SWIndustryDataPipeline:
 
         logger.info("数据合并与本地缓存...")
         df_all = pd.concat(all_hist_data, ignore_index=True)
+        # 去重列（SW接口可能返回同名英文字段）
+        df_all = df_all.loc[:, ~df_all.columns.duplicated()]
         
         # 尝试保存为Parquet，如果失败则保存为CSV
         try:
             df_all.to_parquet(self.cache_file, index=False)
             logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
-        except Exception:
-            # 如果pyarrow或fastparquet不可用，则保存为CSV
+        except Exception as e:
+            logger.warning(f"Parquet保存失败 ({e})，回退到CSV...")
             df_all.to_csv(self.cache_csv_file, index=False, encoding='utf-8-sig')
             logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
-            
+
         return df_all
 
 
@@ -188,9 +212,22 @@ class SWMultiFactorModel:
         self.pipeline = pipeline
         self.ma_periods = [10, 20, 30, 60, 90]
 
+    def _ensure_numpy_backend(self, df: pd.DataFrame) -> pd.DataFrame:
+        for col in df.columns:
+            dtype = df[col].dtype
+            if isinstance(dtype, pd.ArrowDtype):
+                if pd.api.types.is_datetime64_any_dtype(dtype):
+                    df[col] = df[col].astype('datetime64[ns]')
+                elif pd.api.types.is_string_dtype(dtype):
+                    df[col] = df[col].astype(str)
+                else:
+                    df[col] = df[col].astype(dtype.numpy_dtype)
+        return df
+
     def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
         logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
+        df_hist = self._ensure_numpy_backend(df_hist)
         df = df_hist.sort_values(['code', 'date']).copy()
         logger.info("排序完成")
         
@@ -229,7 +266,10 @@ class SWMultiFactorModel:
         try:
             df_hist = pd.read_parquet(self.pipeline.cache_file)
         except (ImportError, OSError, ValueError, TypeError):
-            df_hist = pd.read_csv(self.pipeline.cache_csv_file, parse_dates=['date'])
+            df_hist = pd.read_csv(self.pipeline.cache_csv_file, dtype={'date': str})
+            df_hist['date'] = pd.to_datetime(df_hist['date'])
+            df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
+        df_hist = self._ensure_numpy_backend(df_hist)
         df_hist['code'] = df_hist['code'].astype(str)
 
         df_val = pd.read_csv(self.pipeline.valuation_file)

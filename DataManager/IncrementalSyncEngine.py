@@ -367,76 +367,6 @@ class IncrementalSyncEngine:
         logger.info(f"  {desc} 完成: 成功 {written_cnt} 只, 失败 {len(failed)} 只")
         return written_cnt, failed
 
-    def backfill_close_normal(self, symbols_prefixed: list[str] | None = None) -> pd.DataFrame:
-        """双管道获取全市场最新不复权收盘价,写入本地缓存文件.
-
-        通过 Tencent(stock_zh_a_hist_tx)双管道并行获取原始 close,
-        写入 ``close_normal_{YYYYMMDD}.csv``(symbol, close 两列).
-        Args:
-            symbols_prefixed: 股票代码列表(带前缀),None 表示从 DB 获取全部.
-        Returns:
-            DataFrame 包含 symbol, close 两列；失败返回空 DataFrame.
-        """
-        cache_file = self._close_normal_cache_path()
-        if os.path.exists(cache_file):
-            try:
-                df = pd.read_csv(cache_file)
-                logger.info(f"[close_normal] 从缓存加载 {len(df)} 只 → {os.path.basename(cache_file)}")
-                return df
-            except Exception as e:
-                logger.warning(f"[close_normal] 缓存读取失败: {e},重新拉取")
-
-        if symbols_prefixed is None:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    text(f"SELECT DISTINCT symbol FROM {TABLE}")
-                ).fetchall()
-                symbols_prefixed = [r[0] for r in rows]
-
-        if not symbols_prefixed:
-            return pd.DataFrame()
-
-        mid = len(symbols_prefixed) // 2
-        half_a = symbols_prefixed[:mid]
-        half_b = symbols_prefixed[mid:]
-        end = self._trade_date_str
-        results: dict[str, float] = {}
-
-        def _fetch_one(sym: str) -> tuple[str, float | None]:
-            try:
-                with ProcessPoolExecutor(max_workers=1) as pool:
-                    f = pool.submit(_sina_daily_worker, sym, end, end, "")
-                    r = f.result(timeout=15)
-                if r is not None and not r.empty:
-                    close_val = pd.to_numeric(r["close"].iloc[-1], errors="coerce")
-                    if pd.notna(close_val):
-                        return sym, float(close_val)
-            except Exception:
-                pass
-            return sym, None
-
-        def _fetch_backfill_half(syms: list[str]) -> dict[str, float]:
-            local: dict[str, float] = {}
-            for sym in syms:
-                sym_val = _fetch_one(sym)
-                if sym_val[1] is not None:
-                    local[sym_val[0]] = sym_val[1]
-            return local
-
-        results: dict[str, float] = {}
-        for half in (half_a, half_b):
-            results.update(_fetch_backfill_half(half))
-
-        if not results:
-            logger.warning("[close_normal] 双管道均无数据")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(list(results.items()), columns=["symbol", "close"])
-        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-        df.to_csv(cache_file, index=False)
-        logger.info(f"[close_normal] 双管道获取完成: {len(df)} 只 → {os.path.basename(cache_file)}")
-        return df
-
     # ── stock pool (merged from StockSyncEngine) ──────────────
 
     def get_stock_pool_from_db(self) -> pd.DataFrame:
@@ -447,8 +377,16 @@ class IncrementalSyncEngine:
         """
         with self._engine.connect() as conn:
             df = pd.read_sql(text(query), conn)
+        def _strip(s: str) -> str:
+            s = str(s)
+            for pfx in ("sh", "sz", "bj"):
+                if s.startswith(pfx):
+                    s = s[len(pfx):]
+                    break
+            return s.zfill(6)
         if "股票代码" in df.columns:
-            df["股票代码"] = df["股票代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.zfill(6)
+            df["股票代码"] = df["股票代码"].apply(_strip)
+        df["ts_code"] = df["ts_code"].apply(_strip)
         for col in ("ts_code", "name", "industry", "股票代码"):
             if col not in df.columns:
                 df[col] = "N/A"
@@ -650,10 +588,5 @@ class IncrementalSyncEngine:
             for sym in sorted(symbols):
                 f.write(f"{sym}\n")
         logger.warning(f"缓存 {len(symbols)} 只失败股票 → {os.path.basename(path)}")
-
-    # ── helpers ─────────────────────────────────────────────────
-
-    def _close_normal_cache_path(self) -> str:
-        return os.path.join(self._cache_dir, f"close_normal_{self._trade_date_str}.csv")
 
 

@@ -192,7 +192,8 @@ class StockBasicInfoService:
                 if done % 20 == 0 or done == total:
                     self.logger.info(f"  进度: {done}/{total} 个行业")
 
-        # 5. 过滤 ST / 退市股票（源头保障）
+        # 5. 构建 DataFrame 并过滤 ST / 退市股票
+        df = pd.DataFrame(all_stocks)
         st_pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])|退市"
         mask = ~df["stock_name"].astype(str).str.contains(st_pattern, na=False)
         filtered_count = (~mask).sum()

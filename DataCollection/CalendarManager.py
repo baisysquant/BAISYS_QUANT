@@ -5,15 +5,12 @@ import os
 from datetime import datetime, timedelta
 from typing import Any
 
-import akshare as ak
 import pandas as pd
 import pytz
 import requests
 from loguru import logger
 
 from UtilsManager.AkshareConfig import ensure_akshare_timeout
-
-ensure_akshare_timeout()
 
 
 class TradingCalendarAnalyzer:
@@ -50,6 +47,8 @@ class TradingCalendarAnalyzer:
     def _fetch_from_akshare(self) -> set[str] | None:
         try:
             logger.info("[Calendar] 正在从 Akshare 接口获取最新的官方交易日历...")
+            ensure_akshare_timeout()
+            import akshare as ak
             df = ak.tool_trade_date_hist_sina()
 
             if df is None or df.empty:

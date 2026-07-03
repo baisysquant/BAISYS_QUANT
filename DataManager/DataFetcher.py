@@ -130,13 +130,13 @@ class DataFetcher:
         return df
 
     def fetch(
-        self, fetch_func: Callable, file_base_name: str, clean_pipeline: Callable | None = None, **kwargs: Any  # noqa: ANN401
+        self, fetch_func: Callable | str, file_base_name: str, clean_pipeline: Callable | None = None, **kwargs: Any  # noqa: ANN401
     ) -> pd.DataFrame:
         """
         统一的数据获取方法
 
         Args:
-            fetch_func: 获取数据的函数
+            fetch_func: 获取数据的函数（或akshare函数名字符串）
             file_base_name: 文件基础名称
             clean_pipeline: 可选的自定义清洗函数
             **kwargs: 传递给fetch_func的参数
@@ -149,7 +149,12 @@ class DataFetcher:
         if not cached_df.empty:
             return cached_df
 
-        # 2. 如果清洗后的缓存不存在，则尝试从原始获取
+        # 2. 如果是akshare函数名，延迟加载（避免V8在缓存命中时加载）
+        if isinstance(fetch_func, str):
+            import akshare as ak  # noqa: F811
+            fetch_func = getattr(ak, fetch_func)
+
+        # 3. 如果清洗后的缓存不存在，则尝试从原始获取
         df = pd.DataFrame()
         for i in range(self.config.DATA_FETCH_RETRIES):
             try:

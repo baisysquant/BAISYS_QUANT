@@ -10,13 +10,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-import akshare as ak
 import pandas as pd
 from loguru import logger
-
-from UtilsManager.AkshareConfig import ensure_akshare_timeout
-
-ensure_akshare_timeout()
 
 from ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
@@ -59,6 +54,7 @@ class DataAcquisitionService:
     def get_all_raw_data(self, today_str: str) -> dict[str, pd.DataFrame]:
         """
         获取所有原始数据
+
 
         该方法负责从多个 akshare 接口获取原始数据，包括：
         - 资金流数据（根据配置的周期动态获取）
@@ -117,7 +113,7 @@ class DataAcquisitionService:
             period, desc, symbol, key = task
             try:
                 logger.info(f"  - 正在获取: {desc}...")
-                fund_flow_df = self.data_fetcher.fetch(ak.stock_fund_flow_individual, desc, symbol=symbol)
+                fund_flow_df = self.data_fetcher.fetch('stock_fund_flow_individual', desc, symbol=symbol)
 
                 # 验证资金流数据
                 if not fund_flow_df.empty:
@@ -154,10 +150,10 @@ class DataAcquisitionService:
 
         strong_date = today_str.replace("-", "")
         data_sources = {
-            "strong_stocks_raw": (ak.stock_zt_pool_strong_em, "强势股池", {"date": strong_date}),
-            "consecutive_rise_raw": (ak.stock_rank_lxsz_ths, "连续上涨", {}),
-            "ljqs_raw": (ak.stock_rank_ljqs_ths, "量价齐升", {}),
-            "cxfl_raw": (ak.stock_rank_cxfl_ths, "持续放量", {}),
+            "strong_stocks_raw": ("stock_zt_pool_strong_em", "强势股池", {"date": strong_date}),
+            "consecutive_rise_raw": ("stock_rank_lxsz_ths", "连续上涨", {}),
+            "ljqs_raw": ("stock_rank_ljqs_ths", "量价齐升", {}),
+            "cxfl_raw": ("stock_rank_cxfl_ths", "持续放量", {}),
         }
 
         # 定义单个数据源获取的worker函数
@@ -213,7 +209,7 @@ class DataAcquisitionService:
         def fetch_xstp_worker(config: tuple[str, str, str]) -> tuple[str, pd.DataFrame]:
             key, desc, symbol = config
             try:
-                df = self.data_fetcher.fetch(ak.stock_rank_xstp_ths, desc, symbol=symbol)
+                df = self.data_fetcher.fetch('stock_rank_xstp_ths', desc, symbol=symbol)
 
                 if not df.empty:
                     required_cols = [ColumnNames.STOCK_CODE]
