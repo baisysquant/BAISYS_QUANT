@@ -7,33 +7,10 @@ from loguru import logger
 from pandera.errors import SchemaErrors
 
 from DataManager.DataSchemas import create_final_report_schema
+from UtilsManager.Parse_Currency import Parse_Currency
 
 if TYPE_CHECKING:
     from DataManager.DatabaseWriter import QuantDBManager
-
-
-class DataCleaner:
-    """金融数据清洗工具类：处理亿、万、百分比及非法字符"""
-
-    @staticmethod
-    def parse_money_str(val: object) -> float:
-        if pd.isna(val) or val == "" or val in ["--", "-"]:
-            return 0.0
-        s = str(val).strip()
-        try:
-            multiplier = 1.0
-            if "亿" in s:
-                multiplier = 100000000.0
-                s = s.replace("亿", "")
-            elif "万" in s:
-                multiplier = 10000.0
-                s = s.replace("万", "")
-            elif "%" in s:
-                multiplier = 0.01
-                s = s.replace("%", "")
-            return float(s) * multiplier
-        except (ValueError, TypeError):
-            return 0.0
 
 
 class QuantDBSyncTask:
@@ -172,10 +149,10 @@ class QuantDBSyncTask:
         valid_cols = list(mapping.values())
         df_db = df_db[[c for c in valid_cols if c in df_db.columns]]
 
-        # 数值清洗（使用你已有的 DataCleaner）
+        # 数值清洗
         for col in df_db.columns:
             if col not in ["industry_name", "leading_stock", "industry_signal"]:
-                df_db[col] = df_db[col].apply(DataCleaner.parse_money_str)
+                df_db[col] = df_db[col].apply(Parse_Currency.parse_money_str)
 
         self.db.safe_insert_data(df_db, "ods_ak_industry_analysis", "archive_date", today)
 
@@ -288,7 +265,7 @@ class QuantDBSyncTask:
 
         for col in df_db.columns:
             if col not in text_columns:
-                df_db[col] = df_db[col].apply(DataCleaner.parse_money_str)
+                df_db[col] = df_db[col].apply(Parse_Currency.parse_money_str)
 
         int_columns = ["consecutive_up_days", "high_vol_days", "report_buy_count"]
         for col in int_columns:

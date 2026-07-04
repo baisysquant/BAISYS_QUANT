@@ -32,12 +32,8 @@ if sys.stdout.encoding and sys.stdout.encoding.upper() != "UTF-8":
 
 import traceback
 
-import akshare as ak
 import pandas as pd
-
-# ── 全局 pandas 选项：阻止 PyArrow 后端，避免 Windows SChannel 0xC0000005 ──
-pd.options.future.infer_string = False
-pd.options.mode.string_storage = "python"
+import requests
 
 # ── 从项目现有模块导入 ─────────────────────────────────────────────────────
 from ConfigParser import Config
@@ -66,78 +62,87 @@ def print_field(label: str, value: Any) -> None:  # noqa: ANN401
         print(f"    {label:<26} : {value}")
 
 
-# ── 数据获取 ─────────────────────────────────────────────────────────────
+# ── 腾讯行情 API ─────────────────────────────────────────────────────────
+TENCENT_KLINE_URL = "http://ifzq.gtimg.cn/appstock/app/fqkline/get"
+
+
+def _fetch_stock_name(symbol: str) -> str:
+    """通过腾讯行情接口获取股票简称"""
+    try:
+        r = requests.get(f"http://qt.gtimg.cn/q={symbol}", timeout=10)
+        txt = r.text
+        if "~" in txt:
+            parts = txt.split("~")
+            name = parts[1] if len(parts) > 1 else symbol
+        else:
+            name = symbol
+    except Exception:
+        name = symbol
+    return name
+
+
+def _tencent_kline(symbol: str, days: int) -> pd.DataFrame | None:
+    """
+    直接调用腾讯行情 API 获取后复权日 K 线。
+    API 返回 [date, open, close, high, low, volume]（成交量单位为股）。
+    """
+    params = {"param": f"{symbol},day,,,{days},hfq"}
+    try:
+        r = requests.get(TENCENT_KLINE_URL, params=params, timeout=15)
+        data = r.json()
+    except Exception as e:
+        print(f"  [ERROR] 腾讯 API 请求失败: {e}")
+        return None
+
+    if data.get("code") != 0:
+        print(f"  [ERROR] 腾讯 API 返回错误: {data.get('msg')}")
+        return None
+
+    records = data.get("data", {}).get(symbol, {}).get("hfqday")
+    if not records:
+        print(f"  [ERROR] 未获取到 K 线数据 (symbol={symbol})")
+        return None
+
+    rows = []
+    for row in records:
+        if len(row) < 6:
+            continue
+        try:
+            rows.append({
+                "date": pd.to_datetime(row[0]),
+                "open": float(row[1]),
+                "close": float(row[2]),
+                "high": float(row[3]),
+                "low": float(row[4]),
+                "volume": float(row[5]),
+            })
+        except (ValueError, TypeError):
+            continue
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df.sort_values("date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
 def fetch_kline_data(symbol: str, days: int = 300) -> pd.DataFrame | None:
     """
-    获取个股后复权 K 线数据，返回 OHLCV 日线。
-    akshare stock_zh_a_hist_tx 的 amount 列实际是成交量(手)，
-    统一折算为股数（手数×100）。
+    获取个股后复权 K 线数据，返回 OHLCV 日线（重试 3 次）。
 
     Returns:
         DataFrame | None: 包含 date/open/close/high/low/volume 的 DataFrame
     """
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-
     for attempt in range(3):
-        try:
-            # 1) 后复权数据（调整后价格）
-            df_hfq = ak.stock_zh_a_hist_tx(
-                symbol=symbol, start_date=start_date, end_date=end_date, adjust="hfq"
-            )
-            if df_hfq is None or df_hfq.empty:
-                raise ValueError("空数据")
-
-            expected = ["date", "open", "close", "high", "low", "amount"]
-            if any(c not in df_hfq.columns for c in expected):
-                raise ValueError(f"后复权数据缺失列: {df_hfq.columns.tolist()}")
-
-            time.sleep(0.05)
-
-            # 2) 不复权数据（取实际收盘价用于计算调整因子）
-            df_norm = ak.stock_zh_a_hist_tx(
-                symbol=symbol, start_date=start_date, end_date=end_date, adjust=""
-            )
-            if df_norm is None or df_norm.empty:
-                raise ValueError("空数据")
-
-            df_norm = df_norm[["date", "close"]].rename(
-                columns={"close": "close_normal"}
-            )
-
-            # 3) 合并
-            df = pd.merge(df_hfq, df_norm, on="date", how="inner")
-            if df.empty:
-                raise ValueError("合并后无数据")
-
-            # 4) 数值转换
-            for col in ["close", "close_normal", "amount"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            # 5) 计算调整因子和成交量
-            # amount 列实际是成交量(手)，不复权和后复权的 amount 相同（成交股数不变）
-            # 成交量(股数) = 手数 × 100
-            df["adj_factor"] = df["close"] / df["close_normal"].replace(0, pd.NA)
-            df["volume"] = df["amount"] * 100
-            df.dropna(subset=["volume", "adj_factor"], inplace=True)
-
-            # 6) 标准化
-            df["date"] = pd.to_datetime(df["date"])
-            df.sort_values("date", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-
-            return df[["date", "open", "close", "high", "low", "volume"]]
-
-        except Exception as e:
-            if attempt < 2:
-                wait = 2 ** attempt
-                print(f"  [RETRY] 第 {attempt + 1} 次失败，{wait} 秒后重试...")
-                print(f"       {type(e).__name__}: {e}")
-                time.sleep(wait)
-            else:
-                print(f"  [ERROR] 下载数据失败: {type(e).__name__}: {e}")
-                traceback.print_exc()
-                return None
+        df = _tencent_kline(symbol, days)
+        if df is not None and not df.empty:
+            return df
+        if attempt < 2:
+            wait = 2 ** attempt
+            print(f"  [RETRY] 第 {attempt + 1} 次失败，{wait} 秒后重试...")
+            time.sleep(wait)
     return None
 
 
@@ -173,17 +178,8 @@ def main() -> None:
     print_section("基础信息")
     print_field("股票代码", pure_code)
 
-    # 尝试获取股票名称
-    stock_name = pure_code
-    try:
-        info_df = ak.stock_individual_info_em(symbol=pure_code)
-        if info_df is not None and not info_df.empty and len(info_df.columns) >= 2:
-            first_col = info_df.columns[0]
-            name_row = info_df[info_df[first_col].astype(str).str.contains("股票名称")]
-            if not name_row.empty:
-                stock_name = name_row.iloc[0].iloc[1]
-    except Exception:
-        pass
+    # 尝试获取股票名称（腾讯行情接口）
+    stock_name = _fetch_stock_name(symbol)
     print_field("股票名称", stock_name)
 
     latest_price = df["close"].iloc[-1]
@@ -191,7 +187,8 @@ def main() -> None:
     print_field("数据条数", len(df))
 
     # 4. 复用 TASignalProcessor 计算全部技术信号 ──────────────────────
-    config = Config()
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config = Config(config_file=os.path.join(project_root, "config.ini"))
 
     # 准备 TASignalProcessor 要求的 hist_df 格式
     hist_df = df.copy()

@@ -93,7 +93,7 @@ def run_backtest_pipeline(
     logger.info(f"  初始资金: {bt.INITIAL_CASH:,.0f}")
 
     try:
-        symbols = _resolve_symbols(engine)
+        symbols = _resolve_symbols(engine, config)
         logger.info(f"  股票数量: {len(symbols)}")
         logger.warning("生存偏差: 股票池仅含当前存活股票，已退市/ST 股票的历史负收益未被计入")
 
@@ -131,7 +131,7 @@ def run_backtest_pipeline(
         if not wf_result.empty and wf_result["sharpe_ratio"].max() > 3.0:
             logger.warning(f"akquant 结果异常: Sharpe={wf_result['sharpe_ratio'].max():.2f}>3.0，可能存在前瞻偏差")
 
-        best_params = _extract_best_params(wf_result)
+        best_params = _extract_best_params(wf_result, config=config)
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
         from Backtesting._engine_legacy import EngineConfig, run_full_backtest
@@ -248,8 +248,8 @@ def run_backtest_pipeline(
         return None
 
 
-def _resolve_symbols(engine: Any) -> list[str]:
-    """解析全 A 股股票列表（~5000 只），从 stock_basic_info_sw 表获取。"""
+def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
+    """解析股票列表，支持 main_board_only 过滤。"""
     from UtilsManager.CodeNormalizer import CodeNormalizer
 
     with engine.connect() as conn:
@@ -258,10 +258,15 @@ def _resolve_symbols(engine: Any) -> list[str]:
             ORDER BY stock_code
         """)).fetchall()
     if rows:
-        normalized = sorted({
-            CodeNormalizer.add_market_prefix(str(r[0]).strip().zfill(6))
-            for r in rows
-        })
+        raw_codes = sorted({str(r[0]).strip().zfill(6) for r in rows})
+
+        # ── 主板过滤 ──
+        if config is not None and config.MAIN_BOARD_ONLY:
+            before = len(raw_codes)
+            raw_codes = [c for c in raw_codes if c[:2] in ("60", "00")]
+            logger.info(f"主板过滤: {before} → {len(raw_codes)} 只")
+
+        normalized = sorted({CodeNormalizer.add_market_prefix(c) for c in raw_codes})
         if normalized:
             logger.info(f"从本地股票信息表获取 {len(normalized)} 只股票")
             return normalized
@@ -327,20 +332,51 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
         logger.info(f"  刷新完成，新增 {total} 行")
 
 
-def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5) -> dict[str, float]:
+def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config | None = None) -> dict[str, float]:
+    """
+    从 Walk-Forward 结果中提取最佳参数。
+
+    如果提取失败（数据不足、Sharpe 全为 NaN/负值、params 列缺失等），
+    返回配置中的默认参数中位数作为兜底，并记录警告。
+    """
+    # 默认兜底参数（从配置区间取中位数）
+    def _fallback_params(cfg: Config | None) -> dict[str, float]:
+        if cfg is None:
+            return {
+                "atr_stop_mult": 2.0,
+                "atr_t1_mult": 4.0,
+                "kelly_fraction": 0.25,
+                "position_a": 0.35,
+                "liq_veto_ratio": 0.065,
+                "boll_narrow_ratio": 0.9,
+                "cross_decay_days": 37,
+            }
+        bt = cfg.app_config.backtest
+        return {
+            "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
+            "atr_t1_mult": sum(bt.parse_range("ATR_T1_MULT_RANGE")[:2]) / 2,
+            "kelly_fraction": sum(bt.parse_range("KELLY_FRACTION_RANGE")[:2]) / 2,
+            "position_a": sum(bt.parse_range("POSITION_A_RANGE")[:2]) / 2,
+            "liq_veto_ratio": sum(bt.parse_range("LIQ_VETO_RATIO_RANGE")[:2]) / 2,
+            "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
+            "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
+        }
+
     if wf_result.empty or "params" not in wf_result.columns:
-        return {}
+        logger.warning("Walk-Forward 结果为空或缺少 params 列，使用配置中位数作为兜底参数")
+        return _fallback_params(config)
 
     rows = wf_result.dropna(subset=["sharpe_ratio"])
     if rows.empty:
-        return {}
+        logger.warning("Walk-Forward 所有组合 Sharpe 均为 NaN，使用配置中位数作为兜底参数")
+        return _fallback_params(config)
 
-    # 按 sharpe 降序，取 top-N 加权平均
     rows = rows.sort_values("sharpe_ratio", ascending=False).head(top_n)
     weights = rows["sharpe_ratio"].values
     total_weight = weights.sum()
     if total_weight <= 0:
-        return {}
+        logger.warning("Walk-Forward Top-N 组合 Sharpe 权重和 <= 0，使用配置中位数作为兜底参数")
+        return _fallback_params(config)
 
     all_params: list[dict[str, float]] = []
     for _, r in rows.iterrows():
@@ -348,7 +384,8 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5) -> dict[str, f
             all_params.append({k: float(v) for k, v in r["params"].items()})
 
     if not all_params:
-        return {}
+        logger.warning("Walk-Forward params 列无有效 dict，使用配置中位数作为兜底参数")
+        return _fallback_params(config)
 
     keys = all_params[0].keys()
     weighted: dict[str, float] = {}
