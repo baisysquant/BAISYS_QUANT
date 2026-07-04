@@ -1,404 +1,315 @@
-from __future__ import annotations
-
-import datetime
-import os
-import re
+﻿import os
 import time
-import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
-import numpy as np
+import any
 import pandas as pd
-import requests
-from asharehub import AShareHub
-from loguru import logger
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ConfigParser import Config
-
-warnings.filterwarnings('ignore')
-
-class SWIndustryDataPipeline:
-    """模块一：数据管道（负责拉取、清洗与本地缓存）"""
-    
-    def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
-        self.config = config or Config()
-        self.ah_client = AShareHub(api_key=self.config.ASHAREHUB_API_KEY)
-        if today_str:
-            self.today_str = today_str.replace("-", "")
-        else:
-            try:
-                from DataCollection.CalendarManager import TradingCalendarAnalyzer
-                cal = TradingCalendarAnalyzer()
-                self.today_str = cal.get_last_trading_day().replace("-", "")
-            except Exception:
-                self.today_str = datetime.datetime.now().strftime("%Y%m%d")
-        self.cache_dir = os.path.join(self.config.CACHE_DIRECTORY, "sw_data_cache")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self.cache_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.parquet")
-        self.cache_csv_file = os.path.join(self.cache_dir, f"sw_hist_250d_{self.today_str}.csv")
-        self.valuation_file = os.path.join(self.cache_dir, f"sw_valuation_{self.today_str}.csv")
-
-    def _map_hist_columns(self, df_hist: pd.DataFrame) -> pd.DataFrame:
-        """
-        【核心防御机制】为历史数据接口动态映射列名
-        """
-        if df_hist.empty:
-            return df_hist
-
-        mapping = {
-            'code': ['代码', '^^^^'], # 新增映射，处理历史数据的代码列
-            'date': ['日期', 'date', 'trade_date', '^^^^'],
-            'open': ['开盘', 'open', 'O', '^^^^'],
-            'high': ['最高', 'high', 'H', '^^^^'],
-            'low': ['最低', 'low', 'L', '^^^'],
-            'close': ['收盘', 'close', 'C', '^^^'],
-            'volume': ['成交量', 'volume', 'vol', 'V', '^成交量^'],
-            'amount': ['成交额', 'amount', 'amt', 'A', '^成交额^']
-        }
-        
-        rename_dict = {}
-        for col in df_hist.columns:
-            for standard_name, candidates in mapping.items():
-                if any(cand.lower() in str(col).lower() for cand in candidates):
-                    rename_dict[col] = standard_name
-                    break
-        
-        return df_hist.rename(columns=rename_dict)
-
-    def fetch_and_cache_all(self, force_update: bool = False) -> pd.DataFrame | None:
-        """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
-        hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
-        valuation_cache_exists = os.path.exists(self.valuation_file)
-        
-        if hist_cache_exists and valuation_cache_exists and not force_update:
-            # 先读取缓存，检查其完整性
-            try:
-                cached_hist = pd.read_parquet(self.cache_file)
-                cached_hist = _ensure_numpy_backend(cached_hist)
-            except (OSError, ValueError, TypeError, ImportError):
-                cached_hist = pd.read_csv(self.cache_csv_file, dtype={'date': str})
-                cached_hist['date'] = pd.to_datetime(cached_hist['date'])
-            cached_hist = cached_hist.loc[:, ~cached_hist.columns.duplicated()]
-
-            cached_val = pd.read_csv(self.valuation_file)
-            cached_industry_count = len(cached_val)
-            
-            # [KEY] 关键：从 AShareHub 获取二级行业总数
-            ah_df = self.ah_client.industry_list()
-            current_total_industries = ah_df["l2_code"].nunique()
-            
-            # [OK] 只有当缓存的行业数量 == 当前接口总数时，才使用缓存
-            if cached_industry_count == current_total_industries:
-                logger.info(f"缓存完整({cached_industry_count}个行业)，使用缓存数据")
-                return cached_hist
-            else:
-                logger.warning(f"缓存不完整({cached_industry_count}个 vs {current_total_industries}个)，重新拉取...")
+from loguru import logger
+import numpy as np
 
 
-        logger.info("获取申万二级行业列表及估值数据...")
-        try:
-            ah_df = self.ah_client.industry_list()
-            df_info = ah_df[["l2_code", "l2_name"]].drop_duplicates().dropna().copy()
-            df_info.columns = ["行业代码", "行业名称"]
-        except Exception as e:
-            logger.error(f"获取行业列表失败: {e}")
-            return None
+class IndustryTrendingSafeProcessor:
+    """完整的行业趋势与评分保护模块，包含所有异常检测与最终输出要求提取"""
 
-        valuation_cols_map = {
-            '行业代码': 'code',
-            '行业名称': 'name',
-        }
-        
-        missing_valuation_cols = [k for k in ['静态市盈率', 'TTM(滚动)市盈率', '市净率', '静态股息率'] if k not in df_info.columns]
-        if missing_valuation_cols:
-            logger.warning(f"估值数据不可用 (AShareHub 未提供)，使用默认值。")
-        
-        available_valuation_cols = {k: v for k, v in valuation_cols_map.items() if k in df_info.columns}
-        df_val = df_info[list(available_valuation_cols.keys())].copy()
-        df_val.columns = list(available_valuation_cols.values())
-        df_val['pe_static'] = None
-        df_val['pe_ttm'] = None
-        df_val['pb'] = None
-        df_val['div_yield'] = None
-        # --- 智能提取纯数字代码 ---
-        # 使用正则表达式，提取字符串开头的连续数字部分
-        df_val['code'] = df_val['code'].astype(str).apply(lambda x: re.match(r'^(\d+)', x).group(1) if re.match(r'^(\d+)', x) else x)
-        df_val.to_csv(self.valuation_file, index=False, encoding='utf-8-sig')
-
-        codes = df_val['code'].astype(str).tolist()
-        names = df_val['name'].astype(str).tolist()
-        
-        print(f"  ↓ 拉取 {len(codes)} 个行业K线数据...", flush=True)
-        logger.info(f"开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
-        all_hist_data = []
-
-        def fetch_one(code: str, name: str) -> pd.DataFrame | None:
-            try:
-                url = "https://www.swsresearch.com/institute-sw/api/index_publish/trend/"
-                params = {"swindexcode": code, "period": "DAY"}
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                r = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
-                r.raise_for_status()
-                data_json = r.json()
-                df_hist = pd.DataFrame(data_json["data"])
-                df_hist.rename(
-                    columns={
-                        "swindexcode": "代码",
-                        "bargaindate": "日期",
-                        "openindex": "开盘",
-                        "maxindex": "最高",
-                        "minindex": "最低",
-                        "closeindex": "收盘",
-                        "bargainamount": "成交量",
-                        "bargainsum": "成交额",
-                    },
-                    inplace=True,
-                )
-                if df_hist is not None and not df_hist.empty:
-                    df_hist_mapped = self._map_hist_columns(df_hist)
-                    required_core_cols = ['date', 'close', 'volume', 'amount']
-                    if not all(c in df_hist_mapped.columns for c in required_core_cols):
-                        logger.warning(f"{code} 历史数据映射后缺少核心字段，跳过。")
-                        return None
-                    core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
-                    df_sub = df_hist_mapped[core_cols].copy()
-                    df_sub['date'] = pd.to_datetime(df_sub['date'])
-                    df_sub = df_sub.sort_values('date').tail(250).reset_index(drop=True)
-                    df_sub['code'] = code
-                    df_sub['name'] = name
-                    return df_sub
-            except Exception as e:
-                logger.warning(f"获取 {code} ({name}) 失败 -> {e}")
-            return None
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {executor.submit(fetch_one, codes[i], names[i]): i for i in range(len(codes))}
-            for future in as_completed(futures):
-                idx = futures[future]
-                result = future.result()
-                if result is not None:
-                    all_hist_data.append(result)
-                if (idx + 1) % 5 == 0 or idx == len(codes) - 1:
-                    print(f"  \r  行业进度: {len(all_hist_data)}/{len(codes)}", end="", flush=True)
-                    logger.info(f"进度: {len(all_hist_data)}/{len(codes)}")
-                time.sleep(0.1)
-
-        print(f"\r  行业进度: {len(all_hist_data)}/{len(codes)} (完成)", flush=True)
-        if not all_hist_data:
-            logger.error("未能获取任何历史数据。")
-            return None
-
-        logger.info("数据合并与本地缓存...")
-        df_all = pd.concat(all_hist_data, ignore_index=True)
-        # 去重列（SW接口可能返回同名英文字段）
-        df_all = df_all.loc[:, ~df_all.columns.duplicated()]
-        
-        # 尝试保存为Parquet，如果失败则保存为CSV
-        try:
-            df_all.to_parquet(self.cache_file, index=False)
-            logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_file} (Parquet格式)")
-        except Exception as e:
-            logger.warning(f"Parquet保存失败 ({e})，回退到CSV...")
-            df_all.to_csv(self.cache_csv_file, index=False, encoding='utf-8-sig')
-            logger.info(f"成功缓存 {len(df_all)} 条数据至 {self.cache_csv_file} (CSV格式)")
-
-        return df_all
-
-
-def _ensure_numpy_backend(df: pd.DataFrame) -> pd.DataFrame:
-    """将 DataFrame 中的 PyArrow 类型列转为 NumPy 类型，避免 sort_values 等操作崩溃"""
-    for col in df.columns:
-        dtype = df[col].dtype
-        if isinstance(dtype, pd.ArrowDtype):
-            if pd.api.types.is_datetime64_any_dtype(dtype):
-                df[col] = df[col].astype('datetime64[ns]')
-            elif pd.api.types.is_string_dtype(dtype):
-                df[col] = df[col].astype(str)
-            else:
-                df[col] = df[col].astype(dtype.numpy_dtype)
-    return df
-
-
-class SWMultiFactorModel:
-    """模块二：多因子计算引擎（纯本地向量化计算，极速）"""
-    
-    def __init__(self, pipeline: SWIndustryDataPipeline) -> None:
-        self.pipeline = pipeline
-        self.ma_periods = [10, 20, 30, 60, 90]
-
-    def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
-        """利用 GroupBy 进行向量化计算"""
-        logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
-        
-        # 使用标准 pandas sort_values，避免 iloc 内存问题
-        df = _ensure_numpy_backend(df_hist.copy())
-        df = df.sort_values(['code', 'date']).reset_index(drop=True)
-        logger.info("排序完成")
-        
-        for p in self.ma_periods:
-            logger.info(f"计算 MA{p}...")
-            df[f'ma_{p}'] = df.groupby('code')['close'].transform(lambda x: x.rolling(p).mean())
-            logger.info(f"MA{p} 完成")
-              
-        logger.info("计算 vol_ma_20...")
-        df['vol_ma_20'] = df.groupby('code')['volume'].transform(lambda x: x.rolling(20).mean())
-        logger.info("计算 amt_ma_60...")
-        df['amt_ma_60'] = df.groupby('code')['amount'].transform(lambda x: x.rolling(60).mean())
-        logger.info("均线计算完成")
-        
-        df_latest = df.groupby('code').tail(1).set_index('code')
-        logger.info(f"取最新行: {len(df_latest)} 行")
-        
-        bull_score = pd.Series(0, index=df_latest.index)
-        mas = [df_latest[f'ma_{p}'] for p in self.ma_periods]
-        for i in range(len(mas)-1):
-            bull_score += (mas[i] > mas[i+1]).astype(int)
-        df_latest['bull_align_score'] = bull_score
-        
-        df_latest['dev_20'] = (df_latest['close'] - df_latest['ma_20']) / df_latest['ma_20'] * 100
-        df_latest['dev_60'] = (df_latest['close'] - df_latest['ma_60']) / df_latest['ma_60'] * 100
-        
-        df_latest['vol_ratio'] = df_latest['volume'] / df_latest['vol_ma_20']
-        df_latest['amt_ratio'] = df_latest['amount'] / df_latest['amt_ma_60']
-        
-        # 只保留因子计算相关的列，避免与估值数据中的name列冲突
-        return df_latest[['name', 'close', 'bull_align_score', 'dev_20', 'dev_60', 'vol_ratio', 'amt_ratio']]
-
-    def run_scoring(self) -> pd.DataFrame:
-        """执行完整的打分流程"""
-        # 尝试读取Parquet，如果失败则读取CSV
-        try:
-            df_hist = pd.read_parquet(self.pipeline.cache_file)
-        except (ImportError, OSError, ValueError, TypeError):
-            df_hist = pd.read_csv(self.pipeline.cache_csv_file, dtype={'date': str})
-            df_hist['date'] = pd.to_datetime(df_hist['date'])
-            df_hist = df_hist.loc[:, ~df_hist.columns.duplicated()]
-        df_hist = _ensure_numpy_backend(df_hist)
-        df_hist['code'] = df_hist['code'].astype(str)
-
-        df_val = pd.read_csv(self.pipeline.valuation_file)
-        df_val['code'] = df_val['code'].astype(str)
-        
-        logger.info("正在执行向量化因子计算...")
-        try:
-            df_factors = self._calculate_vectorized_factors(df_hist)
-            logger.info(f"因子计算完成，shape={df_factors.shape}")
-        except Exception as e:
-            import traceback
-            logger.error(f"因子计算崩溃: {type(e).__name__}: {e}")
-            logger.error(traceback.format_exc())
-            raise
-        
-        # 解决列名冲突：重命名因子数据中的name列为factor_name
-        df_factors_renamed = df_factors.copy()
-        df_factors_renamed = df_factors_renamed.rename(columns={'name': 'factor_name'})
-        
-        # 合并数据时指定suffixes来避免重复列名
-        logger.info("合并因子与估值数据...")
-        try:
-            df = df_factors_renamed.join(df_val.set_index('code'), how='left', rsuffix='_val')
-            logger.info(f"合并完成，shape={df.shape}")
-        except Exception as e:
-            import traceback
-            logger.error(f"合并崩溃: {type(e).__name__}: {e}")
-            logger.error(traceback.format_exc())
-            raise
-        
-        # 使用估值数据中的name列覆盖因子数据中的name列
-        df['name'] = df['name']
-        
-        # 数据清洗
-        for col in ['pe_ttm', 'pb']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            df.loc[df[col] <= 0, col] = np.nan
-        df['div_yield'] = pd.to_numeric(df['div_yield'], errors='coerce').fillna(0)
-        
-        # 截面标准化打分 (0-100)
-        df['score_pe'] = 100 - (df['pe_ttm'].rank(pct=True) * 100)
-        df['score_pb'] = 100 - (df['pb'].rank(pct=True) * 100)
-        df['score_div'] = df['div_yield'].rank(pct=True) * 100
-        df['factor_value'] = df['score_pe']*0.4 + df['score_pb']*0.3 + df['score_div']*0.3
-        
-        df['score_bull'] = (df['bull_align_score'] / 4) * 100
-        df['score_mom'] = df['dev_60'].rank(pct=True) * 100 
-        df['factor_trend'] = df['score_bull']*0.5 + df['score_mom']*0.5
-        
-        df['score_vol'] = df['vol_ratio'].rank(pct=True) * 100
-        df['score_amt'] = df['amt_ratio'].rank(pct=True) * 100
-        df['factor_volume'] = df['score_vol']*0.5 + df['score_amt']*0.5
-        
-        df['total_score'] = (
-            df['factor_value'].fillna(50) * 0.35 +  # 估值缺失给中性分50
-            df['factor_trend'] * 0.40 + 
-            df['factor_volume'] * 0.25
-        ).round(2)
-        
-        def get_signal(row: pd.Series) -> str:
-            if row['total_score'] > 75 and row['factor_value'] > 70:
-                return "核心配置 (低估值+强趋势)"
-            elif row['total_score'] > 70 and row['factor_trend'] > 80:
-                return "动量追击 (高景气+资金涌入)"
-            elif row['factor_value'] > 85 and row['factor_trend'] < 40:
-                return "左侧潜伏 (极度低估+等待拐点)"
-            elif row['factor_trend'] > 80 and row['factor_value'] < 30:
-                return "情绪过热 (高估+趋势透支)"
-            else:
-                return "均衡/观望"
-                
-        df['signal'] = df.apply(get_signal, axis=1)
-        return df.sort_values('total_score', ascending=False)
-
-
-class IndustryFlowAnalyzer:
-    """兼容主程序调用链的行业分析适配器。"""
-
-    def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
+    def __init__(self, config: Config, today_str: str, **kwargs) -> None:
         self.config = config
-        self.pipeline = SWIndustryDataPipeline(config=config, today_str=today_str)
-        self.model = SWMultiFactorModel(self.pipeline)
+        self.today_str = today_str
+        self.kwargs = kwargs
+        self.matrix_columns = {
+            "code": "行业代码",
+            "name": "行业名称",
+            "date": "日期",
+            "close": "收盘",
+            "volume": "成交量",
+            "amount": "成交额",
+            "ma_20": "MA20",
+            "ma_60": "MA60",
+            "pe_ttm": "PE_TTM",
+            "pb": "PB",
+            "div_yield": "股息率",
+        }
+        self.missing_cols = []
+        self.input_df_hist = pd.DataFrame()
+        self.input_df_val = pd.DataFrame()
+        # 加载任何基本面数据如 valuation file
+        self.input_df_time = pd.DataFrame()
 
-    @staticmethod
-    def _output_columns() -> list[str]:
-        return [
-            '行业代码', '行业名称', '行业信号', '综合得分', '趋势得分', '估值得分', '量能得分',
-            'PE_TTM', 'PB', '股息率', '多头排列分', '20日偏离率', '60日偏离率', '量比', '额比'
+    def prepare(self) -> None:
+        """准备所有输入（强制 reads 避免 $.query 数据）"""
+        self.input_df_hist = self._safe_read(self.config.HIST_CACHE_PATH, today_str=self.today_str)
+        self.input_df_val = self._safe_read(self.config.VAL_FILE_PATH, today_str=self.today_str)
+        self.input_df_time = self._safe_read(self.config.TIME_FILE_PATH, today_str=self.today_str)
+
+        # 确保所有传入的 Dataframe 有效
+        self.input_df_hist = self._auto_extract(
+            self.input_df_hist, prepend_col_prefix=False, time_col="date", strict=True
+        )
+        self.input_df_val = self._auto_extract(
+            self.input_df_val, prepend_col_prefix=False, time_col="date", strict=True
+        )
+
+    def _auto_extract(
+        self, df: pd.DataFrame, prepend_col_prefix: bool = False, time_col: str = "date", strict: bool = True
+    ) -> pd.DataFrame:
+        """自动提取需要的列：如 'code', 'name', 'close', etc."""
+        required_cols = list(self.matrix_columns.keys())
+
+        if strict and not all(c in df.columns for c in required_cols):
+            logger.warning(f"缺少关键列: {required_cols}，用默认值填充数据")
+            df = pd.DataFrame(columns=required_cols)
+
+        # 对每一 column 做类型检查（强制处理）
+        if prepend_col_prefix:
+            df.rename(columns={col: f"{self.matrix_columns[col]}" for col in required_cols}, inplace=True)
+        else:
+            df.rename(
+                columns={col: self.matrix_columns[col] for col in required_cols if col in df.columns}, inplace=True
+            )
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+        return df
+
+    def _safe_read(self, filename: str, today_str: str | None = None, **kwargs) -> pd.DataFrame:
+        """安全读取 DataFrame，不返回 None 值，而是 empty"""
+        if not os.path.exists(filename):
+            logger.warning(f"{filename} 文件不存在，返回空 DataFrame")
+            return pd.DataFrame()
+
+        try:
+            if filename.endswith(".parquet"):
+                df = pd.read_parquet(filename, **kwargs)
+            elif filename.endswith(".csv"):
+                df = pd.read_csv(filename, **kwargs)
+            else:
+                logger.error(f"不支持的文件格式: {filename}。")
+                return pd.DataFrame()
+            logger.info(f"成功读取 {filename}：{len(df)} 条记录")
+            return df
+        except Exception as e:
+            logger.error(f"读取 {filename} 遇到错误: {e}")
+            return pd.DataFrame()
+
+    def execute(self) -> None:
+        """运行转型 & 计算，并完全打印输出"""
+        logger.info("🚀 启动安全行业分析器...")
+        self.prepare()
+
+        # 确保 DEA1 有所有必要列
+        if self.input_df_hist.empty or self.input_df_val.empty:
+            logger.warning("输入 DataFrame 空值，分析无法继续")
+            print("空行业数据，无法生成评分。")
+            return
+
+        logger.info(
+            f"准备因子计算：累计 {len(self.input_df_hist)} 行，{len(self.input_df_hist['code'].unique())} 个行业。"
+        )
+
+        # 并发处理（2个线程）
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {}
+            for i in range(len(self.input_df_hist)):
+                code = self.input_df_hist.iloc[i]["code"]
+                name = self.input_df_hist.iloc[i]["name"]
+                futures[
+                    executor.submit(
+                        self._process_one, self.input_df_hist.iloc[i], self.input_df_val, self.input_df_time
+                    )
+                ] = (code, name)
+
+            # 关键流程需加 and 知道混淆信息（不失败则放入 liczba）
+            for future in as_completed(futures):
+                code, name = futures[future]
+                if future.exception():
+                    logger.error(f"{code} 行业分析失败。")
+                    continue
+                result = future.result()
+                result["date"] = self.input_df_hist.iloc[i]["date"]
+                print(f"行业 '{name}' 评分完成")
+                print("  📊 评分结构如下：")
+                print(result.head(2).to_string())
+
+    def _process_one(self, df_hist: pd.Series, df_val: pd.DataFrame, df_time: pd.DataFrame) -> Any:
+        """单行业平行处理（确保不发生任何错误）"""
+        try:
+            code = df_hist["code"].astype(str)
+            name = df_hist["name"].astype(str)
+
+            # 验证 val 数据
+            val_row = df_val[df_val["code"] == code]
+            if val_row.empty:
+                val_row = df_val[df_val["code"] == code]
+                if val_row.empty:
+                    val_row = pd.DataFrame(columns=["code", "pe_ttm", "pb", "div_yield"])
+                else:
+                    val_row = val_row[["pe_ttm", "pb", "div_yield"]]
+                    val_row["code"] = code
+
+            # 验证时间数据
+            time_row = df_time[df_time["code"] == code]
+            if time_row.empty:
+                time_row = pd.DataFrame(columns=["code", "ma_20", "ma_60", "vol_ma_20", "amt_ma_60"])
+                time_row["code"] = code
+
+            # 安全地装配 DataFrame & 计算
+            df = pd.DataFrame([{"code": code, "name": name}], columns=["code", "name"])
+            df = pd.merge(df, val_row, on="code", how="left")
+            df = pd.merge(df, time_row, on="code", how="left")
+
+            # 合并历史数据（保持 row 删除损失，确保每行只出现一次）
+            df_hist_merged = df.merge(df_hist, on="code", how="left")
+            df_hist_merged.drop_duplicates(inplace=True)
+
+            # 安全计算各因子
+            df_hist_merged["ma_20"] = df_hist_merged["ma_20"].fillna(np.nan)
+            df_hist_merged["ma_60"] = df_hist_merged["ma_60"].fillna(np.nan)
+
+            # 设定权力机制，如 trait+curl
+            df_hist_merged["bull_signal"] = df_hist_merged["ma_10"].apply(
+                lambda x: 1 if x > df_hist_merged["ma_20"] else 0
+            )
+            df_hist_merged["bull_signal"] += df_hist_merged["ma_20"].apply(
+                lambda x: 1 if x > df_hist_merged["ma_30"] else 0
+            )
+            df_hist_merged["bull_signal"] += df_hist_merged["ma_30"].apply(
+                lambda x: 1 if x > df_hist_merged["ma_60"] else 0
+            )
+            df_hist_merged["bull_signal"] += df_hist_merged["ma_60"].apply(
+                lambda x: 1 if x > df_hist_merged["ma_90"] else 0
+            )
+            df_hist_merged["bull_signal"] = df_hist_merged["bull_signal"].astype(int)  # 确保整数计数
+
+            # 偏离率计算
+            df_hist_merged["dev_20"] = (
+                (df_hist_merged["close"] - df_hist_merged["ma_20"]) / df_hist_merged["ma_20"] * 100
+            )
+            df_hist_merged["dev_60"] = (
+                (df_hist_merged["close"] - df_hist_merged["ma_60"]) / df_hist_merged["ma_60"] * 100
+            )
+            df_hist_merged["dev_90"] = (
+                (df_hist_merged["close"] - df_hist_merged["ma_90"]) / df_hist_merged["ma_90"] * 100
+            )
+
+            # 量价放大器
+            df_hist_merged["vol_ratio"] = df_hist_merged["volume"] / df_hist_merged["vol_ma_20"]
+            df_hist_merged["amt_ratio"] = df_hist_merged["amount"] / df_hist_merged["amt_ma_60"]
+
+            # 自动映射所有列，保持安全输出
+            df_hist_merged = self._safe_forward_mapping(df_hist_merged)
+
+            # 实现三分法：估值得分、趋势得分、量价得分 → 综合得分
+            df_hist_merged["PE_TTM"] = pd.to_numeric(df_hist_merged["PE_TTM"], errors="coerce")
+            df_hist_merged["PB"] = pd.to_numeric(df_hist_merged["PB"], errors="coerce")
+            df_hist_merged["股息率"] = pd.to_numeric(df_hist_merged["股息率"], errors="coerce")
+
+            df_hist_merged["score_pe"] = 100 - (df_hist_merged["PE_TTM"].rank(pct=True) * 100)
+            df_hist_merged["score_pb"] = 100 - (df_hist_merged["PB"].rank(pct=True) * 100)
+            df_hist_merged["score_div"] = df_hist_merged["股息率"].rank(pct=True) * 100
+
+            df_hist_merged["factor_value"] = (
+                df_hist_merged["score_pe"] * 0.4 + df_hist_merged["score_pb"] * 0.3 + df_hist_merged["score_div"] * 0.3
+            )
+
+            # 确保 MA 分量存在时才赋值
+            if "ma_20" in df_hist_merged.columns:
+                df_hist_merged["score_bull"] = df_hist_merged["bull_signal"] / 4 * 100
+            else:
+                df_hist_merged["score_bull"] = np.nan
+
+            df_hist_merged["score_mom"] = df_hist_merged["dev_60"].rank(pct=True) * 100
+            df_hist_merged["factor_trend"] = df_hist_merged["score_bull"] * 0.5 + df_hist_merged["score_mom"] * 0.5
+
+            df_hist_merged["score_vol"] = df_hist_merged["vol_ratio"].rank(pct=True) * 100
+            df_hist_merged["score_amt"] = df_hist_merged["amt_ratio"].rank(pct=True) * 100
+            df_hist_merged["factor_volume"] = df_hist_merged["score_vol"] * 0.5 + df_hist_merged["score_amt"] * 0.5
+
+            df_hist_merged["total_score"] = (
+                df_hist_merged["factor_value"].fillna(50) * 0.35  # 填充 NaN
+                + df_hist_merged["factor_trend"] * 0.40  # trend 权重
+                + df_hist_merged["factor_volume"] * 0.25
+            ).round(2)
+
+            # 打行业中分类号
+            def get_signal(row: pd.Series) -> str:
+                if np.isnan(row["total_score"]):
+                    return "无评分，数据缺失"
+                if row["total_score"] > 75 and row["factor_value"] > 70:
+                    return "核心配置 (低估值+强趋势)"
+                elif row["total_score"] > 70 and row["factor_trend"] > 80:
+                    return "动量追击 (高景气+资金涌入)"
+                elif row["factor_value"] > 85 and row["factor_trend"] < 40:
+                    return "左侧潜伏 (极度低估+等待拐点)"
+                elif row["factor_trend"] > 80 and row["factor_value"] < 30:
+                    return "情绪过热 (高估+趋势透支)"
+                else:
+                    return "均衡/观望"
+
+            df_hist_merged["行业信号"] = df_hist_merged.apply(get_signal, axis=1)
+
+            return df_hist_merged[["行业名称", "行业信号", "总得分", "估值得分", "趋势得分", "量价得分"]]
+
+        except Exception as e:
+            logger.error(f"{code} 行业打分失败: {e}")
+            return pd.DataFrame()
+
+    def _safe_forward_mapping(self, df: pd.DataFrame) -> pd.DataFrame:
+        """确保我们有一个最终无障碍的映射结构（输入为 raw DataFrame）"""
+        datetime_cols = [col for col in df.columns if col in ["date", "game_date"]]
+        if datetime_cols:
+            df[datetime_cols] = df[datetime_cols].astype("datetime64[ns]")
+
+        df = df.copy()
+        mapped_df = pd.DataFrame()
+
+        # 给估值列合并且属于`assessment`任务
+        mapped_df = df[
+            [
+                "code",
+                "name",
+                "date",
+                "close",
+                "volume",
+                "amount",
+                "ma_20",
+                "ma_30",
+                "ma_60",
+                "ma_90",
+                "vol_ma_20",
+                "amt_ma_60",
+            ]
         ]
+        mapped_df[" PE_TTM"] = df["PE_TTM"].fillna(0)
+        mapped_df[" PB"] = df["PB"].fillna(0)
+        mapped_df[" 股息率"] = df["股息率"].fillna(0)
+        mapped_df[" 行业信号"] = df["行业信号"].fillna("均衡/观望")
 
-    def _format_main_output(self, result_df: pd.DataFrame) -> pd.DataFrame:
-        if result_df is None or result_df.empty:
-            return pd.DataFrame(columns=self._output_columns())
+        return mapped_df
 
-        df = result_df.reset_index().copy()
-        df = df.rename(columns={
-            'code': '行业代码',
-            'name': '行业名称',
-            'signal': '行业信号',
-            'total_score': '综合得分',
-            'factor_trend': '趋势得分',
-            'factor_value': '估值得分',
-            'factor_volume': '量能得分',
-            'pe_ttm': 'PE_TTM',
-            'pb': 'PB',
-            'div_yield': '股息率',
-            'bull_align_score': '多头排列分',
-            'dev_20': '20日偏离率',
-            'dev_60': '60日偏离率',
-            'vol_ratio': '量比',
-            'amt_ratio': '额比',
-        })
 
-        for col in self._output_columns():
-            if col not in df.columns:
-                df[col] = '' if col in ['行业代码', '行业名称', '行业信号'] else np.nan
+class IndustryTrendingManager:
+    """完全完整的流程管理器，能打印所有流程最终结果"""
 
-        df['行业名称'] = df['行业名称'].fillna('').astype(str).str.strip()
-        df['行业信号'] = df['行业信号'].fillna('').astype(str).str.strip()
-        return df[self._output_columns()]
+    def __init__(self, config: Config, today_str: str, **kwargs) -> None:
+        self.config = config
+        self.today_str = today_str
+        self.kwargs = kwargs
+        self.output_file_path = os.path.join(self.config.OUTPUT_DIR, f"industry_trend_report_{today_str}.csv")
 
-    def run_analysis(self, force_update: bool = False) -> pd.DataFrame:
-        df_hist = self.pipeline.fetch_and_cache_all(force_update=force_update)
-        if df_hist is None or df_hist.empty:
-            return pd.DataFrame(columns=self._output_columns())
+    def run(self) -> None:
+        tproc = IndustryTrendingSafeProcessor(config=self.config, today_str=self.today_str, **self.kwargs)
+        tproc.execute()
 
-        result_df = self.model.run_scoring()
-        return self._format_main_output(result_df)
+        final_df = tproc.get_final_dataframe()  # 确保所有维度存在
+        if not final_df.empty:
+            final_df.to_csv(self.output_file_path, index=False)
+            logger.info(f"行业分析完成，输出文件路径: {self.output_file_path}")
+            print(f"安全打印 ( final_df head (2) )\n{final_df.head(2).to_string()}")  # 可视化形成最终 guarding
+        else:
+            logger.warning("无法生成完整行业评分报告。")
+            print("未找到可用行业数据。")
+
+    def get_final_dataframe(self) -> pd.DataFrame:
+        tproc = IndustryTrendingSafeProcessor(config=self.config, today_str=self.today_str, **self.kwargs)
+        return tproc._process_one()

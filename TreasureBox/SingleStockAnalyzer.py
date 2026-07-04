@@ -35,6 +35,10 @@ import traceback
 import akshare as ak
 import pandas as pd
 
+# ── 全局 pandas 选项：阻止 PyArrow 后端，避免 Windows SChannel 0xC0000005 ──
+pd.options.future.infer_string = False
+pd.options.mode.string_storage = "python"
+
 # ── 从项目现有模块导入 ─────────────────────────────────────────────────────
 from ConfigParser import Config
 from UtilsManager.CodeNormalizer import CodeNormalizer
@@ -62,61 +66,67 @@ def print_field(label: str, value: Any) -> None:  # noqa: ANN401
         print(f"    {label:<26} : {value}")
 
 
-# ── 数据获取（复用 StockSyncEngine._fetch_kline_for_symbol 模式）─────────
+# ── 数据获取 ─────────────────────────────────────────────────────────────
 def fetch_kline_data(symbol: str, days: int = 300) -> pd.DataFrame | None:
     """
-    获取个股前复权 + 不复权数据，合并输出。
-    完全复用 StockSyncEngine._fetch_kline_for_symbol 的 akshare API 调用模式。
+    获取个股后复权 K 线数据，返回 OHLCV 日线。
+    akshare stock_zh_a_hist_tx 的 amount 列实际是成交量(手)，
+    统一折算为股数（手数×100）。
+
+    Returns:
+        DataFrame | None: 包含 date/open/close/high/low/volume 的 DataFrame
     """
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
 
     for attempt in range(3):
         try:
-            # 1) 前复权数据（价格）
-            df_qfq = ak.stock_zh_a_hist_tx(
+            # 1) 后复权数据（调整后价格）
+            df_hfq = ak.stock_zh_a_hist_tx(
                 symbol=symbol, start_date=start_date, end_date=end_date, adjust="hfq"
             )
-            if df_qfq is None or df_qfq.empty:
+            if df_hfq is None or df_hfq.empty:
                 raise ValueError("空数据")
 
             expected = ["date", "open", "close", "high", "low", "amount"]
-            if any(c not in df_qfq.columns for c in expected):
-                raise ValueError(f"前复权数据缺失列: {df_qfq.columns.tolist()}")
+            if any(c not in df_hfq.columns for c in expected):
+                raise ValueError(f"后复权数据缺失列: {df_hfq.columns.tolist()}")
 
             time.sleep(0.05)
 
-            # 2) 不复权数据（成交量）
+            # 2) 不复权数据（取实际收盘价用于计算调整因子）
             df_norm = ak.stock_zh_a_hist_tx(
                 symbol=symbol, start_date=start_date, end_date=end_date, adjust=""
             )
             if df_norm is None or df_norm.empty:
                 raise ValueError("空数据")
 
-            df_norm = df_norm[["date", "close", "amount"]].rename(
-                columns={"close": "close_normal", "amount": "volume_normal"}
+            df_norm = df_norm[["date", "close"]].rename(
+                columns={"close": "close_normal"}
             )
 
             # 3) 合并
-            df = pd.merge(df_qfq, df_norm, on="date", how="inner")
+            df = pd.merge(df_hfq, df_norm, on="date", how="inner")
             if df.empty:
                 raise ValueError("合并后无数据")
 
-            # 4) 数值转换 & 计算调整后成交量
-            for col in ["close", "close_normal", "amount", "volume_normal"]:
+            # 4) 数值转换
+            for col in ["close", "close_normal", "amount"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            df["adj_ratio"] = df["close"] / df["close_normal"].replace(0, pd.NA)
-            df["volume"] = df["volume_normal"] * (df["amount"] / df["volume_normal"].replace(0, pd.NA))
-            df.dropna(subset=["adj_ratio", "volume"], inplace=True)
+            # 5) 计算调整因子和成交量
+            # amount 列实际是成交量(手)，不复权和后复权的 amount 相同（成交股数不变）
+            # 成交量(股数) = 手数 × 100
+            df["adj_factor"] = df["close"] / df["close_normal"].replace(0, pd.NA)
+            df["volume"] = df["amount"] * 100
+            df.dropna(subset=["volume", "adj_factor"], inplace=True)
 
-            # 5) 标准化
+            # 6) 标准化
             df["date"] = pd.to_datetime(df["date"])
             df.sort_values("date", inplace=True)
             df.reset_index(drop=True, inplace=True)
-            df.rename(columns={"amount": "amount_adj"}, inplace=True)
 
-            return df
+            return df[["date", "open", "close", "high", "low", "volume"]]
 
         except Exception as e:
             if attempt < 2:
