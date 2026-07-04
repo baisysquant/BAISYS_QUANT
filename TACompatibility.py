@@ -2,16 +2,30 @@
 TACompatibility — pandas_ta replacement using TA-Lib (talib).
 Provides the same function signatures and DataFrame accessor (.ta) as pandas_ta.
 Works on Windows (no posix module dependency).
+
+NOTE: TA-Lib C extension is NOT thread-safe. A module-level lock serializes
+all talib calls to prevent access-violation crashes in multi-threaded usage.
 """
 from __future__ import annotations
+
+import threading
 
 import numpy as np
 import pandas as pd
 import talib
 
+_talib_lock = threading.Lock()
+
+
+def _talib_call(func, *args, **kwargs):
+    """Thread-safe wrapper for any talib function call."""
+    with _talib_lock:
+        return func(*args, **kwargs)
+
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
-    result = talib.ATR(
+    result = _talib_call(
+        talib.ATR,
         high.to_numpy(dtype=float), low.to_numpy(dtype=float), close.to_numpy(dtype=float),
         timeperiod=length,
     )
@@ -19,7 +33,8 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> 
 
 
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.DataFrame:
-    result = talib.ADX(
+    result = _talib_call(
+        talib.ADX,
         high.to_numpy(dtype=float), low.to_numpy(dtype=float), close.to_numpy(dtype=float),
         timeperiod=length,
     )
@@ -27,14 +42,14 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> 
 
 
 def rsi(close: pd.Series, length: int = 14) -> pd.Series:
-    result = talib.RSI(close.to_numpy(dtype=float), timeperiod=length)
+    result = _talib_call(talib.RSI, close.to_numpy(dtype=float), timeperiod=length)
     return pd.Series(result, index=close.index, name=f"RSI_{length}")
 
 
 def stoch(
     high: pd.Series, low: pd.Series, close: pd.Series, k: int = 9, d: int = 3,
 ) -> pd.DataFrame:
-    slowk, slowd = talib.STOCH(
+    slowk, slowd = _talib_call(talib.STOCH,
         high.to_numpy(dtype=float), low.to_numpy(dtype=float), close.to_numpy(dtype=float),
         fastk_period=k, slowk_period=3, slowk_matype=0,
         slowd_period=d, slowd_matype=0,
@@ -47,7 +62,7 @@ def stoch(
 
 
 def cci(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 20) -> pd.Series:
-    result = talib.CCI(
+    result = _talib_call(talib.CCI,
         high.to_numpy(dtype=float), low.to_numpy(dtype=float), close.to_numpy(dtype=float),
         timeperiod=length,
     )
@@ -55,7 +70,7 @@ def cci(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 20) -> 
 
 
 def bbands(close: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame:
-    upper, middle, lower = talib.BBANDS(
+    upper, middle, lower = _talib_call(talib.BBANDS,
         close.to_numpy(dtype=float),
         timeperiod=length, nbdevup=std, nbdevdn=std,
     )
@@ -73,7 +88,7 @@ def bbands(close: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFrame
 def macd(
     close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9,
 ) -> pd.DataFrame:
-    macd_val, macdsignal, macdhist = talib.MACD(
+    macd_val, macdsignal, macdhist = _talib_call(talib.MACD,
         close.to_numpy(dtype=float),
         fastperiod=fast, slowperiod=slow, signalperiod=signal,
     )
@@ -95,11 +110,12 @@ def cdl_pattern(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Ser
 
     if name == "all":
         patterns: dict[str, np.ndarray] = {}
-        for func_name in sorted(dir(talib)):
-            if func_name.startswith("CDL"):
-                func = getattr(talib, func_name)
-                if callable(func):
-                    patterns[func_name] = func(o, h, l, c)
+        with _talib_lock:
+            for func_name in sorted(dir(talib)):
+                if func_name.startswith("CDL"):
+                    func = getattr(talib, func_name)
+                    if callable(func):
+                        patterns[func_name] = func(o, h, l, c)
         if not patterns:
             return None
         return pd.DataFrame(patterns, index=close.index)
@@ -108,7 +124,7 @@ def cdl_pattern(open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Ser
     func = getattr(talib, func_name, None)
     if func is None:
         return None
-    return pd.DataFrame({func_name: func(o, h, l, c)}, index=close.index)
+    return pd.DataFrame({func_name: _talib_call(func, o, h, l, c)}, index=close.index)
 
 
 # ── pandas .ta accessor ──────────────────────────────────────────────

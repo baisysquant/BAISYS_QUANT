@@ -5,7 +5,6 @@ import os
 import re
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -129,10 +128,10 @@ class SWIndustryDataPipeline:
         names = df_val['name'].astype(str).tolist()
         
         print(f"  ↓ 拉取 {len(codes)} 个行业K线数据...", flush=True)
-        logger.info(f"开始并行拉取 {len(codes)} 个行业的250天历史量价数据 (2线程)...")
+        logger.info(f"开始拉取 {len(codes)} 个行业的250天历史量价数据（单线程）...")
         all_hist_data = []
 
-        def fetch_one(code: str, name: str) -> pd.DataFrame | None:
+        for idx, (code, name) in enumerate(zip(codes, names)):
             try:
                 url = "https://www.swsresearch.com/institute-sw/api/index_publish/trend/"
                 params = {"swindexcode": code, "period": "DAY"}
@@ -157,33 +156,22 @@ class SWIndustryDataPipeline:
                 if df_hist is not None and not df_hist.empty:
                     df_hist_mapped = self._map_hist_columns(df_hist)
                     required_core_cols = ['date', 'close', 'volume', 'amount']
-                    if not all(c in df_hist_mapped.columns for c in required_core_cols):
+                    if all(c in df_hist_mapped.columns for c in required_core_cols):
+                        core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
+                        df_sub = df_hist_mapped[core_cols].copy()
+                        df_sub['date'] = pd.to_datetime(df_sub['date'])
+                        df_sub = df_sub.sort_values('date').tail(250).reset_index(drop=True)
+                        df_sub['code'] = code
+                        df_sub['name'] = name
+                        all_hist_data.append(df_sub)
+                    else:
                         logger.warning(f"{code} 历史数据映射后缺少核心字段，跳过。")
-                        return None
-                    core_cols = [c for c in ['date', 'close', 'open', 'high', 'low', 'volume', 'amount'] if c in df_hist_mapped.columns]
-                    df_sub = df_hist_mapped[core_cols].copy()
-                    df_sub['date'] = pd.to_datetime(df_sub['date'])
-                    df_sub = df_sub.sort_values('date').tail(250).reset_index(drop=True)
-                    df_sub['code'] = code
-                    df_sub['name'] = name
-                    return df_sub
             except Exception as e:
                 logger.warning(f"获取 {code} ({name}) 失败 -> {e}")
-            return None
+            print(f"    [{idx+1}/{len(codes)}] {name} ({code})", flush=True)
+            time.sleep(0.1)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {executor.submit(fetch_one, codes[i], names[i]): i for i in range(len(codes))}
-            for future in as_completed(futures):
-                idx = futures[future]
-                result = future.result()
-                if result is not None:
-                    all_hist_data.append(result)
-                if (idx + 1) % 5 == 0 or idx == len(codes) - 1:
-                    print(f"  \r  行业进度: {len(all_hist_data)}/{len(codes)}", end="", flush=True)
-                    logger.info(f"进度: {len(all_hist_data)}/{len(codes)}")
-                time.sleep(0.1)
-
-        print(f"\r  行业进度: {len(all_hist_data)}/{len(codes)} (完成)", flush=True)
+        print(f"  完成: {len(all_hist_data)}/{len(codes)} 个行业", flush=True)
         if not all_hist_data:
             logger.error("未能获取任何历史数据。")
             return None
@@ -206,16 +194,32 @@ class SWIndustryDataPipeline:
 
 
 def _ensure_numpy_backend(df: pd.DataFrame) -> pd.DataFrame:
-    """将 DataFrame 中的 PyArrow 类型列转为 NumPy 类型，避免 sort_values 等操作崩溃"""
+    """将 DataFrame 所有列转为 numpy 原生类型，避免 pandas 3.0 C 层崩溃"""
+    def _safe_date(v):
+        try:
+            return str(pd.Timestamp(v).strftime('%Y-%m-%d')) if pd.notna(v) else '1970-01-01'
+        except Exception:
+            return '1970-01-01'
+
+    NUMERIC_COLS = {'close', 'open', 'high', 'low', 'volume', 'amount'}
     for col in df.columns:
-        dtype = df[col].dtype
-        if isinstance(dtype, pd.ArrowDtype):
-            if pd.api.types.is_datetime64_any_dtype(dtype):
-                df[col] = df[col].astype('datetime64[ns]')
-            elif pd.api.types.is_string_dtype(dtype):
+        if col == 'date':
+            df[col] = df[col].apply(_safe_date)
+        elif col in NUMERIC_COLS:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+        elif col in ('code', 'name'):
+            df[col] = df[col].fillna('').astype(str)
+        else:
+            dtype = df[col].dtype
+            if isinstance(dtype, pd.ArrowDtype):
+                if pd.api.types.is_datetime64_any_dtype(dtype):
+                    df[col] = df[col].apply(_safe_date)
+                elif pd.api.types.is_string_dtype(dtype):
+                    df[col] = df[col].astype(str)
+                else:
+                    df[col] = df[col].astype(dtype.numpy_dtype)
+            elif dtype == object:
                 df[col] = df[col].astype(str)
-            else:
-                df[col] = df[col].astype(dtype.numpy_dtype)
     return df
 
 
@@ -229,9 +233,33 @@ class SWMultiFactorModel:
     def _calculate_vectorized_factors(self, df_hist: pd.DataFrame) -> pd.DataFrame:
         """利用 GroupBy 进行向量化计算"""
         logger.info(f"向量化因子计算开始: {len(df_hist)} 行, {df_hist['code'].nunique()} 个行业")
-        
-        # 使用标准 pandas sort_values，避免 iloc 内存问题
-        df = _ensure_numpy_backend(df_hist.copy())
+
+        # ── 列级类型强制转换（全部走 Python 级操作，避免 pandas 3.0 C 扩展崩溃）──
+        df = df_hist.copy()
+
+        def _safe_date(v):
+            try:
+                return str(pd.Timestamp(v).strftime('%Y-%m-%d')) if pd.notna(v) else '1970-01-01'
+            except Exception:
+                return '1970-01-01'
+
+        for col in df.columns:
+            if col == 'date':
+                df[col] = df[col].apply(_safe_date)
+            elif col in {'close', 'open', 'high', 'low', 'volume', 'amount'}:
+                df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+            elif col in ('code', 'name'):
+                df[col] = df[col].fillna('').astype(str)
+            elif isinstance(df[col].dtype, pd.ArrowDtype):
+                if pd.api.types.is_datetime64_any_dtype(df[col].dtype):
+                    df[col] = df[col].apply(_safe_date)
+                elif pd.api.types.is_string_dtype(df[col].dtype):
+                    df[col] = df[col].astype(str)
+                else:
+                    df[col] = df[col].astype(df[col].dtype.numpy_dtype)
+            elif df[col].dtype == object:
+                df[col] = df[col].astype(str)
+
         df = df.sort_values(['code', 'date']).reset_index(drop=True)
         logger.info("排序完成")
         
