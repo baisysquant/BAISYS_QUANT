@@ -22,7 +22,7 @@ numba==0.61.2
 numpy==2.2.6
 openpyxl==3.1.5
 pandas==3.0.2
-pandas-ta==0.4.71b0
+ta-lib==0.7.0
 platformdirs==4.9.4
 psycopg2-binary==2.9.11
 pycparser==3.0

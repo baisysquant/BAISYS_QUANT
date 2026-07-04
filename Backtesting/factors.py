@@ -77,7 +77,7 @@ def ma_divergence_5_20(df: pd.DataFrame) -> pd.Series:
 
 @register_factor("atr_ratio", "ATR(14) / 收盘价", min_periods=14)
 def atr_ratio(df: pd.DataFrame) -> pd.Series:
-    import pandas_ta as ta
+    import TACompatibility as ta
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
     return atr / df["close"]
 

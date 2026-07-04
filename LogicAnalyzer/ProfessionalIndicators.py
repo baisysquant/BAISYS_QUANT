@@ -13,7 +13,7 @@ plus backward-compatible 'simple_signal' string field.
 
 import numpy as np
 import pandas as pd
-import pandas_ta  # noqa: F401
+import TACompatibility  # noqa: F401
 
 # ── helper ─────────────────────────────────────────────────────────
 
