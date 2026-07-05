@@ -30,6 +30,7 @@ from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 from DataManager.ReportService import ReportService
 from LogicAnalyzer.AnalysisService import AnalysisService
 from LogicAnalyzer.DataAcquisitionService import DataAcquisitionService
+from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import DatabaseConnectionError
 from UtilsManager.IDataProvider import IDataProvider
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
@@ -215,8 +216,6 @@ class StockAnalysisCoordinator:
             return False
 
     def _step_2_format_codes(self, ctx: PipelineContext) -> bool:
-        from UtilsManager.CodeNormalizer import CodeNormalizer
-
         filtered_pure_codes: set = ctx.get("filtered_pure_codes")
         stock_codes_prefixed = [CodeNormalizer.add_market_prefix(code) for code in sorted(filtered_pure_codes)]
         stock_codes_pure = sorted(filtered_pure_codes)
@@ -263,7 +262,6 @@ class StockAnalysisCoordinator:
             cn = hist_df_all[hist_df_all["close_normal"].notna()]
             if not cn.empty:
                 last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
-                from UtilsManager.CodeNormalizer import CodeNormalizer
                 last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
                 latest_prices_df = last_cn[["股票代码", "close_normal"]].rename(
                     columns={"close_normal": "最新价"}
@@ -528,8 +526,6 @@ class StockAnalysisCoordinator:
             return pd.DataFrame()
 
     def _filter_by_universe(self, df: pd.DataFrame, universe_set: set) -> pd.DataFrame:
-        from UtilsManager.CodeNormalizer import CodeNormalizer
-
         if df is None or df.empty or "股票代码" not in df.columns:
             return pd.DataFrame()
 

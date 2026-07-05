@@ -22,7 +22,7 @@ class IDataProvider(ABC):
 
 
 class LiveDataProvider(IDataProvider):
-    """实时/日更模式 — 从 stock_daily_kline 读取后复权数据。"""
+    """实时/日更模式 — 从 stock_daily_kline 读取，OHLC 除以 adj_factor 转为不复权。"""
 
     def __init__(self, db_engine: Engine) -> None:
         self._db_engine = db_engine
@@ -40,7 +40,12 @@ class LiveDataProvider(IDataProvider):
             where.append("trade_date <= :end_date")
 
         sql = text(f"""
-            SELECT symbol, trade_date, open, high, low, close, volume, amount, close_normal
+            SELECT symbol, trade_date,
+                   open / adj_factor AS open,
+                   high / adj_factor AS high,
+                   low / adj_factor AS low,
+                   close / adj_factor AS close,
+                   volume, amount, close_normal
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date

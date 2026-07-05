@@ -24,6 +24,7 @@ from LogicAnalyzer.PipelineState import (
     _make_state,
     _pipeline_output,
 )
+from LogicAnalyzer.ScoringRules import execute_rules
 from LogicAnalyzer.SignalConstants import Divergence, MACDSignals, MACDTrend
 
 
@@ -280,8 +281,6 @@ class MACDAnalyzer:
         kline_decay_days = _score_p.get('kline_decay_days', 10)
         kline_decay_min = _score_p.get('kline_decay_min', 0.2)
         expected_return_lookback = _score_p.get('expected_return_lookback', 20)
-
-        from LogicAnalyzer.ScoringRules import execute_rules
 
         if weights is None:
             weights = {"MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,

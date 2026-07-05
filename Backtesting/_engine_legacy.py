@@ -109,6 +109,7 @@ def _run_single_backtest(
 
     # 用于组合优化的累积历史数据
     history: list[pd.DataFrame] = []
+    cumulative_hist: pd.DataFrame | None = None
 
     def _sell_proceeds(sym: str, value: float, volume: float) -> tuple[float, float]:
         if cm is not None:
@@ -138,6 +139,10 @@ def _run_single_backtest(
             if day_data.empty:
                 continue
         history.append(day_data)
+        if cumulative_hist is None:
+            cumulative_hist = day_data.copy()
+        else:
+            cumulative_hist = pd.concat([cumulative_hist, day_data], ignore_index=True)
 
         total_value = cash + sum(positions.values())
 
@@ -176,7 +181,7 @@ def _run_single_backtest(
             & (~day_data[risk_col].isin(["HIGH", "D", "E"]))
         ].copy()
         if not candidates.empty and engine_cfg.portfolio_method != "score_weighted":
-            hist_df = pd.concat(history, ignore_index=True)
+            hist_df = cumulative_hist
             weights = allocate_weights(
                 hist_df, method=engine_cfg.portfolio_method,
                 max_weight=engine_cfg.max_position_pct,

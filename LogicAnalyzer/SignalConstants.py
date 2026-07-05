@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 
 class MACDSignals:
     """MACD 金叉/死叉信号"""
@@ -24,12 +26,10 @@ class MACDSignals:
 
     @classmethod
     def golden_cross_label(cls, dif: Any, dea: Any) -> Any:  # noqa: ANN401
-        import numpy as np
         return np.where((dif > 0) & (dea > 0), cls.GOLDEN_CROSS_ABOVE_ZERO, cls.GOLDEN_CROSS_BELOW_ZERO)
 
     @classmethod
     def death_cross_label(cls, dead: Any, dif: Any, dea: Any) -> Any:  # noqa: ANN401
-        import numpy as np
         return np.where(dead, np.where((dif < 0) & (dea < 0), cls.DEATH_CROSS_BELOW_ZERO, cls.DEATH_CROSS_ABOVE_ZERO), "")
 
 

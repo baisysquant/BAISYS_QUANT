@@ -8,9 +8,15 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
+from ConfigParser import Config
+from DataManager import ParallelUtils as utils
 from DataManager.ColumnNames import ColumnNames
+from DataManager.DbEngine import get_engine as _get_engine
+from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+from LogicAnalyzer.Indicators import calculate_full_bull_score
 from LogicAnalyzer.SignalConstants import TrendLevels
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
@@ -35,11 +41,7 @@ def get_stock_industry_mapping(
         return pd.DataFrame(columns=[ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY])
 
     try:
-        from DataManager.DbEngine import get_engine as _get_engine
-        from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
-
         if engine is None:
-            from ConfigParser import Config
             engine = _get_engine(Config())
 
         sync = IncrementalSyncEngine(db_engine=engine)
@@ -104,8 +106,6 @@ class DataMergeService:
 
     def _get_stock_industry_mapping(self, stock_codes: list[str]) -> pd.DataFrame:
         if self._industry_cache is None:
-            from DataManager.DbEngine import get_engine as _get_engine
-            from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
             sync = IncrementalSyncEngine(db_engine=_get_engine(self.config))
             pool = sync.get_stock_pool_from_db()
             industry = pool[["ts_code", "name", "industry"]].copy()
@@ -182,13 +182,9 @@ class DataMergeService:
             # 补全股票简称（如果原始数据中仍有缺失）
             if ColumnNames.STOCK_NAME in industry_df.columns:
                 ind_name_map = industry_df.set_index(ColumnNames.STOCK_CODE)[ColumnNames.STOCK_NAME].to_dict()
-                final_df[ColumnNames.STOCK_NAME] = final_df.apply(
-                    lambda row: (
-                        ind_name_map.get(row[ColumnNames.STOCK_CODE], "N/A")
-                        if pd.isna(row[ColumnNames.STOCK_NAME]) or row[ColumnNames.STOCK_NAME] == "N/A"
-                        else row[ColumnNames.STOCK_NAME]
-                    ),
-                    axis=1,
+                is_missing = final_df[ColumnNames.STOCK_NAME].isna() | (final_df[ColumnNames.STOCK_NAME] == "N/A")
+                final_df.loc[is_missing, ColumnNames.STOCK_NAME] = (
+                    final_df.loc[is_missing, ColumnNames.STOCK_CODE].map(ind_name_map).fillna("N/A")
                 )
             final_df = pd.merge(final_df, industry_df[[ColumnNames.STOCK_CODE, ColumnNames.INDUSTRY]], on=ColumnNames.STOCK_CODE, how="left")
             final_df[ColumnNames.INDUSTRY] = final_df[ColumnNames.INDUSTRY].fillna("N/A")
@@ -211,8 +207,6 @@ class DataMergeService:
         Returns:
             pd.DataFrame: 添加了 '多头排列趋势' 列的DataFrame
         """
-        from LogicAnalyzer.Indicators import calculate_full_bull_score
-
         hist_df_all = processed_data.get("hist_data_all")
         if hist_df_all is None:
             hist_df_all = processed_data.get("kline_data", pd.DataFrame())
@@ -343,8 +337,6 @@ class DataMergeService:
         Returns:
             pd.DataFrame: 添加了资金流列和动能列的DataFrame
         """
-        from DataManager import ParallelUtils as utils
-
         # 定义周期映射关系（与akshare接口严格对应）
         period_map = {
             3: ("market_fund_flow_raw_3", ColumnNames.FUND_FLOW_3D),
@@ -415,7 +407,7 @@ class DataMergeService:
         if not strong_df.empty and "股票代码" in strong_df.columns:
             strong_df = self._normalize_stock_code_in_df(strong_df)
             strong_codes = set(strong_df["股票代码"].tolist())
-            final_df[ColumnNames.STRONG_STOCK] = final_df["股票代码"].apply(lambda x: "是" if x in strong_codes else "否")
+            final_df[ColumnNames.STRONG_STOCK] = np.where(final_df["股票代码"].isin(strong_codes), "是", "否")
         else:
             final_df[ColumnNames.STRONG_STOCK] = "否"
 
@@ -434,7 +426,7 @@ class DataMergeService:
         if not ljqs_df.empty and "股票代码" in ljqs_df.columns:
             ljqs_df = self._normalize_stock_code_in_df(ljqs_df)
             ljqs_codes = set(ljqs_df["股票代码"].tolist())
-            final_df[ColumnNames.PRICE_VOLUME_RISE] = final_df["股票代码"].apply(lambda x: "是" if x in ljqs_codes else "否")
+            final_df[ColumnNames.PRICE_VOLUME_RISE] = np.where(final_df["股票代码"].isin(ljqs_codes), "是", "否")
         else:
             final_df[ColumnNames.PRICE_VOLUME_RISE] = "否"
 

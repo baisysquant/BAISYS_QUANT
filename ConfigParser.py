@@ -511,7 +511,7 @@ class Config:
         )
 
         # ── 回测自动校准参数覆写 ──
-        # [BACKTEST_CALIBRATED] 将 7 个参数覆写到各自子模型，实现 INI 统一分组
+        # [BACKTEST_CALIBRATED] 将 8 个参数覆写到各自子模型，实现 INI 统一分组
         bt_cal = self._section_upper("BACKTEST_CALIBRATED")
         if bt_cal:
             sc = self.app_config.scoring_params
@@ -526,6 +526,8 @@ class Config:
                 sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
             if "ATR_T1_MULT" in bt_cal:
                 sc.ATR_T1_MULT = float(bt_cal["ATR_T1_MULT"])
+            if "ATR_T2_MULT" in bt_cal:
+                sc.ATR_T2_MULT = float(bt_cal["ATR_T2_MULT"])
             if "LIQ_VETO_RATIO" in bt_cal:
                 fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
             if "KELLY_FRACTION" in bt_cal:

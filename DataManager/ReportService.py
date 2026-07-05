@@ -15,7 +15,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from DataManager.ColumnNames import ColumnNames
-from UtilsManager.Exceptions import DatabaseError
+from DataManager.DbEngine import get_engine
+from DataManager import DatabaseWriter, QuantDataPerformer
+from UtilsManager.Exceptions import DatabaseError, ReportGenerationError
 
 
 class ReportService:
@@ -166,8 +168,6 @@ class ReportService:
         Raises:
             Exception: 当报告生成失败时抛出异常
         """
-        from UtilsManager.Exceptions import ReportGenerationError
-
         self.logger.info("\n>>> 正在生成 Excel 报告...")
         trade_date = today_str.replace("-", "") if today_str else datetime.datetime.now().strftime("%Y%m%d")
         report_path = os.path.join(self.config.HOME_DIRECTORY, f"审计报告_{trade_date}.xlsx")
@@ -177,7 +177,7 @@ class ReportService:
         if user_focus_stocks:
             self.logger.info(f"  - 用户关注股池: {', '.join(sorted(user_focus_stocks))}")
 
-        # ── 退出策略价格已在 _calc_exit_strategy 中基于不复权数据计算，无需转换 ──
+        # ── LiveDataProvider 已返回不复权 OHLC，无需再次转换 ──
         # sheets_data = self._convert_adjusted_to_normal_prices(sheets_data, trade_date)
 
         try:
@@ -303,7 +303,6 @@ class ReportService:
             return sheets_data
 
         # 查询每只股票的 adj_factor 和 max_adj_factor
-        from DataManager.DbEngine import get_engine
         engine = get_engine(self.config)
         trade_date_iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
@@ -418,10 +417,7 @@ class ReportService:
             bool: 是否成功
         """
         try:
-            from DataManager import DatabaseWriter, QuantDataPerformer
-            from DataManager.DbEngine import get_engine as _get_engine
-
-            db_manager = DatabaseWriter.QuantDBManager(engine=_get_engine(self.config))
+            db_manager = DatabaseWriter.QuantDBManager(engine=get_engine(self.config))
 
             sync_task = QuantDataPerformer.QuantDBSyncTask(db_manager)
 

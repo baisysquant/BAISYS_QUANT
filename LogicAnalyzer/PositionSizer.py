@@ -75,96 +75,83 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
         "D": cfg.get("position_d", 0.00),
     }
 
-    positions = []
-    reasons = []
+    levels = result[ColumnNames.COMPREHENSIVE_LEVEL].fillna("C").astype(str).str.strip().str.upper()
+    scores = pd.to_numeric(result[ColumnNames.COMPREHENSIVE_SCORE], errors='coerce').fillna(0).clip(0, 100)
+    score_factors = scores / 100.0
+    level_bases = levels.map(_level_pos).fillna(0.03)
+    bases = level_bases * score_factors
 
-    for _, row in result.iterrows():
-        # ── 1. 基础仓位：级别 + 评分 ────────────────────────────────────
-        level = _safe_str(row.get(ColumnNames.COMPREHENSIVE_LEVEL, "C")).strip().upper()
-        score_raw = _safe_float(row.get(ColumnNames.COMPREHENSIVE_SCORE, 0), 0)
-        score_factor = min(1.0, max(0.0, score_raw) / 100.0)
+    risks = result[ColumnNames.RISK_LEVEL].fillna("MEDIUM").astype(str).str.strip().str.upper()
+    risk_map_s = pd.Series(risks).map({"NONE": 1.0, "LOW": 0.85, "MEDIUM": 0.50, "HIGH": 0.0}).fillna(0.50)
+    high_risk = risks == "HIGH"
 
-        level_base = _level_pos.get(level, 0.03)
-        base = level_base * score_factor
-        parts = [f"级别{level}({level_base:.0%})×评分{score_factor:.0%}→{base:.1%}"]
+    trends = result[ColumnNames.MACD_TREND_TYPE].fillna("").astype(str)
+    regime_map_s = trends.map({"指标超强": 1.0, "指标强势": 0.85, "指标弱势": 0.40, "指标超弱": 0.0}).fillna(0.50)
+    zero_regime = regime_map_s <= 0.0
 
-        # ── 2. 风险等级折价 ────────────────────────────────────────────
-        risk = _safe_str(row.get(ColumnNames.RISK_LEVEL, "MEDIUM")).strip().upper()
-        risk_map = {"NONE": 1.0, "LOW": 0.85, "MEDIUM": 0.50, "HIGH": 0.0}
-        risk_mult = risk_map.get(risk, 0.50)
+    rrr_vals = pd.to_numeric(result[ColumnNames.EXIT_RRR], errors='coerce').fillna(0)
+    rrr_safe = rrr_vals.replace(0, float('nan'))
+    kelly_full = (_win_rate * rrr_vals - (1 - _win_rate)) / rrr_safe
+    kelly_full = kelly_full.clip(0)
+    kelly_used = kelly_full * _kelly_frac
+    kelly_mods = 0.8 + kelly_used * 0.7
+    kelly_mods = kelly_mods.clip(0.5, 1.5)
+    kelly_mods[(rrr_vals <= 0)] = 1.0
+    kelly_mods[(rrr_vals > 0) & (rrr_vals <= 1.0)] = 0.7
 
-        if risk == "HIGH":
-            positions.append(0.0)
-            reasons.append("风险等级 HIGH，不持仓")
-            continue
-        if risk_mult < 1.0:
-            parts.append(f"风险{risk}(×{risk_mult:.0%})")
+    closes = pd.to_numeric(result[ColumnNames.LATEST_PRICE], errors='coerce').fillna(0)
+    stops = pd.to_numeric(result[ColumnNames.STOP_LOSS], errors='coerce').fillna(0)
+    atr_pcts = (closes - stops) / (_atr_stop_mult * closes.replace(0, float('nan')))
+    vol_caps = _risk_budget / atr_pcts.where((closes > 0) & (stops > 0) & (stops < closes) & (atr_pcts > 0.001), float('nan'))
+    vol_caps = vol_caps.clip(0, _max_single).fillna(_max_single)
 
-        # ── 3. 市场状态乘数（MACD 趋势分类）─────────────────────────────
-        trend_type = _safe_str(row.get(ColumnNames.MACD_TREND_TYPE, ""))
-        regime_map = {
-            "指标超强": 1.0,
-            "指标强势": 0.85,
-            "指标弱势": 0.40,
-            "指标超弱": 0.0,
-        }
-        regime_mult = regime_map.get(trend_type, 0.50)
-        if regime_mult < 1.0:
-            parts.append(f"状态{trend_type}(×{regime_mult:.0%})")
-        if regime_mult <= 0.0:
-            positions.append(0.0)
-            reasons.append(f"趋势极弱({trend_type})，不持仓")
-            continue
+    pos_adjs = pd.to_numeric(result.get("position_adjust", 0), errors='coerce').fillna(0).clip(-1.0, 1.0)
 
-        # ── 4. Kelly 调整（盈亏比驱动）───────────────────────────────────
-        rrr = _safe_float(row.get(ColumnNames.EXIT_RRR, 0), 0)
-        kelly_mod = 1.0
-        if rrr > 1.0:
-            # f* = (p * b - q) / b  ;  q = 1 - p
-            # 默认 p=0.5（保守），半凯利
-            kelly_full = (_win_rate * rrr - (1 - _win_rate)) / rrr
-            kelly_full = max(0.0, kelly_full)
-            kelly_used = kelly_full * _kelly_frac
-            # 映射到乘数范围 [0.8, 1.5]
-            kelly_mod = 0.8 + kelly_used * 0.7
-            kelly_mod = min(max(kelly_mod, 0.5), 1.5)
-            parts.append(f"Kelly(RRR={rrr:.1f},×{kelly_mod:.0%})")
-        elif rrr > 0:
-            kelly_mod = 0.7
-            parts.append(f"RRR≤1({rrr:.1f},×{kelly_mod:.0%})")
-        else:
-            parts.append("无RRR(×1.0)")
-
-        # ── 5. 波动率上限（ATR 推导）────────────────────────────────────
-        close = _safe_float(row.get(ColumnNames.LATEST_PRICE, 0), 0)
-        stop_loss = _safe_float(row.get(ColumnNames.STOP_LOSS, 0), 0)
-        vol_cap = _max_single
-        if close > 0 and stop_loss > 0 and stop_loss < close:
-            atr = (close - stop_loss) / _atr_stop_mult
-            atr_pct = atr / close
-            if atr_pct > 0.001:
-                vol_cap = _risk_budget / atr_pct
-                vol_cap = min(vol_cap, _max_single)
-                if vol_cap < _max_single:
-                    parts.append(f"波动约束(ATR%={atr_pct:.1%},上限{vol_cap:.0%})")
-
-        # ── 6. Gate 4 仓位调整（来自 ScoringRules 规则引擎）───────────────
-        pos_adj = _safe_float(row.get("position_adjust", 0), 0)
-        pos_adj = max(-1.0, min(1.0, pos_adj))
-        if pos_adj != 0:
-            parts.append(f"规则调整({pos_adj:+.0%})")
-
-        # ── 7. 合成最终仓位 ─────────────────────────────────────────────
-        position = base * risk_mult * regime_mult * kelly_mod * (1 + pos_adj)
-        position = min(position, vol_cap, _max_single)
-        position = max(position, 0.0)
-        position = round(position, 4)
-
-        positions.append(position)
-        reasons.append(" | ".join(parts))
+    positions = bases * risk_map_s * regime_map_s * kelly_mods * (1 + pos_adjs)
+    positions = positions.clip(0, _max_single)
+    positions[high_risk | zero_regime] = 0.0
+    positions = positions.round(4)
 
     result[ColumnNames.SUGGESTED_POSITION] = positions
+
+    reasons = []
+    for i in range(len(result)):
+        if high_risk.iloc[i]:
+            reasons.append("风险等级 HIGH，不持仓")
+        elif zero_regime.iloc[i]:
+            reasons.append(f"趋势极弱({trends.iloc[i]})，不持仓")
+        else:
+            level = levels.iloc[i]
+            lb = level_bases.iloc[i]
+            sf = score_factors.iloc[i]
+            base = bases.iloc[i]
+            parts = [f"级别{level}({lb:.0%})×评分{sf:.0%}→{base:.1%}"]
+            risk = risks.iloc[i]
+            rm = risk_map_s.iloc[i]
+            if rm < 1.0:
+                parts.append(f"风险{risk}(×{rm:.0%})")
+            trend = trends.iloc[i]
+            tm = regime_map_s.iloc[i]
+            if tm < 1.0:
+                parts.append(f"状态{trend}(×{tm:.0%})")
+            rrr = rrr_vals.iloc[i]
+            km = kelly_mods.iloc[i]
+            if rrr > 1.0:
+                parts.append(f"Kelly(RRR={rrr:.1f},×{km:.0%})")
+            elif rrr > 0:
+                parts.append(f"RRR≤1({rrr:.1f},×{km:.0%})")
+            else:
+                parts.append("无RRR(×1.0)")
+            close = closes.iloc[i]
+            stop = stops.iloc[i]
+            if close > 0 and stop > 0 and stop < close:
+                atr = (close - stop) / _atr_stop_mult
+                atr_pct = atr / close
+                if atr_pct > 0.001 and vol_caps.iloc[i] < _max_single:
+                    parts.append(f"波动约束(ATR%={atr_pct:.1%},上限{vol_caps.iloc[i]:.0%})")
+            adj = pos_adjs.iloc[i]
+            if adj != 0:
+                parts.append(f"规则调整({adj:+.0%})")
+            reasons.append(" | ".join(parts))
     result[ColumnNames.POSITION_REASON] = reasons
     return result
-
-

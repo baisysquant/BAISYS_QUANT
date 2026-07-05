@@ -14,14 +14,14 @@ from loguru import logger
 
 from ConfigParser import Config
 
-warnings.filterwarnings('ignore')
-
 class SWIndustryDataPipeline:
     """模块一：数据管道（负责拉取、清洗与本地缓存）"""
     
     def __init__(self, config: Config | None = None, today_str: str | None = None) -> None:
-        self.config = config or Config()
-        self.ah_client = AShareHub(api_key=self.config.ASHAREHUB_API_KEY)
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            self.config = config or Config()
+            self.ah_client = AShareHub(api_key=self.config.ASHAREHUB_API_KEY)
         if today_str:
             self.today_str = today_str.replace("-", "")
         else:

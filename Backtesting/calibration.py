@@ -24,10 +24,13 @@ PROJECT_ROOT = _project_root()
 
 import pandas as pd
 
+from Backtesting._engine_legacy import EngineConfig, grid_search, walk_forward
+
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
     "atr_t1_mult": ("BACKTEST_CALIBRATED", "atr_t1_mult"),
+    "atr_t2_mult": ("BACKTEST_CALIBRATED", "atr_t2_mult"),
     "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
     "position_a": ("BACKTEST_CALIBRATED", "position_a"),
     "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
@@ -141,8 +144,6 @@ def run_grid_search(
     param_grid: dict[str, list[float]] | None = None,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from Backtesting._engine_legacy import EngineConfig, grid_search as _gs
-
     cfg = _build_engine_config(backtest_kwargs)
     if param_grid is None:
         param_grid = {
@@ -150,7 +151,7 @@ def run_grid_search(
             "kelly_fraction": [0.1, 0.25, 0.5],
             "position_a": [0.2, 0.3, 0.4],
         }
-    results = _gs(
+    results = grid_search(
         data=kline_df,
         param_grid=param_grid,
         engine_cfg=cfg,
@@ -167,8 +168,6 @@ def run_walk_forward(
     initial_cash: float = 1_000_000.0,
     **backtest_kwargs: Any,
 ) -> pd.DataFrame:
-    from Backtesting._engine_legacy import EngineConfig, walk_forward as _wf
-
     cfg = _build_engine_config(initial_cash, backtest_kwargs)
     if param_grid is None:
         param_grid = {
@@ -176,7 +175,7 @@ def run_walk_forward(
             "kelly_fraction": [0.1, 0.25, 0.5],
         }
 
-    results = _wf(
+    results = walk_forward(
         data=kline_df,
         engine_cfg=cfg,
         train_period=train_period,
@@ -188,8 +187,6 @@ def run_walk_forward(
 
 
 def _build_engine_config(initial_cash_or_kwargs: float | dict[str, Any], kwargs: dict[str, Any] | None = None) -> Any:
-    from Backtesting._engine_legacy import EngineConfig
-
     if isinstance(initial_cash_or_kwargs, dict):
         kwargs = initial_cash_or_kwargs
         initial_cash = kwargs.get("initial_cash", 1_000_000)
@@ -248,7 +245,7 @@ def apply_calibration_to_config(config: object) -> None:
             rd.BOLL_NARROW_RATIO = val
         elif key == "cross_decay_days":
             sc.CROSS_DECAY_DAYS = int(val)
-        elif key in ("atr_stop_mult", "atr_t1_mult"):
+        elif key in ("atr_stop_mult", "atr_t1_mult", "atr_t2_mult"):
             setattr(sc, attr, val)
         elif key == "liq_veto_ratio":
             fr.LIQ_VETO_RATIO = val

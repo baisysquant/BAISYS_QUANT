@@ -121,7 +121,10 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
 
 
 def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
-    """计算退出策略（止损/目标价/移动止损/盈亏比），全部基于不复权价格。
+    """计算退出策略（止损/目标价/移动止损/盈亏比）。
+
+    复盘路径中 LiveDataProvider 已将 OHLC 转为不复权，
+    回测路径仍为后复权。两种场景均无需在此处做复权转换。
 
     Args:
         df: K 线 DataFrame
@@ -131,17 +134,10 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     if params is None:
         params = {}
 
-    # 将后复权 OHLC 转换为不复权，保证 ATR/高低点均为实际交易价格
-    has_adj = 'adj_factor' in df.columns and df['adj_factor'].notna().any()
-    if has_adj:
-        adj = df['adj_factor']
-        high = df['high'] / adj
-        low = df['low'] / adj
-        close_series = df['close_normal'] if 'close_normal' in df.columns else df['close'] / adj
-    else:
-        high = df['high']
-        low = df['low']
-        close_series = df['close']
+    # 复盘路径中 LiveDataProvider 已将 OHLC 转为不复权，无需再次转换
+    high = df['high']
+    low = df['low']
+    close_series = df['close']
 
     close = df.attrs.get('latest_price', None)
     if close is None:
