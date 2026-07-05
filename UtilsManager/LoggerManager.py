@@ -78,17 +78,35 @@ def setup_logger(log_dir: str | None = None, log_filename: str | None = None, le
         enqueue=True,
     )
 
-    # 添加文件 handler（支持自动轮转）
+    # 手动轮转旧日志（避免自动轮转时 Windows 文件锁冲突）
+    if os.path.exists(log_path):
+        try:
+            base, ext = os.path.splitext(log_path)
+            rotated_name = f"{base}.{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}{ext}"
+            os.rename(log_path, rotated_name)
+        except PermissionError:
+            pass
+
+    # 添加文件 handler
     logger.add(
         log_path,
         format=format_file,
         level="DEBUG",
-        rotation="00:00",
-        retention="30 days",
-        compression="zip",
         encoding="utf-8",
         enqueue=True,
     )
+
+    # 清理 30 天前的旧日志
+    try:
+        now = datetime.now()
+        for f in os.listdir(log_dir):
+            fpath = os.path.join(log_dir, f)
+            if os.path.isfile(fpath) and f != os.path.basename(log_path):
+                age = now - datetime.fromtimestamp(os.path.getmtime(fpath))
+                if age.days > 30:
+                    os.remove(fpath)
+    except Exception:
+        pass
 
     return logger
 
