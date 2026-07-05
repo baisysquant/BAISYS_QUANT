@@ -356,18 +356,4 @@ class DataValidator:
         return report
 
 
-# 全局验证器实例（可选）
-_global_validator: DataValidator | None = None
 
-
-def get_validator() -> DataValidator:
-    """
-    获取全局数据验证器实例
-
-    Returns:
-        DataValidator: 数据验证器实例
-    """
-    global _global_validator
-    if _global_validator is None:
-        _global_validator = DataValidator()
-    return _global_validator

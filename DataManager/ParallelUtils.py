@@ -64,37 +64,4 @@ def _normalize_fund_data(df: pd.DataFrame | None) -> pd.DataFrame:
     return df
 
 
-def run_with_thread_pool(
-    items: Iterable[Any], worker_func: Callable[[Any], Any], max_workers: int = 10, desc: str = "任务"
-) -> list[Any]:
-    """
-    通用的多线程执行器。
 
-    :param items: 需要处理的数据列表 (如股票代码列表)
-    :param worker_func: 处理单个数据的函数 (输入一个item，返回结果)
-    :param max_workers: 最大线程数
-    :param desc: 任务描述，用于日志打印
-    :return: 包含所有成功结果的列表 (过滤掉 None)
-    """
-    items_list = list(items)
-    total = len(items_list)
-    results: list[Any] = []
-
-    logger.info(f">>> 开始并发执行: {desc} (数量: {total}, 线程: {max_workers})...")
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_item = {executor.submit(worker_func, item): item for item in items_list}
-
-        for future in as_completed(future_to_item):
-            item = future_to_item[future]
-            try:
-                res = future.result()
-                if res is not None:
-                    # 如果结果是 DataFrame 且为空，视具体情况决定是否添加
-                    # 这里只要不是 None 就添加，由调用方后续处理 (如 concat)
-                    results.append(res)
-            except (TimeoutError, TypeError, ValueError, KeyError, AttributeError) as e:
-                logger.error(f"处理 {item} 时发生异常: {e}")
-
-    logger.info(f">>> {desc} 执行完毕，成功获取 {len(results)} 条结果。")
-    return results

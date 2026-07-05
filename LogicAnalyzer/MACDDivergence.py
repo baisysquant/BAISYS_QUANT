@@ -30,17 +30,6 @@ def adaptive_distance(series: pd.Series, base_distance: int = 10) -> int:
     return min(dynamic, max(10, n // 5))
 
 
-def calc_slope_linear(series: pd.Series, window: int = 3) -> float:
-    if len(series) < 2:
-        return 0.0
-    y = series.iloc[-window:].values
-    x = np.arange(len(y))
-    if len(y) < 2:
-        return 0.0
-    slope = np.polyfit(x, y, 1)[0]
-    return slope
-
-
 def signal_with_decay(signal_type: str | None, signal_idx: int | None,
                        current_idx: int, half_life: int = 8) -> float:
     if signal_type is None or signal_idx is None:
@@ -87,22 +76,6 @@ def detect_divergence_single_param(
             return Divergence.BOTTOM_DIVERGENCE, t, strength
 
     return None, None, 0.0
-
-
-def volume_confirmation(df: pd.DataFrame, signal_type: str | None, signal_idx: int | None) -> str:
-    if signal_type is None or signal_idx is None:
-        return "量价正常"
-    recent_vol = df["volume"].iloc[-5:].mean()
-    hist_vol = df["volume"].iloc[signal_idx:signal_idx + 5].mean() if signal_idx < len(df) - 5 else recent_vol
-    if hist_vol == 0:
-        return "量价正常"
-    vol_ratio = recent_vol / hist_vol
-    if signal_type == Divergence.BOTTOM_DIVERGENCE:
-        return "底背离：量能放大（vol_ratio >= 1.2）→ 确认买入" if vol_ratio >= 1.2 else f"底背离：量能不足（vol_ratio={vol_ratio:.2f}）→ 需等待"
-    else:
-        return "顶背离：量能萎缩（vol_ratio <= 0.8）→ 确认卖出" if vol_ratio <= 0.8 else f"顶背离：量能正常（vol_ratio={vol_ratio:.2f}）→ 需观察"
-
-
 
 
 

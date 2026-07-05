@@ -6,26 +6,6 @@ from akquant import Bar, Strategy
 from akquant.params import FloatParam, IntParam, ParamModel
 
 
-_trade_log: list[dict[str, Any]] = []
-_equity_curve: list[dict[str, Any]] = []
-
-
-def get_trade_log() -> list[dict[str, Any]]:
-    return list(_trade_log)
-
-
-def clear_trade_log() -> None:
-    _trade_log.clear()
-
-
-def get_equity_curve() -> list[dict[str, Any]]:
-    return list(_equity_curve)
-
-
-def clear_equity_curve() -> None:
-    _equity_curve.clear()
-
-
 
 class QuantPipelineParams(ParamModel):
     """回测策略可寻优参数。"""

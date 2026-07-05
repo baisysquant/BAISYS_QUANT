@@ -27,10 +27,6 @@ EquityCurve: TypeAlias = list[dict[str, Any]]
 _WALK_FORWARD_RESULTS: list[dict[str, Any]] = []
 
 
-def get_walk_forward_results() -> list[dict[str, Any]]:
-    return list(_WALK_FORWARD_RESULTS)
-
-
 def clear_walk_forward_results() -> None:
     _WALK_FORWARD_RESULTS.clear()
 

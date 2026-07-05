@@ -232,55 +232,6 @@ class MainCostDataManager:
 
         return result_df
 
-    def get_stock_cost_info(self, stock_code: str) -> dict[str, Any] | None:
-        df = self.get_main_cost_data()
-        if df is None or df.empty:
-            return None
-
-        formatted_code = str(stock_code).zfill(6)
-        stock_data = df[df["代码"].astype(str).str.zfill(6) == formatted_code]
-
-        if stock_data.empty:
-            return None
-
-        record = stock_data.iloc[0].to_dict()
-
-        return {
-            "代码": record.get("代码"),
-            "名称": record.get("名称"),
-            "最新价": record.get("最新价"),
-            "主力成本": record.get("主力成本"),
-            "机构参与度": record.get("机构参与度"),
-            "主力成本差价": record.get("主力成本差价") if "主力成本差价" in record else None,
-            "主力成本差价百分比": record.get("主力成本差价百分比") if "主力成本差价百分比" in record else None,
-            "成本位置": record.get("成本位置") if "成本位置" in record else None,
-            "机构参与度等级": record.get("机构参与度等级") if "机构参与度等级" in record else None,
-            "主力控盘强度": record.get("主力控盘强度") if "主力控盘强度" in record else None,
-        }
-
-    def filter_by_cost_criteria(
-        self,
-        df: pd.DataFrame,
-        cost_diff_threshold: float = 0.0,
-        participation_threshold: float = 0.0,
-        cost_position: str | None = None,
-    ) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-
-        result_df = df.copy()
-
-        if "主力成本差价百分比" in result_df.columns:
-            result_df = result_df[result_df["主力成本差价百分比"] >= cost_diff_threshold]
-
-        if "机构参与度" in result_df.columns:
-            result_df = result_df[result_df["机构参与度"] >= participation_threshold]
-
-        if cost_position and "成本位置" in result_df.columns:
-            result_df = result_df[result_df["成本位置"] == cost_position]
-
-        return result_df
-
     def print_cost_summary(self, df: pd.DataFrame) -> None:
         if df is None or df.empty:
             logger.warning("主力成本数据为空")

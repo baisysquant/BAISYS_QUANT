@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-import pandas as pd
-
 from ConfigParser import Config
 from Backtesting.domain.models import CostModel
 

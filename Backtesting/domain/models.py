@@ -34,17 +34,6 @@ class CostModel:
             impact = 0.0
         return base + impact
 
-    def total_cost(self, value: float, volume: float, adv: float, side: str = "buy", order_type: str = "market") -> float:
-        """计算一笔交易的总成本（佣金 + 印花税 + 滑点）。"""
-        slip = self.calc_slippage(volume, adv, side, order_type)
-        stamp = self.stamp_tax_rate if side == "sell" else 0.0
-        return value * (self.commission_rate + stamp + slip)
-
-    def sell_proceeds(self, value: float, volume: float, adv: float, order_type: str = "market") -> float:
-        """卖出净收入（扣除所有成本后）。"""
-        slip = self.calc_slippage(volume, adv, side="sell", order_type=order_type)
-        return value * (1 - slip - self.stamp_tax_rate)
-
     def buy_cost(self, value: float, volume: float, adv: float, order_type: str = "market") -> float:
         """买入所需额外成本（佣金 + 滑点）。"""
         slip = self.calc_slippage(volume, adv, side="buy", order_type=order_type)
