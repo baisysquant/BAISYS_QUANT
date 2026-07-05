@@ -75,6 +75,72 @@ class MACDAnalyzer:
         return df
 
     @staticmethod
+    def detect_macd_zero_axis_pattern(df: pd.DataFrame) -> dict:
+        """
+        检测 MACD 零轴完整反弹形态：下穿零轴 → 零轴下金叉 → 上穿零轴
+        返回最近一次完整形态的三个日期，若不存在则返回空 dict
+        """
+        if len(df) < 60 or 'DIF' not in df.columns or 'DEA' not in df.columns:
+            return {}
+
+        dif = df['DIF']
+        dea = df['DEA']
+
+        # 1. 零轴穿越事件
+        zero_cross_up = (dif > 0) & (dif.shift(1) <= 0)
+        zero_cross_down = (dif < 0) & (dif.shift(1) >= 0)
+
+        # 2. 金叉/死叉
+        golden_cross = (df['DIF'] > df['DEA']) & (df['DIF'].shift(1) <= df['DEA'].shift(1))
+
+        # 3. 零轴下金叉：金叉发生时 DIF<0 且 DEA<0
+        golden_below_zero = golden_cross & (df['DIF'] < 0) & (df['DEA'] < 0)
+
+        if not zero_cross_up.any():
+            return {}
+
+        # 使用 date 列（若有）获取日期值，否则回退到 index
+        has_date_col = 'date' in df.columns
+        date_series = df['date'] if has_date_col else None
+
+        def _get_date_str(idx: int) -> str:
+            if has_date_col:
+                d = date_series.iloc[idx]
+                if hasattr(d, 'strftime'):
+                    return d.strftime('%Y-%m-%d')
+                return str(pd.Timestamp(d).strftime('%Y-%m-%d')) if pd.notna(d) else str(idx)
+            idx_val = df.index[idx]
+            if hasattr(idx_val, 'strftime'):
+                return idx_val.strftime('%Y-%m-%d')
+            return str(idx_val)
+
+        # 收集事件位置（整数位置）
+        zero_down_positions = df.index[zero_cross_down].tolist()
+        golden_below_positions = df.index[golden_below_zero].tolist()
+        zero_up_positions = df.index[zero_cross_up].tolist()
+
+        # 从最近一次上穿零轴向前回溯，找完整序列
+        for zero_up_pos in reversed(zero_up_positions):
+            golden_before = [p for p in golden_below_positions if p < zero_up_pos]
+            if not golden_before:
+                continue
+            golden_pos = max(golden_before)
+
+            zero_down_before = [p for p in zero_down_positions if p < golden_pos]
+            if not zero_down_before:
+                continue
+            zero_down_pos = max(zero_down_before)
+
+            if zero_down_pos < golden_pos < zero_up_pos:
+                return {
+                    'macd_zero_axis_down_date': _get_date_str(zero_down_pos),
+                    'macd_zero_axis_golden_date': _get_date_str(golden_pos),
+                    'macd_zero_axis_up_date': _get_date_str(zero_up_pos),
+                }
+
+        return {}
+
+    @staticmethod
     def _check_multitimeframe(df: pd.DataFrame) -> dict:
         if len(df) < 30 or 'DIF' not in df.columns or 'DEA' not in df.columns:
             return {'alignment': 'UNKNOWN', 'multiplier': 1.0, 'desc': ''}
@@ -334,6 +400,13 @@ class MACDAnalyzer:
             'vol_regime': self._detect_volatility_regime(df),
             'position_adjust': 0.0,
         })
+
+        # 检测 MACD 零轴完整反弹形态（下穿→零轴下金叉→上穿零轴）
+        zero_axis_pattern = self.detect_macd_zero_axis_pattern(df)
+        if zero_axis_pattern:
+            state['macd_zero_axis_up_date'] = zero_axis_pattern.get('macd_zero_axis_up_date', '')
+        else:
+            state['macd_zero_axis_up_date'] = ''
 
         signal_list = []
         detail_str = df['MACD_SIGNAL_DETAIL'].iloc[-1] if 'MACD_SIGNAL_DETAIL' in df.columns else ''

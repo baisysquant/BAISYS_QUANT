@@ -1,5 +1,6 @@
 import configparser
 import os
+import sys
 import threading
 import time
 import warnings
@@ -14,12 +15,20 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from tqdm import tqdm
 
+# 把项目根目录加入 sys.path，以便导入根目录下的模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 注册自定义 TA accessor (替代 pandas_ta)
+import TACompatibility  # noqa: F401  # 自动注册 df.ta accessor
+
 warnings.filterwarnings("ignore")
 
 
 class Config:
-    def __init__(self, config_file: str = "../config.ini") -> None:
-        self.config_file = config_file
+    def __init__(self, config_file: str = "../../config.ini") -> None:
+        # 将相对路径解析为基于脚本目录的绝对路径
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config_file = os.path.join(script_dir, config_file)
         self._validate_config_file()
         self._load_config()
         self._ensure_directories()
@@ -82,7 +91,7 @@ class Config:
             os.makedirs(d, exist_ok=True)
 
     def get_db_connection_string(self) -> str:
-        return f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        return f"host={self.DB_HOST} port={self.DB_PORT} dbname={self.DB_NAME} user={self.DB_USER} password={self.DB_PASSWORD}"
 
 
 def calculate_kdj_from_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -386,6 +395,13 @@ class MACDKDJDoubleBottomAnalyzer:
                 retry_count += 1
                 logger.warning(f"获取股票 {symbol} 数据失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
+                # 回滚事务，防止后续查询报 "current transaction is aborted"
+                try:
+                    if self.conn:
+                        self.conn.rollback()
+                except (psycopg2.Error, psycopg2.OperationalError):
+                    pass
+
                 if retry_count < self.max_retries:
                     try:
                         if self.conn:
@@ -427,6 +443,13 @@ class MACDKDJDoubleBottomAnalyzer:
                 retry_count += 1
                 logger.warning(f"获取股票代码列表失败 (尝试 {retry_count}/{self.max_retries}): {e}")
 
+                # 回滚事务，防止后续查询报 "current transaction is aborted"
+                try:
+                    if self.conn:
+                        self.conn.rollback()
+                except (psycopg2.Error, psycopg2.OperationalError):
+                    pass
+
                 if retry_count < self.max_retries:
                     try:
                         if self.conn:
@@ -449,21 +472,28 @@ class MACDKDJDoubleBottomAnalyzer:
                 if not self.conn:
                     self.connect_database()
 
-            # 构建SQL查询，从stock_basic_info表获取股票名称
+            # 构建SQL查询，从stock_basic_info_sw表获取股票名称
             query = """
-            SELECT "name"
-            FROM stock_basic_info
-            WHERE symbol = %s OR ts_code = %s
+            SELECT "stock_name"
+            FROM stock_basic_info_sw
+            WHERE stock_code = %s
             LIMIT 1
             """
 
-            df = pd.read_sql_query(query, self.conn, params=(symbol[2:], symbol))
-
-            if not df.empty and not pd.isna(df["name"].iloc[0]):
-                return df["name"].iloc[0]
-            else:
-                return "未知"
+            with self.conn.cursor() as cur:
+                cur.execute(query, (symbol[2:],))
+                row = cur.fetchone()
+                self.conn.commit()  # 提交事务
+                if row and row[0]:
+                    return row[0]
+            return "未知"
         except Exception as e:
+            # 回滚失败事务，防止后续查询报 "current transaction is aborted"
+            try:
+                if self.conn:
+                    self.conn.rollback()
+            except Exception:
+                pass
             logger.warning(f"获取股票 {symbol} 名称时出错: {e}")
             return "未知"
 
@@ -1005,9 +1035,11 @@ class MACDKDJDoubleBottomAnalyzer:
         Returns:
             分析结果字典
         """
+        logger.debug(f"开始分析股票: {symbol}")
         try:
             # 获取股票简称
             stock_name = self.get_stock_name(symbol)
+            logger.debug(f"股票 {symbol} 名称: {stock_name}")
 
             # 检查是否为ST股票，如果是则直接返回空结果
             if self.is_st_stock(stock_name):
@@ -1022,17 +1054,25 @@ class MACDKDJDoubleBottomAnalyzer:
 
             # 获取数据
             df = self.safe_fetch_stock_data(symbol, start_date, end_date)
+            logger.debug(f"股票 {symbol} 获取数据完成，行数: {len(df)}")
 
             if df.empty:
                 return {"symbol": symbol, "error": f"未找到股票 {symbol} 的数据", "patterns_found": 0}
 
             # 计算指标
+            logger.debug(f"股票 {symbol} 计算 MA60")
             df = self.calculate_ma60(df)
+            logger.debug(f"股票 {symbol} 计算 MA60 完成")
             df = self.calculate_macd(df)
+            logger.debug(f"股票 {symbol} 计算 MACD 完成")
 
             # 获取KDJ信号
+            logger.debug(f"股票 {symbol} 检测 KDJ 信号")
             kdj_signals = self.detect_kdj_signals(df)
+            logger.debug(f"股票 {symbol} KDJ 信号完成: {len(kdj_signals)}")
+            logger.debug(f"股票 {symbol} 开始双重谷检测")
             patterns = self.detect_recent_double_bottom_pattern(df, recent_days, external_kdj_signals=kdj_signals)
+            logger.debug(f"股票 {symbol} 双重谷检测完成: {len(patterns)}")
 
             result = {
                 "symbol": symbol,
@@ -1215,8 +1255,8 @@ def main() -> None:
         update_progress()
         return symbol, result
 
-    # 使用ThreadPoolExecutor进行多线程处理
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # 使用ThreadPoolExecutor进行多线程处理 (TA-Lib 非线程安全，限制为单线程)
+    with ThreadPoolExecutor(max_workers=1) as executor:
         # 提交所有任务
         future_to_symbol = {executor.submit(analyze_wrapper, symbol): symbol for symbol in all_symbols}
 

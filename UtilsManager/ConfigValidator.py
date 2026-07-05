@@ -420,6 +420,7 @@ SECTION_RULES: list[SectionRule] = [
                    allowed_values=["score_weighted", "risk_parity", "min_variance", "mean_variance"]),
         FieldRule("point_in_time", "bool", required=False, default="true"),
     ]),
+    SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True),
 ]
 
 _CUSTOM_VALIDATORS = {

@@ -121,7 +121,7 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
 
 
 def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
-    """计算退出策略（止损/目标价/移动止损/盈亏比）。
+    """计算退出策略（止损/目标价/移动止损/盈亏比），全部基于不复权价格。
 
     Args:
         df: K 线 DataFrame
@@ -130,28 +130,55 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     """
     if params is None:
         params = {}
-    close = df.attrs.get('latest_price', df['close'].iloc[-1])
-    atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else float('nan')
 
-    if pd.isna(atr) or atr <= 0:
+    # 将后复权 OHLC 转换为不复权，保证 ATR/高低点均为实际交易价格
+    has_adj = 'adj_factor' in df.columns and df['adj_factor'].notna().any()
+    if has_adj:
+        adj = df['adj_factor']
+        high = df['high'] / adj
+        low = df['low'] / adj
+        close_series = df['close_normal'] if 'close_normal' in df.columns else df['close'] / adj
+    else:
+        high = df['high']
+        low = df['low']
+        close_series = df['close']
+
+    close = df.attrs.get('latest_price', None)
+    if close is None:
+        close = float(close_series.iloc[-1])
+
+    # 基于不复权数据计算 ATR（纯 pandas，不依赖 TA-Lib）
+    atr_period = 14
+    if len(df) >= atr_period + 1:
+        prev_close = close_series.shift(1)
+        tr = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr_val = float(tr.rolling(atr_period).mean().iloc[-1])
+    else:
+        atr_val = float('nan')
+
+    if pd.isna(atr_val) or atr_val <= 0:
         return {'stop_loss': None, 't1_target': None, 't2_target': None,
                 'trailing_stop': None, 'exit_rrr': None}
 
     atr_stop = params.get('atr_stop_mult', 1.5)
     atr_t1 = params.get('atr_t1_mult', 3.0)
     atr_t2 = params.get('atr_t2_mult', 5.0)
-    stop_loss = round(float(close - atr * atr_stop), 2)
-    t1 = round(float(close + atr * atr_t1), 2)
-    t2 = round(float(close + atr * atr_t2), 2)
+    stop_loss = round(float(close - atr_val * atr_stop), 2)
+    t1 = round(float(close + atr_val * atr_t1), 2)
+    t2 = round(float(close + atr_val * atr_t2), 2)
 
     trailing_stop = None
     high_lookback = params.get('trailing_stop_high_lookback', 20)
     high_ratio = params.get('trailing_stop_high_ratio', 0.98)
     stop_lookback = params.get('trailing_stop_lookback', 10)
     if len(df) >= high_lookback:
-        recent_high = df['high'].iloc[-high_lookback:].max()
+        recent_high = high.iloc[-high_lookback:].max()
         if close >= recent_high * high_ratio:
-            trailing_stop = round(float(df['low'].iloc[-stop_lookback:].min()), 2)
+            trailing_stop = round(float(low.iloc[-stop_lookback:].min()), 2)
 
     risk = float(close - stop_loss) if stop_loss and close > stop_loss else 0.01
     reward = float(t1 - close)
@@ -206,6 +233,7 @@ def _pipeline_output(state: dict) -> dict:
         "risk_reward_ratio": state.get('risk_reward_ratio', 0),
         "macd_trend": state.get('macd_trend', ''),
         "position_adjust": state.get('position_adjust', 0.0),
+        "macd_zero_axis_up_date": state.get('macd_zero_axis_up_date', ''),
     }
 
     # 仅当 exit_strategy 存在且非空时才包含退出策略字段

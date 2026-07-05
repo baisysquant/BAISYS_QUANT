@@ -53,37 +53,4 @@ class EngineConfig:
         )
 
 
-class BacktestEngine:
-    """纯计算核心：给定数据和配置，运行回测返回权益曲线和交易记录。
-
-    无状态、可序列化、易于测试。
-    """
-
-    def __init__(self, config: EngineConfig):
-        self.config = config
-
-    def run(
-        self,
-        data: pd.DataFrame,
-        params: dict[str, Any] | None = None,
-    ) -> tuple[list[dict], list[dict]]:
-        from Backtesting._engine_legacy import _run_single_backtest
-
-        if params is None:
-            params = {}
-        tl: list[dict] = []
-        ec: list[dict] = []
-        _run_single_backtest(data, params, self.config, tl, ec)
-        return tl, ec
-
-    def run_from_config(
-        self,
-        data: pd.DataFrame,
-        config: "Config",
-        params: dict[str, Any] | None = None,
-    ) -> tuple[list[dict], list[dict]]:
-        engine_cfg = EngineConfig.from_config(config)
-        return self.run(data, params)
-
-
 

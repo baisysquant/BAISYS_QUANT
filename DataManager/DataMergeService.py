@@ -481,7 +481,8 @@ class DataMergeService:
                              ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR,
                              "position_adjust",
                              ColumnNames.AMOUNT, ColumnNames.AMOUNT_MA20,
-                             "宏观风险"]:
+                             "宏观风险",
+                             ColumnNames.MACD_ZERO_AXIS_UP_DATE]:
                 if pipe_col in macd_full_bull_df.columns:
                     cols.append(pipe_col)
             ta_dfs_to_merge.append(macd_full_bull_df[cols])
@@ -528,7 +529,8 @@ class DataMergeService:
         # MACD 管线列也补 NaN → 空串（部分股票可能因早期返回未进 MACD_FULL_BULL）
         macd_fill_cols = [ColumnNames.MACD_TREND, ColumnNames.MACD_CROSS, ColumnNames.MACD_HIST_MOMENTUM, ColumnNames.DIF_SLOPE,
                           ColumnNames.DIVERGENCE_SIGNAL, ColumnNames.VOLUME_PRICE_CONFIRM, ColumnNames.KLINE_PATTERN,
-                          ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE, ColumnNames.MACD_TREND_TYPE, "macd_trend"]
+                          ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE, ColumnNames.MACD_TREND_TYPE, "macd_trend",
+                          ColumnNames.MACD_ZERO_AXIS_UP_DATE]
         for col in macd_fill_cols:
             if col in final_df.columns:
                 final_df[col] = final_df[col].fillna("")

@@ -127,6 +127,7 @@ class ColumnNames:
     # ==================== 背离位置列 ====================
     DIVERGENCE_DAYS = "背离距今"
     DIVERGENCE_PRICE = "背离位置"
+    MACD_ZERO_AXIS_UP_DATE = "MACD上穿零轴时间"  # MACD上穿零轴日期
 
     # ==================== 仓位管理列 ====================
     SUGGESTED_POSITION = "建议仓位比例"
@@ -135,6 +136,3 @@ class ColumnNames:
     # ==================== 流动性分析列 ====================
     AMOUNT = "成交额"
     AMOUNT_MA20 = "成交额MA20"
-    INDUSTRY_MEDIAN_AMOUNT = "行业中位数成交额"
-    LIQUIDITY_SCORE = "流动性评分"
-    LIQUIDITY_LEVEL = "流动性等级"

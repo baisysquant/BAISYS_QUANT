@@ -1,8 +1,4 @@
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any, Literal
+from dataclasses import dataclass
 
 
 @dataclass
@@ -54,32 +50,3 @@ class CostModel:
         slip = self.calc_slippage(volume, adv, side="buy", order_type=order_type)
         return value * (self.commission_rate + slip)
 
-
-@dataclass
-class Order:
-    symbol: str
-    action: Literal["buy", "sell"]
-    target_weight: float = 0.0
-
-
-@dataclass
-class TradeRecord:
-    time: str
-    symbol: str
-    action: str
-    price: float
-    shares: float
-    value: float
-    cost: float
-
-
-@dataclass
-class BarRow:
-    trade_date: str
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    amount: float
-    features: dict[str, Any] = field(default_factory=dict)

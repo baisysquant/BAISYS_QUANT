@@ -8,7 +8,6 @@ from . import Exceptions
 from .CodeNormalizer import CodeNormalizer
 from .ConfigCipher import ConfigCipher
 from .LoggerManager import get_log_path, get_logger
-from .PriceExtractor import PriceExtractor
 from .UnifiedCacheManager import UnifiedCacheManager
 
 __all__ = [
@@ -17,6 +16,5 @@ __all__ = [
     "Exceptions",
     "get_logger",
     "get_log_path",
-    "PriceExtractor",
     "UnifiedCacheManager",
 ]

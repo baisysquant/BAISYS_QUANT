@@ -76,29 +76,6 @@ def _score_kline_pattern(df: pd.DataFrame, max_score: int = 10) -> tuple[str, in
     return desc, score
 
 
-def _backtest_signal_winrate(df: pd.DataFrame, signal_col: str, target_signal: str, forward_bars: int = 5) -> dict:
-    if signal_col not in df.columns:
-        return {"sample_count": 0, "win_rate": None, "avg_return": None, "max_gain": None, "max_loss": None}
-    hit_locs = [df.index.get_loc(i) for i in df.index[df[signal_col] == target_signal]]
-    results = []
-    for loc in hit_locs:
-        end_loc = min(loc + forward_bars, len(df) - 1)
-        if end_loc <= loc:
-            continue
-        entry = df["close"].iloc[loc]
-        exit_ = df["close"].iloc[end_loc]
-        results.append((exit_ - entry) / (entry + 1e-9))
-    if not results:
-        return {"sample_count": 0, "win_rate": None, "avg_return": None, "max_gain": None, "max_loss": None}
-    arr = np.array(results)
-    return {
-        "sample_count": len(arr),
-        "win_rate": round(float((arr > 0).mean()), 3),
-        "avg_return": round(float(arr.mean()), 4),
-        "max_gain": round(float(arr.max()), 4),
-        "max_loss": round(float(arr.min()), 4),
-    }
-
 
 def _calc_moneyflow_score(mf_data: dict | None) -> tuple[int, str]:
     if not mf_data:

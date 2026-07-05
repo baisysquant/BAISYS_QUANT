@@ -3,10 +3,8 @@ from __future__ import annotations
 import itertools
 import os
 import tempfile
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -24,36 +22,6 @@ from ConfigParser import Config as _Config
 ParamsDict: TypeAlias = dict[str, Any]
 TradeLog: TypeAlias = list[dict[str, Any]]
 EquityCurve: TypeAlias = list[dict[str, Any]]
-
-
-@dataclass
-class Order:
-    symbol: str
-    action: Literal["buy", "sell"]
-    target_weight: float = 0.0
-
-
-@dataclass
-class TradeRecord:
-    time: str
-    symbol: str
-    action: str
-    price: float
-    shares: float
-    value: float
-    cost: float
-
-
-@dataclass
-class BarRow:
-    trade_date: str
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    amount: float
-    features: dict[str, Any] = field(default_factory=dict)
 
 
 _WALK_FORWARD_RESULTS: list[dict[str, Any]] = []

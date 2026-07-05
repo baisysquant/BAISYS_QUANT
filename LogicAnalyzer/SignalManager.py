@@ -174,6 +174,7 @@ class TASignalProcessor:
                 weights=weights, thresholds=adj_thresholds or thresholds,
                 rule_thresholds=getattr(self.config, 'RULE_THRESHOLDS', None),
                 params=pipeline_params,
+                compute_exit_strategy=True,
             )
             result['pipeline'] = pipeline_result
             result['details'] = pipeline_result.get('details', {})
@@ -536,6 +537,7 @@ class TASignalProcessor:
                 'position_adjust', 'macd_trend_raw',
                 'AMOUNT', 'AMOUNT_MA20',
                 '宏观风险',
+                'MACD上穿零轴时间',
             ]),
         }
 
@@ -695,6 +697,7 @@ class TASignalProcessor:
                     'macd_trend_raw': r.get('macd_trend_raw', ''),
                     'AMOUNT': r.get('amount', 0),
                     'AMOUNT_MA20': r.get('amount_ma20', 0),
+                    'MACD上穿零轴时间': pipeline.get('macd_zero_axis_up_date', ''),
                 })
 
             if 'kdj_signal' in r:

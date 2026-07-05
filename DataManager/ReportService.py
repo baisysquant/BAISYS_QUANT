@@ -102,8 +102,13 @@ class ReportService:
             "背离信号",
             ColumnNames.DIVERGENCE_DAYS,
             ColumnNames.DIVERGENCE_PRICE,
+            ColumnNames.MACD_ZERO_AXIS_UP_DATE,
             ColumnNames.RISK_LEVEL,
             "宏观风险",
+            ColumnNames.STOP_LOSS,
+            ColumnNames.T1_TARGET,
+            ColumnNames.T2_TARGET,
+            ColumnNames.TRAILING_STOP,
         ]
         return cols
 
@@ -144,7 +149,7 @@ class ReportService:
         base_cols = ReportService.get_base_columns()
         signal_cols = ReportService.get_signal_columns()
         report_cols = ReportService.get_report_columns(fund_flow_periods)
-        tail_cols = [ColumnNames.LIQUIDITY_SCORE, ColumnNames.LIQUIDITY_LEVEL, ColumnNames.STOCK_LINK]
+        tail_cols = [ColumnNames.STOCK_LINK]
         return base_cols + signal_cols + report_cols + tail_cols
 
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
@@ -172,8 +177,8 @@ class ReportService:
         if user_focus_stocks:
             self.logger.info(f"  - 用户关注股池: {', '.join(sorted(user_focus_stocks))}")
 
-        # ── 先将所有 sheet 中的 后复权 止损/目标价 转为 不复权 价格 ─────────
-        sheets_data = self._convert_adjusted_to_normal_prices(sheets_data, trade_date)
+        # ── 退出策略价格已在 _calc_exit_strategy 中基于不复权数据计算，无需转换 ──
+        # sheets_data = self._convert_adjusted_to_normal_prices(sheets_data, trade_date)
 
         try:
             writer = pd.ExcelWriter(report_path, engine="xlsxwriter", engine_kwargs={'options': {'nan_inf_to_errors': True}})
