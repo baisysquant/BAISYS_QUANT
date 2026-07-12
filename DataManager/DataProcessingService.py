@@ -14,7 +14,7 @@ from pandera.errors import SchemaErrors
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DataMergeService import DataMergeService
 from DataManager.DataSchemas import create_final_report_schema
-from DataManager.ReportService import ReportService
+from Review.report import ReportService
 from LogicAnalyzer.DataValidator import DataValidator
 from LogicAnalyzer.PositionSizer import calculate_positions
 from UtilsManager.CodeNormalizer import CodeNormalizer

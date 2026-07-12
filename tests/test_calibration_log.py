@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 
-from Backtesting.calibration_log import should_rerun
+from BackTrading.calibration_log import should_rerun
 
 
 class TestShouldRerun:

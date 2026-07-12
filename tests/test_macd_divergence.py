@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from LogicAnalyzer.MACDDivergence import (
+from LogicAnalyzer.signals.divergence import (
     adaptive_distance,
     find_peaks_troughs,
     slope_analysis,

@@ -12,7 +12,7 @@ import requests
 from asharehub import AShareHub
 from loguru import logger
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 
 class SWIndustryDataPipeline:
     """模块一：数据管道（负责拉取、清洗与本地缓存）"""

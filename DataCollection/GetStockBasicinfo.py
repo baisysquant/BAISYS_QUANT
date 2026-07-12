@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,7 +10,7 @@ from asharehub import AShareHub
 from loguru import logger
 from sqlalchemy.exc import DBAPIError, OperationalError
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DatabaseWriter import QuantDBManager
 from UtilsManager.Exceptions import DatabaseConnectionError, DatabaseError

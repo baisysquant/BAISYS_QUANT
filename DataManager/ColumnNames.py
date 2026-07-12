@@ -129,9 +129,17 @@ class ColumnNames:
     DIVERGENCE_PRICE = "背离位置"
     MACD_ZERO_AXIS_UP_DATE = "MACD上穿零轴时间"  # MACD上穿零轴日期
 
+    # ==================== 多因子 Alpha 评分列 ====================
+    FACTOR_QUALITY = "基本面评分"
+    FACTOR_VALUATION = "估值评分"
+    FACTOR_MOMENTUM = "动量评分"
+    FACTOR_MONEYFLOW = "资金流评分"
+    FACTOR_MACD = "MACD评分"
+
     # ==================== 仓位管理列 ====================
     SUGGESTED_POSITION = "建议仓位比例"
     POSITION_REASON = "仓位依据"
+    TARGET_WEIGHT = "目标权重"
 
     # ==================== 流动性分析列 ====================
     AMOUNT = "成交额"

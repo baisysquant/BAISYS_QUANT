@@ -44,3 +44,52 @@ CREATE TABLE IF NOT EXISTS public.backtest_calibration_log (
 );
 CREATE INDEX IF NOT EXISTS idx_backtest_calibration_log_run_time
     ON public.backtest_calibration_log (run_time DESC);
+
+-- 因子 IC 历史（衰减监控）
+CREATE TABLE IF NOT EXISTS public.ods_factor_ic_history (
+    id SERIAL PRIMARY KEY,
+    factor_name VARCHAR(20) NOT NULL,
+    check_date DATE NOT NULL,
+    rolling_ic_mean FLOAT,
+    is_decayed BOOLEAN DEFAULT FALSE,
+    current_weight FLOAT,
+    suggested_weight FLOAT
+);
+
+-- 基准指数日线（如上证综指 000001.SH）
+CREATE TABLE IF NOT EXISTS public.ods_index_daily (
+    index_code VARCHAR(20) NOT NULL,
+    trade_date DATE NOT NULL,
+    open FLOAT,
+    high FLOAT,
+    low FLOAT,
+    close FLOAT,
+    volume FLOAT,
+    amount FLOAT,
+    PRIMARY KEY (index_code, trade_date)
+);
+
+-- 质量/成长因子（季度）
+CREATE TABLE IF NOT EXISTS public.ods_financial_quality (
+    symbol VARCHAR(20) NOT NULL,
+    record_date DATE NOT NULL,
+    roe FLOAT,
+    gross_profit_margin FLOAT,
+    net_profit_margin FLOAT,
+    revenue_growth_rate FLOAT,
+    net_profit_growth_rate FLOAT,
+    PRIMARY KEY (symbol, record_date)
+);
+
+-- 估值/市值因子（日频）
+CREATE TABLE IF NOT EXISTS public.ods_financial_valuation (
+    symbol VARCHAR(20) NOT NULL,
+    trade_date DATE NOT NULL,
+    pe FLOAT,
+    pe_ttm FLOAT,
+    pb FLOAT,
+    total_mv FLOAT,
+    circ_mv FLOAT,
+    PRIMARY KEY (symbol, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_fv_date ON public.ods_financial_valuation (trade_date);

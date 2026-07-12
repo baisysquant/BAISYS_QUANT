@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from UtilsManager.ConfigCipher import ConfigCipher
 
 
@@ -31,19 +31,19 @@ class TestStripInline:
 class TestParseAliases:
     @pytest.mark.unit
     def test_parses_single_alias(self):
-        from ConfigParser import parse_aliases
+        from UtilsManager.ConfigParser import parse_aliases
         result = parse_aliases("代码=ts_code")
         assert result == {"代码": "ts_code"}
 
     @pytest.mark.unit
     def test_parses_multi_alias(self):
-        from ConfigParser import parse_aliases
+        from UtilsManager.ConfigParser import parse_aliases
         result = parse_aliases("代码=ts_code,名称=name")
         assert result == {"代码": "ts_code", "名称": "name"}
 
     @pytest.mark.unit
     def test_empty_string(self):
-        from ConfigParser import parse_aliases
+        from UtilsManager.ConfigParser import parse_aliases
         assert parse_aliases("") == {}
 
 

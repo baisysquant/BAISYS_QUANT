@@ -24,7 +24,7 @@ PROJECT_ROOT = _project_root()
 
 import pandas as pd
 
-from Backtesting._engine_legacy import EngineConfig, grid_search, walk_forward
+from BackTrading._engine_legacy import EngineConfig, grid_search, walk_forward
 
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
@@ -223,7 +223,7 @@ def load_calibration() -> CalibrationResult | None:
 
 
 def apply_calibration_to_config(config: object) -> None:
-    from ConfigParser import Config
+    from UtilsManager.ConfigParser import Config
 
     assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
     cfg = config

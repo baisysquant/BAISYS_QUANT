@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from LogicAnalyzer.PipelineScoring import (
+from Review.pipeline_scoring import (
     _calc_momentum_desc,
     _calc_moneyflow_score,
     _score_kline_pattern,

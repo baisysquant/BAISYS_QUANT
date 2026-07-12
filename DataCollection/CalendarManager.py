@@ -27,7 +27,7 @@ class TradingCalendarAnalyzer:
             return
         if cache_dir is None:
             try:
-                from ConfigParser import Config
+                from UtilsManager.ConfigParser import Config
                 cache_dir = os.path.join(Config().CACHE_DIRECTORY, "calendar")
             except Exception:
                 cache_dir = "./cache"

@@ -13,7 +13,7 @@ pd.options.mode.string_storage = "python"
 
 from loguru import logger
 
-from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+from Review.coordinator import StockAnalysisCoordinatorFactory
 
 
 def main() -> None:
@@ -44,15 +44,15 @@ def main() -> None:
 
     # ── 回测定时调度器 ──────────────────────────────────────
     if schedule:
-        from Backtesting.runner import start_scheduler
+        from BackTrading.runner import start_scheduler
 
         start_scheduler()
         return
 
     # ── 回测校准阶段 ────────────────────────────────────────
     if not pipeline_only:
-        from Backtesting.calibration_log import ensure_table, get_last_run, should_rerun
-        from ConfigParser import Config
+        from BackTrading.calibration_log import ensure_table, get_last_run, should_rerun
+        from UtilsManager.ConfigParser import Config
         from DataManager.DbEngine import get_engine
 
         cfg = Config()
@@ -72,7 +72,7 @@ def main() -> None:
                     logger.info(reason)
                     logger.info("到期，校准完成后自动进入复盘流程")
 
-                from Backtesting.runner import run_backtest_pipeline
+                from BackTrading.runner import run_backtest_pipeline
 
                 result = run_backtest_pipeline(cfg, force=True)
                 if result is None:

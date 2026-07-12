@@ -36,7 +36,7 @@ import pandas as pd
 import requests
 
 # ── 从项目现有模块导入 ─────────────────────────────────────────────────────
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from UtilsManager.CodeNormalizer import CodeNormalizer
 
 # ── 打印辅助函数 ───────────────────────────────────────────────────────────

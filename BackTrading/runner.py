@@ -8,9 +8,9 @@ import pandas as pd
 from loguru import logger
 from sqlalchemy import text
 
-from Backtesting.alert import BacktestAlert
-from Backtesting.analytics import compute_risk_metrics, compute_trade_metrics
-from Backtesting.calibration import (
+from BackTrading.alert import BacktestAlert
+from BackTrading.analytics import compute_risk_metrics, compute_trade_metrics
+from BackTrading.calibration import (
     CALIB_PARAM_MAP,
     CalibrationResult,
     apply_calibration_to_config,
@@ -19,10 +19,10 @@ from Backtesting.calibration import (
     save_calibration,
     write_calibration_to_ini,
 )
-from Backtesting.calibration_log import ensure_table, get_last_run, record_run, should_rerun
+from BackTrading.calibration_log import ensure_table, get_last_run, record_run, should_rerun
 from UtilsManager.IDataProvider import BacktestDataProvider
-from Backtesting.prepare import _build_params, prepare_backtest_data
-from ConfigParser import Config
+from BackTrading.prepare import _build_params, prepare_backtest_data
+from UtilsManager.ConfigParser import Config
 from DataManager.DbEngine import get_engine
 
 
@@ -134,7 +134,7 @@ def run_backtest_pipeline(
         best_params = _extract_best_params(wf_result, config=config)
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
-        from Backtesting._engine_legacy import EngineConfig, run_full_backtest
+        from BackTrading._engine_legacy import EngineConfig, run_full_backtest
 
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
@@ -160,10 +160,10 @@ def run_backtest_pipeline(
         total_return_avg = float(top["total_return"].mean())
         max_dd_avg = float(top["max_drawdown"].mean())
 
-        from Backtesting.calibration import _get_git_commit
-        from Backtesting.prepare import _compute_config_hash
+        from BackTrading.calibration import _get_git_commit
+        from BackTrading.prepare import _compute_config_hash
 
-        from Backtesting.overfitting import compute_pbo, compute_dsr_from_equity_curve
+        from BackTrading.overfitting import compute_pbo, compute_dsr_from_equity_curve
 
         wf_results_list = wf_result.to_dict("records") if not wf_result.empty else []
         pbo = compute_pbo(wf_results_list)
@@ -284,7 +284,7 @@ def _fetch_kline(
     symbols: list[str],
     backtest_start_date: str,
 ) -> pd.DataFrame:
-    from Backtesting.sync import ensure_table
+    from BackTrading.sync import ensure_table
     from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 
     # 将配置日期对齐到首个交易日，与 IncrementalSyncEngine 内部逻辑一致
@@ -440,9 +440,9 @@ def main() -> None:
     """CLI 入口。
 
     Usage:
-        python -m Backtesting.runner            # 执行回测（交互式判断是否已过期）
-        python -m Backtesting.runner --force     # 强制重新回测
-        python -m Backtesting.runner --schedule  # 启动常驻调度器
+        python -m BackTrading.runner            # 执行回测（交互式判断是否已过期）
+        python -m BackTrading.runner --force     # 强制重新回测
+        python -m BackTrading.runner --schedule  # 启动常驻调度器
     """
     args = sys.argv[1:]
     config = Config()

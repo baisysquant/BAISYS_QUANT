@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ConfigParser import Config
-from Backtesting.domain.models import CostModel
+from UtilsManager.ConfigParser import Config
+from BackTrading.domain.models import CostModel
 
 
 @dataclass

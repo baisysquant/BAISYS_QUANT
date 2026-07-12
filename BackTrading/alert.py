@@ -7,7 +7,7 @@ from typing import Any
 
 from loguru import logger
 
-from Backtesting.calibration import PROJECT_ROOT, CalibrationResult, load_calibration
+from BackTrading.calibration import PROJECT_ROOT, CalibrationResult, load_calibration
 
 
 class BacktestAlert:

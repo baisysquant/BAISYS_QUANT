@@ -60,13 +60,18 @@ class MainCostDataManager:
     提供主力成本、机构参与度等相关数据的获取、分析和管理功能
     """
 
-    def __init__(self, cache_enabled: bool = True, cache_dir: str | None = None) -> None:
-        if cache_dir is None:
+    def __init__(self, config: Any | None = None, cache_enabled: bool = True, cache_dir: str | None = None) -> None:
+        if config is None:
             try:
-                from ConfigParser import Config
-                cache_dir = os.path.join(Config().CACHE_DIRECTORY, "cost_data_cache")
+                from UtilsManager.ConfigParser import Config
+                config = Config()
             except Exception:
-                cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports/cache/cost_data_cache")
+                config = None
+        self.config = config
+        if cache_dir is None and config is not None:
+            cache_dir = os.path.join(config.CACHE_DIRECTORY, "cost_data_cache")
+        if cache_dir is None:
+            cache_dir = os.path.expanduser("~/Downloads/CoreNews_Reports/cache/cost_data_cache")
         self.cache_enabled = cache_enabled
         self.cache_dir = cache_dir
         if cache_enabled and not os.path.exists(cache_dir):
@@ -82,6 +87,11 @@ class MainCostDataManager:
 
     def _fetch_from_eastmoney(self) -> pd.DataFrame:
         """直调东方财富数据中心 API，获取主力成本数据"""
+        token = (
+            self.config.DISTRIBUTION_API_TOKEN
+            if self.config is not None
+            else "894050c76af8597a853f5b408b759f5d"
+        )
         url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
         base_params = {
             "sortColumns": "SECURITY_CODE",
@@ -95,7 +105,7 @@ class MainCostDataManager:
                             "f9~01~SECURITY_CODE~PE_DYNAMIC",
             "columns": "ALL",
             "filter": "",
-            "token": "894050c76af8597a853f5b408b759f5d",
+            "token": token,
         }
 
         frames: list[pd.DataFrame] = []

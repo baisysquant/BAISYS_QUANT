@@ -421,6 +421,27 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("point_in_time", "bool", required=False, default="true"),
     ]),
     SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True),
+    SectionRule(name="MULTI_FACTOR_ALPHA", description="多因子Alpha评分配置", optional=True, fields=[
+        FieldRule("enabled", "bool", required=False, default="true"),
+        FieldRule("financial_quality_cache_days", "int", required=False, default="90", min_value=1, max_value=365),
+        FieldRule("fundamentals_retry", "int", required=False, default="3", min_value=1, max_value=10),
+        FieldRule("w_macd", "float", required=False, default="0.25", min_value=0, max_value=1),
+        FieldRule("w_momentum", "float", required=False, default="0.25", min_value=0, max_value=1),
+        FieldRule("w_moneyflow", "float", required=False, default="0.20", min_value=0, max_value=1),
+        FieldRule("w_quality", "float", required=False, default="0.15", min_value=0, max_value=1),
+        FieldRule("w_valuation", "float", required=False, default="0.15", min_value=0, max_value=1),
+    ]),
+    SectionRule(name="DISTRIBUTION", description="筹码分布数据配置", optional=True, fields=[
+        FieldRule("api_token", "str", required=False, default=""),
+    ]),
+    SectionRule(name="TRADING_COST", description="交易成本参数", optional=True, fields=[
+        FieldRule("commission_rate", "float", required=False, default="0.0003", min_value=0, max_value=0.01),
+        FieldRule("stamp_tax_rate", "float", required=False, default="0.001", min_value=0, max_value=0.01),
+        FieldRule("transfer_fee_rate", "float", required=False, default="0.00001", min_value=0, max_value=0.001),
+    ]),
+    SectionRule(name="POSITION_BACKTEST", description="跟仓回测配置", optional=True, fields=[
+        FieldRule("pool_file_path", "str", required=False, default="证券交割单.xlsx"),
+    ]),
 ]
 
 _CUSTOM_VALIDATORS = {

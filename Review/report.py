@@ -14,9 +14,9 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
+from DataManager import DatabaseWriter, QuantDataPerformer
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DbEngine import get_engine
-from DataManager import DatabaseWriter, QuantDataPerformer
 from UtilsManager.Exceptions import DatabaseError, ReportGenerationError
 
 
@@ -111,6 +111,8 @@ class ReportService:
             ColumnNames.T1_TARGET,
             ColumnNames.T2_TARGET,
             ColumnNames.TRAILING_STOP,
+            ColumnNames.SUGGESTED_POSITION,
+            ColumnNames.TARGET_WEIGHT,
         ]
         return cols
 
@@ -121,6 +123,11 @@ class ReportService:
             ColumnNames.COMPREHENSIVE_ANALYSIS,
             ColumnNames.COMPREHENSIVE_SCORE,
             ColumnNames.COMPREHENSIVE_LEVEL,
+            ColumnNames.FACTOR_QUALITY,
+            ColumnNames.FACTOR_VALUATION,
+            ColumnNames.FACTOR_MOMENTUM,
+            ColumnNames.FACTOR_MONEYFLOW,
+            ColumnNames.FACTOR_MACD,
             ColumnNames.RESEARCH_REPORT_COUNT,
             ColumnNames.FUND_MOMENTUM,
         ]
@@ -258,6 +265,26 @@ class ReportService:
                             # Apply the user focus format to the entire row
                             for col_idx in range(len(df.columns)):
                                 worksheet.write(row_idx, col_idx, row[df.columns[col_idx]], user_focus_format)
+
+                # ── 跟仓回测 Sheet 条件格式 ──
+                if sheet_name == "跟仓回测" and "综合收益率" in df.columns:
+                    import xlsxwriter
+                    pnl_col_idx = list(df.columns).index("综合收益率")
+                    col_letter = xlsxwriter.utility.xl_col_to_name(pnl_col_idx)
+                    num_rows = len(df_sorted) + 1
+                    rng = f"{col_letter}2:{col_letter}{num_rows}"
+                    green_fmt = workbook.add_format({"bg_color": "#C6EFCE", "font_color": "#006100"})
+                    red_fmt = workbook.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006"})
+                    worksheet.conditional_format(rng, {
+                        "type": "formula",
+                        "criteria": f'LEFT({col_letter}2,1)<>"-"',
+                        "format": green_fmt,
+                    })
+                    worksheet.conditional_format(rng, {
+                        "type": "formula",
+                        "criteria": f'LEFT({col_letter}2,1)="-"',
+                        "format": red_fmt,
+                    })
 
             writer.close()
             self.logger.info(f"  - 报告已成功生成并保存到: {report_path}")

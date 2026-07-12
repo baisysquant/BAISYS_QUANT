@@ -134,7 +134,7 @@ def find_macd_zero_axis_pattern(symbol: str, df: pd.DataFrame) -> Optional[dict]
 
 def scan_all_symbols() -> list[dict]:
     """扫描全市场股票，返回符合条件的股票列表"""
-    from ConfigParser import Config
+    from UtilsManager.ConfigParser import Config
     # config.ini 在项目根目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_dir, "..", "config.ini")

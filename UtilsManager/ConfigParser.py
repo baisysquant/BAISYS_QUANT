@@ -18,7 +18,6 @@
 """
 
 import os
-import warnings
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -235,6 +234,26 @@ class UserFocusStocksConfig(BaseModel):
     USER_FOCUS_STOCKS: str = Field(default="")
 
 
+class MultiFactorAlphaConfig(BaseModel):
+    """多因子 Alpha 配置"""
+
+    ENABLED: bool = Field(default=True, description="是否启用多因子 Alpha 评分")
+    FINANCIAL_QUALITY_CACHE_DAYS: int = Field(default=90, ge=1, le=365,
+                                               description="质量因子缓存天数")
+    FUNDAMENTALS_RETRY: int = Field(default=3, ge=0, le=10,
+                                     description="估值因子 API 重试次数")
+    W_MACD: float = Field(default=0.25, ge=0.0, le=1.0,
+                           description="MACD 7 维权重")
+    W_MOMENTUM: float = Field(default=0.25, ge=0.0, le=1.0,
+                               description="动量因子权重")
+    W_MONEYFLOW: float = Field(default=0.20, ge=0.0, le=1.0,
+                                description="资金流因子权重")
+    W_QUALITY: float = Field(default=0.15, ge=0.0, le=1.0,
+                              description="质量/成长因子权重")
+    W_VALUATION: float = Field(default=0.15, ge=0.0, le=1.0,
+                                description="估值/市值因子权重")
+
+
 class AShareHubConfig(BaseModel):
     """AShareHub 筹码分布数据配置"""
 
@@ -244,6 +263,8 @@ class AShareHubConfig(BaseModel):
                                    description="资金流向 API 429 重试次数")
     MONEYFLOW_PAGE_DELAY: float = Field(default=1.0, ge=0.0, le=30.0,
                                           description="资金流分页间隔秒数")
+    ENABLE_FUNDAMENTALS: bool = Field(default=True,
+                                       description="是否启用 AShareHub 估值因子同步")
 
 
 class MacroFilterConfig(BaseModel):
@@ -374,6 +395,29 @@ class BacktestConfig(BaseModel):
         return (parts[0], parts[1], parts[2])
 
 
+class DistributionConfig(BaseModel):
+    """东方财富API配置模型"""
+
+    API_TOKEN: str = Field(default="", description="东方财富数据中心 API Token")
+
+
+class TradingCostConfig(BaseModel):
+    """A股交易成本配置模型"""
+
+    COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01,
+                                    description="佣金费率（默认万三）")
+    STAMP_TAX_RATE: float = Field(default=0.001, ge=0, le=0.01,
+                                   description="印花税费率（卖出收取，默认千一）")
+    TRANSFER_FEE_RATE: float = Field(default=0.00001, ge=0, le=0.001,
+                                      description="过户费率（双向，默认万0.1）")
+
+
+class PositionBacktestConfig(BaseModel):
+    """跟仓回测配置模型"""
+
+    POOL_FILE_PATH: str = Field(default="证券交割单.xlsx", description="证券交割单文件路径（XLSX格式）")
+
+
 class PositionSizingConfig(BaseModel):
     """仓位管理配置模型"""
 
@@ -423,6 +467,10 @@ class AppConfig(BaseSettings):
     technical_constants: TechnicalConstantsConfig
     position_sizing: PositionSizingConfig
     backtest: BacktestConfig
+    position_backtest: PositionBacktestConfig
+    trading_cost: TradingCostConfig
+    distribution: DistributionConfig
+    multi_factor_alpha: MultiFactorAlphaConfig
 
 
 class Config:
@@ -487,6 +535,11 @@ class Config:
         if ah_raw:
             ah_raw["API_KEY"] = ConfigCipher.maybe_decrypt(ah_raw.get("API_KEY", ""))
 
+        # DISTRIBUTION（API_TOKEN 需解密）
+        dist_raw = self._section_upper("DISTRIBUTION")
+        if dist_raw:
+            dist_raw["API_TOKEN"] = ConfigCipher.maybe_decrypt(dist_raw.get("API_TOKEN", ""))
+
         # 装配 AppConfig（Pydantic field_validator 自动处理逗号/bool/int/float 转换）
         self.app_config = AppConfig(
             database=DatabaseConfig(**db_raw),
@@ -508,6 +561,10 @@ class Config:
             technical_constants=TechnicalConstantsConfig(**self._section_upper("TECHNICAL_CONSTANTS")),
             position_sizing=PositionSizingConfig(**self._section_upper("POSITION_SIZING")),
             backtest=BacktestConfig(**self._section_upper("BACKTEST")),
+            position_backtest=PositionBacktestConfig(**self._section_upper("POSITION_BACKTEST")),
+            trading_cost=TradingCostConfig(**self._section_upper("TRADING_COST")),
+            distribution=DistributionConfig(**dist_raw),
+            multi_factor_alpha=MultiFactorAlphaConfig(**self._section_upper("MULTI_FACTOR_ALPHA")),
         )
 
         # ── 回测自动校准参数覆写 ──
@@ -702,6 +759,52 @@ class Config:
 
     @property
     def SIGNAL_PIPELINES(self) -> int: return self.app_config.backtest.SIGNAL_PIPELINES
+
+    # 跟仓回测
+    @property
+    def POOL_FILE_PATH(self) -> str: return self.app_config.position_backtest.POOL_FILE_PATH
+
+    # 东方财富 API
+    @property
+    def DISTRIBUTION_API_TOKEN(self) -> str: return self.app_config.distribution.API_TOKEN
+
+    # 交易成本
+    @property
+    def TRADING_COST_PARAMS(self) -> dict:
+        t = self.app_config.trading_cost
+        return {
+            "commission_rate": t.COMMISSION_RATE,
+            "stamp_tax_rate": t.STAMP_TAX_RATE,
+            "transfer_fee_rate": t.TRANSFER_FEE_RATE,
+        }
+
+    # 多因子 Alpha
+    @property
+    def MULTI_FACTOR_ALPHA_ENABLED(self) -> bool:
+        return self.app_config.multi_factor_alpha.ENABLED
+
+    @property
+    def FINANCIAL_QUALITY_CACHE_DAYS(self) -> int:
+        return self.app_config.multi_factor_alpha.FINANCIAL_QUALITY_CACHE_DAYS
+
+    @property
+    def FUNDAMENTALS_RETRY(self) -> int:
+        return self.app_config.multi_factor_alpha.FUNDAMENTALS_RETRY
+
+    @property
+    def FACTOR_WEIGHTS(self) -> dict[str, float]:
+        m = self.app_config.multi_factor_alpha
+        return {
+            "macd": m.W_MACD,
+            "momentum": m.W_MOMENTUM,
+            "moneyflow": m.W_MONEYFLOW,
+            "quality": m.W_QUALITY,
+            "valuation": m.W_VALUATION,
+        }
+
+    @property
+    def ENABLE_FUNDAMENTALS(self) -> bool:
+        return self.app_config.asharehub.ENABLE_FUNDAMENTALS
 
     # ── Dict 聚合属性（供 SignalManager / DataProcessingService 等使用） ──
 

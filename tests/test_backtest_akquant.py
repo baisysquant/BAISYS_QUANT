@@ -42,7 +42,7 @@ def backtest_akquant_df() -> pd.DataFrame:
 
 
 def test_quant_pipeline_strategy_import() -> None:
-    from Backtesting.akquant_strategy import QuantPipelineStrategy, QuantPipelineParams
+    from BackTrading.akquant_strategy import QuantPipelineStrategy, QuantPipelineParams
     assert hasattr(QuantPipelineStrategy, "on_bar")
     assert hasattr(QuantPipelineStrategy, "PARAM_MODEL")
     assert QuantPipelineStrategy.PARAM_MODEL is QuantPipelineParams
@@ -51,7 +51,7 @@ def test_quant_pipeline_strategy_import() -> None:
 @pytest.mark.slow
 def test_run_backtest(backtest_akquant_df: pd.DataFrame) -> None:
     from akquant import run_backtest
-    from Backtesting.akquant_strategy import QuantPipelineStrategy
+    from BackTrading.akquant_strategy import QuantPipelineStrategy
 
     result = run_backtest(
         data=backtest_akquant_df,
@@ -67,7 +67,7 @@ def test_run_backtest(backtest_akquant_df: pd.DataFrame) -> None:
 
 @pytest.mark.slow
 def test_run_grid_search(backtest_akquant_df: pd.DataFrame) -> None:
-    from Backtesting.calibration import run_grid_search
+    from BackTrading.calibration import run_grid_search
 
     param_grid = {
         "atr_stop_mult": [1.0, 2.0, 3.0],
@@ -87,7 +87,7 @@ def test_run_grid_search(backtest_akquant_df: pd.DataFrame) -> None:
 
 @pytest.mark.slow
 def test_run_walk_forward(backtest_akquant_df: pd.DataFrame) -> None:
-    from Backtesting.calibration import run_walk_forward
+    from BackTrading.calibration import run_walk_forward
 
     param_grid = {
         "atr_stop_mult": [1.0, 2.0],

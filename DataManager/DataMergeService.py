@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from DataManager import ParallelUtils as utils
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DbEngine import get_engine as _get_engine

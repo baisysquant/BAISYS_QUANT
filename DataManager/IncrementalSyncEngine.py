@@ -44,7 +44,7 @@ class IncrementalSyncEngine:
         self._cache_dir = cache_dir
         if not self._cache_dir:
             try:
-                from ConfigParser import Config
+                from UtilsManager.ConfigParser import Config
                 self._cache_dir = os.path.join(Config().CACHE_DIRECTORY, "kline_batches")
             except Exception:
                 self._cache_dir = os.path.join(

@@ -15,13 +15,13 @@ from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 import numpy as np
 import pandas as pd
-import TACompatibility as ta
+from LogicAnalyzer import TACompatibility as ta
 from loguru import logger
 
-from LogicAnalyzer.pipeline import MACDAnalyzer
+from Review.pipeline import MACDAnalyzer
 
 try:
-    from ConfigParser import Config
+    from UtilsManager.ConfigParser import Config
     CACHE_DIR = Path(Config().CACHE_DIRECTORY) / "backtest_signal_cache"
 except Exception:
     CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"

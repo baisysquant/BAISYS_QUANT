@@ -23,13 +23,18 @@ import pandas as pd
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DataProcessingService import DataProcessingService
 from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
-from DataManager.ReportService import ReportService
+from Review.report import ReportService
 from LogicAnalyzer.AnalysisService import AnalysisService
+from LogicAnalyzer.portfolio.benchmark import BenchmarkEvaluator
 from LogicAnalyzer.DataAcquisitionService import DataAcquisitionService
+from LogicAnalyzer.scoring.calculator import FactorCalculator
+from LogicAnalyzer.scoring.decay import FactorDecayMonitor
+from LogicAnalyzer.portfolio.builder import PortfolioBuilder
+from LogicAnalyzer.portfolio.tracking import PositionTrackingService, SHEET_NAME as POSITION_BT_SHEET
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import DatabaseConnectionError
 from UtilsManager.IDataProvider import IDataProvider
@@ -123,6 +128,18 @@ class StockAnalysisCoordinator:
         self.data_processing = data_processing
         self.analysis_service = analysis_service
         self.report_service = report_service
+        self.position_tracking_service = PositionTrackingService(
+            config=config,
+            logger=logger,
+            data_provider=data_provider,
+            calendar_mgr=calendar_mgr,
+            db_engine=db_engine,
+        )
+
+        self.factor_calculator = FactorCalculator(config=config, db_engine=db_engine)
+        self.portfolio_builder = PortfolioBuilder(config=config)
+        self.benchmark_evaluator = BenchmarkEvaluator(config=config)
+        self.factor_decay_monitor = FactorDecayMonitor(config=config, db_engine=db_engine)
 
         self.today_str = today_str or self.calendar_mgr.get_last_trading_day()
         self.start_time = time.time()
@@ -156,9 +173,14 @@ class StockAnalysisCoordinator:
             ("准备处理数据字典", self._step_8_prepare_processed_data, False),
             ("合并处理数据", self._step_9_consolidate_data, True),
             ("映射行业信号", self._step_10_merge_industry_signal, False),
-            ("剔除弱势股", self._step_11_filter_weak_stocks, False),
-            ("生成Excel报告", self._step_12_generate_report, False),
-            ("同步结果到数据库", self._step_13_sync_to_database, False),
+            ("多因子Alpha评分", self._step_11_multi_factor_alpha, False),
+            ("剔除弱势股", self._step_12_filter_weak_stocks, False),
+            ("组合构建", self._step_13_build_portfolio, False),
+            ("基准对比", self._step_14_benchmark_compare, False),
+            ("因子衰减监控", self._step_15_factor_decay, False),
+            ("跟仓回测分析", self._step_16_position_backtest, False),
+            ("生成Excel报告", self._step_17_generate_report, False),
+            ("同步结果到数据库", self._step_18_sync_to_database, False),
         ]
 
         total = len(pipeline)
@@ -210,10 +232,47 @@ class StockAnalysisCoordinator:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return False
             ctx.set("filtered_pure_codes", filtered_pure_codes)
+
+            # 同步因子数据
+            if self.config.MULTI_FACTOR_ALPHA_ENABLED:
+                self._sync_factor_fetchers(filtered_pure_codes)
+
             return True
         except Exception as e:
             self.logger.error(f"同步失败: {e}")
             return False
+
+    def _sync_factor_fetchers(self, stock_codes: set[str]) -> None:
+        """同步估值/质量因子数据采集器。"""
+        stock_list = sorted(stock_codes)
+
+        # 估值因子（日频，AShareHub）
+        try:
+            from DataCollection.FinancialValuationFetcher import FinancialValuationFetcher
+            val_fetcher = FinancialValuationFetcher(self.config)
+            written = val_fetcher.sync_daily(trade_date=self.today_str)
+            if written:
+                self.logger.info(f"[因子数据] 估值因子同步完成，写入 {written} 条")
+        except Exception as e:
+            self.logger.warning(f"[因子数据] 估值因子同步失败: {e}")
+
+        # 基准指数（日频，AShareHub）
+        try:
+            from DataCollection.BenchmarkFetcher import BenchmarkFetcher
+            bm_fetcher = BenchmarkFetcher(self.config)
+            bm_fetcher.sync_daily()
+        except Exception as e:
+            self.logger.warning(f"[因子数据] 基准指数同步失败: {e}")
+
+        # 质量因子（季度，akShare，增量同步）
+        try:
+            from DataCollection.FinancialQualityFetcher import FinancialQualityFetcher
+            qual_fetcher = FinancialQualityFetcher(self.config)
+            count = qual_fetcher.sync(stock_list, today_str=self.today_str)
+            if count:
+                self.logger.info(f"[因子数据] 质量因子同步完成，采集 {count} 只")
+        except Exception as e:
+            self.logger.warning(f"[因子数据] 质量因子同步失败: {e}")
 
     def _step_2_format_codes(self, ctx: PipelineContext) -> bool:
         filtered_pure_codes: set = ctx.get("filtered_pure_codes")
@@ -440,7 +499,44 @@ class StockAnalysisCoordinator:
 
         return df
 
-    def _step_11_filter_weak_stocks(self, ctx: PipelineContext) -> bool:
+    def _step_11_multi_factor_alpha(self, ctx: PipelineContext) -> bool:
+        if not self.config.MULTI_FACTOR_ALPHA_ENABLED:
+            self.logger.info("[多因子Alpha] 未启用，跳过。")
+            return True
+
+        consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
+        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+
+        if consolidated_report.empty:
+            self.logger.warning("[多因子Alpha] consolidated_report 为空，跳过。")
+            return False
+
+        symbols = list(consolidated_report["股票代码"].unique())
+
+        quality_df = self.factor_calculator.load_quality_from_db(symbols)
+        valuation_df = self.factor_calculator.load_valuation_from_db(symbols)
+
+        if quality_df.empty and valuation_df.empty:
+            self.logger.info("[多因子Alpha] 无外部因子数据，跳过。")
+            return True
+
+        try:
+            updated = self.factor_calculator.fuse_scores(
+                report=consolidated_report,
+                macd_score_col="综合分析评分",
+                industry_col="行业",
+                hist_df=hist_df,
+                quality_df=quality_df,
+                valuation_df=valuation_df,
+            )
+            ctx.set("consolidated_report", updated)
+            self.logger.info(f"[多因子Alpha] 评分融合完成，结果 {len(updated)} 行。")
+            return True
+        except Exception:
+            self.logger.opt(exception=True).warning("[多因子Alpha] 评分融合失败")
+            return False
+
+    def _step_12_filter_weak_stocks(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
         if consolidated_report.empty:
             return False
@@ -448,23 +544,122 @@ class StockAnalysisCoordinator:
         ctx.set("consolidated_report", consolidated_report)
         return True
 
-    def _step_12_generate_report(self, ctx: PipelineContext) -> bool:
+    def _step_13_build_portfolio(self, ctx: PipelineContext) -> bool:
+        consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
+        if consolidated_report.empty:
+            self.logger.warning("[组合构建] consolidated_report 为空，跳过。")
+            return False
+        updated = self.portfolio_builder.build(consolidated_report)
+        ctx.set("consolidated_report", updated)
+        return True
+
+    def _step_14_benchmark_compare(self, ctx: PipelineContext) -> bool:
+        consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
+        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+
+        if consolidated_report.empty or hist_df.empty:
+            self.logger.warning("[基准对比] 数据不足，跳过。")
+            return True
+
+        self.logger.info(f"[基准对比] hist_df columns: {list(hist_df.columns)}, shape={hist_df.shape}")
+        self.logger.info(f"[基准对比] consolidated_report columns: {list(consolidated_report.columns)}, shape={consolidated_report.shape}")
+
+        # 用 PortfolioBuilder 输出的目标权重估算组合历史收益率
+        try:
+            portfolio_rets = self.benchmark_evaluator.estimate_portfolio_returns(
+                portfolio_df=consolidated_report,
+                kline_df=hist_df,
+            )
+        except Exception as e:
+            self.logger.opt(exception=True).warning(f"[基准对比] 估算组合收益率失败: {e}")
+            return True
+        if portfolio_rets.empty:
+            self.logger.info("[基准对比] 无法估算组合收益率，跳过。")
+            return True
+
+        # 从 DB 加载基准指数数据
+        try:
+            from DataCollection.BenchmarkFetcher import BenchmarkFetcher
+            bm_fetcher = BenchmarkFetcher(self.config)
+            bm_df = bm_fetcher.load_index_data()
+            if bm_df.empty:
+                self.logger.info("[基准对比] 基准指数数据为空，跳过。")
+                return True
+        except Exception as e:
+            self.logger.warning(f"[基准对比] 加载基准数据失败: {e}")
+            return True
+
+        # 基准日收益率
+        bm_df = bm_df.sort_values("trade_date")
+        bm_df["daily_return"] = bm_df["close"].pct_change()
+
+        # 执行对比
+        result = self.benchmark_evaluator.evaluate(
+            portfolio_returns=portfolio_rets,
+            benchmark_df=bm_df,
+        )
+        ctx.set("benchmark_result", result)
+
+        if "error" not in result:
+            summary = pd.DataFrame([{
+                "指标": k, "值": v
+            } for k, v in result.items() if k != "日收益率数据"])
+            ctx.set("benchmark_report", summary)
+
+        self.logger.info("[基准对比] 完成。")
+        return True
+
+    def _step_15_factor_decay(self, ctx: PipelineContext) -> bool:
+        consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
+        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+        if consolidated_report.empty or hist_df.empty:
+            self.logger.info("[因子衰减] 数据不足，跳过。")
+            return True
+        try:
+            decay_result = self.factor_decay_monitor.run(consolidated_report, hist_df)
+            ctx.set("factor_decay_result", decay_result)
+            if decay_result.get("needs_rebalance"):
+                self.logger.warning("[因子衰减] 检测到因子衰减，建议重新平衡权重")
+        except Exception as e:
+            self.logger.warning(f"[因子衰减] 执行异常: {e}")
+        return True
+
+    def _step_16_position_backtest(self, ctx: PipelineContext) -> bool:
+        df = self.position_tracking_service.run()
+        ctx.set("position_backtest_report", df)
+        if df.empty:
+            self.logger.info("[跟仓回测] 无输出数据，跳过")
+            return True
+        self.logger.info(f"[跟仓回测] 生成 {len(df)} 条记录，等待写入 Excel")
+        return True
+
+    def _step_17_generate_report(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
         industry_df: pd.DataFrame = ctx.get("industry_df", pd.DataFrame())
         processed_data: dict = ctx.get("processed_data", {})
 
         # 裁剪仅保留 final column order 中的列（step 10 可能加入了计算用列）
         from DataManager.ColumnNames import ColumnNames as CN
-        from DataManager.ReportService import ReportService
+        from Review.report import ReportService
         final_cols = ReportService.get_final_column_order(
             fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )
         existing_cols = [c for c in final_cols if c in consolidated_report.columns]
         # 明确剔除计算用列（即使因命名不一致混入）
-        drop_cols = {CN.INDUSTRY_PERCENTILE, CN.INDUSTRY_SIGNAL_SCORE, CN.INDUSTRY_DEVIATION}
+        drop_cols = {
+            CN.INDUSTRY_PERCENTILE, CN.INDUSTRY_SIGNAL_SCORE, CN.INDUSTRY_DEVIATION,
+            "roe", "gross_profit_margin", "net_profit_margin",
+            "pe_ttm", "pb", "total_mv", "circ_mv",
+        }
         consolidated_report = consolidated_report[[c for c in existing_cols if c not in drop_cols]]
 
-        sheets_data = self._prepare_sheets_data(consolidated_report, industry_df, processed_data)
+        position_backtest_report: pd.DataFrame = ctx.get("position_backtest_report", pd.DataFrame())
+        benchmark_report: pd.DataFrame = ctx.get("benchmark_report", pd.DataFrame())
+        sheets_data = self._prepare_sheets_data(
+            consolidated_report, industry_df, processed_data,
+            position_backtest_report=position_backtest_report,
+            benchmark_report=benchmark_report,
+        )
         self.report_service.generate_excel_report(sheets_data, self.today_str)
         self._validate_report_integrity(consolidated_report)
         return True
@@ -498,7 +693,7 @@ class StockAnalysisCoordinator:
         else:
             self.logger.info("[完整性断言] 数据完整性检查通过")
 
-    def _step_13_sync_to_database(self, ctx: PipelineContext) -> bool:
+    def _step_18_sync_to_database(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
         industry_df: pd.DataFrame = ctx.get("industry_df", pd.DataFrame())
         raw_data: dict = ctx.get("raw_data", {})
@@ -554,13 +749,20 @@ class StockAnalysisCoordinator:
         consolidated_report: pd.DataFrame,
         industry_df: pd.DataFrame,
         processed_data: dict[str, pd.DataFrame],
+        position_backtest_report: pd.DataFrame | None = None,
+        benchmark_report: pd.DataFrame | None = None,
     ) -> dict[str, pd.DataFrame]:
-        return {
+        sheets = {
             "数据汇总": consolidated_report,
             "行业深度分析": industry_df,
             "主力研报筛选": processed_data.get("processed_main_report", pd.DataFrame()),
             "主力成本分析": processed_data.get("main_cost_data", pd.DataFrame()),
         }
+        if position_backtest_report is not None and not position_backtest_report.empty:
+            sheets[POSITION_BT_SHEET] = position_backtest_report
+        if benchmark_report is not None and not benchmark_report.empty:
+            sheets["基准对比"] = benchmark_report
+        return sheets
 
     def _sync_results_to_database(
         self,
@@ -646,7 +848,7 @@ class StockAnalysisCoordinatorFactory:
         from UtilsManager.IDataProvider import LiveDataProvider
 
         # 确保 stock_daily_kline 有 adj_factor 列
-        from Backtesting.sync import ensure_table
+        from BackTrading.sync import ensure_table
         ensure_table(db_engine)
 
         data_provider = LiveDataProvider(db_engine=db_engine)

@@ -32,7 +32,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from LogicAnalyzer.StockAnalysisCoordinator import StockAnalysisCoordinatorFactory
+from Review.coordinator import StockAnalysisCoordinatorFactory
 
 # ── 工具函数 ────────────────────────────────────────────────────────
 

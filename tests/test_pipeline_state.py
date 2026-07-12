@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from LogicAnalyzer.PipelineState import (
+from Review.pipeline_state import (
     _calc_exit_strategy,
     _detect_market_regime,
     _make_state,

@@ -1,21 +1,21 @@
 import numpy as np
 import pandas as pd
-import TACompatibility as ta
+from LogicAnalyzer import TACompatibility as ta
 from loguru import logger
 
-from LogicAnalyzer.MACDDivergence import (
+from LogicAnalyzer.signals.divergence import (
     adaptive_distance,
     detect_divergence_single_param,
     signal_with_decay,
     slope_analysis,
 )
-from LogicAnalyzer.PipelineScoring import (
+from Review.pipeline_scoring import (
     _calc_momentum_desc,
     _calc_moneyflow_score,
     _score_kline_pattern,
     _volume_price_trend_score,
 )
-from LogicAnalyzer.PipelineState import (
+from Review.pipeline_state import (
     _apply_chip_risk,
     _calc_exit_strategy,
     _detect_market_regime,
@@ -24,7 +24,7 @@ from LogicAnalyzer.PipelineState import (
     _make_state,
     _pipeline_output,
 )
-from LogicAnalyzer.ScoringRules import execute_rules
+from LogicAnalyzer.scoring.rules import execute_rules
 from LogicAnalyzer.SignalConstants import Divergence, MACDSignals, MACDTrend
 
 

@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DataFetcher import DataFetcher

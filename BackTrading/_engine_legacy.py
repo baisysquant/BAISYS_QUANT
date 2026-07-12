@@ -11,13 +11,13 @@ import pandas as pd
 from loguru import logger
 from typing_extensions import TypeAlias
 
-from Backtesting.analytics import compute_risk_metrics, compute_trade_metrics
-from Backtesting.domain.models import CostModel
-from Backtesting.prepare import prepare_backtest_data, _compute_param_hash
-from Backtesting.engine import EngineConfig
-from Backtesting.portfolio import allocate_weights
+from BackTrading.analytics import compute_risk_metrics, compute_trade_metrics
+from BackTrading.domain.models import CostModel
+from BackTrading.prepare import prepare_backtest_data, _compute_param_hash
+from BackTrading.engine import EngineConfig
+from BackTrading.portfolio import allocate_weights
 
-from ConfigParser import Config as _Config
+from UtilsManager.ConfigParser import Config as _Config
 
 ParamsDict: TypeAlias = dict[str, Any]
 TradeLog: TypeAlias = list[dict[str, Any]]

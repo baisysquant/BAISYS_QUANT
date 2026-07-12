@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from Backtesting.overfitting import (
+from BackTrading.overfitting import (
     compute_pbo,
     deflated_sharpe_ratio,
     probabilistic_sharpe_ratio,

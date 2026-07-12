@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import os
 import sys
 from datetime import datetime as dt
@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, text
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from ConfigParser import Config
+from UtilsManager.ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 import akshare as ak  # 可选，为整合新闻数据做准备
 

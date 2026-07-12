@@ -2,7 +2,7 @@ from typing import Any
 
 import pandas as pd
 
-from LogicAnalyzer.MACDDivergence import slope_analysis
+from LogicAnalyzer.signals.divergence import slope_analysis
 from LogicAnalyzer.SignalConstants import MACDTrend
 
 

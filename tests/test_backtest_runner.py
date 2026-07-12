@@ -7,10 +7,10 @@ from textwrap import dedent
 
 import pytest
 
-from Backtesting.alert import BacktestAlert
-from Backtesting.calibration import CalibrationResult
-from Backtesting.calibration_log import should_rerun
-from ConfigParser import Config
+from BackTrading.alert import BacktestAlert
+from BackTrading.calibration import CalibrationResult
+from BackTrading.calibration_log import should_rerun
+from UtilsManager.ConfigParser import Config
 
 
 class TestShouldRun:
@@ -52,7 +52,7 @@ class TestBacktestAlert:
         alert.on_failure(ValueError("test error"))  # 不应抛出异常
 
     def test_drift_detection(self, alert: BacktestAlert, tmp_path: Path) -> None:
-        from Backtesting.calibration import save_calibration
+        from BackTrading.calibration import save_calibration
 
         old = CalibrationResult(params={"atr_stop_mult": 1.0}, sharpe=0.5)
         save_calibration(old)
@@ -69,7 +69,7 @@ class TestBacktestAlert:
             alert.DRIFT_LOG.unlink()
 
     def test_no_drift(self, alert: BacktestAlert) -> None:
-        from Backtesting.calibration import save_calibration
+        from BackTrading.calibration import save_calibration
 
         old = CalibrationResult(params={"atr_stop_mult": 1.0})
         save_calibration(old)
@@ -88,7 +88,7 @@ class TestBacktestAlert:
 
 class TestWriteCalibrationToIni:
     def test_updates_config_ini_values(self, tmp_path: Path) -> None:
-        from Backtesting.calibration import write_calibration_to_ini, CONFIG_INI
+        from BackTrading.calibration import write_calibration_to_ini, CONFIG_INI
         import importlib
 
         ini_content = dedent("""\
@@ -106,7 +106,7 @@ class TestWriteCalibrationToIni:
 
         try:
             CONFIG_INI.write_text(ini_content, encoding="utf-8")
-            importlib.reload(__import__("Backtesting.calibration"))
+            importlib.reload(__import__("BackTrading.calibration"))
 
             params = {
                 "atr_stop_mult": 2.0,
