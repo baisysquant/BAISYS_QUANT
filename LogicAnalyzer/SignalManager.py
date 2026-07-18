@@ -9,7 +9,7 @@ from loguru import logger
 
 from UtilsManager.ConfigParser import Config
 from LogicAnalyzer.signals.kdj import AdvancedKDJAnalyzer
-from Review.pipeline import MACDAnalyzer
+from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.signals.professional import (
     analyze_bollinger,
     analyze_cci,
@@ -243,7 +243,7 @@ class TASignalProcessor:
     @staticmethod
     def _vectorized_compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         """在全部股票上一次性向量化计算所有技术指标，避免 per-stock 重复计算。"""
-        from LogicAnalyzer import TACompatibility as ta
+        from UtilsManager import TACompatibility as ta
         import numpy as np
 
         needed = ['close', 'high', 'low', 'volume', 'open']
@@ -352,7 +352,7 @@ class TASignalProcessor:
         使用 TA-Lib CDL 模式识别 + pandas_ta.cdl_pattern()。
         返回综合信号文本和评分（-10 ~ +10），供 FullBull 评分使用。
         """
-        from LogicAnalyzer import TACompatibility as ta
+        from UtilsManager import TACompatibility as ta
 
         required = ['open', 'high', 'low', 'close']
         if not all(c in df.columns for c in required):
@@ -598,7 +598,7 @@ class TASignalProcessor:
         macro_result = None
         macro_adjust = 1.0
         if getattr(self.config, 'ENABLE_MACRO_FILTER', True):
-            from LogicAnalyzer.MacroFilter import MacroFilter
+            from DataCollection.MacroFilter import MacroFilter
             _retries = 2
             for _attempt in range(_retries + 1):
                 try:

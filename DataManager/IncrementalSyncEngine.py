@@ -23,7 +23,7 @@ BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
 FETCH_WORKERS = 2         # 每管道并发取数线程数
-_STOCK_FETCH_LOCK = threading.Lock()  # 全局锁：Windows SSL 并发必崩，同一时刻只允许一只股票发请求
+_STOCK_FETCH_LOCK = threading.Semaphore(2)  # Windows SSL 限制并发数，允许 2 路避免完全串行化
 
 
 class IncrementalSyncEngine:

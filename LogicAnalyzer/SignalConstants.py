@@ -51,16 +51,7 @@ class KLineDirection:
     BEARISH = "看跌"
 
 
-class TrendLevels:
-    """多头排列趋势四档定级"""
-    FULL_BULL = "完全主升"
-    TREND_ACCELERATION = "趋势加速"
-    TREND_OSCILLATION = "趋势震荡"
-    TREND_WATCH = "趋势观望"
-
-    @classmethod
-    def all_levels(cls) -> list[str]:
-        return [cls.FULL_BULL, cls.TREND_ACCELERATION, cls.TREND_OSCILLATION, cls.TREND_WATCH]
+from DataManager.Indicators import TrendLevels  # noqa: F401
 
 
 class Divergence:

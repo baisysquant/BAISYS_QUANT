@@ -13,6 +13,8 @@
 使用 Pydantic 带来的优势：
 - 开箱即用的类型安全
 - 自动类型转换（字符串→int/list/tuple）
+
+版本: 2.0.0
 - 优雅的数据校验（使用 @field_validator）
 - 支持环境变量覆盖
 """
@@ -95,6 +97,10 @@ class FilterRulesConfig(BaseModel):
 
     ENABLE_WEAK_STOCK_FILTER: bool = Field(default=True)
     EXEMPT_LEVELS: list[str] = Field(default=["完全主升", "趋势加速"])
+    # 行业截面百分位过滤阈值（0-100）
+    INDUSTRY_PCT_HARD: float = Field(default=10.0, ge=0.0, le=100.0)
+    INDUSTRY_PCT_D: float = Field(default=30.0, ge=0.0, le=100.0)
+    INDUSTRY_PCT_EXEMPT: float = Field(default=80.0, ge=0.0, le=100.0)
 
     @field_validator("EXEMPT_LEVELS", mode="before")
     @classmethod
@@ -439,6 +445,24 @@ class PositionSizingConfig(BaseModel):
                                          description="最大行业集中度")
     RISK_BUDGET: float = Field(default=0.02, ge=0.001, le=0.10,
                                 description="波动率风险预算")
+    MAX_DAY_TURNOVER: float = Field(default=0.20, ge=0.0, le=1.0,
+                                    description="单日最大双边换手率")
+    ENABLE_CONVEX_OPTIMIZER: bool = Field(default=False,
+                                          description="启用凸优化器替代启发式约束")
+    RISK_AVERSION: float = Field(default=1.0, ge=0.01, le=10.0,
+                                 description="风险厌恶系数（越大越保守）")
+
+
+class ApiConfig(BaseModel):
+    """API 服务配置模型"""
+
+    ENABLED: bool = Field(default=False, description="是否启用 API 服务")
+    HOST: str = Field(default="127.0.0.1", description="监听地址")
+    PORT: int = Field(default=8000, ge=1024, le=65535, description="监听端口")
+    ALERT_WEBHOOK_URL: str = Field(default="", description="告警 Webhook URL")
+    ALERT_CHANNEL: str = Field(default="generic", description="告警渠道(generic/wecom/feishu/dingtalk)")
+    ALERT_ON_FAILURE: bool = Field(default=True, description="失败时告警")
+    ALERT_ON_SUCCESS: bool = Field(default=False, description="成功时告警")
 
 
 class AppConfig(BaseSettings):
@@ -448,6 +472,7 @@ class AppConfig(BaseSettings):
         env_prefix="BAISYS_", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
 
+    api: ApiConfig = ApiConfig()
     database: DatabaseConfig
     system: SystemConfig
     logging: LoggingConfig
@@ -565,6 +590,7 @@ class Config:
             trading_cost=TradingCostConfig(**self._section_upper("TRADING_COST")),
             distribution=DistributionConfig(**dist_raw),
             multi_factor_alpha=MultiFactorAlphaConfig(**self._section_upper("MULTI_FACTOR_ALPHA")),
+            api=ApiConfig(**self._section_upper("API")),
         )
 
         # ── 回测自动校准参数覆写 ──
@@ -703,6 +729,15 @@ class Config:
 
     @property
     def EXEMPT_LEVELS(self) -> list[str]: return self.app_config.filter_rules.EXEMPT_LEVELS
+
+    @property
+    def FILTER_PCT_HARD(self) -> float: return self.app_config.filter_rules.INDUSTRY_PCT_HARD
+
+    @property
+    def FILTER_PCT_D(self) -> float: return self.app_config.filter_rules.INDUSTRY_PCT_D
+
+    @property
+    def FILTER_PCT_EXEMPT(self) -> float: return self.app_config.filter_rules.INDUSTRY_PCT_EXEMPT
 
     # 资金流
     @property
@@ -910,6 +945,9 @@ class Config:
             "position_d": p.POSITION_D,
             "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": p.RISK_BUDGET,
+            "max_day_turnover": p.MAX_DAY_TURNOVER,
+            "enable_convex_optimizer": p.ENABLE_CONVEX_OPTIMIZER,
+            "risk_aversion": p.RISK_AVERSION,
             "liq_w_section": f.LIQ_W_SECTION,
             "liq_w_timeseries": f.LIQ_W_TIMESERIES,
             "liq_w_marketcap": f.LIQ_W_MARKETCAP,

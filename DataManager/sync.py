@@ -40,6 +40,12 @@ def _ensure_factor_tables(engine: Any) -> None:
                 factor_name VARCHAR(20) NOT NULL,
                 check_date DATE NOT NULL,
                 rolling_ic_mean FLOAT,
+                rolling_ic_std FLOAT,
+                icir FLOAT,
+                rank_ic FLOAT,
+                normal_ic FLOAT,
+                decile_spread FLOAT,
+                decile_monotonicity FLOAT,
                 is_decayed BOOLEAN DEFAULT FALSE,
                 current_weight FLOAT,
                 suggested_weight FLOAT

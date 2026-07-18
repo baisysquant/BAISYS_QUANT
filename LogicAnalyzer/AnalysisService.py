@@ -91,16 +91,13 @@ class AnalysisService:
 
     def filter_weak_stocks(self, consolidated_report: pd.DataFrame) -> pd.DataFrame:
         """
-        剔除弱势且加速下跌的个股
+        多因子弱信号过滤 v2 — 行业截面百分位 + 三级过滤。
 
-        筛选条件：
-        - 非强势股
-        - 无量价齐升
-        - 无连涨/放量
-        - MACD双周期加速下跌
-        - KDJ无信号
-        - 资金流为负
-        - 非豁免级别
+        流程:
+          Stage 0: 确保行业百分位列存在（由 fuse_scores 预计算）
+          Stage 1: 豁免通道（强趋势 / 单因子前 N%）→ 保留
+          Stage 2: 多因子评分硬地板（行业内后 N%）→ 剔除
+          Stage 3: MACD 结论辅助剔除（D/C 级 + 低评分）→ 剔除
 
         Args:
             consolidated_report: 汇总报告DataFrame
@@ -108,42 +105,48 @@ class AnalysisService:
         Returns:
             pd.DataFrame: 过滤后的DataFrame
         """
-        self.logger.info(">>> 正在执行最终数据清洗：剔除弱势且加速下跌的个股...")
+        self.logger.info(">>> 正在执行最终数据清洗：剔除弱信号个股...")
 
         if consolidated_report.empty:
             return consolidated_report
 
-        # 为了安全比较，确保 DIF 列被正确解析为数字，非数字转为 NaN
-        dif_single = pd.to_numeric(consolidated_report.get("_current_dif"), errors="coerce")
+        # ── 配置读取 ──
+        pct_hard = self.config.FILTER_PCT_HARD           # 10%
+        pct_d = self.config.FILTER_PCT_D                # 30%
+        pct_exempt = self.config.FILTER_PCT_EXEMPT       # 80%
+        exempt_levels = self.config.EXEMPT_LEVELS
 
-        kdj_col = consolidated_report.get(
-            ColumnNames.KDJ_SIGNAL,
-            pd.Series([""] * len(consolidated_report), index=consolidated_report.index),
-        )
-        kdj_is_empty = kdj_col.isna() | (kdj_col.astype(str).str.strip().str.lower().isin(["", "nan", "none"]))
+        # ── Stage 0: 确保百分位列存在 ──
+        score_pct = consolidated_report.get(ColumnNames.SCORE_PCT_INDUSTRY, pd.Series(50.0, index=consolidated_report.index))
+        momentum_pct = consolidated_report.get(ColumnNames.MOMENTUM_PCT_INDUSTRY, pd.Series(50.0, index=consolidated_report.index))
+        quality_pct = consolidated_report.get(ColumnNames.QUALITY_PCT_INDUSTRY, pd.Series(50.0, index=consolidated_report.index))
+        valuation_pct = consolidated_report.get(ColumnNames.VALUATION_PCT_INDUSTRY, pd.Series(50.0, index=consolidated_report.index))
+        conclusion = consolidated_report.get(ColumnNames.COMPREHENSIVE_ANALYSIS, pd.Series([""] * len(consolidated_report), index=consolidated_report.index)).astype(str)
+        bull_trend = consolidated_report.get(ColumnNames.BULL_TREND, pd.Series(dtype=str)).astype(str)
 
-        full_bull_level = consolidated_report.get(ColumnNames.BULL_TREND, pd.Series(dtype=str))
-        # 使用配置中的豁免条件
-        exempt_from_drop = full_bull_level.isin(self.config.EXEMPT_LEVELS)
-
-        drop_condition = (
-            (consolidated_report.get(ColumnNames.STRONG_STOCK) == "否")
-            & (consolidated_report.get(ColumnNames.PRICE_VOLUME_RISE) == "否")
-            & (consolidated_report.get(ColumnNames.CONSECUTIVE_RISE_DAYS) == 0)
-            & (consolidated_report.get(ColumnNames.VOLUME_INCREASE_DAYS) == 0)
-            & (dif_single < 0)
-            & kdj_is_empty
-            & (
-                # 使用配置的第一个资金流周期进行检查
-                consolidated_report.get(self._get_first_fund_flow_col(), pd.Series(dtype=str))
-                .astype(str)
-                .str.contains("-", na=False)
-            )
-            & (~exempt_from_drop)  # 使用豁免条件
+        # ── Stage 1: 豁免通道（满足任一即保留） ──
+        is_exempt = (
+            bull_trend.isin(exempt_levels)
+            | (momentum_pct > pct_exempt)
+            | (quality_pct > pct_exempt)
+            | (valuation_pct > pct_exempt)
         )
 
+        # ── Stage 2: 多因子评分硬地板（行业内评分后 N%） ──
+        is_score_weak = score_pct < pct_hard
+
+        # ── Stage 3: MACD 结论辅助剔除 ──
+        is_d_weak = conclusion.str.startswith("D:")  # 所有 D 级 → 无条件剔除（绕过豁免）
+        is_c_weak = conclusion.str.strip() == "C: 无明确入场信号"
+
+        # ── 综合决策 ──
+        # D 级 / C:无明确入场信号 无条件剔除（绕过豁免）；评分硬地板受豁免保护
+        drop_condition = is_d_weak | is_c_weak | ((~is_exempt) & is_score_weak)
+
+        n_before = len(consolidated_report)
         consolidated_report = consolidated_report[~drop_condition].copy()
-        self.logger.info(f"  排除极度弱势特征的股票。剩余 {len(consolidated_report)} 只。")
+        n_removed = n_before - len(consolidated_report)
+        self.logger.info(f"  剔除 {n_removed} 只弱信号个股，剩余 {len(consolidated_report)} 只。")
 
         return consolidated_report
 

@@ -27,14 +27,16 @@ from UtilsManager.ConfigParser import Config
 from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.DataProcessingService import DataProcessingService
 from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+from DataManager.DataQualityChecker import DataQualityChecker
 from Review.report import ReportService
 from LogicAnalyzer.AnalysisService import AnalysisService
 from LogicAnalyzer.portfolio.benchmark import BenchmarkEvaluator
-from LogicAnalyzer.DataAcquisitionService import DataAcquisitionService
+from DataManager.DataAcquisitionService import DataAcquisitionService
 from LogicAnalyzer.scoring.calculator import FactorCalculator
 from LogicAnalyzer.scoring.decay import FactorDecayMonitor
 from LogicAnalyzer.portfolio.builder import PortfolioBuilder
 from LogicAnalyzer.portfolio.tracking import PositionTrackingService, SHEET_NAME as POSITION_BT_SHEET
+from LogicAnalyzer.pipeline.dag import DagPipeline, PipelineStep
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import DatabaseConnectionError
 from UtilsManager.IDataProvider import IDataProvider
@@ -136,84 +138,103 @@ class StockAnalysisCoordinator:
             db_engine=db_engine,
         )
 
+        self.today_str = today_str or self.calendar_mgr.get_last_trading_day()
+
         self.factor_calculator = FactorCalculator(config=config, db_engine=db_engine)
-        self.portfolio_builder = PortfolioBuilder(config=config)
+        self.portfolio_builder = PortfolioBuilder(
+            config=config, db_engine=db_engine, today_str=self.today_str
+        )
         self.benchmark_evaluator = BenchmarkEvaluator(config=config)
         self.factor_decay_monitor = FactorDecayMonitor(config=config, db_engine=db_engine)
-
-        self.today_str = today_str or self.calendar_mgr.get_last_trading_day()
+        self.quality_checker = DataQualityChecker(db_engine=db_engine)
+        self.force_rerun = False
         self.start_time = time.time()
 
     # ──────────────────────────────────────────────
     # Pipeline 定义
     # ──────────────────────────────────────────────
 
+    def _build_dag(self) -> DagPipeline:
+        """构建 DAG 流水线，定义步骤及其依赖关系。"""
+        dag = DagPipeline(
+            name="stock_analysis",
+            db_engine=self.db_engine,
+            cache_dir=self.config.CACHE_DIRECTORY,
+            config_path="config.ini",
+        )
+
+        # (步骤名, 方法, 依赖列表, 是否致命)
+        steps: list[tuple[str, Callable, list[str], bool]] = [
+            ("同步历史数据", self._step_1_sync_data, [], True),
+            ("格式化股票代码", self._step_2_format_codes, ["同步历史数据"], True),
+            ("获取原始数据", self._step_3_get_raw_data, ["格式化股票代码"], False),
+            ("获取K线数据及最新价", self._step_4_get_kline_and_prices, ["格式化股票代码"], True),
+            ("处理技术指标信号", self._step_5_technical_signals, ["获取K线数据及最新价"], False),
+            ("运行行业分析", self._step_6_industry_analysis, [], False),
+            ("处理均线突破数据", self._step_7_xstp_and_filter, ["获取原始数据", "获取K线数据及最新价"], False),
+            ("准备处理数据字典", self._step_8_prepare_processed_data,
+             ["处理技术指标信号", "运行行业分析", "处理均线突破数据"], False),
+            ("合并处理数据", self._step_9_consolidate_data,
+             ["准备处理数据字典", "格式化股票代码"], True),
+            ("数据质量检查", self._step_9a_data_quality,
+             ["合并处理数据"], False),
+            ("映射行业信号", self._step_10_merge_industry_signal,
+             ["合并处理数据", "运行行业分析"], False),
+            ("多因子Alpha评分", self._step_11_multi_factor_alpha,
+             ["映射行业信号", "获取K线数据及最新价"], False),
+            ("剔除弱势股", self._step_12_filter_weak_stocks, ["多因子Alpha评分"], False),
+            ("组合构建", self._step_13_build_portfolio, ["剔除弱势股"], False),
+            ("基准对比", self._step_14_benchmark_compare,
+             ["组合构建", "获取K线数据及最新价"], False),
+            ("因子衰减监控", self._step_15_factor_decay,
+             ["组合构建", "获取K线数据及最新价"], False),
+            ("跟仓回测分析", self._step_16_position_backtest, [], False),
+            ("生成Excel报告", self._step_17_generate_report,
+             ["组合构建", "运行行业分析", "准备处理数据字典",
+              "跟仓回测分析", "基准对比"], False),
+            ("同步结果到数据库", self._step_18_sync_to_database,
+             ["组合构建", "运行行业分析", "获取原始数据"], False),
+        ]
+
+        for name, fn, deps, fatal in steps:
+            dag.add_step(PipelineStep(name=name, fn=fn, depends_on=deps, is_fatal=fatal))
+
+        dag.register_intermediate("获取K线数据及最新价", "hist_df")
+        dag.register_intermediate("处理均线突破数据", "processed_xstp_df")
+        dag.register_intermediate("运行行业分析", "industry_df")
+
+        return dag
+
     def run(self) -> None:
         """
-        按序执行流水线各步骤。每步独立 try/except，
-        致命步骤（如无股票代码）会终止流程，非致命步骤失败仅记录。
+        基于 DAG 执行流水线，支持断点续跑。
+        每步独立 try/except，致命步骤失败终止流程。
         """
         self.logger.info(f"[INFO] 股票分析程序启动 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"[INFO] 最后一个交易日为: {self.today_str}")
 
         print(f"\n{'='*50}")
-        print(f"  股票分析流水线启动 | 交易日: {self.today_str}")
+        print(f"  股票分析流水线 | 交易日: {self.today_str}")
         print(f"{'='*50}")
 
         ctx = PipelineContext()
+        dag = self._build_dag()
 
-        pipeline = [
-            ("同步历史数据", self._step_1_sync_data, True),
-            ("格式化股票代码", self._step_2_format_codes, True),
-            ("获取原始数据", self._step_3_get_raw_data, False),
-            ("获取K线数据及最新价", self._step_4_get_kline_and_prices, True),
-            ("处理技术指标信号", self._step_5_technical_signals, False),
-            ("运行行业分析", self._step_6_industry_analysis, False),
-            ("处理均线突破数据", self._step_7_xstp_and_filter, False),
-            ("准备处理数据字典", self._step_8_prepare_processed_data, False),
-            ("合并处理数据", self._step_9_consolidate_data, True),
-            ("映射行业信号", self._step_10_merge_industry_signal, False),
-            ("多因子Alpha评分", self._step_11_multi_factor_alpha, False),
-            ("剔除弱势股", self._step_12_filter_weak_stocks, False),
-            ("组合构建", self._step_13_build_portfolio, False),
-            ("基准对比", self._step_14_benchmark_compare, False),
-            ("因子衰减监控", self._step_15_factor_decay, False),
-            ("跟仓回测分析", self._step_16_position_backtest, False),
-            ("生成Excel报告", self._step_17_generate_report, False),
-            ("同步结果到数据库", self._step_18_sync_to_database, False),
-        ]
-
-        total = len(pipeline)
-        for i, (step_name, step_fn, fatal) in enumerate(pipeline, 1):
-            print(f"\n[{i}/{total}] {step_name}...", end="", flush=True)
-            step_start = time.time()
-            ok = self._run_single_step(step_name, step_fn, ctx)
-            elapsed = time.time() - step_start
-            if ok:
-                print(f" ✓ ({elapsed:.1f}s)", flush=True)
-            else:
-                print(f" ✗ ({elapsed:.1f}s)", flush=True)
-            if not ok and fatal:
-                print(f"\n  ⚠ 致命步骤失败，流程终止。")
-                self.logger.critical(f"[流水线终止] 致命步骤 '{step_name}' 失败，结束流程")
-                self._shutdown()
-                return
+        success = dag.run(ctx, trade_date=self.today_str, force_rerun=self.force_rerun)
 
         total_elapsed = timedelta(seconds=time.time() - self.start_time)
-        print(f"\n{'='*50}")
-        print(f"  流水线完成 | 总耗时: {total_elapsed}")
-        print(f"{'='*50}\n")
-        self.logger.info(f"\n>>> 流程结束。总耗时: {total_elapsed}")
-        self._shutdown()
+        if success:
+            print(f"\n{'='*50}")
+            print(f"  流水线完成 | 总耗时: {total_elapsed}")
+            print(f"{'='*50}\n")
+            self.logger.info(f"\n>>> 流程结束。总耗时: {total_elapsed}")
+        else:
+            print(f"\n{'='*50}")
+            print(f"  流水线异常终止 | 总耗时: {total_elapsed}")
+            print(f"{'='*50}\n")
+            self.logger.warning(f"\n>>> 流程异常终止。总耗时: {total_elapsed}")
 
-    def _run_single_step(self, name: str, fn: Callable[[PipelineContext], bool], ctx: PipelineContext) -> bool:
-        try:
-            self.logger.info(f">>> 步骤: {name}")
-            return fn(ctx)
-        except Exception as e:
-            ctx.record_error(name, str(e))
-            self.logger.error(f"[步骤失败] {name}: {type(e).__name__}: {e}")
-            return False
+        self._shutdown()
 
     def _shutdown(self) -> None:
         self.executor.shutdown(wait=True)
@@ -288,6 +309,8 @@ class StockAnalysisCoordinator:
 
     def _step_3_get_raw_data(self, ctx: PipelineContext) -> bool:
         raw_data = self.data_acquisition.get_all_raw_data(self.today_str)
+        if not raw_data:
+            self.logger.warning("[获取原始数据] akshare 原始数据为空")
         ctx.set("raw_data", raw_data)
         return True
 
@@ -338,13 +361,13 @@ class StockAnalysisCoordinator:
         return True
 
     def _step_5_technical_signals(self, ctx: PipelineContext) -> bool:
-        if not ctx.has("stock_codes_prefixed", "hist_df", "spot_data"):
+        if not ctx.has("stock_codes_prefixed"):
             self.logger.warning("[SKIP] 技术指标信号缺少前置依赖")
             return False
 
         stock_codes_prefixed: list[str] = ctx.get("stock_codes_prefixed")
-        hist_df: pd.DataFrame = ctx.get("hist_df")
-        spot_data: pd.DataFrame = ctx.get("spot_data")
+        hist_df = self._ensure_hist_df(ctx)
+        spot_data: pd.DataFrame = ctx.get("spot_data", pd.DataFrame())
 
         if hist_df.empty:
             self.logger.warning("[SKIP] K线数据为空，跳过技术指标计算")
@@ -371,7 +394,23 @@ class StockAnalysisCoordinator:
 
     def _step_7_xstp_and_filter(self, ctx: PipelineContext) -> bool:
         raw_data: dict = ctx.get("raw_data", {})
+        _ = self._ensure_hist_df(ctx)
         spot_data: pd.DataFrame = ctx.get("spot_data", pd.DataFrame())
+        if spot_data.empty:
+            hist = ctx.get("hist_df", pd.DataFrame())
+            if not hist.empty:
+                try:
+                    cn = hist[hist["close_normal"].notna()]
+                    if not cn.empty:
+                        last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
+                        last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
+                        spot_data = last_cn[["股票代码", "close_normal"]].rename(
+                            columns={"close_normal": "最新价"}
+                        )
+                        ctx.set("spot_data", spot_data)
+                        self.logger.info(f"[spot_data] 从 hist_df 重建，{len(spot_data)} 条")
+                except Exception:
+                    pass
         stock_codes_pure: list[str] = ctx.get("stock_codes_pure", [])
 
         if not raw_data or spot_data.empty:
@@ -415,6 +454,22 @@ class StockAnalysisCoordinator:
 
         consolidated_report = self.data_processing.consolidate_data(processed_data, stock_codes_pure)
         ctx.set("consolidated_report", consolidated_report)
+        return True
+
+    def _step_9a_data_quality(self, ctx: PipelineContext) -> bool:
+        """数据质量检查：在合并数据后执行，提前发现异常。"""
+        consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
+        if consolidated_report.empty:
+            self.logger.info("[数据质量] consolidated_report 为空，跳过检查")
+            return True
+        try:
+            result = self.quality_checker.run_all(consolidated_report, self.today_str)
+            if not result["all_pass"]:
+                self.logger.warning("[数据质量] 部分检查未通过，但流程继续")
+            else:
+                self.logger.info("[数据质量] 全部检查通过")
+        except Exception as e:
+            self.logger.warning(f"[数据质量] 执行异常: {e}")
         return True
 
     def _step_10_merge_industry_signal(self, ctx: PipelineContext) -> bool:
@@ -505,7 +560,7 @@ class StockAnalysisCoordinator:
             return True
 
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
-        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+        hist_df = self._ensure_hist_df(ctx)
 
         if consolidated_report.empty:
             self.logger.warning("[多因子Alpha] consolidated_report 为空，跳过。")
@@ -528,12 +583,13 @@ class StockAnalysisCoordinator:
                 hist_df=hist_df,
                 quality_df=quality_df,
                 valuation_df=valuation_df,
+                trade_date=self.today_str,
             )
             ctx.set("consolidated_report", updated)
             self.logger.info(f"[多因子Alpha] 评分融合完成，结果 {len(updated)} 行。")
             return True
-        except Exception:
-            self.logger.opt(exception=True).warning("[多因子Alpha] 评分融合失败")
+        except Exception as e:
+            self.logger.opt(exception=True).warning(f"[多因子Alpha] 评分融合失败: {e}")
             return False
 
     def _step_12_filter_weak_stocks(self, ctx: PipelineContext) -> bool:
@@ -549,13 +605,31 @@ class StockAnalysisCoordinator:
         if consolidated_report.empty:
             self.logger.warning("[组合构建] consolidated_report 为空，跳过。")
             return False
-        updated = self.portfolio_builder.build(consolidated_report)
+        hist_df = self._ensure_hist_df(ctx)
+        updated = self.portfolio_builder.build(consolidated_report, hist_df=hist_df)
         ctx.set("consolidated_report", updated)
         return True
 
+    def _ensure_hist_df(self, ctx: PipelineContext) -> pd.DataFrame:
+        """确保 hist_df 可用，尝试从缓存/DB 恢复。"""
+        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+        if not hist_df.empty:
+            if "trade_date" not in hist_df.columns and "date" in hist_df.columns:
+                hist_df = hist_df.rename(columns={"date": "trade_date"})
+                ctx.set("hist_df", hist_df)
+            return hist_df
+        stock_codes = ctx.get("stock_codes_prefixed", [])
+        if stock_codes:
+            self.logger.info("[hist_df] hist_df 缺失，重新从 DB 加载")
+            hist_df = self.data_provider.get_kline(stock_codes)
+            if not hist_df.empty and "trade_date" not in hist_df.columns and "date" in hist_df.columns:
+                hist_df = hist_df.rename(columns={"date": "trade_date"})
+            ctx.set("hist_df", hist_df)
+        return hist_df
+
     def _step_14_benchmark_compare(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
-        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+        hist_df = self._ensure_hist_df(ctx)
 
         if consolidated_report.empty or hist_df.empty:
             self.logger.warning("[基准对比] 数据不足，跳过。")
@@ -611,7 +685,7 @@ class StockAnalysisCoordinator:
 
     def _step_15_factor_decay(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
-        hist_df: pd.DataFrame = ctx.get("hist_df", pd.DataFrame())
+        hist_df = self._ensure_hist_df(ctx)
         if consolidated_report.empty or hist_df.empty:
             self.logger.info("[因子衰减] 数据不足，跳过。")
             return True
@@ -705,20 +779,36 @@ class StockAnalysisCoordinator:
     # ──────────────────────────────────────────────
 
     def _load_research_report_data(self) -> pd.DataFrame:
+        cache_path = os.path.join(self.config.CACHE_DIRECTORY, f"研报买入次数_经清洗_{self.today_str.replace('-', '')}.csv")
         try:
-            cache_path = os.path.join(self.config.CACHE_DIRECTORY, f"研报买入次数_经清洗_{self.today_str.replace('-', '')}.csv")
             if os.path.exists(cache_path):
                 report_df = pd.read_csv(
                     cache_path, sep="|", encoding="utf-8-sig", dtype={"股票代码": str}
                 )
                 self.logger.info(f"  - 已加载研报数据: {len(report_df)} 条记录")
                 return report_df
-            else:
-                self.logger.warning("  - 研报数据缓存文件不存在")
-                return pd.DataFrame()
         except Exception as e:
-            self.logger.error(f"  - 加载研报数据失败: {e}")
-            return pd.DataFrame()
+            self.logger.warning(f"  - 缓存文件读取失败({e})，将重新拉取")
+
+        self.logger.info("  - 从 akshare 拉取研报数据...")
+        try:
+            import akshare as ak
+            raw = ak.stock_profit_forecast_em()
+            if raw is not None and not raw.empty:
+                df = raw.copy()
+                if "代码" in df.columns and "股票代码" not in df.columns:
+                    df.rename(columns={"代码": "股票代码"}, inplace=True)
+                    df["股票代码"] = df["股票代码"].astype(str).str.zfill(6)
+                report_col = next((c for c in df.columns if "买入" in c), None)
+                if report_col:
+                    df.rename(columns={report_col: "研报买入次数"}, inplace=True)
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                df.to_csv(cache_path, sep="|", index=False, encoding="utf-8-sig")
+                self.logger.info(f"  - 研报数据已缓存: {len(df)} 条")
+                return df
+        except Exception as e:
+            self.logger.error(f"  - 拉取研报数据失败: {e}")
+        return pd.DataFrame()
 
     def _filter_by_universe(self, df: pd.DataFrame, universe_set: set) -> pd.DataFrame:
         if df is None or df.empty or "股票代码" not in df.columns:
@@ -797,6 +887,7 @@ class StockAnalysisCoordinatorFactory:
     def create(
         cls,
         config_file: str = "config.ini",
+        force_rerun: bool = False,
     ) -> StockAnalysisCoordinator:
         from LogicAnalyzer.FundMomentumAnalyzer import FundMomentumAnalyzer
         from UtilsManager.LoggerManager import get_logger
@@ -848,7 +939,7 @@ class StockAnalysisCoordinatorFactory:
         from UtilsManager.IDataProvider import LiveDataProvider
 
         # 确保 stock_daily_kline 有 adj_factor 列
-        from BackTrading.sync import ensure_table
+        from DataManager.sync import ensure_table
         ensure_table(db_engine)
 
         data_provider = LiveDataProvider(db_engine=db_engine)
@@ -858,7 +949,7 @@ class StockAnalysisCoordinatorFactory:
         analysis_service = AnalysisService(config, logger, db_engine, executor=executor, today_str=today_str)
         report_service = ReportService(config, logger)
 
-        return StockAnalysisCoordinator(
+        coordinator = StockAnalysisCoordinator(
             config=config,
             calendar_mgr=calendar_mgr,
             logger=logger,
@@ -873,3 +964,5 @@ class StockAnalysisCoordinatorFactory:
             report_service=report_service,
             today_str=today_str,
         )
+        coordinator.force_rerun = force_rerun
+        return coordinator

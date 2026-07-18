@@ -267,7 +267,7 @@ class QuantDBSyncTask:
             if col not in text_columns:
                 df_db[col] = df_db[col].apply(Parse_Currency.parse_money_str)
 
-        int_columns = ["consecutive_up_days", "high_vol_days", "report_buy_count"]
+        int_columns = ["consecutive_up_days", "high_vol_days", "report_buy_count", "divergence_days"]
         for col in int_columns:
             if col in df_db.columns:
                 df_db[col] = pd.to_numeric(df_db[col], errors="coerce").fillna(0).astype(int)

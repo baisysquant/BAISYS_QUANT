@@ -65,14 +65,6 @@ def _apply_chip_risk(state: dict, df: pd.DataFrame) -> None:
 
 def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
                           params: dict | None = None) -> str:
-    """检测市场状态。
-
-    Args:
-        df: K 线 DataFrame
-        boll_col: BOLL 带宽列名（用于窄布林判定）
-        params: 可选参数字典，键名见 ConfigParser.REGIME_DETECTION。
-                不传则使用默认值（同 magic number 旧值）。
-    """
     if params is None:
         params = {}
     close = float(df['close'].iloc[-1])
@@ -121,20 +113,9 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
 
 
 def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
-    """计算退出策略（止损/目标价/移动止损/盈亏比）。
-
-    复盘路径中 LiveDataProvider 已将 OHLC 转为不复权，
-    回测路径仍为后复权。两种场景均无需在此处做复权转换。
-
-    Args:
-        df: K 线 DataFrame
-        params: 可选参数字典，键名见 ConfigParser.SCORING_PARAMS。
-                不传则使用默认值。
-    """
     if params is None:
         params = {}
 
-    # 复盘路径中 LiveDataProvider 已将 OHLC 转为不复权，无需再次转换
     high = df['high']
     low = df['low']
     close_series = df['close']
@@ -143,7 +124,6 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     if close is None:
         close = float(close_series.iloc[-1])
 
-    # 基于不复权数据计算 ATR（纯 pandas，不依赖 TA-Lib）
     atr_period = 14
     if len(df) >= atr_period + 1:
         prev_close = close_series.shift(1)
@@ -232,7 +212,6 @@ def _pipeline_output(state: dict) -> dict:
         "macd_zero_axis_up_date": state.get('macd_zero_axis_up_date', ''),
     }
 
-    # 仅当 exit_strategy 存在且非空时才包含退出策略字段
     if exit_strat:
         output.update({
             "stop_loss": exit_strat.get('stop_loss'),

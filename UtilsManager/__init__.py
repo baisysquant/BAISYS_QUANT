@@ -6,6 +6,7 @@
 
 from . import Exceptions
 from .CodeNormalizer import CodeNormalizer
+from . import TACompatibility
 from .ConfigCipher import ConfigCipher
 from .LoggerManager import get_log_path, get_logger
 from .UnifiedCacheManager import UnifiedCacheManager

@@ -15,10 +15,10 @@ from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 import numpy as np
 import pandas as pd
-from LogicAnalyzer import TACompatibility as ta
+from UtilsManager import TACompatibility as ta
 from loguru import logger
 
-from Review.pipeline import MACDAnalyzer
+from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 
 try:
     from UtilsManager.ConfigParser import Config

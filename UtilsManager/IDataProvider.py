@@ -87,7 +87,12 @@ class BacktestDataProvider(IDataProvider):
         where.append("trade_date <= :end_date")
 
         sql = text(f"""
-            SELECT symbol, trade_date, open, high, low, close, volume, amount, close_normal
+            SELECT symbol, trade_date,
+                   open / adj_factor AS open,
+                   high / adj_factor AS high,
+                   low / adj_factor AS low,
+                   close / adj_factor AS close,
+                   volume, amount, close_normal
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date

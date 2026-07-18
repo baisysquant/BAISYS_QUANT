@@ -90,7 +90,10 @@ def main() -> None:
     if not backtest_only:
         logger.info("")
         try:
-            coordinator = StockAnalysisCoordinatorFactory.create(config_file="config.ini")
+            coordinator = StockAnalysisCoordinatorFactory.create(
+                config_file="config.ini",
+                force_rerun=force,
+            )
             coordinator.run()
 
             logger.info("")

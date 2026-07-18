@@ -19,7 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 注册自定义 TA accessor (替代 pandas_ta)
-from LogicAnalyzer import TACompatibility  # noqa: F401  # 自动注册 df.ta accessor
+from UtilsManager import TACompatibility  # noqa: F401  # 自动注册 df.ta accessor
 
 warnings.filterwarnings("ignore")
 

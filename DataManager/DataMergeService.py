@@ -16,8 +16,7 @@ from DataManager import ParallelUtils as utils
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DbEngine import get_engine as _get_engine
 from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
-from LogicAnalyzer.Indicators import calculate_full_bull_score
-from LogicAnalyzer.SignalConstants import TrendLevels
+from DataManager.Indicators import calculate_full_bull_score, TrendLevels
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from UtilsManager.Exceptions import CalculationError, handle_exception_with_recovery
 

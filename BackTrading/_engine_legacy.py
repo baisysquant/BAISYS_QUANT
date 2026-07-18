@@ -11,11 +11,11 @@ import pandas as pd
 from loguru import logger
 from typing_extensions import TypeAlias
 
-from BackTrading.analytics import compute_risk_metrics, compute_trade_metrics
+from LogicAnalyzer.backtest_metrics import compute_risk_metrics, compute_trade_metrics
 from BackTrading.domain.models import CostModel
 from BackTrading.prepare import prepare_backtest_data, _compute_param_hash
 from BackTrading.engine import EngineConfig
-from BackTrading.portfolio import allocate_weights
+from LogicAnalyzer.portfolio.backtest_weights import allocate_weights
 
 from UtilsManager.ConfigParser import Config as _Config
 

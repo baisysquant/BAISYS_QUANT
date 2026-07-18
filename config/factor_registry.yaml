@@ -1,0 +1,80 @@
+# ============================================================
+# 多因子 Alpha 注册中心
+# ============================================================
+# 研究效率提升：修改此文件即可调整因子定义，无需修改 Python 代码。
+# 每项因子可配置：权重、计算参数、行业中性化开关、IC 衰减参数。
+#
+# 类别 (category):
+#   technical  — 技术面因子（MACD、RSI 等）
+#   momentum   — 动量因子
+#   moneyflow  — 资金流因子
+#   fundamental — 基本面因子（质量、估值）
+#
+# 权重归一化：系统启动时自动校验，总和建议为 1.0。
+
+factors:
+  macd:
+    name: "MACD评分"
+    category: "technical"
+    weight: 0.25
+    weight_min: 0.0
+    weight_max: 0.5
+    description: "MACD 七维度综合评分（行业百分位归一化）"
+    industry_neutral: true
+    column: "MACD评分"
+
+  momentum:
+    name: "动量评分"
+    category: "momentum"
+    weight: 0.25
+    weight_min: 0.0
+    weight_max: 0.5
+    description: "21 日动量因子（行业内 Z-Score）"
+    industry_neutral: true
+    column: "动量评分"
+    params:
+      lookback: 21
+
+  moneyflow:
+    name: "资金流评分"
+    category: "moneyflow"
+    weight: 0.20
+    weight_min: 0.0
+    weight_max: 0.4
+    description: "资金流加权评分（行业内 Z-Score）"
+    industry_neutral: true
+    column: "资金流评分"
+    params:
+      column_weights:
+        "3日资金流入万元": 0.3
+        "5日资金流入万元": 0.4
+        "10日资金流入万元": 0.2
+        "20日资金流入万元": 0.1
+
+  quality:
+    name: "基本面评分"
+    category: "fundamental"
+    weight: 0.15
+    weight_min: 0.0
+    weight_max: 0.3
+    description: "质量因子：ROE×0.4 + 毛利率×0.3 + 净利率×0.3"
+    industry_neutral: true
+    column: "基本面评分"
+    params:
+      components:
+        roe: 0.4
+        gross_profit_margin: 0.3
+        net_profit_margin: 0.3
+
+  valuation:
+    name: "估值评分"
+    category: "fundamental"
+    weight: 0.15
+    weight_min: 0.0
+    weight_max: 0.3
+    description: "估值因子：-(PE_TTM_z + PB_z) / 2"
+    industry_neutral: true
+    column: "估值评分"
+    params:
+      pe_range: [0, 200]
+      pb_range: [0, 100]

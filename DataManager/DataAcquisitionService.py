@@ -18,7 +18,7 @@ from DataCollection.CalendarManager import TradingCalendarAnalyzer
 from DataManager.ColumnNames import ColumnNames
 from DataManager.DataFetcher import DataFetcher
 from DataManager.DataSchemas import SchemaValidator
-from LogicAnalyzer.DataValidator import DataValidator
+from DataManager.DataValidator import DataValidator
 from UtilsManager.Exceptions import DataFetchError, handle_exception_with_recovery
 from UtilsManager.UnifiedCacheManager import UnifiedCacheManager
 

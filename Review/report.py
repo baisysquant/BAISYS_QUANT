@@ -66,100 +66,28 @@ class ReportService:
 
     @staticmethod
     def get_base_columns() -> list:
-        return [
-            ColumnNames.STOCK_CODE,
-            ColumnNames.STOCK_NAME,
-            ColumnNames.INDUSTRY,
-            ColumnNames.INDUSTRY_SIGNAL,
-            ColumnNames.LATEST_PRICE,
-            ColumnNames.CHIP_95_PRICE,
-            ColumnNames.MAIN_COST,
-            ColumnNames.COST_POSITION,
-        ]
+        from DataManager.ColumnNames import get_base_columns as _f
+        return _f()
 
     @staticmethod
     def get_signal_columns() -> list:
-        cols = [
-            ColumnNames.STRONG_STOCK,
-            ColumnNames.PRICE_VOLUME_RISE,
-            "量价配合",
-            ColumnNames.CONSECUTIVE_RISE_DAYS,
-            ColumnNames.VOLUME_INCREASE_DAYS,
-            # MACD趋势评分列（前4维度）
-            ColumnNames.MACD_TREND,
-            ColumnNames.MACD_CROSS,
-            "柱状动能",
-            "DIF斜率",
-            # 独立技术指标（水平多因子交叉验证）
-            ColumnNames.KDJ_SIGNAL,
-            ColumnNames.CCI_SIGNAL,
-            ColumnNames.RSI_SIGNAL,
-            ColumnNames.BOLL_SIGNAL,
-            ColumnNames.KLINE_PATTERN_SIGNAL,
-            # 均线参考
-            "10日均线价",
-            "30日均线价",
-            "60日均线价",
-            # 背离信号 + 位置
-            "背离信号",
-            ColumnNames.DIVERGENCE_DAYS,
-            ColumnNames.DIVERGENCE_PRICE,
-            ColumnNames.MACD_ZERO_AXIS_UP_DATE,
-            ColumnNames.RISK_LEVEL,
-            "宏观风险",
-            ColumnNames.STOP_LOSS,
-            ColumnNames.T1_TARGET,
-            ColumnNames.T2_TARGET,
-            ColumnNames.TRAILING_STOP,
-            ColumnNames.SUGGESTED_POSITION,
-            ColumnNames.TARGET_WEIGHT,
-        ]
-        return cols
+        from DataManager.ColumnNames import get_signal_columns as _f
+        return _f()
 
     @staticmethod
     def get_report_columns(fund_flow_periods: list = None) -> list:
-        cols = [
-            ColumnNames.BULL_TREND,
-            ColumnNames.COMPREHENSIVE_ANALYSIS,
-            ColumnNames.COMPREHENSIVE_SCORE,
-            ColumnNames.COMPREHENSIVE_LEVEL,
-            ColumnNames.FACTOR_QUALITY,
-            ColumnNames.FACTOR_VALUATION,
-            ColumnNames.FACTOR_MOMENTUM,
-            ColumnNames.FACTOR_MONEYFLOW,
-            ColumnNames.FACTOR_MACD,
-            ColumnNames.RESEARCH_REPORT_COUNT,
-            ColumnNames.FUND_MOMENTUM,
-        ]
-        if fund_flow_periods:
-            period_map = {
-                5: ColumnNames.FUND_FLOW_5D,
-                10: ColumnNames.FUND_FLOW_10D,
-                20: ColumnNames.FUND_FLOW_20D,
-            }
-            for period in fund_flow_periods:
-                if period in period_map:
-                    cols.append(period_map[period])
-        return cols
+        from DataManager.ColumnNames import get_report_columns as _f
+        return _f(fund_flow_periods)
 
     @staticmethod
     def get_all_technical_signal_columns() -> list:
-        cols = [
-            ColumnNames.MACD_TREND,
-            ColumnNames.KDJ_SIGNAL,
-            ColumnNames.CCI_SIGNAL,
-            ColumnNames.RSI_SIGNAL,
-            ColumnNames.BOLL_SIGNAL,
-        ]
-        return cols
+        from DataManager.ColumnNames import get_all_technical_signal_columns as _f
+        return _f()
 
     @staticmethod
     def get_final_column_order(fund_flow_periods: list = None) -> list:
-        base_cols = ReportService.get_base_columns()
-        signal_cols = ReportService.get_signal_columns()
-        report_cols = ReportService.get_report_columns(fund_flow_periods)
-        tail_cols = [ColumnNames.STOCK_LINK]
-        return base_cols + signal_cols + report_cols + tail_cols
+        from DataManager.ColumnNames import get_final_column_order as _f
+        return _f(fund_flow_periods)
 
     def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
         """

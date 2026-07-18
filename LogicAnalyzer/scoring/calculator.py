@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from typing import Any
-
-import traceback
 
 import numpy as np
 import pandas as pd
@@ -16,12 +15,20 @@ class FactorCalculator:
 
     计算质量、估值、动量、资金流四类因子 Z-Score（行业内中性化），
     与现有 MACD 评分加权融合生成新的综合分析评分。
+
+    因子定义由 FactorRegistry（YAML 配置驱动）统一管理，
+    修改 config/factor_registry.yaml 即可调整权重和参数，无需改代码。
     """
 
     def __init__(self, config: Any, db_engine: Any) -> None:  # noqa: ANN401
         self.config = config
         self._engine = db_engine
-        self._weights: dict[str, float] = getattr(config, "FACTOR_WEIGHTS", None) or {}
+        from LogicAnalyzer.scoring.factor_registry import FactorRegistry
+
+        config_dir = getattr(config, "CONFIG_DIR", None) or "config"
+        registry_path = os.path.join(config_dir, "factor_registry.yaml")
+        self._registry = FactorRegistry(config_path=registry_path)
+        self._weights: dict[str, float] = self._registry.weights
 
     # ── 质量因子 ─────────────────────────────────────────────────
 
@@ -74,7 +81,7 @@ class FactorCalculator:
     @staticmethod
     def calc_momentum_scores(symbols: list[str], hist_df: pd.DataFrame,
                              industry_map: dict[str, str] | None = None) -> pd.Series:
-        """计算 21 交易日动量（行业内中性化）。
+        """计算 21 交易日动量（行业内中性化），向量化版本。
 
         Args:
             symbols: 股票代码列表（纯代码，如 600519）。
@@ -87,28 +94,29 @@ class FactorCalculator:
         if hist_df.empty:
             return pd.Series(0.0, index=symbols)
 
-        # 排序后取最后 21 根
-        momentum_list = []
-        for symbol in symbols:
-            kline = hist_df[hist_df["symbol"] == symbol].sort_values("trade_date")
-            if len(kline) < 2:
-                continue
-            recent = kline.tail(21)
-            ret = (recent["close"].iloc[-1] - recent["close"].iloc[0]) / recent["close"].iloc[0]
-            momentum_list.append({"symbol": symbol, "momentum": ret})
-
-        mom_df = pd.DataFrame(momentum_list)
-        if mom_df.empty:
+        # 向量化：过滤目标股票 → 排序 → 每组取最近 21 根 → 计算收益率
+        subset = hist_df[hist_df["symbol"].isin(symbols)]
+        if subset.empty:
             return pd.Series(0.0, index=symbols)
 
+        sorted_df = subset.sort_values(["symbol", "trade_date"])
+        last_21 = sorted_df.groupby("symbol").tail(21)
+
+        first_close = last_21.groupby("symbol")["close"].first()
+        last_close = last_21.groupby("symbol")["close"].last()
+        momentum = ((last_close - first_close) / first_close).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+        # 确保所有请求的 symbol 都有值
+        momentum = momentum.reindex(symbols, fill_value=0.0)
+
         if industry_map:
-            mom_df["行业"] = mom_df["symbol"].map(industry_map)
-            return FactorCalculator._industry_zscore(
-                mom_df["momentum"], mom_df.get("行业", pd.Series(dtype=str))
-            ).fillna(0)
+            aligned_ind = momentum.index.to_series().map(industry_map)
+            return FactorCalculator._industry_zscore(momentum, aligned_ind).fillna(0)
         else:
-            raw = mom_df["momentum"]
-            return ((raw - raw.mean()) / raw.std()).fillna(0)
+            std = momentum.std()
+            if std == 0:
+                return momentum
+            return ((momentum - momentum.mean()) / std).fillna(0)
 
     # ── 资金流因子 ───────────────────────────────────────────────
 
@@ -162,6 +170,7 @@ class FactorCalculator:
         hist_df: pd.DataFrame | None = None,
         quality_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
+        trade_date: str | None = None,
     ) -> pd.DataFrame:
         """将多维因子评分融合到报告中，更新综合分析评分。
 
@@ -207,14 +216,17 @@ class FactorCalculator:
             result.set_index("股票代码")[industry_col].to_dict()
             if industry_col in result.columns else None
         )
-        momentum_score = self.calc_momentum_scores(symbols, hist_df or pd.DataFrame(), industry_map)
+        momentum_score = self.calc_momentum_scores(symbols, hist_df if not hist_df.empty else pd.DataFrame(), industry_map)
 
         # 对齐索引
         result["基本面评分"] = quality_score.reindex(result.index).fillna(0)
         result["估值评分"] = valuation_score.reindex(result.index).fillna(0)
-        result["动量评分"] = momentum_score.reindex(
-            result.set_index("股票代码").index
-        ).values if not result.empty else 0
+        if not result.empty:
+            code_idx = result.drop_duplicates(subset="股票代码").set_index("股票代码").index
+            aligned = momentum_score.reindex(code_idx)
+            result["动量评分"] = result["股票代码"].map(aligned.to_dict()).fillna(0)
+        else:
+            result["动量评分"] = 0
         result["资金流评分"] = moneyflow_score.reindex(result.index).fillna(0)
 
         # 3. MACD 原始评分归一化到 [-3, 3]
@@ -241,6 +253,9 @@ class FactorCalculator:
         raw = result["综合分析评分"]
         result["综合分析评分"] = ((raw - raw.min()) / (raw.max() - raw.min() + 1e-10) * 100).clip(0, 100)
 
+        # 行业截面百分位（用于步骤 14 过滤）
+        result = self._add_industry_percentiles(result, industry_col)
+
         logger.info(
             "[FactorCalculator] 多因子评分融合完成，因子权重: "
             f"MACD={w.get('macd',0):.2f} 动量={w.get('momentum',0):.2f} "
@@ -248,7 +263,105 @@ class FactorCalculator:
             f"估值={w.get('valuation',0):.2f}"
         )
 
+        # 写入 DW 层宽表
+        if trade_date:
+            try:
+                self._save_to_dwd(result, trade_date)
+            except Exception:
+                logger.opt(exception=True).warning("[DW层] dwd_factor_daily 写入失败")
+
         return result
+
+    @staticmethod
+    def _add_industry_percentiles(df: pd.DataFrame, industry_col: str = "行业") -> pd.DataFrame:
+        """在 DataFrame 中添加行业截面百分位列（0-100），用于步骤 14 过滤。"""
+        if industry_col not in df.columns:
+            return df
+        from DataManager.ColumnNames import ColumnNames as CN
+        score_cols = [
+            ("综合分析评分", CN.SCORE_PCT_INDUSTRY),
+            ("动量评分", CN.MOMENTUM_PCT_INDUSTRY),
+            ("基本面评分", CN.QUALITY_PCT_INDUSTRY),
+            ("估值评分", CN.VALUATION_PCT_INDUSTRY),
+        ]
+        for src, dst in score_cols:
+            if src in df.columns:
+                df[dst] = df.groupby(industry_col, observed=True)[src].rank(pct=True) * 100
+            else:
+                df[dst] = 50.0
+        return df
+
+    def _save_to_dwd(self, df: pd.DataFrame, trade_date: str) -> None:
+        """将因子评分写入 dwd_factor_daily 宽表。"""
+        import json
+
+        FACTOR_KEYS = ["momentum", "quality", "valuation", "moneyflow", "macd"]
+        COL_MAP = {
+            "momentum": "动量评分",
+            "quality": "基本面评分",
+            "valuation": "估值评分",
+            "moneyflow": "资金流评分",
+            "macd": "MACD评分",
+        }
+
+        if "股票代码" not in df.columns:
+            return
+
+        rows = []
+        for _, r in df.iterrows():
+            symbol = str(r.get("股票代码", ""))
+            if not symbol:
+                continue
+
+            factors = {}
+            factor_z = {}
+            factor_raw = {}
+
+            for k in FACTOR_KEYS:
+                col = COL_MAP.get(k, "")
+                if col in df.columns:
+                    val = r.get(col)
+                    if val is not None:
+                        factors[k] = float(val)
+
+            composite = r.get("综合分析评分")
+            industry = r.get("行业", "")
+
+            rows.append({
+                "trade_date": trade_date,
+                "symbol": symbol,
+                "industry": str(industry) if pd.notna(industry) else "",
+                "composite_score": float(composite) if composite is not None else None,
+                "composite_rank": 0,
+                "factors": json.dumps(factors),
+                "factor_z": json.dumps(factor_z),
+                "factor_raw": json.dumps(factor_raw),
+            })
+
+        if not rows:
+            return
+
+        from sqlalchemy import text as sql_text
+
+        INSERT_SQL = sql_text("""
+        INSERT INTO public.dwd_factor_daily
+            (trade_date, symbol, industry, composite_score, composite_rank,
+             factors, factor_z, factor_raw)
+         VALUES
+             (:trade_date, :symbol, :industry, :composite_score, :composite_rank,
+              CAST(:factors AS jsonb), CAST(:factor_z AS jsonb), CAST(:factor_raw AS jsonb))
+        ON CONFLICT (trade_date, symbol) DO UPDATE SET
+            industry = EXCLUDED.industry,
+            composite_score = EXCLUDED.composite_score,
+            factors = EXCLUDED.factors,
+            factor_z = EXCLUDED.factor_z,
+            factor_raw = EXCLUDED.factor_raw
+        """)
+
+        with self._engine.begin() as conn:
+            for row in rows:
+                conn.execute(INSERT_SQL, row)
+        logger.info(f"[DW层] dwd_factor_daily 写入 {len(rows)} 条")
 
     def load_quality_from_db(self, symbols: list[str] | None = None) -> pd.DataFrame:
         """从数据库加载质量因子数据。"""

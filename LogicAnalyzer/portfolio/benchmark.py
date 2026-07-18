@@ -169,6 +169,12 @@ class BenchmarkEvaluator:
         if portfolio_df.empty or kline_df.empty:
             return pd.Series(dtype=float)
 
+        # 对齐 symbol 格式：kline_df["symbol"] 是 sh600519，portfolio_df[code_col] 是 600519
+        kline = kline_df.copy()
+        if "股票代码" not in kline.columns:
+            from UtilsManager.CodeNormalizer import CodeNormalizer
+            kline["股票代码"] = kline["symbol"].apply(CodeNormalizer.normalize)
+
         # 过滤有持仓的股票
         weighted = portfolio_df[portfolio_df[weight_col].fillna(0) > 0]
         if weighted.empty:
@@ -179,7 +185,7 @@ class BenchmarkEvaluator:
         for _, row in weighted.iterrows():
             symbol = row[code_col]
             weight = row[weight_col]
-            stock_kline = kline_df[kline_df["symbol"] == symbol].sort_values("trade_date")
+            stock_kline = kline[kline["股票代码"] == symbol].sort_values("trade_date")
             if len(stock_kline) < 2:
                 continue
             stock_kline["return"] = stock_kline["close"].pct_change()

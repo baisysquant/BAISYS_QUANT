@@ -9,7 +9,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from BackTrading.alert import BacktestAlert
-from BackTrading.analytics import compute_risk_metrics, compute_trade_metrics
+from LogicAnalyzer.backtest_metrics import compute_risk_metrics, compute_trade_metrics
 from BackTrading.calibration import (
     CALIB_PARAM_MAP,
     CalibrationResult,
@@ -284,7 +284,7 @@ def _fetch_kline(
     symbols: list[str],
     backtest_start_date: str,
 ) -> pd.DataFrame:
-    from BackTrading.sync import ensure_table
+    from DataManager.sync import ensure_table
     from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
 
     # 将配置日期对齐到首个交易日，与 IncrementalSyncEngine 内部逻辑一致

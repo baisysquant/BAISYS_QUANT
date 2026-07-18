@@ -19,7 +19,7 @@ log_cli = false
 addopts = "-v --tb=short"
 
 [tool.coverage.run]
-source = ["Backtesting", "ConfigParser", "DataManager", "UtilsManager"]
+source = ["BackTrading", "UtilsManager", "DataManager", "LogicAnalyzer", "DataCollection"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 parallel = true
 
@@ -35,14 +35,15 @@ directory = "htmlcov"
 output = "coverage.json"
 
 [tool.coverage.paths]
-source = ["Backtesting", "ConfigParser", "DataManager", "UtilsManager"]
+source = ["BackTrading", "UtilsManager", "DataManager", "LogicAnalyzer", "DataCollection"]
 
 # ── 各模块覆盖率门限 ──
 [tool.coverage.report.fail_under]
-Backtesting = 72.00
-ConfigParser = 45.00
-DataManager = 15.00
+BackTrading = 72.00
 UtilsManager = 20.00
+DataManager = 15.00
+LogicAnalyzer = 10.00
+DataCollection = 10.00
 
 [tool.ruff]
 line-length = 120
@@ -131,9 +132,9 @@ ignore_errors = true
 
 # ── 核心模块：渐进式启用严格类型检查 ──
 
-# Backtesting 模块：全部通过 strict 检查
+# BackTrading 模块：全部通过 strict 检查
 [[tool.mypy.overrides]]
-module = "Backtesting.*"
+module = "BackTrading.*"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 warn_return_any = false
@@ -142,8 +143,8 @@ warn_return_any = false
 [[tool.mypy.overrides]]
 module = [
     "LogicAnalyzer.pipeline",
-    "LogicAnalyzer.PipelineState",
-    "LogicAnalyzer.DataValidator",
+    "LogicAnalyzer.pipeline_state",
+    "DataManager.DataValidator",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

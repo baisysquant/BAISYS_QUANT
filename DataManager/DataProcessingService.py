@@ -12,11 +12,11 @@ import pandas as pd
 from pandera.errors import SchemaErrors
 
 from DataManager.ColumnNames import ColumnNames
+from DataManager.ColumnNames import get_all_technical_signal_columns, get_final_column_order
 from DataManager.DataMergeService import DataMergeService
 from DataManager.DataSchemas import create_final_report_schema
-from Review.report import ReportService
-from LogicAnalyzer.DataValidator import DataValidator
-from LogicAnalyzer.PositionSizer import calculate_positions
+from DataManager.DataValidator import DataValidator
+from DataManager.PositionSizer import calculate_positions
 from UtilsManager.CodeNormalizer import CodeNormalizer
 
 
@@ -140,7 +140,7 @@ class DataProcessingService:
             return final_df
 
         # 使用常量类获取所有技术指标信号列
-        str_cols = ReportService.get_all_technical_signal_columns()
+        str_cols = get_all_technical_signal_columns()
         str_cols = [c for c in str_cols if c in final_df.columns]
 
         mask = (
@@ -201,7 +201,7 @@ class DataProcessingService:
             pd.DataFrame: 列重排后的DataFrame
         """
         # 使用常量类获取最终列顺序
-        final_cols = ReportService.get_final_column_order(
+        final_cols = get_final_column_order(
             fund_flow_periods=self.config.FUND_FLOW_PERIODS
         )
 

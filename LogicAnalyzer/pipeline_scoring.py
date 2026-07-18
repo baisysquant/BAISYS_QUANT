@@ -112,6 +112,3 @@ def _calc_moneyflow_score(mf_data: dict | None) -> tuple[int, str]:
     if divergence < -5:
         return -2, desc + '(主力温和流出)'
     return 0, desc
-
-
-

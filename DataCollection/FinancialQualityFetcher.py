@@ -202,6 +202,7 @@ class FinancialQualityFetcher:
         all_rows: list[dict[str, Any]] = []
         total = len(stale)
         done = 0
+        failed = 0
 
         logger.info(f"[FinancialQuality] 开始并发采集 {total} 只（{max_workers} 路）...")
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -215,6 +216,7 @@ class FinancialQualityFetcher:
                         logger.warning(f"[FinancialQuality] {sym} 采集超时（120s），跳过")
                         fut.cancel()
                         done += 1
+                        failed += 1
                     break
                 for fut in done_set:
                     sym = fut_to_sym.pop(fut, "?")
@@ -223,12 +225,14 @@ class FinancialQualityFetcher:
                         row = fut.result(timeout=5)
                     except Exception:
                         logger.warning(f"[FinancialQuality] {sym} 采集失败，跳过")
+                        failed += 1
                         continue
                     if row is None:
+                        failed += 1
                         continue
                     all_rows.append(row)
                     if done % 50 == 0 or done == total:
-                        logger.info(f"[FinancialQuality] 进度 {done}/{total}，已采集 {len(all_rows)} 只")
+                        logger.info(f"[FinancialQuality] 进度 {done}/{total}，已采集 {len(all_rows)} 只，失败 {failed} 只")
 
         skipped = total - len(all_rows)
         # ── 保存缓存文件 ──────────────────────────────────────
@@ -239,7 +243,7 @@ class FinancialQualityFetcher:
         if all_rows:
             self._bulk_upsert(all_rows)
 
-        logger.info(f"[FinancialQuality] 完成，采集 {len(all_rows)}/{total} 只（跳过 {skipped}）")
+        logger.info(f"[FinancialQuality] 完成，采集 {len(all_rows)}/{total} 只，失败 {failed} 只")
         return len(all_rows)
 
     def load_quality(self, symbols: list[str] | None = None) -> pd.DataFrame:

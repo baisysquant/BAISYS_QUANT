@@ -2,7 +2,64 @@
 CREATE TABLE public.stock_daily_kline ( trade_date text NULL, symbol text NULL, "open" float8 NULL, "close" float8 NULL, high float8 NULL, low float8 NULL, amount float8 NULL, close_normal float8 NULL, volume float8 NULL, adj_ratio float8 NULL);
 
 -- app_stock_strategy_report definition
-CREATE TABLE public.app_stock_strategy_report ( archive_date date NOT NULL, stock_code varchar(20) NOT NULL, stock_name varchar(50) NULL, industry varchar(50) NULL, close_price numeric(12, 2) NULL, is_strong_stock varchar(10) NULL, is_vol_price_rise varchar(10) NULL, consecutive_up_days int4 DEFAULT 0 NULL, high_vol_days int4 DEFAULT 0 NULL, is_top10_industry varchar(10) NULL, is_full_bullish varchar(10) NULL, macd_12269_signal varchar(50) NULL, macd_12269_momentum varchar(50) NULL, macd_12269_dif numeric(12, 4) NULL, macd_second_signal varchar(50) NULL, macd_second_momentum varchar(50) NULL, macd_second_dif numeric(12, 4) NULL, kdj_signal text NULL, cci_signal varchar(100) NULL, rsi_signal varchar(100) NULL, boll_signal varchar(50) NULL, report_buy_count int4 DEFAULT 0 NULL, fund_flow_trend numeric(18, 2) NULL, fund_inflow_5d numeric(18, 2) NULL, fund_inflow_10d numeric(18, 2) NULL, fund_inflow_20d numeric(18, 2) NULL, stock_link text NULL, created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL, macd_second_period_name varchar(20) NULL, CONSTRAINT app_stock_strategy_report_pkey PRIMARY KEY (archive_date, stock_code));
+CREATE TABLE public.app_stock_strategy_report (
+    archive_date date NOT NULL,
+    stock_code varchar(20) NOT NULL,
+    stock_name varchar(50) NULL,
+    industry varchar(50) NULL,
+    close_price numeric(12,2) NULL,
+    is_strong_stock varchar(10) NULL,
+    is_vol_price_rise varchar(10) NULL,
+    consecutive_up_days int4 DEFAULT 0 NULL,
+    high_vol_days int4 DEFAULT 0 NULL,
+    is_top10_industry varchar(10) NULL,
+    is_full_bullish varchar(10) NULL,
+    macd_12269_signal varchar(50) NULL,
+    macd_12269_momentum varchar(50) NULL,
+    macd_12269_dif numeric(12,4) NULL,
+    macd_second_signal varchar(50) NULL,
+    macd_second_momentum varchar(50) NULL,
+    macd_second_dif numeric(12,4) NULL,
+    -- 多因子评分列
+    macd_cross varchar(50) NULL,
+    macd_momentum varchar(50) NULL,
+    dif_slope varchar(50) NULL,
+    divergence_signal varchar(100) NULL,
+    volume_price_score varchar(50) NULL,
+    comprehensive_conclusion text NULL,
+    comprehensive_score numeric(12,4) NULL,
+    comprehensive_level varchar(20) NULL,
+    risk_level varchar(20) NULL,
+    macd_trend_type varchar(50) NULL,
+    -- 独立技术指标
+    kdj_signal text NULL,
+    cci_signal varchar(100) NULL,
+    rsi_signal varchar(100) NULL,
+    boll_signal varchar(50) NULL,
+    report_buy_count int4 DEFAULT 0 NULL,
+    fund_flow_trend numeric(18,2) NULL,
+    fund_inflow_5d numeric(18,2) NULL,
+    fund_inflow_10d numeric(18,2) NULL,
+    fund_inflow_20d numeric(18,2) NULL,
+    stock_link text NULL,
+    -- 行业中性化
+    industry_signal_tag varchar(50) NULL,
+    industry_pctile numeric(12,4) NULL,
+    industry_signal_score numeric(12,4) NULL,
+    industry_deviation numeric(12,4) NULL,
+    -- 背离
+    divergence_days int4 NULL,
+    divergence_price numeric(12,4) NULL,
+    -- 退出策略
+    stop_loss numeric(12,4) NULL,
+    t1_target numeric(12,4) NULL,
+    t2_target numeric(12,4) NULL,
+    trailing_stop numeric(12,4) NULL,
+    exit_rrr numeric(12,4) NULL,
+    created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL,
+    macd_second_period_name varchar(20) NULL,
+    CONSTRAINT app_stock_strategy_report_pkey PRIMARY KEY (archive_date, stock_code)
+);
 CREATE INDEX idx_strategy_report_code ON public.app_stock_strategy_report USING btree (stock_code);
 CREATE INDEX idx_strategy_report_date ON public.app_stock_strategy_report USING btree (archive_date);
 
@@ -51,10 +108,18 @@ CREATE TABLE IF NOT EXISTS public.ods_factor_ic_history (
     factor_name VARCHAR(20) NOT NULL,
     check_date DATE NOT NULL,
     rolling_ic_mean FLOAT,
+    rolling_ic_std FLOAT,
+    icir FLOAT,
+    rank_ic FLOAT,
+    normal_ic FLOAT,
+    decile_spread FLOAT,
+    decile_monotonicity FLOAT,
     is_decayed BOOLEAN DEFAULT FALSE,
     current_weight FLOAT,
     suggested_weight FLOAT
 );
+CREATE INDEX IF NOT EXISTS idx_ic_factor_date
+    ON public.ods_factor_ic_history (factor_name, check_date);
 
 -- 基准指数日线（如上证综指 000001.SH）
 CREATE TABLE IF NOT EXISTS public.ods_index_daily (
@@ -80,6 +145,75 @@ CREATE TABLE IF NOT EXISTS public.ods_financial_quality (
     net_profit_growth_rate FLOAT,
     PRIMARY KEY (symbol, record_date)
 );
+
+-- ── v2.0 migration: 数据质量日志 ────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.dash_quality_log (
+    id SERIAL PRIMARY KEY,
+    trade_date VARCHAR(16) NOT NULL,
+    step_name VARCHAR(64) NOT NULL,
+    check_name VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pass',
+    metric FLOAT,
+    threshold FLOAT,
+    detail TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ql_date ON public.dash_quality_log (trade_date);
+CREATE INDEX IF NOT EXISTS idx_ql_step ON public.dash_quality_log (step_name);
+
+-- ── v2.0 migration: DW 层因子日宽表 ─────────────────────────────
+CREATE TABLE IF NOT EXISTS public.dwd_factor_daily (
+    trade_date DATE NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    industry VARCHAR(50),
+    composite_score FLOAT,
+    composite_rank INT,
+    factors JSONB DEFAULT '{}'::jsonb,       -- {"momentum": 0.5, "quality": -0.3, ...}
+    factor_z JSONB DEFAULT '{}'::jsonb,      -- 行业内 Z-Score
+    factor_raw JSONB DEFAULT '{}'::jsonb,    -- 原始值 {"momentum_raw": 0.05, "roe": 0.15}
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (trade_date, symbol)
+);
+
+-- ── v2.0 migration: 实验版本管理 ───────────────────────────────
+CREATE TABLE IF NOT EXISTS public.dash_run_log (
+    id SERIAL PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL UNIQUE,
+    trade_date VARCHAR(16) NOT NULL,
+    pipeline_name VARCHAR(64) NOT NULL DEFAULT '',
+    status VARCHAR(16) NOT NULL DEFAULT 'running',
+    started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMP,
+    duration_seconds FLOAT,
+    config_hash VARCHAR(64),
+    stock_pool_hash VARCHAR(64),
+    stock_count INT DEFAULT 0,
+    score_summary JSONB DEFAULT '{}'::jsonb,
+    error_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_runlog_date ON public.dash_run_log (trade_date DESC);
+CREATE INDEX IF NOT EXISTS idx_runlog_status ON public.dash_run_log (status);
+
+-- ── v2.0 migration: DAG pipeline checkpoint ─────────────────────
+CREATE TABLE IF NOT EXISTS public.dash_pipeline_checkpoint (
+    id SERIAL PRIMARY KEY,
+    run_id VARCHAR(64) NOT NULL,
+    pipeline_name VARCHAR(64) NOT NULL,
+    trade_date VARCHAR(16) NOT NULL,
+    step_name VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    duration_seconds FLOAT,
+    error_message TEXT,
+    ctx_json JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (run_id, step_name)
+);
+CREATE INDEX IF NOT EXISTS idx_ckpt_run ON public.dash_pipeline_checkpoint (run_id);
+CREATE INDEX IF NOT EXISTS idx_ckpt_date ON public.dash_pipeline_checkpoint (trade_date);
+CREATE INDEX IF NOT EXISTS idx_ckpt_pname_date ON public.dash_pipeline_checkpoint (pipeline_name, trade_date);
 
 -- 估值/市值因子（日频）
 CREATE TABLE IF NOT EXISTS public.ods_financial_valuation (
