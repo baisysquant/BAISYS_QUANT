@@ -600,7 +600,8 @@ def _act_boost_bottom_resonance(state: dict) -> None:
 
 
 def _act_boost_golden_volume(state: dict) -> None:
-    state['score'] = min(100, state.get('score', 0) + 10)
+    bonus = state.get('config', {}).get('golden_cross_bonus', 10)
+    state['score'] = min(100, state.get('score', 0) + bonus)
     state['triggered_rules'].append('R04')
 
 
@@ -773,7 +774,8 @@ def _act_extreme_vol_risk(state: dict) -> None:
 
 
 def _act_top_divergence_volume_down(state: dict) -> None:
-    state['score'] = max(0, state.get('score', 0) - 20)
+    penalty = state.get('config', {}).get('divergence_penalty', 20)
+    state['score'] = max(0, state.get('score', 0) - penalty)
     state['triggered_rules'].append('R41')
 
 

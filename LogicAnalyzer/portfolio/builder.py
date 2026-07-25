@@ -28,8 +28,7 @@ class PortfolioBuilder:
     输入：已过滤弱势股的 consolidated_report（含建议仓位比例）
     输出：添加"目标权重"列，更新"建议仓位比例"为组合约束后值
 
-    当 enable_convex_optimizer=True 时，使用 scipy.optimize 凸优化
-    替代启发式约束规则，直接优化收益/风险/换手率/行业约束。
+
     """
 
     def __init__(
@@ -47,7 +46,6 @@ class PortfolioBuilder:
         self._max_industry = sizing.get("max_industry_exposure", 0.30)
         self._max_total = sizing.get("max_total_exposure", 1.0)
         self._max_turnover = sizing.get("max_day_turnover", 0.20)
-        self._enable_convex = sizing.get("enable_convex_optimizer", False)
         self._risk_aversion = sizing.get("risk_aversion", 1.0)
 
         # 交易成本参数
@@ -59,74 +57,14 @@ class PortfolioBuilder:
     # ── 入口 ───────────────────────────────────────────────
 
     def build(self, df: pd.DataFrame, hist_df: pd.DataFrame | None = None) -> pd.DataFrame:
-        """执行组合构建全流程。
-
-        Args:
-            df: 过滤弱势股后的 DataFrame。
-            hist_df: K线 DataFrame（凸优化需要，可选）。
-
-        Returns:
-            更新了 建议仓位比例 + 目标权重 列的 DataFrame。
-        """
+        """执行组合构建全流程，使用启发式约束。"""
         if df.empty:
             df[ColumnNames.SUGGESTED_POSITION] = np.nan
             df["目标权重"] = np.nan
             return df
 
         result = df.copy()
-        code_col = ColumnNames.STOCK_CODE
-
-        if self._enable_convex and code_col in result.columns:
-            result = self._build_convex(result, hist_df)
-        else:
-            result = self._build_heuristic(result)
-        return result
-
-    # ── 凸优化方法 ──────────────────────────────────────────
-
-    def _build_convex(self, df: pd.DataFrame,
-                      hist_df: pd.DataFrame | None) -> pd.DataFrame:
-        """使用凸优化求解最优权重。"""
-        from LogicAnalyzer.portfolio.optimizer import ConvexPortfolioOptimizer
-
-        code_col = ColumnNames.STOCK_CODE
-        score_col = ColumnNames.COMPREHENSIVE_SCORE
-        industry_col = ColumnNames.INDUSTRY
-
-        scores = df.set_index(code_col)[score_col]
-
-        industry = df.set_index(code_col)[industry_col] if industry_col in df.columns else pd.Series(dtype=str)
-
-        # 日收益率矩阵（从 hist_df 构建）
-        daily_rets: pd.DataFrame | None = None
-        if hist_df is not None and not hist_df.empty:
-            k = hist_df.copy()
-            k["return"] = k.groupby("symbol")["close"].pct_change()
-            daily_rets = k.pivot_table(
-                index="trade_date", columns="symbol", values="return"
-            )
-
-        # 上日持仓
-        prev_weights = self._load_previous_positions()
-
-        opt = ConvexPortfolioOptimizer(
-            risk_aversion=self._risk_aversion,
-            max_single=self._max_single,
-            max_industry=self._max_industry,
-            max_turnover=self._max_turnover,
-        )
-
-        optimal_w = opt.optimize(scores, industry, daily_rets, prev_weights)
-
-        result = df.copy()
-        result[ColumnNames.SUGGESTED_POSITION] = result[code_col].map(optimal_w).fillna(0)
-        result["目标权重"] = result[ColumnNames.SUGGESTED_POSITION]
-
-        filled = (result["目标权重"] > 0.001).sum()
-        logger.info(
-            f"[PortfolioBuilder] 凸优化组合构建完成：{filled}/{len(result)} 只持仓，"
-            f"总仓位 {result['目标权重'].sum():.1%}"
-        )
+        result = self._build_heuristic(result)
         return result
 
     # ── 启发式方法 ──────────────────────────────────────────

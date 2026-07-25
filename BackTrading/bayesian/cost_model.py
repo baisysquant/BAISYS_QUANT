@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import collections
+import dataclasses
+import hashlib
+import json
+import threading
+import time
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from BackTrading._engine_legacy import (
+    EngineConfig,
+    _run_single_backtest,
+)
+from BackTrading.prepare import prepare_backtest_data, _compute_param_hash
+
+# 影响信号计算的参数名（必须与 prepare._compute_param_hash 一致）
+_SIGNAL_PARAM_KEYS = frozenset({
+    "boll_narrow_ratio",
+    "cross_decay_days",
+    "golden_cross_bonus",
+    "divergence_penalty",
+})
+
+# EngineConfig 中可被优化的字段（必须是 EngineConfig 的 dataclass 字段）
+_TUNABLE_CFG_FIELDS = frozenset({
+    "atr_stop_mult", "kelly_fraction", "position_a",
+    "liq_veto_ratio", "boll_narrow_ratio", "cross_decay_days",
+    "risk_none_multiplier",
+})
+
+# ── 全局信号缓存（跨路径/跨窗口共享） ──
+# key: (config_hash, data_fingerprint, param_hash) → DataFrame
+# 注意：每个条目 ~0.7 GiB（1.8M 行 × 50 列），磁盘缓存已保底，此处仅做最近参数加速
+_GLOBAL_SIGNAL_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
+_GLOBAL_CACHE_MAX = 2
+_GLOBAL_CACHE_LOCK = threading.Lock()
+
+
+def _signal_hash(params: dict[str, Any]) -> str:
+    """只取信号参数的子集做哈希。"""
+    sub = {k: params[k] for k in _SIGNAL_PARAM_KEYS if k in params}
+    return hashlib.md5(json.dumps(sub, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def _data_fingerprint(df: pd.DataFrame) -> str:
+    """给 kline_df 切片生成指纹，区分不同 CV 路径的日期区间与股票列表。"""
+    dates = df["trade_date"]
+    symbols = df["symbol"]
+    sym_list = sorted(symbols.dropna().unique())
+    sym_hash = hashlib.md5("|".join(sym_list).encode()).hexdigest()[:8]
+    raw = f"{len(df)}_{dates.min()}_{dates.max()}_{len(sym_list)}_{sym_hash}"
+    return hashlib.md5(raw.encode()).hexdigest()[:8]
+
+
+def _make_eval_cfg(base: EngineConfig, params: dict[str, Any]) -> EngineConfig:
+    """用 params 中的可调字段覆盖 base EngineConfig，生成新副本。"""
+    overrides = {k: v for k, v in params.items() if k in _TUNABLE_CFG_FIELDS}
+    if not overrides:
+        return base
+    return dataclasses.replace(base, **overrides)
+
+
+class FidelityController:
+    """两保真度评估控制器。
+
+    Level 1 (昂贵):  compute_signals + 回测
+    Level 2 (廉价):  复用缓存信号 + 仅回测
+
+    若输入数据已包含信号列（进场评分/退出评分/风险等级/止损价），
+    自动跳过 prepare_backtest_data，直接运行 _run_single_backtest。
+    """
+
+    _SIGNAL_COLS = {"进场评分", "退出评分", "风险等级", "止损价"}
+
+    def __init__(
+        self,
+        kline_df: pd.DataFrame,
+        base_engine_cfg: EngineConfig,
+        compute_exit_strategy: bool = True,
+        vectorized: bool = True,
+    ):
+        self._kline = kline_df
+        self._base_cfg = base_engine_cfg
+        self._compute_exit = compute_exit_strategy
+        self._vectorized = vectorized
+        # 实例级缓存（信号参数 hash → DataFrame），上限 2 防 OOM
+        self._signal_cache: dict[str, pd.DataFrame] = {}
+        self._INSTANCE_CACHE_MAX = 2
+        self._last_signal_hash: str | None = None
+        # 自动检测数据是否已含信号列
+        self._has_signals = self._SIGNAL_COLS.issubset(set(kline_df.columns))
+        # 数据指纹（用于全局缓存键）
+        self._data_key = _data_fingerprint(kline_df) if not self._has_signals else ""
+
+    def _config_hash(self) -> str:
+        """计算当前 BaseConfig 的哈希，用于全局缓存键。"""
+        from BackTrading.prepare import _compute_config_hash
+        return _compute_config_hash()
+
+    def evaluate(
+        self, params: dict[str, Any], fidelity: int = 1
+    ) -> dict[str, Any]:
+        """评估一组参数。
+
+        Args:
+            params: 完整参数 dict（含信号 + 组合参数）。
+            fidelity: 1=Level 1(含信号计算), 0=Level 2(仅回测)。
+
+        Returns:
+            { "sharpe": float, "total_return": float, "cost": float,
+              "elapsed": float, "equity": list, "trades": list }
+        """
+        t0 = time.perf_counter()
+
+        # ── 信号准备 ──
+        need_signal = False
+        if self._has_signals:
+            data = self._kline
+        else:
+            need_signal = fidelity == 1 or any(
+                k in params for k in _SIGNAL_PARAM_KEYS
+            )
+            if need_signal:
+                sig_hash = _signal_hash(params)
+                # 优先查实例级缓存（最快）
+                data = self._signal_cache.get(sig_hash)
+                if data is None:
+                    # 查全局缓存（跨路径共享）
+                    global_key = (self._config_hash(), self._data_key, sig_hash)
+                    data = _GLOBAL_SIGNAL_CACHE.get(global_key)
+                    if data is None:
+                        data = prepare_backtest_data(
+                            self._kline, params=params,
+                            compute_exit_strategy=self._compute_exit,
+                            vectorized=self._vectorized,
+                        )
+                        with _GLOBAL_CACHE_LOCK:
+                            if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
+                                _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))
+                            _GLOBAL_SIGNAL_CACHE[global_key] = data
+                    self._signal_cache[sig_hash] = data
+                    while len(self._signal_cache) > self._INSTANCE_CACHE_MAX:
+                        self._signal_cache.pop(next(iter(self._signal_cache)))
+                self._last_signal_hash = sig_hash
+            else:
+                if self._signal_cache:
+                    data = next(iter(self._signal_cache.values()))
+                else:
+                    logger.warning("fidelity=0 但信号缓存为空，自动升级到 Level 1")
+                    return self.evaluate(params, fidelity=1)
+
+        # ── 回测 ──
+        trade_log: list[dict[str, Any]] = []
+        equity_curve: list[dict[str, Any]] = []
+        eval_cfg = _make_eval_cfg(self._base_cfg, params)
+        total_return = _run_single_backtest(
+            data, params, eval_cfg, trade_log, equity_curve
+        )
+
+        # ── 计算 Sharpe ──
+        try:
+            from LogicAnalyzer.backtest_metrics import compute_risk_metrics
+            risk = compute_risk_metrics(equity_curve) or {}
+            sharpe = risk.get("sharpe_ratio", -1e10)
+            if sharpe is None or (isinstance(sharpe, float) and np.isnan(sharpe)):
+                sharpe = -1e10
+        except Exception:
+            sharpe = -1e10
+
+        elapsed = time.perf_counter() - t0
+        return {
+            "sharpe": float(sharpe),
+            "total_return": float(total_return) if total_return is not None else -1.0,
+            "cost": 1.0 if need_signal else 0.1,
+            "elapsed": elapsed,
+            "equity": equity_curve,
+            "trades": trade_log,
+        }
+
+    def warm_cache(self, signal_params: dict[str, Any]) -> str:
+        """预热信号缓存（用于 Level 2 优化前固定信号参数）。"""
+        if self._has_signals:
+            return "_presignaled"
+        sig_hash = _signal_hash(signal_params)
+        # 检查实例级缓存
+        if sig_hash not in self._signal_cache:
+            # 检查全局缓存
+            global_key = (self._config_hash(), self._data_key, sig_hash)
+            data = _GLOBAL_SIGNAL_CACHE.get(global_key)
+            if data is None:
+                data = prepare_backtest_data(
+                    self._kline, params=signal_params,
+                    compute_exit_strategy=self._compute_exit,
+                    vectorized=self._vectorized,
+                )
+                with _GLOBAL_CACHE_LOCK:
+                    if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
+                        _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))
+                    _GLOBAL_SIGNAL_CACHE[global_key] = data
+            self._signal_cache[sig_hash] = data
+            while len(self._signal_cache) > self._INSTANCE_CACHE_MAX:
+                self._signal_cache.pop(next(iter(self._signal_cache)))
+        self._last_signal_hash = sig_hash
+        return sig_hash
+
+    @property
+    def cached_signal_hashes(self) -> list[str]:
+        return list(self._signal_cache.keys())

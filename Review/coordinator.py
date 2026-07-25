@@ -34,6 +34,7 @@ from LogicAnalyzer.portfolio.benchmark import BenchmarkEvaluator
 from DataManager.DataAcquisitionService import DataAcquisitionService
 from LogicAnalyzer.scoring.calculator import FactorCalculator
 from LogicAnalyzer.scoring.decay import FactorDecayMonitor
+from LogicAnalyzer.ml.factor_rotation import FactorRotationPlatform
 from LogicAnalyzer.portfolio.builder import PortfolioBuilder
 from LogicAnalyzer.portfolio.tracking import PositionTrackingService, SHEET_NAME as POSITION_BT_SHEET
 from LogicAnalyzer.pipeline.dag import DagPipeline, PipelineStep
@@ -146,6 +147,7 @@ class StockAnalysisCoordinator:
         )
         self.benchmark_evaluator = BenchmarkEvaluator(config=config)
         self.factor_decay_monitor = FactorDecayMonitor(config=config, db_engine=db_engine)
+        self.factor_rotation = FactorRotationPlatform()
         self.quality_checker = DataQualityChecker(db_engine=db_engine)
         self.force_rerun = False
         self.start_time = time.time()
@@ -554,6 +556,185 @@ class StockAnalysisCoordinator:
 
         return df
 
+    def _load_north_flow(self, symbols: list[str]) -> pd.DataFrame | None:
+        """加载北向资金因子数据。"""
+        try:
+            from DataCollection.NorthFlowFetcher import NorthFlowFetcher
+            fetcher = NorthFlowFetcher(self.config)
+            df = fetcher.fetch_multi_day(days=20)
+            if df.empty:
+                return None
+            symbols_set = set(symbols)
+            df = df[df["symbol"].isin(symbols_set)].copy()
+            if df.empty:
+                return None
+            df["行业"] = "未知"
+            try:
+                from DataManager.DbEngine import get_engine
+                from sqlalchemy import text
+                engine = get_engine(self.config)
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
+                    )).fetchall()
+                    name_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
+                    df["行业"] = df["symbol"].apply(
+                        lambda s: name_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                    )
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            self.logger.warning(f"[北向资金] 加载失败: {e}")
+            return None
+
+    def _load_top_trader(self, symbols: list[str]) -> pd.DataFrame | None:
+        """加载龙虎榜因子数据。"""
+        try:
+            from DataCollection.TopTraderFetcher import TopTraderFetcher
+            fetcher = TopTraderFetcher(self.config)
+            df = fetcher.fetch_multi_day(days=20)
+            if df.empty:
+                return None
+            symbols_set = set(symbols)
+            df = df[df["symbol"].isin(symbols_set)].copy()
+            if df.empty:
+                return None
+            df["行业"] = "未知"
+            try:
+                from DataManager.DbEngine import get_engine
+                from sqlalchemy import text
+                engine = get_engine(self.config)
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
+                    )).fetchall()
+                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
+                    df["行业"] = df["symbol"].apply(
+                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                    )
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            self.logger.warning(f"[龙虎榜] 加载失败: {e}")
+            return None
+
+    def _load_macro_tilts(self) -> dict[str, float] | None:
+        """加载宏观因子行业 tilt。"""
+        try:
+            from DataCollection.MacroFactorFetcher import MacroFactorFetcher
+            fetcher = MacroFactorFetcher(self.config)
+            return fetcher.get_industry_tilts()
+        except Exception as e:
+            self.logger.warning(f"[宏观因子] 加载失败: {e}")
+            return None
+
+    def _load_financial_forward(self, symbols: list[str]) -> pd.DataFrame | None:
+        """加载财务前瞻因子。"""
+        try:
+            from DataCollection.FinancialForwardFetcher import FinancialForwardFetcher
+            fetcher = FinancialForwardFetcher(self.config)
+            forecast = fetcher.fetch_forecasts()
+            analyst = fetcher.fetch_analyst_ranks()
+            if forecast.empty and analyst.empty:
+                return None
+            symbols_set = set(symbols)
+            result = forecast[forecast["symbol"].isin(symbols_set)].copy() if not forecast.empty else pd.DataFrame()
+            if not analyst.empty:
+                _a = analyst[analyst["symbol"].isin(symbols_set)].copy()
+                if not result.empty:
+                    result = result.merge(_a[["symbol", "分析师共识分"]], on="symbol", how="left")
+                else:
+                    result = _a.copy()
+            if result.empty:
+                return None
+            result["行业"] = "未知"
+            try:
+                from DataManager.DbEngine import get_engine
+                from sqlalchemy import text
+                engine = get_engine(self.config)
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
+                    )).fetchall()
+                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
+                    result["行业"] = result["symbol"].apply(
+                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                    )
+            except Exception:
+                pass
+            result["业绩超预期分"] = result.get("业绩超预期分", 0.0)
+            result["分析师共识分"] = result.get("分析师共识分", 0.0)
+            return result
+        except Exception as e:
+            self.logger.warning(f"[财务前瞻] 加载失败: {e}")
+            return None
+
+    def _load_news_sentiment(self, symbols: list[str]) -> pd.DataFrame | None:
+        """加载舆情因子（NLP 新闻情感）。"""
+        try:
+            from DataCollection.NewsSentimentFetcher import NewsSentimentFetcher
+            fetcher = NewsSentimentFetcher(self.config)
+            df = fetcher.fetch_multi_day(days=20)
+            if df is None or df.empty:
+                return None
+            symbols_set = set(symbols)
+            df = df[df["symbol"].isin(symbols_set)].copy()
+            if df.empty:
+                return None
+            df["行业"] = "未知"
+            try:
+                from DataManager.DbEngine import get_engine
+                from sqlalchemy import text
+                engine = get_engine(self.config)
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
+                    )).fetchall()
+                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
+                    df["行业"] = df["symbol"].apply(
+                        lambda s: code_to_ind.get(s.replace("sh","").replace("sz","").zfill(6), "未知")
+                    )
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            self.logger.warning(f"[舆情因子] 加载失败: {e}")
+            return None
+
+    def _load_event_driven(self, symbols: list[str]) -> pd.DataFrame | None:
+        """加载事件驱动因子。"""
+        try:
+            from DataCollection.EventDrivenFetcher import EventDrivenFetcher
+            fetcher = EventDrivenFetcher(self.config)
+            df = fetcher.fetch_all()
+            if df.empty:
+                return None
+            symbols_set = set(symbols)
+            df = df[df["symbol"].isin(symbols_set)].copy()
+            if df.empty:
+                return None
+            df["行业"] = "未知"
+            try:
+                from DataManager.DbEngine import get_engine
+                from sqlalchemy import text
+                engine = get_engine(self.config)
+                with engine.connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
+                    )).fetchall()
+                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
+                    df["行业"] = df["symbol"].apply(
+                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                    )
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            self.logger.warning(f"[事件驱动] 加载失败: {e}")
+            return None
+
     def _step_11_multi_factor_alpha(self, ctx: PipelineContext) -> bool:
         if not self.config.MULTI_FACTOR_ALPHA_ENABLED:
             self.logger.info("[多因子Alpha] 未启用，跳过。")
@@ -571,7 +752,26 @@ class StockAnalysisCoordinator:
         quality_df = self.factor_calculator.load_quality_from_db(symbols)
         valuation_df = self.factor_calculator.load_valuation_from_db(symbols)
 
-        if quality_df.empty and valuation_df.empty:
+        # 北向资金因子
+        north_df = self._load_north_flow(symbols)
+        # 龙虎榜因子
+        trader_df = self._load_top_trader(symbols)
+        # 宏观因子
+        macro_tilts = self._load_macro_tilts()
+        # 财务前瞻
+        forward_df = self._load_financial_forward(symbols)
+        # 事件驱动
+        event_df = self._load_event_driven(symbols)
+        # 舆情因子（NLP 新闻情感）
+        sentiment_df = self._load_news_sentiment(symbols)
+
+        if (quality_df.empty and valuation_df.empty
+                and (north_df is None or north_df.empty)
+                and (trader_df is None or trader_df.empty)
+                and not macro_tilts
+                and (forward_df is None or forward_df.empty)
+                and (event_df is None or event_df.empty)
+                and (sentiment_df is None or sentiment_df.empty)):
             self.logger.info("[多因子Alpha] 无外部因子数据，跳过。")
             return True
 
@@ -583,6 +783,12 @@ class StockAnalysisCoordinator:
                 hist_df=hist_df,
                 quality_df=quality_df,
                 valuation_df=valuation_df,
+                north_df=north_df,
+                trader_df=trader_df,
+                macro_tilts=macro_tilts,
+                forward_df=forward_df,
+                event_df=event_df,
+                sentiment_df=sentiment_df,
                 trade_date=self.today_str,
             )
             ctx.set("consolidated_report", updated)
@@ -689,11 +895,70 @@ class StockAnalysisCoordinator:
         if consolidated_report.empty or hist_df.empty:
             self.logger.info("[因子衰减] 数据不足，跳过。")
             return True
+        re_fuse = False
         try:
-            decay_result = self.factor_decay_monitor.run(consolidated_report, hist_df)
-            ctx.set("factor_decay_result", decay_result)
-            if decay_result.get("needs_rebalance"):
-                self.logger.warning("[因子衰减] 检测到因子衰减，建议重新平衡权重")
+            # ── 1. 长周期因子衰减监控（FactorDecayMonitor） ──
+            try:
+                decay_result = self.factor_decay_monitor.run(consolidated_report, hist_df)
+                ctx.set("factor_decay_result", decay_result)
+                if decay_result.get("needs_rebalance"):
+                    decay_adjusted = False
+                    for fname, status in decay_result.get("factors", {}).items():
+                        current_w = status.get("当前权重", 0.0)
+                        suggested_w = status.get("建议权重", 0.0)
+                        if suggested_w > 0 and suggested_w < current_w * 0.9:
+                            self.factor_calculator.adjust_weight(fname, suggested_w)
+                            decay_adjusted = True
+                            self.logger.warning(
+                                f"[因子衰减] {fname}: IC={status.get('滚动IC均值', '?'):.4f}, "
+                                f"权重 {current_w:.3f} → {suggested_w:.3f}"
+                            )
+                        is_recovered = status.get("已恢复", False)
+                        if is_recovered and suggested_w > current_w:
+                            restore_w = min(suggested_w, current_w * 1.5)
+                            self.factor_calculator.adjust_weight(fname, restore_w)
+                            decay_adjusted = True
+                            self.logger.info(
+                                f"[因子恢复] {fname}: IC={status.get('滚动IC均值', '?'):.4f} > 0.03 持续, "
+                                f"权重 {current_w:.3f} → {restore_w:.3f}"
+                            )
+                    if decay_adjusted:
+                        re_fuse = True
+                        ctx.set("weights_adjusted", True)
+            except Exception as e:
+                self.logger.warning(f"[因子衰减] 监控异常: {e}")
+
+            # ── 2. 短周期因子 IC 轮动（FactorRotationPlatform） ──
+            try:
+                base_w = dict(self.factor_calculator._weights)
+                rotated_w = self.factor_rotation.step(
+                    consolidated_report, hist_df, base_w, trade_date=self.today_str,
+                )
+                if rotated_w != base_w:
+                    for fname, new_w in rotated_w.items():
+                        self.factor_calculator.adjust_weight(fname, new_w)
+                    re_fuse = True
+                    self.logger.info("[IC轮动] 因子权重 tilt 已应用")
+            except Exception as e:
+                self.logger.warning(f"[IC轮动] 执行异常: {e}")
+
+            # ── 3. 如有调整，重新融合评分 ──
+            if re_fuse:
+                try:
+                    updated = self.factor_calculator.fuse_scores(
+                        report=consolidated_report,
+                        macd_score_col="综合分析评分",
+                        industry_col="行业",
+                        hist_df=hist_df,
+                        quality_df=pd.DataFrame(),
+                        valuation_df=pd.DataFrame(),
+                        sentiment_df=pd.DataFrame(),
+                        trade_date=self.today_str,
+                    )
+                    ctx.set("consolidated_report", updated)
+                    self.logger.info("[因子衰减+IC轮动] 权重调整完成，评分已更新")
+                except Exception as e2:
+                    self.logger.warning(f"[因子衰减] 重算评分失败: {e2}")
         except Exception as e:
             self.logger.warning(f"[因子衰减] 执行异常: {e}")
         return True

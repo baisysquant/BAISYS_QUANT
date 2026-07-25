@@ -45,9 +45,25 @@ def detect_divergence_single_param(
     current_idx = len(df) - 1
     adj_dist = adaptive_distance(indicator, base_distance=distance)
     peaks, troughs = find_peaks_troughs(indicator, distance=adj_dist)
+    return _detect_from_peaks(price, indicator, current_idx, adj_dist, peaks, troughs)
 
+
+def detect_divergence_precomputed(
+    price: pd.Series, indicator: pd.Series, current_idx: int,
+    adj_dist: int, peaks: np.ndarray, troughs: np.ndarray,
+) -> tuple[str | None, int | None, float]:
+    """使用预计算的 peak/trough 索引检测背离，避免每 bar 重跑 find_peaks。"""
+    peaks = peaks[peaks <= current_idx]
+    troughs = troughs[troughs <= current_idx]
+    return _detect_from_peaks(price, indicator, current_idx, adj_dist, peaks, troughs)
+
+
+def _detect_from_peaks(
+    price: pd.Series, indicator: pd.Series, current_idx: int,
+    adj_dist: int, peaks: np.ndarray, troughs: np.ndarray,
+) -> tuple[str | None, int | None, float]:
+    """共享的背离检测核心逻辑。"""
     strength = 0.0
-    # 顶背离：价格创新高，指标未创新高
     for p in reversed(peaks):
         if p < current_idx - adj_dist * 2:
             continue
@@ -61,7 +77,6 @@ def detect_divergence_single_param(
         if strength > 0.15:
             return Divergence.TOP_DIVERGENCE, p, strength
 
-    # 底背离：价格创新低，指标未创新低
     for t in reversed(troughs):
         if t < current_idx - adj_dist * 2:
             continue

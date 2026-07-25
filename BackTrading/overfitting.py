@@ -44,6 +44,8 @@ def deflated_sharpe_ratio(
         return probabilistic_sharpe_ratio(sharpe, n_obs, skew, kurt, 0.0)
 
     sigma_sr = 1.0 / math.sqrt(n_obs - 1) if n_obs > 1 else 1.0
+    # sigma_sr = 1/sqrt(T) (Bailey & López de Prado 2014),
+    # T ≡ 单次回测的独立收益观测数（n_obs），非试验次数
     gamma_euler = 0.5772156649
 
     inv_n = 1.0 / num_trials

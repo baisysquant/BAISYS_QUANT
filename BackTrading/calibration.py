@@ -23,8 +23,9 @@ def _project_root() -> Path:
 PROJECT_ROOT = _project_root()
 
 import pandas as pd
+from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, grid_search, walk_forward
+from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
@@ -36,79 +37,15 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
     "boll_narrow_ratio": ("BACKTEST_CALIBRATED", "boll_narrow_ratio"),
     "cross_decay_days": ("BACKTEST_CALIBRATED", "cross_decay_days"),
+    "conclusion_full_bull": ("BACKTEST_CALIBRATED", "conclusion_full_bull"),
+    "golden_cross_bonus": ("BACKTEST_CALIBRATED", "golden_cross_bonus"),
+    "divergence_penalty": ("BACKTEST_CALIBRATED", "divergence_penalty"),
+    "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
 }
-
-CONFIG_INI = PROJECT_ROOT / "config.ini"
-
-
-def write_calibration_to_ini(params: dict[str, float]) -> None:
-    """将寻优后的参数写回 config.ini，保留注释和格式。"""
-    if not CONFIG_INI.exists():
-        return
-
-    lines = CONFIG_INI.read_text(encoding="utf-8").splitlines(keepends=True)
-    current_section: str | None = None
-    updated_keys: set[str] = set()
-
-    def _format_val(key: str, val: float) -> str:
-        if key.endswith("_days"):
-            return str(int(val))
-        s = f"{val:.6f}".rstrip("0").rstrip(".")
-        return s if s else "0"
-
-    for i, line in enumerate(lines):
-        # 检测 section 头
-        sec_match = re.match(r"^\s*\[(\w+)\]", line)
-        if sec_match:
-            current_section = sec_match.group(1)
-            continue
-
-        if current_section is None:
-            continue
-
-        # 检测 key = value
-        kv_match = re.match(r"^\s*(\w+)\s*=", line)
-        if not kv_match:
-            continue
-
-        raw_key = kv_match.group(1).lower()
-        # 反向查找 param_map 中有无匹配
-        for param_key, (sec, ini_key) in CALIB_PARAM_MAP.items():
-            if sec == current_section and ini_key.lower() == raw_key and param_key in params:
-                new_val = _format_val(param_key, params[param_key])
-                eq = line.index("=")
-                after = line[eq + 1:]
-                # 分离值部分与 inline comment（保留原始格式向后补）
-                val_only = after
-                for sep in ("#", ";"):
-                    idx = val_only.find(sep)
-                    if idx >= 0 and (idx == 0 or val_only[idx - 1] in (" ", "\t")):
-                        val_only = val_only[:idx].rstrip()
-                old_val = val_only.strip()
-                if old_val != new_val:
-                    comment = after[len(val_only):].rstrip()
-                    lines[i] = f"{line[:eq + 1]} {new_val}{comment}\n"
-                    updated_keys.add(param_key)
-                break
-
-    if updated_keys:
-        CONFIG_INI.write_text("".join(lines), encoding="utf-8")
-
-
-def _get_git_commit() -> str:
-    """获取当前 git commit hash，用于回测结果追溯。"""
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()[:12]
-    except Exception:
-        return "unknown"
 
 
 @dataclass
 class CalibrationResult:
-    """寻优结果数据类（含数据血缘字段，可追溯到 config 版本和代码 commit）。"""
-
     params: dict[str, float] = field(default_factory=dict)
     score: float = 0.0
     sharpe: float = 0.0
@@ -139,70 +76,58 @@ class CalibrationResult:
 CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
 
 
-def run_grid_search(
+def run_bayesian_walk_forward(
     kline_df: pd.DataFrame,
-    param_grid: dict[str, list[float]] | None = None,
-    **backtest_kwargs: Any,
-) -> pd.DataFrame:
-    cfg = _build_engine_config(backtest_kwargs)
-    if param_grid is None:
-        param_grid = {
-            "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
-            "kelly_fraction": [0.1, 0.25, 0.5],
-            "position_a": [0.2, 0.3, 0.4],
-        }
-    results = grid_search(
-        data=kline_df,
-        param_grid=param_grid,
-        engine_cfg=cfg,
-        show_progress=backtest_kwargs.get("show_progress", False),
-    )
-    return pd.DataFrame(results)
-
-
-def run_walk_forward(
-    kline_df: pd.DataFrame,
-    param_grid: dict[str, list[float]] | None = None,
     train_period: int = 120,
     test_period: int = 20,
+    num_paths: int = 3,
     initial_cash: float = 1_000_000.0,
-    **backtest_kwargs: Any,
+    spaces: dict | None = None,
+    **kwargs: Any,
 ) -> pd.DataFrame:
-    cfg = _build_engine_config(initial_cash, backtest_kwargs)
-    if param_grid is None:
-        param_grid = {
-            "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
-            "kelly_fraction": [0.1, 0.25, 0.5],
-        }
+    """贝叶斯 Walk-Forward 优化入口。
 
-    results = walk_forward(
-        data=kline_df,
-        engine_cfg=cfg,
+    Args:
+        kline_df: K 线数据
+        train_period: IS 训练窗口（交易日）
+        test_period: OOS 验证窗口
+        num_paths: 多路径数
+        initial_cash: 初始资金
+        spaces: 预构建的 ParamSpace dict（None 时从 config 自动构建）
+        **kwargs: 透传给引擎的额外参数
+
+    Returns:
+        DataFrame, 每行一个 WFO 窗口，与旧 walk_forward 返回格式兼容。
+    """
+    from UtilsManager.ConfigParser import Config as _Config
+
+    if spaces is None:
+        cfg = _Config().app_config.backtest
+        spaces = build_spaces(cfg)
+
+    signal_sp, portfolio_sp = split_by_cost(spaces)
+    logger.info(f"贝叶斯 WFO 参数空间:\n{describe(spaces)}")
+    logger.info(f"  信号参数: {len(signal_sp)} | 组合参数: {len(portfolio_sp)}")
+
+    n_dates = len(kline_df["trade_date"].unique())
+    logger.info(f"  交易日数: {n_dates} | IS={train_period} | OOS={test_period}")
+    if test_period < 60:
+        logger.warning(f"OOS 窗口仅 {test_period} 天，Sharpe 估计标准误约 {1.96/ (test_period-1)**0.5:.2f}，建议 ≥60 天")
+
+    # ── 正式调用贝叶斯 WFO 引擎 ─────────────────────────
+    from BackTrading.bayesian.meta_optimizer import bayesian_walk_forward_multi
+
+    result = bayesian_walk_forward_multi(
+        kline_df=kline_df,
         train_period=train_period,
         test_period=test_period,
-        param_grid=param_grid,
-        show_progress=backtest_kwargs.get("show_progress", False),
-    )
-    return pd.DataFrame(results)
-
-
-def _build_engine_config(initial_cash_or_kwargs: float | dict[str, Any], kwargs: dict[str, Any] | None = None) -> Any:
-    if isinstance(initial_cash_or_kwargs, dict):
-        kwargs = initial_cash_or_kwargs
-        initial_cash = kwargs.get("initial_cash", 1_000_000)
-    else:
-        initial_cash = initial_cash_or_kwargs
-        kwargs = kwargs or {}
-
-    return EngineConfig(
+        num_paths=num_paths,
         initial_cash=initial_cash,
-        commission_rate=kwargs.get("commission", 0.0003),
-        stamp_tax_rate=kwargs.get("stamp_tax", 0.001),
-        slippage=kwargs.get("slippage", 0.001),
-        max_position_pct=kwargs.get("max_position_pct", 0.1),
-        portfolio_method=kwargs.get("portfolio_method", "score_weighted"),
-        point_in_time=kwargs.get("point_in_time", True),
+        spaces=spaces,
+        **kwargs,
     )
+    return result
+
 
 
 def save_calibration(result: CalibrationResult) -> None:
@@ -251,3 +176,65 @@ def apply_calibration_to_config(config: object) -> None:
             fr.LIQ_VETO_RATIO = val
         elif key in ("kelly_fraction", "position_a"):
             setattr(ps, attr, val)
+        elif key == "conclusion_full_bull":
+            cfg.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(val)
+        elif key == "golden_cross_bonus":
+            sc.GOLDEN_CROSS_BONUS = int(val)
+        elif key == "divergence_penalty":
+            sc.DIVERGENCE_PENALTY = int(val)
+        elif key == "risk_none_multiplier":
+            ps.RISK_NONE_MULTIPLIER = float(val)
+
+
+def _get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def write_calibration_to_ini(config: object) -> None:
+    from UtilsManager.ConfigParser import Config
+
+    assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
+    result = load_calibration()
+    if result is None:
+        logger.warning("未找到校准结果，跳过写入 config.ini")
+        return
+    overrides = result.params
+    if not overrides:
+        logger.info("无校准参数，跳过写入")
+        return
+
+    ini_path = Path(config.config_path) if hasattr(config, "config_path") and config.config_path else Path("config.ini")
+    if not ini_path.exists():
+        logger.warning(f"config.ini 不存在: {ini_path}")
+        return
+
+    raw = ini_path.read_text(encoding="utf-8")
+    section_header = "[BACKTEST_CALIBRATED]"
+
+    if section_header not in raw:
+        raw += f"\n\n{section_header}\n"
+
+    def _update_section(text: str, section: str, key: str, value: Any) -> str:
+        pat = re.compile(rf"^({key}\s*=\s*).*", re.MULTILINE)
+        in_section = False
+        new_lines: list[str] = []
+        for line in text.splitlines(keepends=True):
+            if line.strip().startswith("["):
+                in_section = line.strip().startswith(section)
+            if in_section and pat.match(line):
+                line = pat.sub(rf"\g<1>{value}", line)
+            new_lines.append(line)
+        return "".join(new_lines)
+
+    for key, val in overrides.items():
+        raw = _update_section(raw, section_header, key, val)
+
+    ini_path.write_text(raw, encoding="utf-8")
+    logger.info(f"校准参数已写入 {ini_path} [{section_header}]")

@@ -35,11 +35,46 @@ class TestParamHash:
         assert len(h1) == 8
 
     @pytest.mark.unit
-    def test_param_hash_differs_with_different_params(self):
+    def test_param_hash_differs_with_different_signal_params(self):
+        from BackTrading.prepare import _compute_param_hash
+        h1 = _compute_param_hash({"golden_cross_bonus": 5})
+        h2 = _compute_param_hash({"golden_cross_bonus": 15})
+        assert h1 != h2
+
+    @pytest.mark.unit
+    def test_param_hash_excludes_atr_params(self):
         from BackTrading.prepare import _compute_param_hash
         h1 = _compute_param_hash({"atr_stop_mult": 1.0})
-        h2 = _compute_param_hash({"atr_stop_mult": 2.0})
+        h2 = _compute_param_hash({"atr_stop_mult": 3.0})
+        assert h1 == h2  # atr_stop_mult 不影响信号，hash 相同
+
+    @pytest.mark.unit
+    def test_param_hash_excludes_conclusion_full_bull(self):
+        from BackTrading.prepare import _compute_param_hash
+        h1 = _compute_param_hash({"conclusion_full_bull": 70})
+        h2 = _compute_param_hash({"conclusion_full_bull": 90})
+        assert h1 == h2  # conclusion_full_bull 不影响信号，hash 相同
+
+    @pytest.mark.unit
+    def test_param_hash_includes_golden_cross_bonus(self):
+        from BackTrading.prepare import _compute_param_hash
+        h1 = _compute_param_hash({"golden_cross_bonus": 5})
+        h2 = _compute_param_hash({"golden_cross_bonus": 15})
         assert h1 != h2
+
+    @pytest.mark.unit
+    def test_param_hash_includes_divergence_penalty(self):
+        from BackTrading.prepare import _compute_param_hash
+        h1 = _compute_param_hash({"divergence_penalty": 10})
+        h2 = _compute_param_hash({"divergence_penalty": 30})
+        assert h1 != h2
+
+    @pytest.mark.unit
+    def test_param_hash_excludes_risk_none_multiplier(self):
+        from BackTrading.prepare import _compute_param_hash
+        h1 = _compute_param_hash({"risk_none_multiplier": 0.5})
+        h2 = _compute_param_hash({"risk_none_multiplier": 2.0})
+        assert h1 == h2  # risk_none_multiplier 不影响信号，hash 相同
 
 
 class TestCacheDirFor:

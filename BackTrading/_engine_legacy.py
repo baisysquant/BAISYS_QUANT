@@ -1,59 +1,17 @@
 from __future__ import annotations
 
-import itertools
-import os
-import tempfile
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from loguru import logger
 from typing_extensions import TypeAlias
 
-from LogicAnalyzer.backtest_metrics import compute_risk_metrics, compute_trade_metrics
-from BackTrading.domain.models import CostModel
-from BackTrading.prepare import prepare_backtest_data, _compute_param_hash
 from BackTrading.engine import EngineConfig
 from LogicAnalyzer.portfolio.backtest_weights import allocate_weights
-
-from UtilsManager.ConfigParser import Config as _Config
 
 ParamsDict: TypeAlias = dict[str, Any]
 TradeLog: TypeAlias = list[dict[str, Any]]
 EquityCurve: TypeAlias = list[dict[str, Any]]
-
-
-_WALK_FORWARD_RESULTS: list[dict[str, Any]] = []
-
-
-def clear_walk_forward_results() -> None:
-    _WALK_FORWARD_RESULTS.clear()
-
-
-# 模块级函数（Windows 下 ProcessPoolExecutor 需要可 pickle）
-_EVAL_PARAM_KEYS: list[str] = []
-_EVAL_CFG: EngineConfig | None = None
-_EVAL_DATA_CACHE: pd.DataFrame | None = None
-
-
-def _init_eval_worker(filepath: str, param_keys: list[str], cfg: EngineConfig | None = None) -> None:
-    global _EVAL_PARAM_KEYS, _EVAL_CFG, _EVAL_DATA_CACHE
-    _EVAL_PARAM_KEYS = param_keys
-    _EVAL_CFG = cfg or EngineConfig()
-    _EVAL_DATA_CACHE = pd.read_parquet(filepath)
-
-
-def _eval_one_combo(combo: tuple[Any, ...]) -> tuple[float, dict[str, Any]]:
-    global _EVAL_PARAM_KEYS, _EVAL_CFG, _EVAL_DATA_CACHE
-    assert _EVAL_DATA_CACHE is not None and _EVAL_CFG is not None  # 由 _init_eval_worker 保证
-    p = dict(zip(_EVAL_PARAM_KEYS, combo))
-    tl: list[dict[str, Any]] = []
-    ec: list[dict[str, Any]] = []
-    _run_single_backtest(_EVAL_DATA_CACHE, p, _EVAL_CFG, tl, ec)
-    r = compute_risk_metrics(ec) or {}
-    s = r.get("sharpe_ratio")
-    return (s if s is not None and not (isinstance(s, float) and np.isnan(s)) else -1e10), p
 
 
 def run_full_backtest(
@@ -61,9 +19,7 @@ def run_full_backtest(
     params: dict[str, Any],
     engine_cfg: EngineConfig | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """用给定参数在整个数据集上跑一遍回测，返回 (trade_log, equity_curve)。"""
     if engine_cfg is None:
-        # 如果没有提供 engine_cfg，需要从某处获取 Config，这里保留默认行为
         engine_cfg = EngineConfig()
     tl: list[dict[str, Any]] = []
     ec: list[dict[str, Any]] = []
@@ -78,402 +34,327 @@ def _run_single_backtest(
     trade_log: TradeLog,
     equity_curve: EquityCurve,
 ) -> float:
-    cash = engine_cfg.initial_cash
-    positions: dict[str, float] = {}
+    if pd.api.types.is_datetime64_any_dtype(data["trade_date"]):
+        data = data.copy()
+        data["trade_date"] = data["trade_date"].dt.strftime("%Y-%m-%d")
 
-    # 预分组：一次 O(n) 扫描，后续 O(1) 查找（避免每根 bar 扫全表）
-    _day_map: dict[pd.Timestamp, pd.DataFrame] = {
-        dt: grp.copy() for dt, grp in data.groupby("trade_date")  # type: ignore[misc]
-    }
-    dates = sorted(_day_map.keys())
+    date_groups = list(data.groupby("trade_date", sort=True))
 
-    # Point-in-time: 每个股票首次出现的日期
-    _first_date: dict[str, pd.Timestamp] | None = None
+    symbols = data["symbol"].unique()
+    symbols.sort()
+    sym_to_idx = {s: i for i, s in enumerate(symbols)}
+    n_syms = len(symbols)
+    pos_value = np.zeros(n_syms, dtype=np.float64)
+
     if engine_cfg.point_in_time:
-        _first_date = data.groupby("symbol")["trade_date"].min().to_dict()  # type: ignore[assignment]
+        pit = data.groupby("symbol", sort=False)["trade_date"].min().to_dict()
+    else:
+        pit = None
 
-    # 预计算 ADV（日均成交量），供 CostModel 大单冲击成本使用
     cm = engine_cfg.cost_model
-    adv_map: dict[str, float] = {}
-    if cm is not None:
-        adv_map = data.groupby("symbol")["volume"].mean().to_dict()  # type: ignore[assignment]
+    _adv_state: dict[str, tuple[float, int]] = {}  # symbol -> (expanding_mean, count)
+    _prev_bar: dict[str, tuple[float, float]] = {}  # symbol -> (prev_close, prev_atr)
+    _buy_date: dict[str, str] = {}  # symbol -> 买入日期（T+1 检查）
 
-    buy_signal_col = "进场评分"
-    sell_signal_col = "退出评分"
-    risk_col = "风险等级"
-    stop_loss_col = "止损价"
+    use_sw = engine_cfg.portfolio_method == "score_weighted"
+    max_pos_pct = engine_cfg.max_position_pct
+    _max_holdings = engine_cfg.max_holdings
+    _buy_threshold = engine_cfg.buy_threshold
+    init_cash = engine_cfg.initial_cash
 
-    # 用于组合优化的累积历史数据
-    history: list[pd.DataFrame] = []
-    cumulative_hist: pd.DataFrame | None = None
+    risk_key = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "D": 4}
+    _none_mult = engine_cfg.risk_none_multiplier
+    risk_mult = np.array([_none_mult, 1.5, 3.0, 5.0, 8.0], dtype=np.float64)
+    _kelly = engine_cfg.kelly_fraction
+    _pos_a = engine_cfg.position_a
+    _atr_stop = engine_cfg.atr_stop_mult
+    sell_rate = engine_cfg.slippage + engine_cfg.stamp_tax_rate
+    buy_rate = engine_cfg.commission_rate + engine_cfg.slippage
 
-    def _sell_proceeds(sym: str, value: float, volume: float) -> tuple[float, float]:
+    cash = float(init_cash)
+
+    def _update_adv(sym: str, vol: float) -> float:
+        if sym not in _adv_state:
+            _adv_state[sym] = (vol, 1)
+            return vol
+        m, n = _adv_state[sym]
+        n += 1
+        new_m = m + (vol - m) / n
+        _adv_state[sym] = (new_m, n)
+        return new_m
+
+    def _sell_proceeds_and_cost(sym: str, value: float, volume: float) -> tuple[float, float]:
         if cm is not None:
-            adv = adv_map.get(sym, 0)
+            adv = _adv_state.get(sym, (0.0, 0))[0]
             slip = cm.calc_slippage(volume, adv, side="sell", order_type="market")
-            stamp = cm.stamp_tax_rate
-            total_rate = slip + stamp
-            proceeds = value * (1 - total_rate)
-            cost = value * total_rate
-        else:
-            proceeds = value * (1 - engine_cfg.slippage - engine_cfg.stamp_tax_rate)
-            cost = value * (engine_cfg.slippage + engine_cfg.stamp_tax_rate)
-        return proceeds, cost
+            rate = slip + cm.stamp_tax_rate
+            return value * (1 - rate), value * rate
+        return value * (1 - sell_rate), value * sell_rate
 
     def _buy_cost(sym: str, value: float, volume: float) -> float:
         if cm is not None:
-            adv = adv_map.get(sym, 0)
+            adv = _adv_state.get(sym, (0.0, 0))[0]
             return cm.buy_cost(value, volume, adv)
-        return value * (engine_cfg.commission_rate + engine_cfg.slippage)
+        return value * buy_rate
 
-    for dt in dates:
-        day_data = _day_map[dt].copy()
-        if _first_date is not None:
-            day_data = day_data[
-                day_data["symbol"].apply(lambda s: _first_date.get(str(s), dt) <= dt)
-            ]
-            if day_data.empty:
+    def _process_sell(dt, s_syms, s_idx, s_close, s_vol):
+        total_sold = 0.0
+        for j in range(len(s_syms)):
+            pv = float(pos_value[s_idx[j]])
+            if pv <= 0:
                 continue
-        history.append(day_data)
-        if cumulative_hist is None:
-            cumulative_hist = day_data.copy()
-        else:
-            cumulative_hist = pd.concat([cumulative_hist, day_data], ignore_index=True)
+            pos_value[s_idx[j]] = 0.0
+            proc, cst = _sell_proceeds_and_cost(s_syms[j], pv, float(s_vol[j]))
+            nonlocal cash
+            cash += proc
+            total_sold += pv
+            trade_log.append({
+                "time": dt, "symbol": s_syms[j], "action": "sell",
+                "price": float(s_close[j]), "value": round(proc, 2),
+                "cost": round(cst, 2),
+            })
+        return total_sold
 
-        total_value = cash + sum(positions.values())
-
-        # 出场
-        for _, row in day_data.iterrows():
-            sym = str(row.get("symbol", ""))
-            if not sym or sym not in positions:
-                continue
-
-            exit_score = float(row.get(sell_signal_col, 0))
-            entry_score = float(row.get(buy_signal_col, 0))
-            risk_str = str(row.get(risk_col, "LOW")).upper()
-            stop_loss = float(row.get(stop_loss_col, 0) or 0)
-            close = float(row["close"])
-
-            should_sell = (
-                risk_str in ("HIGH", "D")
-                or (exit_score > entry_score and exit_score > 0)
-                or (stop_loss > 0 and close < stop_loss)
-            )
-            if should_sell:
-                sell_value = positions.pop(sym)
-                volume = float(row.get("volume", 0))
-                proceeds, cost = _sell_proceeds(sym, sell_value, volume)
-                cash += proceeds
-                trade_log.append({
-                    "time": dt, "symbol": sym, "action": "sell",
-                    "price": close, "value": round(proceeds, 2),
-                    "cost": round(cost, 2),
-                })
-
-        # 入场 — 使用组合优化器分配权重
-        candidates = day_data[
-            (day_data[buy_signal_col] >= 60)
-            & (~day_data["symbol"].isin(positions))
-            & (~day_data[risk_col].isin(["HIGH", "D", "E"]))
-        ].copy()
-        if not candidates.empty and engine_cfg.portfolio_method != "score_weighted":
-            hist_df = cumulative_hist
-            weights = allocate_weights(
-                hist_df, method=engine_cfg.portfolio_method,
-                max_weight=engine_cfg.max_position_pct,
-                entry_col=buy_signal_col, risk_col=risk_col,
-            )
-        else:
-            risk_map = {"NONE": 1.0, "LOW": 1.5, "MEDIUM": 3.0, "HIGH": 5.0, "D": 8.0}
-            weights = {}
-            for _, r in candidates.iterrows():
-                risk = risk_map.get(str(r.get(risk_col, "MEDIUM")).upper(), 3.0)
-                weights[str(r["symbol"])] = min(1.0 / risk, engine_cfg.max_position_pct)
-
-        total_weight = sum(weights.values()) or 1.0
-        for _, row in day_data.iterrows():
-            sym = str(row.get("symbol", ""))
-            if sym not in weights or sym in positions:
-                continue
-            target_weight = weights[sym] / total_weight
-            target_value = total_value * target_weight
-            volume = float(row.get("volume", 0))
-            cost = _buy_cost(sym, target_value, volume)
-            spend = target_value + cost
-            if cash >= spend:
-                cash -= spend
-                positions[sym] = target_value
-                trade_log.append({
-                    "time": dt, "symbol": sym, "action": "buy",
-                    "price": float(row["close"]), "value": round(target_value, 2), "cost": round(cost, 2),
-                })
-
-        total_value = cash + sum(positions.values())
-        equity_curve.append({"time": dt, "portfolio_value": round(total_value, 2)})
-
-    final_value = cash + sum(positions.values())
-    total_return = (final_value / engine_cfg.initial_cash) - 1
-    return total_return
-
-
-def _eval_wf_combo(
-    data_path: str,
-    train_dates: list,
-    combo_dict: dict[str, Any],
-    engine_cfg: EngineConfig,
-) -> tuple[float, dict[str, Any]]:
-    """Evaluate a single param combo on training data (ProcessPoolExecutor worker)."""
-    data = pd.read_parquet(data_path)
-    train_data = data[data["trade_date"].isin(train_dates)]
-    if train_data.empty:
-        return -1e10, combo_dict
-    tl: TradeLog = []
-    ec: EquityCurve = []
-    _run_single_backtest(train_data, combo_dict, engine_cfg, tl, ec)
-    r = compute_risk_metrics(ec) or {}
-    s = r.get("sharpe_ratio")
-    score = s if s is not None and not (isinstance(s, float) and np.isnan(s)) else -1e10
-    return score, combo_dict
-
-
-def walk_forward(
-    data: pd.DataFrame,
-    engine_cfg: EngineConfig | None = None,
-    config: _Config | None = None,
-    train_period: int = 120,
-    test_period: int = 60,
-    param_grid: dict[str, list[Any]] | None = None,
-    show_progress: bool = False,
-    max_workers: int | None = None,
-) -> list[dict[str, Any]]:
-    if engine_cfg is None:
-        if config is not None:
-            engine_cfg = EngineConfig.from_config(config)
-        else:
-            engine_cfg = EngineConfig()
-
-    if max_workers is None:
-        max_workers = min(8, (os.cpu_count() or 4))
-
-    if param_grid is None:
-        param_grid = {
-            "atr_stop_mult": [1.0, 1.5, 2.0, 2.5, 3.0],
-            "kelly_fraction": [0.1, 0.25, 0.5],
-        }
-
-    dates = sorted(data["trade_date"].unique())
-    n = len(dates)
-    if n < train_period + test_period:
-        raise ValueError(f"数据不足: {n} 个交易日，需要至少 {train_period + test_period}")
-
-    windows: list[tuple[int, int]] = []
-    start = 0
-    while start + train_period + test_period <= n:
-        windows.append((start, start + train_period))
-        start += test_period
-
-    clear_walk_forward_results()
-    results: list[dict[str, Any]] = []
-
-    param_keys = list(param_grid.keys())
-    param_values = list(param_grid.values())
-    param_combos = list(itertools.product(*param_values))
-
-    # ── 检查数据是否已包含信号列，决定是否需要预计算 ──
-    required_signal_cols = {"进场评分", "退出评分", "风险等级", "止损价"}
-    has_signals = required_signal_cols.issubset(set(data.columns))
-
-    if has_signals:
-        logger.info("输入数据已包含信号列，直接使用，跳过信号预计算")
-        prepared_data_by_hash = None
-        combo_to_hash = None
-    else:
-        # ── 预准备所有参数组合的信号数据（带缓存，仅首次计算慢） ──
-        logger.info(f"预准备 {len(param_combos)} 个参数组合的信号数据...")
-        prepared_data_by_hash = {}
-        combo_to_hash = {}
-
-        for combo in param_combos:
-            combo_dict = dict(zip(param_keys, combo))
-            p_hash = _compute_param_hash(combo_dict)
-            combo_to_hash[combo] = p_hash
-            if p_hash not in prepared_data_by_hash:
-                logger.info(f"准备参数组合 {combo_dict} [hash={p_hash}] 的信号数据...")
-                prepared_data_by_hash[p_hash] = prepare_backtest_data(data, params=combo_dict, signal_param_hash=p_hash, compute_exit_strategy=True)
-
-    # ── 将每个参数组合的完整数据写入临时文件，供 worker 进程读取 ──
-    tmp_combo_dir = tempfile.mkdtemp(prefix="wf_combos_")
-    combo_data_paths: list[str] = []
-    try:
-        for i, combo in enumerate(param_combos):
-            if has_signals:
-                prepared = data
-            else:
-                p_hash = combo_to_hash[combo]
-                prepared = prepared_data_by_hash[p_hash]
-            path = os.path.join(tmp_combo_dir, f"combo_{i}.parquet")
-            prepared.to_parquet(path, compression="zstd", compression_level=1)
-            combo_data_paths.append(path)
-
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        from tqdm import tqdm as _tqdm
-
-        loop_iter = _tqdm(windows, desc="Walk-Forward", ncols=80) if show_progress else windows
-
-        for win_idx, (train_start, train_end) in enumerate(loop_iter):
-            test_start_idx = train_end
-            test_end_idx = min(test_start_idx + test_period, n)
-
-            clear_walk_forward_results()
-            train_dates_list = list(dates[train_start:train_end])
-
-            # ── IS 评估：并行计算所有参数组合的 Sharpe ──
-            scored_combos: list[tuple[float, dict[str, Any]]] = []
-
-            with ProcessPoolExecutor(max_workers=max_workers) as pool:
-                futures = {}
-                for i, combo in enumerate(param_combos):
-                    combo_dict = dict(zip(param_keys, combo))
-                    future = pool.submit(
-                        _eval_wf_combo,
-                        combo_data_paths[i],
-                        train_dates_list,
-                        combo_dict,
-                        engine_cfg,
-                    )
-                    futures[future] = combo_dict
-
-                combo_iter = _tqdm(as_completed(futures), desc=f"  Win-{win_idx} combos", ncols=80, total=len(futures)) if show_progress else as_completed(futures)
-                for f in combo_iter:
-                    try:
-                        score, params_dict = f.result()
-                        scored_combos.append((score, params_dict))
-                    except Exception:
-                        continue
-
-            if not scored_combos:
-                continue
-
-            # 按 IS Sharpe 降序排列
-            scored_combos.sort(key=lambda x: x[0], reverse=True)
-            best_sharpe, best_combo = scored_combos[0]
-
-            # ── 准备 OOS 数据 ──
-            if has_signals:
-                prepared_full = data
-            else:
-                best_hash = combo_to_hash.get(tuple(best_combo.items()))
-                if best_hash is None:
+    if use_sw:
+        # ── Fast path: no cumulative_hist needed ──
+        for dt, grp in date_groups:
+            day_data = grp.copy()
+            if pit is not None:
+                sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
+                day_data = day_data[sym_first <= dt]
+                if day_data.empty:
                     continue
-                prepared_full = prepared_data_by_hash[best_hash]
 
-            test_dates_list = dates[train_end:min(train_end + test_period, n)]
-            test_data = prepared_full[prepared_full["trade_date"].isin(test_dates_list)]
-            if test_data.empty:
-                continue
+            syms_str = day_data["symbol"].astype(str).values
+            idx = np.array([sym_to_idx[s] for s in syms_str], dtype=np.int32)
+            close = day_data["close"].values
+            volume = day_data["volume"].values
+            buy_score = day_data["进场评分"].values
+            sell_score = day_data["退出评分"].values
+            risk_str = day_data["风险等级"].astype(str).values
 
-            # ── OOS 评估：对 top-M 组合分别跑回测 ──
-            oos_results: list[dict[str, Any]] = []
-            top_m = min(5, len(scored_combos))
-            for rank_idx in range(top_m):
-                is_score, params = scored_combos[rank_idx]
-                tl_t: list[dict[str, Any]] = []
-                ec_t: list[dict[str, Any]] = []
-                _run_single_backtest(test_data, params, engine_cfg, tl_t, ec_t)
-                risk_t = compute_risk_metrics(ec_t) or {}
-                sr = risk_t.get("sharpe_ratio")
-                sr = sr if sr is not None and not (isinstance(sr, float) and np.isnan(sr)) else None
-                oos_results.append({
-                    "params": params,
-                    "is_rank": rank_idx + 1,
-                    "is_sharpe": is_score,
-                    "oos_sharpe": sr,
-                })
+            # ── 涨跌停/停牌检查 ──
+            _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+            _limit_ratio = np.array([
+                0.20 if s.startswith(("30", "688")) else 0.10
+                for s in syms_str
+            ], dtype=np.float64)
+            limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
+            limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+            not_limit_up = close < limit_up_arr
+            not_limit_down = close > limit_down_arr
+            has_volume = volume > 0
 
-            # 用 #1 组合构建主结果（向后兼容 runner.py 的 _extract_best_params）
-            best_oos = oos_results[0]
-            tl_test: list[dict[str, Any]] = []
-            ec_test: list[dict[str, Any]] = []
-            _run_single_backtest(test_data, best_combo, engine_cfg, tl_test, ec_test)
-            test_risk = compute_risk_metrics(ec_test) or {}
-            test_trade = compute_trade_metrics(tl_test) or {}
+            # ── 止损：信号列与 ATR 独立生效 ──
+            stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
+            stop_hit_col = (stop_col > 0) & (close < stop_col)
+            stop_hit_atr = np.zeros(len(day_data), dtype=bool)
+            if _atr_stop > 0 and "ATR" in day_data.columns:
+                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
+                atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
+                stop_hit_atr = (atr_stop > 0) & (close < atr_stop)
+            if "ATR" in day_data.columns:
+                for i_s, s in enumerate(syms_str):
+                    _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
+            stop_hit = stop_hit_col | stop_hit_atr
 
-            results.append({
-                "window": win_idx,
-                "train_start": dates[train_start],
-                "train_end": dates[train_end - 1],
-                "test_start": test_dates_list[0] if test_dates_list else "",
-                "test_end": test_dates_list[-1] if test_dates_list else "",
-                "params": best_combo,
-                "train_sharpe": best_sharpe,
-                "sharpe_ratio": best_oos["oos_sharpe"] if best_oos["oos_sharpe"] is not None else 0,
-                "total_return": test_risk.get("total_return", 0),
-                "max_drawdown": test_risk.get("max_drawdown", 0),
-                "annual_return": test_risk.get("annual_return", 0),
-                "annual_vol": test_risk.get("annual_vol", 0),
-                "var_95": test_risk.get("var_95", 0),
-                "cvar_95": test_risk.get("cvar_95", 0),
-                "win_rate": test_trade.get("win_rate", 0),
-                "profit_factor": test_trade.get("profit_factor", 0),
-                "total_trades": test_trade.get("total_trades", 0),
-                "num_combos": len(param_combos),
-                "oos_combos": oos_results,
+            total_value = cash + float(pos_value.sum())
+            daily_sell_value = 0.0
+
+            # ── 卖出（含 T+1 检查） ──
+            held = pos_value[idx] > 0
+            if held.any():
+                _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
+                exit_high = np.isin(risk_str, ["HIGH", "D"])
+                exit_gt = (sell_score > buy_score) & (sell_score > 0)
+                sel = held & (exit_high | exit_gt | stop_hit) & not_limit_down & has_volume & _t1_ok
+                si = np.where(sel)[0]
+                if len(si):
+                    daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+
+            # ── 买入 ──
+            buy_ok = (buy_score >= _buy_threshold) & (pos_value[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            bi = np.where(buy_ok)[0]
+            daily_buy_value = 0.0
+            if len(bi):
+                b_syms = syms_str[bi]
+                b_idx = idx[bi]
+                b_close = close[bi]
+                b_vol = volume[bi]
+                b_risk_str = risk_str[bi]
+
+                risk_int = np.array([risk_key.get(r, 2) for r in b_risk_str], dtype=np.int32)
+                w = np.clip(1.0 / risk_mult[risk_int], None, max_pos_pct) * _kelly
+                w = np.power(w, _pos_a)
+                order = np.argsort(-w)
+                total_w = float(w.sum()) or 1.0
+
+                existing = int((pos_value > 0).sum())
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else len(order)
+                bought = 0
+                for j in order:
+                    if bought >= max_new:
+                        break
+                    si = b_idx[j]
+                    if pos_value[si] > 0:
+                        continue
+                    # 用可用现金分配（而非总资产），避免持仓市值占比失真
+                    tv = cash * (float(w[j]) / total_w)
+                    price = float(b_close[j])
+                    shares = int(tv / price) // 100 * 100 if price > 0 else 0
+                    if shares < 100:
+                        continue
+                    tv = shares * price
+                    cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
+                    if cash >= tv + cst:
+                        cash -= tv + cst
+                        pos_value[si] = tv
+                        daily_buy_value += tv
+                        _buy_date[b_syms[j]] = str(dt)
+                        trade_log.append({
+                            "time": dt, "symbol": b_syms[j], "action": "buy",
+                            "price": float(b_close[j]), "value": round(tv, 2),
+                            "cost": round(cst, 2),
+                        })
+                        bought += 1
+
+            # ── ADV 更新（移后：使用今日数据为明日服务，不干扰今日买卖） ──
+            for i_sym, i_vol in zip(syms_str, volume):
+                _update_adv(i_sym, i_vol)
+
+            total_value = cash + float(pos_value.sum())
+            _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
+            equity_curve.append({
+                "time": dt, "portfolio_value": round(total_value, 2),
+                "turnover": round(_turnover, 6),
+            })
+    else:
+        # ── Legacy path: build cumulative_hist for allocate_weights ──
+        cumulative_hist: pd.DataFrame | None = None
+        for dt, grp in date_groups:
+            day_data = grp.copy()
+            if pit is not None:
+                sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
+                day_data = day_data[sym_first <= dt]
+                if day_data.empty:
+                    continue
+
+            if cumulative_hist is None:
+                cumulative_hist = day_data.copy()
+            else:
+                cumulative_hist = pd.concat([cumulative_hist, day_data], ignore_index=True)
+            if len(cumulative_hist) > 100_000:
+                _cut = cumulative_hist["trade_date"].unique()
+                if len(_cut) > 252:
+                    _keep = sorted(_cut)[-252:]
+                    cumulative_hist = cumulative_hist[cumulative_hist["trade_date"].isin(_keep)].copy()
+
+            syms_str = day_data["symbol"].astype(str).values
+            idx = np.array([sym_to_idx[s] for s in syms_str], dtype=np.int32)
+            close = day_data["close"].values
+            volume = day_data["volume"].values
+            buy_score = day_data["进场评分"].values
+            sell_score = day_data["退出评分"].values
+            risk_str = day_data["风险等级"].astype(str).values
+
+            # ── 涨跌停/停牌检查 ──
+            _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+            _limit_ratio = np.array([
+                0.20 if s.startswith(("30", "688")) else 0.10
+                for s in syms_str
+            ], dtype=np.float64)
+            limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
+            limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+            not_limit_up = close < limit_up_arr
+            not_limit_down = close > limit_down_arr
+            has_volume = volume > 0
+
+            # ── 止损：信号列与 ATR 独立生效 ──
+            stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
+            stop_hit_col = (stop_col > 0) & (close < stop_col)
+            stop_hit_atr = np.zeros(len(day_data), dtype=bool)
+            if _atr_stop > 0 and "ATR" in day_data.columns:
+                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
+                atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
+                stop_hit_atr = (atr_stop > 0) & (close < atr_stop)
+            if "ATR" in day_data.columns:
+                for i_s, s in enumerate(syms_str):
+                    _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
+            stop_hit = stop_hit_col | stop_hit_atr
+
+            total_value = cash + float(pos_value.sum())
+            daily_sell_value = 0.0
+
+            # ── 卖出（含 T+1 检查） ──
+            held = pos_value[idx] > 0
+            if held.any():
+                _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
+                exit_high = np.isin(risk_str, ["HIGH", "D"])
+                exit_gt = (sell_score > buy_score) & (sell_score > 0)
+                sel = held & (exit_high | exit_gt | stop_hit) & not_limit_down & has_volume & _t1_ok
+                si = np.where(sel)[0]
+                if len(si):
+                    daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+
+            # ── 买入 ──
+            buy_ok = (buy_score >= _buy_threshold) & (pos_value[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            bi = np.where(buy_ok)[0]
+            daily_buy_value = 0.0
+            if len(bi):
+                b_syms = syms_str[bi]
+                b_idx = idx[bi]
+                b_close = close[bi]
+                b_vol = volume[bi]
+
+                w_dict = allocate_weights(
+                    cumulative_hist, method=engine_cfg.portfolio_method,
+                    max_weight=max_pos_pct,
+                    entry_col="进场评分", risk_col="风险等级",
+                )
+                w = np.array([w_dict.get(s, 0.0) for s in b_syms], dtype=np.float64)
+                order = np.argsort(-w)
+                total_w = float(w.sum()) or 1.0
+
+                existing = int((pos_value > 0).sum())
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else len(order)
+                bought = 0
+                for j in order:
+                    if bought >= max_new:
+                        break
+                    si = b_idx[j]
+                    if pos_value[si] > 0:
+                        continue
+                    tv = cash * (float(w[j]) / total_w)
+                    price = float(b_close[j])
+                    shares = int(tv / price) // 100 * 100 if price > 0 else 0
+                    if shares < 100:
+                        continue
+                    tv = shares * price
+                    cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
+                    if cash >= tv + cst:
+                        cash -= tv + cst
+                        pos_value[si] = tv
+                        daily_buy_value += tv
+                        _buy_date[b_syms[j]] = str(dt)
+                        trade_log.append({
+                            "time": dt, "symbol": b_syms[j], "action": "buy",
+                            "price": float(b_close[j]), "value": round(tv, 2),
+                            "cost": round(cst, 2),
+                        })
+                        bought += 1
+
+            # ── ADV 更新（移后：使用今日数据为明日服务） ──
+            for i_sym, i_vol in zip(syms_str, volume):
+                _update_adv(i_sym, i_vol)
+
+            total_value = cash + float(pos_value.sum())
+            _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
+            equity_curve.append({
+                "time": dt, "portfolio_value": round(total_value, 2),
+                "turnover": round(_turnover, 6),
             })
 
-    finally:
-        import shutil
-        shutil.rmtree(tmp_combo_dir, ignore_errors=True)
-
-    return results
-
-
-def _eval_combo_grid(combo: tuple[Any, ...]) -> dict[str, Any]:
-    global _EVAL_PARAM_KEYS, _EVAL_CFG, _EVAL_DATA_CACHE
-    assert _EVAL_DATA_CACHE is not None and _EVAL_CFG is not None
-    p = dict(zip(_EVAL_PARAM_KEYS, combo))
-    tl: list[dict[str, Any]] = []
-    ec: list[dict[str, Any]] = []
-    ret = _run_single_backtest(_EVAL_DATA_CACHE, p, _EVAL_CFG, tl, ec)
-    risk = compute_risk_metrics(ec) or {}
-    trade = compute_trade_metrics(tl) or {}
-    sr = risk.get("sharpe_ratio")
-    sr = sr if sr is not None and not (isinstance(sr, float) and np.isnan(sr)) else -1e10
-    return {**p, "total_return": ret, "sharpe_ratio": sr, "max_drawdown": risk.get("max_drawdown", 0)}
-
-
-def grid_search(
-    data: pd.DataFrame,
-    param_grid: dict[str, list[Any]],
-    engine_cfg: EngineConfig | None = None,
-    show_progress: bool = False,
-    max_workers: int = 2,
-) -> list[dict[str, Any]]:
-    if engine_cfg is None:
-        engine_cfg = EngineConfig()
-
-    param_keys = list(param_grid.keys())
-    param_values = list(param_grid.values())
-    combos = list(itertools.product(*param_values))
-
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from tqdm import tqdm as _tqdm
-
-    _tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
-    _tmp_path = _tmp.name
-    _tmp.close()
-    data.to_parquet(_tmp_path)
-
-    results: list[dict[str, Any]] = []
-    try:
-        with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_eval_worker, initargs=(_tmp_path, param_keys, engine_cfg)) as pool:
-            futures = {pool.submit(_eval_combo_grid, c): c for c in combos}
-            iterator = _tqdm(as_completed(futures), desc="Grid Search", ncols=80, total=len(combos)) if show_progress else as_completed(futures)
-            for f in iterator:
-                results.append(f.result())
-    finally:
-        try:
-            os.unlink(_tmp_path)
-        except Exception:
-            pass
-
-    return results
+    final_value = cash + float(pos_value.sum())
+    return (final_value / init_cash) - 1

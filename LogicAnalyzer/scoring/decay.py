@@ -44,6 +44,12 @@ class FactorDecayMonitor:
         "moneyflow": "资金流评分",
         "quality": "基本面评分",
         "valuation": "估值评分",
+        "north_flow": "北向资金评分",
+        "top_trader": "龙虎榜评分",
+        "liquidity": "流动性评分",
+        "volatility": "波动率评分",
+        "financial_forward": "财务前瞻评分",
+        "event_driven": "事件驱动评分",
     }
 
     def __init__(self, config: Any, db_engine: Any) -> None:
@@ -230,7 +236,7 @@ class FactorDecayMonitor:
             return False, 0.0
         recent = rolling_ic[-decay_days:] if len(rolling_ic) >= decay_days else rolling_ic
         recent_mean = float(np.mean(recent))
-        is_decayed = recent_mean < ic_threshold and recent_mean < 0
+        is_decayed = recent_mean < ic_threshold
         return is_decayed, recent_mean
 
     # ── 权重建议 ───────────────────────────────────────────────
@@ -245,6 +251,25 @@ class FactorDecayMonitor:
         ratio = max(0.0, recent_mean_ic / initial_ic)
         suggested = current * ratio
         return round(suggested, 4)
+
+    # ── 衰减恢复检测 ──────────────────────────────────────────
+
+    def check_recovery(self, factor_name: str, rolling_ic: list[float],
+                       ic_recovery_threshold: float = 0.03,
+                       recovery_days: int = 10) -> tuple[bool, float]:
+        """检测因子是否从衰减中恢复（IC 持续 > threshold 超过 recovery_days）。
+
+        Returns:
+            (is_recovered, recent_ic_mean)
+        """
+        if len(rolling_ic) < recovery_days:
+            return False, 0.0
+        recent = rolling_ic[-recovery_days:]
+        recent_mean = float(np.mean(recent))
+        # 连续 recovery_days 天 IC > threshold
+        above = sum(1 for ic in recent if ic > ic_recovery_threshold)
+        is_recovered = above >= recovery_days * 0.8  # 80% 天数满足
+        return is_recovered, recent_mean
 
     # ── 主流程 ─────────────────────────────────────────────────
 
@@ -285,6 +310,9 @@ class FactorDecayMonitor:
             suggested = self.suggest_weight(fname, recent_mean)
             current = self._weights.get(fname, 0.0)
 
+            # 衰减恢复检测
+            is_recovered, rec_ic = self.check_recovery(fname, rolling_ic)
+
             status = {
                 "滚动IC均值": round(ic_mean, 4),
                 "滚动IC标准差": round(ic_std, 4),
@@ -295,6 +323,7 @@ class FactorDecayMonitor:
                 "多头收益": round(decile_result.get("long_only_return", 0.0), 6),
                 "空头收益": round(decile_result.get("short_only_return", 0.0), 6),
                 "已衰减": is_decayed,
+                "已恢复": is_recovered,
                 "当前权重": current,
                 "建议权重": suggested,
             }
@@ -305,6 +334,12 @@ class FactorDecayMonitor:
                 logger.warning(
                     f"[因子衰减] {fname} 衰减！IC={ic_mean:.4f}, ICIR={icir_val:.2f}, "
                     f"权重 {current:.2f} → 建议 {suggested:.2f}"
+                )
+            elif is_recovered:
+                result["needs_rebalance"] = True
+                logger.info(
+                    f"[因子恢复] {fname} 已恢复！IC={ic_mean:.4f}>0.03, "
+                    f"建议恢复权重"
                 )
             else:
                 logger.info(

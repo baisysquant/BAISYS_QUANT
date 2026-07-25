@@ -1,0 +1,92 @@
+[
+  {
+    "type": "failure",
+    "error": "'止损价'",
+    "time": "2026-07-19T05:48:17.313027"
+  },
+  {
+    "type": "failure",
+    "error": "'止损价'",
+    "time": "2026-07-19T05:52:49.292493"
+  },
+  {
+    "type": "failure",
+    "error": "['sharpe_ratio']",
+    "time": "2026-07-19T11:59:54.885002"
+  },
+  {
+    "type": "failure",
+    "error": "'total_return'",
+    "time": "2026-07-19T15:34:29.772121"
+  },
+  {
+    "type": "failure",
+    "error": "'str' object has no attribute 'strftime'",
+    "time": "2026-07-19T15:49:19.417893"
+  },
+  {
+    "type": "failure",
+    "error": "invalid syntax (simulated_trading.py, line 74)",
+    "time": "2026-07-19T15:56:07.675102"
+  },
+  {
+    "type": "failure",
+    "error": "'total_return'",
+    "time": "2026-07-19T16:46:04.547361"
+  },
+  {
+    "type": "failure",
+    "error": "No module named 'sklearn'",
+    "time": "2026-07-19T17:51:16.791362"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-22T07:50:59.423619"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-23T06:41:32.172034"
+  },
+  {
+    "type": "failure",
+    "error": "Unable to allocate 13.9 MiB for an array with shape (1, 1827893) and data type float64",
+    "time": "2026-07-23T15:44:10.261396"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-23T22:10:08.193561"
+  },
+  {
+    "type": "failure",
+    "error": "Unable to allocate 126. MiB for an array with shape (7, 2367429) and data type float64",
+    "time": "2026-07-24T00:12:51.501162"
+  },
+  {
+    "type": "failure",
+    "error": "Unable to allocate 163. MiB for an array with shape (9, 2367429) and data type float64",
+    "time": "2026-07-24T03:19:41.299282"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-24T21:24:27.379119"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-25T01:39:21.487156"
+  },
+  {
+    "type": "failure",
+    "error": "Unable to allocate 18.1 MiB for an array with shape (2370437, 1) and data type float64",
+    "time": "2026-07-25T02:59:59.492760"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-25T05:50:59.329066"
+  }
+]

@@ -13,10 +13,78 @@
 # 权重归一化：系统启动时自动校验，总和建议为 1.0。
 
 factors:
+  top_trader:
+    name: "龙虎榜评分"
+    category: "moneyflow"
+    weight: 0.03
+    weight_min: 0.0
+    weight_max: 0.10
+    description: "龙虎榜 20 日净买入总额（行业内 Z-Score）"
+    industry_neutral: true
+    column: "龙虎榜评分"
+    params:
+      lookback_days: 20
+
+  liquidity:
+    name: "流动性评分"
+    category: "technical"
+    weight: 0.03
+    weight_min: 0.0
+    weight_max: 0.10
+    description: "相对换手率因子（行业内 Z-Score，流动性越好分越高）"
+    industry_neutral: true
+    column: "流动性评分"
+    params:
+      lookback: 20
+
+  volatility:
+    name: "波动率评分"
+    category: "technical"
+    weight: 0.03
+    weight_min: 0.0
+    weight_max: 0.10
+    description: "20日波动率因子（行业内 Z-Score，低波动得高分）"
+    industry_neutral: true
+    column: "波动率评分"
+    params:
+      lookback: 20
+
+  macro:
+    name: "宏观评分"
+    category: "macro"
+    weight: 0.07
+    weight_min: 0.0
+    weight_max: 0.15
+    description: "宏观周期行业 tilt（PMI+M2+CPI 驱动的行业偏好）"
+    industry_neutral: false
+    column: "宏观评分"
+    params:
+      lookback_months: 1
+
+  financial_forward:
+    name: "财务前瞻评分"
+    category: "fundamental"
+    weight: 0.05
+    weight_min: 0.0
+    weight_max: 0.15
+    description: "业绩预告超预期 + 分析师共识评分"
+    industry_neutral: true
+    column: "财务前瞻评分"
+
+  event_driven:
+    name: "事件驱动评分"
+    category: "fundamental"
+    weight: 0.05
+    weight_min: 0.0
+    weight_max: 0.10
+    description: "回购/增减持/分红事件综合评分"
+    industry_neutral: true
+    column: "事件驱动评分"
+
   macd:
     name: "MACD评分"
     category: "technical"
-    weight: 0.25
+    weight: 0.14
     weight_min: 0.0
     weight_max: 0.5
     description: "MACD 七维度综合评分（行业百分位归一化）"
@@ -26,7 +94,7 @@ factors:
   momentum:
     name: "动量评分"
     category: "momentum"
-    weight: 0.25
+    weight: 0.16
     weight_min: 0.0
     weight_max: 0.5
     description: "21 日动量因子（行业内 Z-Score）"
@@ -38,7 +106,7 @@ factors:
   moneyflow:
     name: "资金流评分"
     category: "moneyflow"
-    weight: 0.20
+    weight: 0.17
     weight_min: 0.0
     weight_max: 0.4
     description: "资金流加权评分（行业内 Z-Score）"
@@ -54,10 +122,10 @@ factors:
   quality:
     name: "基本面评分"
     category: "fundamental"
-    weight: 0.15
+    weight: 0.11
     weight_min: 0.0
-    weight_max: 0.3
-    description: "质量因子：ROE×0.4 + 毛利率×0.3 + 净利率×0.3"
+    weight_max: 0.25
+    description: "质量因子：ROE×0.30 + 毛利率×0.20 + 净利率×0.20 + 营收增长×0.15 + 净利增长×0.15"
     industry_neutral: true
     column: "基本面评分"
     params:
@@ -69,12 +137,36 @@ factors:
   valuation:
     name: "估值评分"
     category: "fundamental"
-    weight: 0.15
+    weight: 0.11
     weight_min: 0.0
-    weight_max: 0.3
+    weight_max: 0.25
     description: "估值因子：-(PE_TTM_z + PB_z) / 2"
     industry_neutral: true
     column: "估值评分"
     params:
       pe_range: [0, 200]
       pb_range: [0, 100]
+
+  north_flow:
+    name: "北向资金评分"
+    category: "moneyflow"
+    weight: 0.05
+    weight_min: 0.0
+    weight_max: 0.15
+    description: "北向资金 20 日净买入趋势（行业内 Z-Score）"
+    industry_neutral: true
+    column: "北向资金评分"
+    params:
+      lookback_days: 20
+
+  news_sentiment:
+    name: "舆情评分"
+    category: "sentiment"
+    weight: 0.03
+    weight_min: 0.0
+    weight_max: 0.10
+    description: "新闻情感 NLP 评分（keyword-based，行业内 Z-Score）"
+    industry_neutral: true
+    column: "舆情评分"
+    params:
+      lookback_days: 20

@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import time
+from typing import Any
+
+import numpy as np
+from loguru import logger
+from scipy.optimize import minimize
+from scipy.stats.qmc import Sobol
+
+from BackTrading._engine_legacy import EngineConfig
+from BackTrading.bayesian.cost_model import FidelityController
+from BackTrading.bayesian.kernel import (
+    GPState,
+    build_gp,
+    restore_gp_state,
+    save_gp_state,
+)
+from BackTrading.bayesian.acquisition import mixed_acquisition, optimize_acquisition
+from BackTrading.bayesian.space import ParamSpace, split_by_cost
+
+
+# ── 参数归一化工具 ──
+
+def _to_normalized(params: dict[str, float], spaces: dict[str, ParamSpace]) -> np.ndarray:
+    """将参数 dict 映射为 [0,1]^d 向量（按 spaces 顺序）。"""
+    arr = []
+    for name, sp in spaces.items():
+        val = params[name]
+        if sp.high - sp.low < 1e-12:
+            arr.append(0.5)
+        else:
+            arr.append((val - sp.low) / (sp.high - sp.low))
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _from_normalized(
+    x: np.ndarray, spaces: dict[str, ParamSpace]
+) -> dict[str, float]:
+    """将 [0,1]^d 向量还原为参数 dict，含离散化取整。"""
+    names = list(spaces.keys())
+    out: dict[str, float] = {}
+    for i, name in enumerate(names):
+        sp = spaces[name]
+        raw = float(x[i]) * (sp.high - sp.low) + sp.low
+        if sp.step is not None and sp.step > 0:
+            n = int(round((sp.high - sp.low) / sp.step))
+            ticks = sp.low + np.arange(n + 1) * sp.step
+            raw = float(ticks[np.argmin(np.abs(ticks - raw))])
+        out[name] = float(np.clip(raw, sp.low, sp.high))
+    return out
+
+
+def _to_tensor(x: dict[str, float], spaces: dict[str, ParamSpace]) -> np.ndarray:
+    return _to_normalized(x, spaces)
+
+
+# ── Sobol 初始采样 ──
+
+def _sobol_samples(n: int, d: int, seed: int = 42) -> np.ndarray:
+    """Sobol 准随机序列 in [0,1]^d。向上取整到 2 的幂次再截断。"""
+    n_pow2 = 1
+    while n_pow2 < n:
+        n_pow2 <<= 1
+    sampler = Sobol(d, seed=seed, scramble=True)
+    return sampler.random(n_pow2)[:n]
+
+
+# ── 局部精细化（L-BFGS-B on GP 代理） ──
+
+def _local_refine(
+    base_x: np.ndarray,
+    gp_signal,  # GaussianProcessRegressor
+    signal_bounds: np.ndarray,
+    n_iters: int = 10,
+) -> np.ndarray:
+    """在 GP 代理模型上做 L-BFGS-B 爬山。"""
+    best_x = base_x.copy()
+    best_val = float(gp_signal.predict(best_x.reshape(1, -1), return_std=False)[0])
+
+    for _ in range(n_iters):
+        res = minimize(
+            lambda x: -float(gp_signal.predict(x.reshape(1, -1), return_std=False)[0]),
+            best_x,
+            method="L-BFGS-B",
+            bounds=signal_bounds,
+            options={"maxiter": 50, "ftol": 1e-10},
+        )
+        if res.success:
+            val = float(gp_signal.predict(res.x.reshape(1, -1), return_std=False)[0])
+            if val > best_val:
+                best_x = res.x
+                best_val = val
+    return best_x
+
+
+# ── 主优化函数 ──
+
+def optimize_window(
+    kline_df: "pd.DataFrame",
+    engine_cfg: EngineConfig,
+    spaces: dict[str, ParamSpace],
+    *,
+    n_init_signal: int = 15,
+    n_iter_signal: int = 35,
+    n_init_portfolio: int = 20,
+    n_iter_portfolio: int = 150,
+    n_refine_top: int = 3,
+    seed: int = 42,
+    previous_gp_state: GPState | None = None,
+    progress_cb: Any = None,
+    compute_exit_strategy: bool = True,
+) -> tuple[dict[str, float], GPState | None, list[dict[str, float]]]:
+    """单窗口贝叶斯优化（4 阶段）。
+
+    Args:
+        kline_df: 窗口内训练数据。
+        engine_cfg: 基座 EngineConfig（params 叠加在其上）。
+        spaces: 全参数空间。
+        n_init_signal: Phase 1 Sobol 采样数。
+        n_iter_signal: Phase 2 贝叶斯迭代数。
+        n_init_portfolio: Phase 3 初始采样数（固定信号参数后）。
+        n_iter_portfolio: Phase 3 贝叶斯迭代数。
+        n_refine_top: Phase 4 精细化候选数。
+        seed: 随机种子。
+        previous_gp_state: 前一窗口的 GPState（warm-start）。
+        progress_cb: 可选回调 progress_cb(phase, i, n, sharpe)。
+        compute_exit_strategy: 传给 FidelityController。
+
+    Returns:
+        (best_params, gp_state_for_next_window, top_k_params_for_oos)
+    """
+    import pandas as pd  # type: ignore[import]
+
+    signal_sp, portfolio_sp = split_by_cost(spaces)
+    full_names = list(spaces.keys())
+    signal_names = list(signal_sp.keys())
+    portfolio_names = list(portfolio_sp.keys())
+
+    n_signal = len(signal_sp)
+    n_total = len(spaces)
+
+    controller = FidelityController(kline_df, engine_cfg, compute_exit_strategy, vectorized=True)
+    _opt_t0 = time.time()
+
+    best_sharpe_local = -1e10
+    best_params_local: dict[str, float] = {}
+    X_hist: list[np.ndarray] = []
+    Y_hist: list[float] = []
+    params_hist: list[dict[str, float]] = []
+
+    def _track(sharpe: float, params: dict[str, float], x: np.ndarray) -> None:
+        nonlocal best_sharpe_local, best_params_local
+        X_hist.append(x)
+        Y_hist.append(sharpe)
+        params_hist.append(params.copy())
+        if sharpe > best_sharpe_local:
+            best_sharpe_local = sharpe
+            best_params_local = params.copy()
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 1: Sobol + 预热缓存（组合空间 × Level2，信号用默认参数）
+    # ═══════════════════════════════════════════════════════════
+    n_init = n_init_signal if n_total > 0 else 3
+    n_portfolio = len(portfolio_sp)
+
+    # 预热信号缓存：用信号参数中点值，确保 Phase 1 的 Level 2 始终命中
+    default_signal = {k: (sp.low + sp.high) / 2.0 for k, sp in signal_sp.items()}
+    if default_signal:
+        controller.warm_cache(default_signal)
+
+    if n_portfolio > 0:
+        logger.info(f"[Phase 1/4] Sobol init: {n_init} 组 (组合空间 Level2, 信号=默认)")
+        sobol_x = _sobol_samples(n_init, n_portfolio, seed=seed)
+        for i in range(n_init):
+            port_params = _from_normalized(sobol_x[i], portfolio_sp)
+            params = {**default_signal, **port_params}
+            x_norm = _to_normalized(params, spaces)
+            result = controller.evaluate(params, fidelity=0)
+            sharpe = result["sharpe"]
+            _track(sharpe, params, x_norm)
+            if progress_cb:
+                progress_cb(1, i, n_init, sharpe)
+            logger.debug(f"  Sobol[{i}] sharpe={sharpe:.4f}")
+    else:
+        logger.info(f"[Phase 1/4] Sobol init: {n_init} 组 (全空间 Level2)")
+        sobol_x = _sobol_samples(n_init, n_total, seed=seed)
+        for i in range(n_init):
+            params = _from_normalized(sobol_x[i], spaces)
+            x_norm = sobol_x[i].reshape(1, -1)
+            result = controller.evaluate(params, fidelity=0)
+            sharpe = result["sharpe"]
+            _track(sharpe, params, x_norm.ravel())
+            if progress_cb:
+                progress_cb(1, i, n_init, sharpe)
+            logger.debug(f"  Sobol[{i}] sharpe={sharpe:.4f}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 2: 贝叶斯 Level 1（全空间 GP + 组合参数冻结，仅优化信号维度）
+    # ═══════════════════════════════════════════════════════════
+    if n_signal > 0 and n_iter_signal > 0:
+        logger.info(f"[Phase 2/4] Bayes signal: {n_iter_signal} 轮 (全空间GP)")
+        X_all = np.array(X_hist)
+        Y_arr = np.array(Y_hist)
+        # 信号 + 组合参数边界
+        signal_bounds = np.array([[0.0, 1.0]] * n_signal)
+
+        for i in range(n_iter_signal):
+            gp = build_gp(
+                X_all, Y_arr,
+                previous_state=restore_gp_state(previous_gp_state, n_total),
+                n_restarts=5,
+            )
+            best_f = float(max(Y_hist))
+
+            # 当前最佳组合参数（归一化）
+            best_port_x = _to_normalized(
+                {k: best_params_local.get(k, (sp.low + sp.high) / 2.0)
+                 for k, sp in portfolio_sp.items()},
+                portfolio_sp,
+            )
+
+            # 多起点 L-BFGS-B 优化混合采集函数（仅信号维度）
+            best_acq = -1e10
+            best_sig_x = None
+            rng = np.random.RandomState(seed + i)
+            for restart in range(10):
+                x0 = rng.uniform(0, 1, n_signal)
+                res = minimize(
+                    lambda xs: -float(mixed_acquisition(
+                        np.concatenate([xs, best_port_x]).reshape(1, -1),
+                        gp, best_f, xi=0.01, dsr_lambda=0.05,
+                    )[0]),
+                    x0, method="L-BFGS-B", bounds=signal_bounds,
+                    options={"maxiter": 50, "ftol": 1e-10},
+                )
+                if res.fun < -best_acq + 1e-10:
+                    best_acq = -res.fun
+                    best_sig_x = res.x
+
+            sig_params = _from_normalized(best_sig_x, signal_sp)
+            best_port_params = {
+                k: best_params_local.get(k, (sp.low + sp.high) / 2.0)
+                for k, sp in portfolio_sp.items()
+            }
+            params = {**sig_params, **best_port_params}
+            result = controller.evaluate(params, fidelity=1)
+            sharpe = result["sharpe"]
+            x_norm = _to_normalized(params, spaces)
+            _track(sharpe, params, x_norm)
+
+            X_all = np.array(X_hist)
+            Y_arr = np.array(Y_hist)
+
+            if progress_cb:
+                progress_cb(2, i, n_iter_signal, sharpe)
+            logger.debug(f"  Bayes-Sig[{i}/{n_iter_signal}] sharpe={sharpe:.4f} best={best_sharpe_local:.4f}")
+
+    _p2_end = time.time()
+    logger.info(f"[Phase 1+2] 完成: best={best_sharpe_local:.4f}, 耗时={_p2_end-_opt_t0:.1f}s")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 3: 固定信号最优值，优化组合参数
+    # ═══════════════════════════════════════════════════════════
+    # 取出最优的信号参数
+    if n_signal > 0:
+        best_signal_params = {
+            k: best_params_local[k] for k in signal_names
+        }
+    else:
+        best_signal_params = {}
+    # 预热信号缓存（Level 2 需要）
+    if best_signal_params:
+        controller.warm_cache(best_signal_params)
+
+    logger.info(f"[Phase 3/4] Bayes portfolio: {n_iter_portfolio} 轮")
+
+    if n_init_portfolio > 0 and len(portfolio_sp) > 0:
+        sobol_port = _sobol_samples(n_init_portfolio, len(portfolio_sp), seed=seed + 999)
+        for i in range(n_init_portfolio):
+            port_params = _from_normalized(sobol_port[i], portfolio_sp)
+            params = {**best_signal_params, **port_params}
+            x_norm = _to_normalized(params, spaces)
+            result = controller.evaluate(params, fidelity=0)
+            sharpe = result["sharpe"]
+            _track(sharpe, params, x_norm)
+            if progress_cb:
+                progress_cb(3, i, n_init_portfolio + n_iter_portfolio, sharpe)
+
+    if len(portfolio_sp) > 0:
+        for i in range(n_iter_portfolio):
+            # 构建 GP 只用于组合参数（信号参数已固定）
+            X_port = np.array([x[n_signal:] for x in X_hist])
+            Y_arr = np.array(Y_hist)
+
+            if len(X_port) < 3:
+                logger.debug(f"  组合参数数据点 < 3，跳过 BO 迭代")
+                continue
+
+            gp_port = build_gp(
+                X_port, Y_arr,
+                previous_state=restore_gp_state(previous_gp_state, len(portfolio_sp)),
+                n_restarts=5,
+            )
+            port_bounds = np.array([[0.0, 1.0]] * len(portfolio_sp))
+            best_f = float(max(Y_hist))
+
+            x_cand, _ = optimize_acquisition(
+                gp_port, port_bounds, best_f,
+                n_restarts=10, xi=0.01, dsr_lambda=0.05,
+                random_state=seed + i + 1000,
+            )
+            port_params = _from_normalized(x_cand, portfolio_sp)
+            params = {**best_signal_params, **port_params}
+            result = controller.evaluate(params, fidelity=0)
+            sharpe = result["sharpe"]
+            x_norm = _to_normalized(params, spaces)
+            _track(sharpe, params, x_norm)
+            if progress_cb:
+                progress_cb(3, n_init_portfolio + i, n_init_portfolio + n_iter_portfolio, sharpe)
+            logger.debug(f"  Bayes-Port[{i}/{n_iter_portfolio}] sharpe={sharpe:.4f} best={best_sharpe_local:.4f}")
+
+    _p3_end = time.time()
+    logger.info(f"[Phase 3] 完成: best={best_sharpe_local:.4f}, 耗时={_p3_end-_opt_t0:.1f}s")
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 4: 局部精细化（代理模型上爬山，然后真实评估 top-3）
+    # ═══════════════════════════════════════════════════════════
+    if n_signal > 0 and len(X_hist) >= 3:
+        logger.info(f"[Phase 4/4] Local refinement: top-{n_refine_top}")
+        X_all_arr = np.array([x[:n_signal] for x in X_hist])
+        Y_all_arr = np.array(Y_hist)
+
+        gp_refine = build_gp(X_all_arr, Y_all_arr, n_restarts=3)
+        top_idx = np.argsort(Y_all_arr)[-n_refine_top:]
+
+        # 取当前最优组合参数
+        best_full_x = np.array([x for x in X_hist])[Y_all_arr.argmax()]
+        best_port_params = _from_normalized(best_full_x[n_signal:], portfolio_sp)
+
+        for idx in top_idx:
+            refined = _local_refine(X_all_arr[idx], gp_refine, np.array([[0.0, 1.0]] * n_signal))
+            sig_params = _from_normalized(refined, signal_sp)
+            params = {**sig_params, **best_port_params}
+            result = controller.evaluate(params, fidelity=1)
+            sharpe = result["sharpe"]
+            x_norm = _to_normalized(params, spaces)
+            _track(sharpe, params, x_norm)
+            logger.debug(f"  Refine sharpe={sharpe:.4f}")
+
+    # ── 最终结果 ──
+    best_params = best_params_local
+    best_sharpe = best_sharpe_local
+
+    # 提取 GP 状态用于 warm-start
+    gp_state = None
+    if len(X_hist) > 0:
+        try:
+            X_all_final = np.array([x for x in X_hist])
+            Y_all_final = np.array(Y_hist)
+            if n_signal > 0:
+                gp_final = build_gp(X_all_final[:, :n_signal], Y_all_final, n_restarts=3)
+                gp_state = save_gp_state(gp_final, X_all_final[:, :n_signal], Y_all_final)
+        except Exception as exc:
+            logger.warning(f"保存 GP 状态失败: {exc}")
+
+    _opt_elapsed = time.time() - _opt_t0
+    logger.info(f"  窗口优化完成: best_sharpe={best_sharpe:.4f}, 耗时={_opt_elapsed:.1f}s, params={best_params}")
+
+    # ── 提取 top-K 参数用于 OOS 验证（PBO 需要多组 OOS 结果） ──
+    n_top = min(n_refine_top, len(Y_hist))
+    if n_top >= 2:
+        top_indices = np.argsort(Y_hist)[-n_top:]
+        top_k_params = [params_hist[i] for i in top_indices]
+    else:
+        top_k_params = [best_params]
+
+    return best_params, gp_state, top_k_params

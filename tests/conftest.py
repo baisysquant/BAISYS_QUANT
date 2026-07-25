@@ -75,6 +75,11 @@ def temp_config_ini() -> Path:
         "cross_decay_days = 30\n"
         "liq_veto_ratio = 0.05\n"
         "atr_t1_mult = 3.0\n"
+        "atr_t2_mult = 5.0\n"
+        "conclusion_full_bull = 80\n"
+        "golden_cross_bonus = 10\n"
+        "divergence_penalty = 20\n"
+        "risk_none_multiplier = 1.0\n"
         , encoding="utf-8"
     )
     yield cfg

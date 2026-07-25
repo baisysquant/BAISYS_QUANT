@@ -109,6 +109,13 @@ class ColumnNames:
     MOMENTUM_PCT_INDUSTRY = "行业内动量百分位"
     QUALITY_PCT_INDUSTRY = "行业内基本面百分位"
     VALUATION_PCT_INDUSTRY = "行业内估值百分位"
+    NORTH_FLOW_PCT_INDUSTRY = "行业内北向资金百分位"
+    TOP_TRADER_PCT_INDUSTRY = "行业内龙虎榜百分位"
+    LIQUIDITY_PCT_INDUSTRY = "行业内流动性百分位"
+    VOLATILITY_PCT_INDUSTRY = "行业内波动率百分位"
+    MACRO_PCT_INDUSTRY = "行业内宏观百分位"
+    FINANCIAL_FORWARD_PCT_INDUSTRY = "行业内财务前瞻百分位"
+    EVENT_DRIVEN_PCT_INDUSTRY = "行业内事件驱动百分位"
 
     # ==================== 通用列名候选列表 ====================
     DATE_COLUMN_CANDIDATES = ["trade_date", "date", "日期", "datetime", "Date", "TRADE_DATE"]

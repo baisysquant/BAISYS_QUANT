@@ -43,6 +43,11 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
 
     calmar = total_ret / abs(max_dd) if max_dd != 0 else 0.0
 
+    # ── 换手率 ──
+    turnover = df["turnover"].values if "turnover" in df.columns else np.array([0.0])
+    avg_turnover = float(turnover.mean())
+    max_turnover = float(turnover.max())
+
     return {
         "total_return": round(total_ret, 6),
         "annual_return": round(mu, 6),
@@ -54,6 +59,8 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
         "max_drawdown_duration": dd_duration,
         "var_95": round(var_95, 6),
         "cvar_95": round(cvar_95, 6),
+        "avg_turnover": round(avg_turnover, 6),
+        "max_turnover": round(max_turnover, 6),
     }
 
 
@@ -65,9 +72,24 @@ def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
         return {"total_trades": 0}
 
     total = len(buys) + len(sells)
-    paired = min(len(buys), len(sells))
 
-    pnl = [s.get("price", 0) - b.get("price", 0) for b, s in zip(buys[:paired], sells[:paired])]
+    # FIFO 按 symbol 配对：每个 symbol 独立队列，买入顺序匹配卖出顺序
+    from collections import defaultdict
+    buy_queue: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for b in buys:
+        buy_queue.setdefault(b["symbol"], []).append(b)
+
+    pnl = []
+    for s in sells:
+        sym = s["symbol"]
+        if sym not in buy_queue or not buy_queue[sym]:
+            continue
+        b = buy_queue[sym].pop(0)
+        # 使用 value（实际成交金额）而非 price 计算 PnL
+        # buy["value"] = 买入分配金额, sell["value"] = 卖出税后收入
+        # PnL = 卖出收入 - 买入成本 - 买入佣金滑点
+        pnl.append(s.get("value", 0) - b.get("value", 0) - b.get("cost", 0))
+
     wins = [p for p in pnl if p > 0]
     losses = [p for p in pnl if p <= 0]
 
@@ -84,4 +106,5 @@ def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_win": round(float(avg_win), 4),
         "avg_loss": round(float(avg_loss), 4),
         "profit_factor": round(float(profit_factor), 4),
+        "total_pnl": round(float(sum(pnl)), 2),
     }

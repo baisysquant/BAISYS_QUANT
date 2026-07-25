@@ -24,6 +24,9 @@ class EngineConfig:
     liq_veto_ratio: float = 0.05
     boll_narrow_ratio: float = 0.8
     cross_decay_days: int = 30
+    risk_none_multiplier: float = 1.0
+    max_holdings: int = 0  # 0=不限制
+    buy_threshold: int = 60  # 买入评分阈值
     cost_model: Any = None  # CostModel | None — forward ref to avoid circular import
 
     @classmethod
@@ -48,6 +51,7 @@ class EngineConfig:
             liq_veto_ratio=filter_rules.LIQ_VETO_RATIO,
             boll_narrow_ratio=regime.BOLL_NARROW_RATIO,
             cross_decay_days=scoring.CROSS_DECAY_DAYS,
+            risk_none_multiplier=position.RISK_NONE_MULTIPLIER,
         )
 
 

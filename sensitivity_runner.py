@@ -119,11 +119,16 @@ SCANS["first_pass"] = {
         "cross_decay_min": [0.2, 0.3, 0.5],
         "kline_decay_days": [5, 10, 20],
         "kline_decay_min": [0.1, 0.2, 0.3],
+        "atr_t2_mult": [3.0, 5.0, 7.0, 10.0],
+        "golden_cross_bonus": [5, 10, 15, 20],
+        "divergence_penalty": [10, 15, 20, 25, 30],
     },
     "RULE_THRESHOLDS": {
         "divergence": [0.2, 0.3, 0.4],
         "winner_rate_high": [70, 80, 90],
         "liq_veto_ratio": [0.03, 0.05, 0.08],
+        "conclusion_full_bull": [65, 80, 95],
+        "risk_none_multiplier": [0.5, 1.0, 1.5],
     },
     "TECHNICAL_CONSTANTS": {
         "atr_length": [10, 14, 20],
@@ -182,6 +187,9 @@ def _build_overrides(combo: dict) -> dict:
         "cross_decay_min": "cross_decay_min",
         "kline_decay_days": "kline_decay_days",
         "kline_decay_min": "kline_decay_min",
+        "atr_t2_mult": "atr_t2_mult",
+        "golden_cross_bonus": "golden_cross_bonus",
+        "divergence_penalty": "divergence_penalty",
     }
     # RULE_THRESHOLDS → ini 映射（注意来源不同，target 格式为 (section, key)）
     RULE_MAP = {
@@ -189,6 +197,8 @@ def _build_overrides(combo: dict) -> dict:
         "winner_rate_high": ("FULL_BULL_SCORING", "RULE_WINNER_RATE_HIGH"),
         "winner_rate_low": ("FULL_BULL_SCORING", "RULE_WINNER_RATE_LOW"),
         "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
+        "conclusion_full_bull": ("BACKTEST_CALIBRATED", "conclusion_full_bull"),
+        "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
     }
     # TECHNICAL_CONSTANTS 键名映射
     TECH_MAP = {

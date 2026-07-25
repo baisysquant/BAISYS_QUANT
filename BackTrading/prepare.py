@@ -6,7 +6,9 @@ import os
 import random
 import shutil
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures.process import BrokenProcessPool
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -19,13 +21,52 @@ from UtilsManager import TACompatibility as ta
 from loguru import logger
 
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
+from LogicAnalyzer.ml.signal_model import apply_ml_signal
+
+# 向量化信号引擎（延迟导入，在导入时解析以避免 Windows spawn 锁）
+try:
+    from BackTrading.vectorized_signal import compute_signals as _compute_signals_vec
+    _HAVE_VECTORIZED = True
+except ImportError:
+    _HAVE_VECTORIZED = False
+    _compute_signals_vec = None
 
 try:
     from UtilsManager.ConfigParser import Config
     CACHE_DIR = Path(Config().CACHE_DIRECTORY) / "backtest_signal_cache"
 except Exception:
     CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
-PROCESS_BATCH_SIZE = 200
+
+from BackTrading.indicator_cache import get_precomputed, precompute_all_indicators
+
+
+def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
+    """启动时清理残留的 bprep_* 临时目录（上次异常中断遗留）。"""
+    import stat
+    base = tempfile.gettempdir()
+    removed = 0
+    now = time.time()
+    for entry in os.listdir(base):
+        full = os.path.join(base, entry)
+        if not entry.startswith("bprep_") or not os.path.isdir(full):
+            continue
+        try:
+            age_hours = (now - os.path.getmtime(full)) / 3600
+            if age_hours > max_age_hours:
+                def _onerr(func, path, exc_info):
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                shutil.rmtree(full, onerror=_onerr, ignore_errors=True)
+                removed += 1
+        except Exception:
+            pass
+    if removed:
+        logger.info(f"清理了 {removed} 个残留临时目录")
+    return removed
+
+
+_clean_stale_tempdirs()
+
 
 
 def _trade_day_str() -> str:
@@ -37,33 +78,27 @@ def _trade_day_str() -> str:
 
 # ── 增量缓存（日期后缀 + 每只股票独立写入，支持中断续算） ──
 
+_SIGNAL_PIPELINE_VERSION = "v2"  # 信号管线版本号；管线逻辑变更时手动 +1，自动使旧缓存失效
+
+
 def _compute_config_hash() -> str:
-    """计算所有非校准信号参数的哈希（用于缓存隔离）。
-    
-    当 config.ini 中任何信号相关参数变更时（如 atr_length、rsi_length 等），
-    config_hash 会变化，自动使旧缓存失效。"""
+    """全量 config 哈希 + 管线版本号（用于缓存隔离）。
+
+    计算所有非校准信号参数的全量哈希，不再手动排除字段。
+    每次 `_SIGNAL_PIPELINE_VERSION` 变更时旧缓存自动失效。
+    """
     try:
         cfg = Config()
         ac = cfg.app_config
-        # 收集所有信号相关配置（排除仅用于回测的 7 个校准参数）
         payload = {
-            "regime": {
-                "oscillation_hist_std_ratio": ac.regime_detection.OSCILLATION_HIST_STD_RATIO,
-                "top_risk_ma20_deviation": ac.regime_detection.TOP_RISK_MA20_DEVIATION,
-                "oscillation_min_bars": ac.regime_detection.OSCILLATION_MIN_BARS,
-                "reversal_lookback": ac.regime_detection.REVERSAL_LOOKBACK,
-            },
+            "_version": _SIGNAL_PIPELINE_VERSION,
+            "regime": ac.regime_detection.model_dump(),
             "divergence": ac.divergence.model_dump(),
-            "scoring": {
-                k: v for k, v in ac.scoring_params.model_dump().items()
-                if k not in ("atr_stop_mult", "atr_t1_mult", "cross_decay_days", "cross_decay_min", "kline_decay_days", "kline_decay_min", "vol_norm_denominator", "atr_t2_mult", "trailing_stop_high_ratio", "trailing_stop_lookback", "trailing_stop_high_lookback", "expected_return_lookback")
-            },
+            "scoring": ac.scoring_params.model_dump(),
             "technical": ac.technical_constants.model_dump(),
             "full_bull_scoring": ac.full_bull_scoring.model_dump() if hasattr(ac, 'full_bull_scoring') else {},
-            "filter_rules": {
-                k: v for k, v in ac.filter_rules.model_dump().items()
-                if k != "liq_veto_ratio"
-            },
+            "filter_rules": ac.filter_rules.model_dump(),
+            "position_sizing": ac.position_sizing.model_dump(),
         }
         s = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.md5(s.encode()).hexdigest()[:8]
@@ -72,15 +107,16 @@ def _compute_config_hash() -> str:
 
 
 def _compute_param_hash(params: dict[str, Any]) -> str:
-    """计算回测校准参数的哈希（用于同一天多参数组合缓存隔离）。"""
+    """仅对影响信号计算的参数做哈希（用于信号缓存隔离）。
+
+    PORTFOLIO/RISK 类参数（atr_stop_mult / risk_none_multiplier 等）排除在外，
+    它们通过 post-cache 变换注入，不触发信号重算。
+    """
     key_params = {
-        "atr_stop_mult": params.get("atr_stop_mult", 1.5),
-        "atr_t1_mult": params.get("atr_t1_mult", 3.0),
-        "kelly_fraction": params.get("kelly_fraction", 0.25),
-        "position_a": params.get("position_a", 0.30),
-        "liq_veto_ratio": params.get("liq_veto_ratio", 0.05),
         "boll_narrow_ratio": params.get("boll_narrow_ratio", 0.8),
         "cross_decay_days": params.get("cross_decay_days", 30),
+        "golden_cross_bonus": params.get("golden_cross_bonus", 10),
+        "divergence_penalty": params.get("divergence_penalty", 20),
     }
     s = json.dumps(key_params, sort_keys=True)
     return hashlib.md5(s.encode()).hexdigest()[:8]
@@ -142,17 +178,29 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
         return None
     parts = [pd.read_parquet(f) for f in files]
     df = pd.concat(parts, ignore_index=True)
-    # 将英文列名映射回中文列名
-    df.rename(columns=_REV_SIGNAL_COL_MAP, inplace=True)
+    # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
+    rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
+    # 兼容旧版：若 exit_strategy 列存在且为 dict，提取 stop_loss
+    if "exit_strategy" in df.columns and "止损价" not in df.columns:
+        df["止损价"] = df["exit_strategy"].apply(
+            lambda x: float(x.get("stop_loss", 0)) if isinstance(x, dict) else 0.0
+        )
     return df
 
 
 def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFrame:
     result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
     for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
-        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
-    result["风险等级"] = result["风险等级"].fillna("LOW")
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
+    if "风险等级" in result.columns:
+        result["风险等级"] = result["风险等级"].fillna("LOW")
     return result
+
+
+
 
 
 def prepare_backtest_data(
@@ -160,13 +208,39 @@ def prepare_backtest_data(
     params: dict[str, Any] | None = None,
     signal_param_hash: str | None = None,
     compute_exit_strategy: bool = False,
+    vectorized: bool = False,
 ) -> pd.DataFrame:
-    if params is None:
-        cfg = Config()
-        params = _build_params(cfg)
+    is_flat = params is not None and (
+        "atr_stop_mult" in params or "atr_t2_mult" in params
+        or "conclusion_full_bull" in params or "golden_cross_bonus" in params
+    )
+
+    # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO/RISK 单值
+    _saved_atr_stop = params.get("atr_stop_mult") if isinstance(params, dict) else None
+    _saved_risk_none = params.get("risk_none_multiplier") if isinstance(params, dict) else None
 
     if signal_param_hash is None:
         signal_param_hash = _compute_param_hash(params)
+
+    if params is None:
+        cfg = Config()
+        params = _build_params(cfg)
+    elif is_flat:
+        cfg = Config()
+        base = _build_params(cfg)
+        base["scoring"].update({k: v for k, v in params.items() if k in (
+            "atr_t1_mult", "atr_t2_mult",
+            "cross_decay_days", "cross_decay_min",
+            "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
+            "expected_return_lookback",
+            "golden_cross_bonus", "divergence_penalty",
+        )})
+        base["thresholds"] = {
+            "fully_bull": int(params.get("conclusion_full_bull", base["thresholds"]["fully_bull"])),
+            "bullish": base["thresholds"]["bullish"],
+            "oscillate": base["thresholds"]["oscillate"],
+        }
+        params = base
 
     config_hash = _compute_config_hash()
     cache_tag = f"cfg={config_hash},param={signal_param_hash}"
@@ -181,66 +255,104 @@ def prepare_backtest_data(
     done = _completed_symbols(trade_date, signal_param_hash, config_hash)
     missing = [s for s in symbols if s not in done]
 
+    def _finalize(kline, signal) -> pd.DataFrame:
+        merged = _merge_signal(kline, signal)
+        del kline, signal
+        merged = apply_ml_signal(merged)
+        if _saved_atr_stop is not None and "ATR" in merged.columns:
+            merged["止损价"] = merged["close"] - merged["ATR"] * _saved_atr_stop
+        return merged
+
     if done:
         if not missing:
             logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
             signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
             if signal_df is not None:
-                return _merge_signal(kline_df, signal_df)
+                return _finalize(kline_df, signal_df)
         else:
             logger.info(f"信号缓存部分命中（{len(done)}/{len(symbols)}），续算 {len(missing)} 只 [{cache_tag}]")
 
     if not missing:
         logger.info("无需要计算的股票")
         signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
-        return _merge_signal(kline_df, signal_df) if signal_df is not None else kline_df
+        if signal_df is not None:
+            return _finalize(kline_df, signal_df)
+        return kline_df
 
     # ── 需要计算的股票 ──
+    _t0 = time.time()
     logger.info(f"信号缓存无效或不存在，开始计算 {len(missing)} 只 [{cache_tag}]...")
     tmpdir = tempfile.mkdtemp(prefix="bprep_")
     stock_dir = os.path.join(tmpdir, "stocks")
     os.mkdir(stock_dir)
-    for sym, grp in kline_df.groupby("symbol"):
-        grp.sort_values("trade_date").to_parquet(
-            os.path.join(stock_dir, f"{sym}.parquet"), index=False
+    try:
+        for sym, grp in kline_df.groupby("symbol"):
+            grp.sort_values("trade_date").to_parquet(
+                os.path.join(stock_dir, f"{sym}.parquet"), index=False
+            )
+
+        # Phase 0: 预计算所有股票的技术指标 + peak/trough（仅一次，后续评估复用）
+        if vectorized:
+            precompute_all_indicators(stock_dir)
+
+        from tqdm import tqdm
+        signal_pipelines = Config().SIGNAL_PIPELINES
+        _workers_per_pipeline = max(
+            min((os.cpu_count() or 4) // signal_pipelines, 3), 1
         )
 
-    from tqdm import tqdm
-    signal_pipelines = Config().SIGNAL_PIPELINES
+        _worker_fn = _stock_worker_vectorized if vectorized else _stock_worker
 
-    def _pipeline(syms: list[str], idx: int) -> None:
-        """单管道：内部自带 ProcessPoolExecutor，逐个 batch 提交。"""
-        pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
-        for i in range(0, len(syms), PROCESS_BATCH_SIZE):
-            batch = syms[i:i + PROCESS_BATCH_SIZE]
-            with ProcessPoolExecutor(max_workers=2) as pool:
-                fut_to_sym = {
-                    pool.submit(_stock_worker, sym, stock_dir, params, compute_exit_strategy): sym
-                    for sym in batch
-                }
+        def _pipeline(syms: list[str], idx: int) -> None:
+            """单管道：ThreadPoolExecutor 并发处理股票（Windows spawn 下 ProcessPoolExecutor 会死锁）。"""
+            if not syms:
+                return
+            pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
+            pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
+            try:
+                fut_to_sym: dict[Any, str] = {}
+                for sym in syms:
+                    fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy)
+                    fut_to_sym[fut] = sym
+
                 for future in as_completed(fut_to_sym):
                     sym = fut_to_sym[future]
                     try:
-                        rows = future.result()
+                        rows = future.result(timeout=120)
                         if rows:
                             _save_stock_signal(cache_dir, sym, rows)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")
                     pbar.update(1)
+            finally:
+                pool.shutdown(wait=False)
             pbar.close()
 
-    chunks = [missing[i::signal_pipelines] for i in range(signal_pipelines)]
-    with ThreadPoolExecutor(max_workers=signal_pipelines) as pool:
-        for idx, chunk in enumerate(chunks):
-            pool.submit(_pipeline, chunk, idx)
-    shutil.rmtree(tmpdir, ignore_errors=True)
+        chunks = [missing[i::signal_pipelines] for i in range(signal_pipelines)]
+        pool_t = ThreadPoolExecutor(max_workers=signal_pipelines)
+        try:
+            futs = [pool_t.submit(_pipeline, chunk, idx) for idx, chunk in enumerate(chunks)]
+            for f in futs:
+                try:
+                    f.result(timeout=3600)
+                except Exception:
+                    logger.warning(f" 管道 Future 异常，继续等待其他管道")
+        finally:
+            pool_t.shutdown(wait=False)
+        _t1 = time.time()
+        logger.info(f"所有管道完成，耗时 {_t1-_t0:.1f}s")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        logger.debug(f"临时目录已清理: {tmpdir}")
 
     # ── 加载缓存合并 ──
+    logger.info(f"加载信号缓存合并...")
     signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
-    if signal_df is None:
-        logger.warning("所有信号计算失败，返回原始 K 线")
+    if signal_df is None or signal_df.empty:
+        logger.warning(f"所有信号计算失败（signal_df={type(signal_df).__name__}），返回原始 K 线")
         return kline_df
-    return _merge_signal(kline_df, signal_df)
+    logger.info(f"信号合并完成: {len(signal_df)} 行 ({time.time()-_t0:.1f}s)")
+    return _finalize(kline_df, signal_df)
 
 
 def _stock_worker(
@@ -249,7 +361,7 @@ def _stock_worker(
     params: dict[str, Any],
     compute_exit_strategy: bool = False,
 ) -> list[dict[str, Any]]:
-    stock_df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"))
+    stock_df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"), engine="fastparquet")
     if len(stock_df) < 60:
         return []
 
@@ -260,7 +372,17 @@ def _stock_worker(
     # 在全量数据上一次性计算，避免每根 bar 重复 800 次。
     stock_df = _compute_indicators(stock_df)
 
+    # 预计算背离检测的 peak/trough（全序列一次，避免每 bar O(i) 的 find_peaks）
+    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
+    if 'DIF' in stock_df.columns:
+        _dd = adaptive_distance(stock_df['DIF'], base_distance=10)
+        _peaks, _troughs = find_peaks_troughs(stock_df['DIF'], distance=_dd)
+
     analyzer = MACDAnalyzer()
+    if 'DIF' in stock_df.columns:
+        analyzer._precomputed_diverge = {
+            'distance': _dd, 'peaks': _peaks, 'troughs': _troughs,
+        }
     rows: list[dict[str, Any]] = []
 
     for i in range(len(stock_df)):
@@ -269,16 +391,95 @@ def _stock_worker(
             signal = _compute_signal(analyzer, bar, params, compute_exit_strategy)
         except Exception:
             continue
+        _details = signal.get("details") or {}
         rows.append({
             "symbol": symbol,
             "trade_date": bar["trade_date"].iloc[-1],
             "entry_score": float(signal.get("进场评分", 0)),
             "exit_score": float(signal.get("退出评分", 0)),
             "risk_level": str(signal.get("风险等级", "LOW")),
-            "stop_loss": float(signal.get("止损价", 0) or 0),
             "score": float(signal.get("score", 0)),
+            "atr": float(bar["ATR"].iloc[-1]) if "ATR" in bar.columns else 0.0,
+            "macd_trend": float(_details.get("MACD趋势", {}).get("score", 0)),
+            "golden_cross": float(_details.get("金叉信号", {}).get("score", 0)),
+            "hist_momentum": float(_details.get("柱状动能", {}).get("score", 0)),
+            "dif_slope": float(_details.get("DIF斜率", {}).get("score", 0)),
+            "divergence": float(_details.get("背离信号", {}).get("score", 0)),
+            "vol_price": float(_details.get("量价配合", {}).get("score", 0)),
+            "kline": float(_details.get("K线形态", {}).get("score", 0)),
         })
     return rows
+
+
+def _stock_worker_vectorized(
+    symbol: str,
+    stock_dir: str,
+    params: dict[str, Any],
+    compute_exit_strategy: bool = False,
+) -> list[dict[str, Any]]:
+    """全向量化版本的 _stock_worker — 无 per-bar Python 循环。
+
+    使用 Phase 0 预计算的技术指标 + peak/trough 缓存，
+    仅运行评分层 compute_signals。
+
+    捕获 BaseException 并写入 stderr（loguru 在 spawn 子进程中可能不可用），
+    防止子进程崩溃导致 BrokenProcessPool。
+    """
+    import sys as _sys
+    try:
+        stock_df, _peaks, _troughs = get_precomputed(symbol, stock_dir)
+        if stock_df.empty or len(stock_df) < 60:
+            return []
+
+        _validate_stock_data(stock_df, symbol)
+
+        # 自动适应波动率调整背离距离
+        from LogicAnalyzer.signals.divergence import adaptive_distance
+        _dd = adaptive_distance(stock_df["DIF"], base_distance=10) if "DIF" in stock_df.columns else 11
+
+        try:
+            signal_df = _compute_signals_vec(
+                stock_df,
+                params=params,
+                compute_exit_strategy=compute_exit_strategy,
+                precomputed_peaks=_peaks,
+                precomputed_troughs=_troughs,
+                diverge_distance=_dd,
+            )
+        except Exception as e:
+            logger.warning(f"  [{symbol}] 向量化信号计算失败({e})，回退原始逐bar引擎")
+            try:
+                return _stock_worker(symbol, stock_dir, params, compute_exit_strategy)
+            except Exception as f:
+                logger.warning(f"  [{symbol}] 原始引擎也失败: {f}")
+                return []
+        # 将向量化结果格式化为 _stock_worker 相同的 list[dict]
+        signal_df["symbol"] = symbol
+        rows: list[dict[str, Any]] = []
+        for _, row in signal_df.iterrows():
+            rows.append({
+                "symbol": symbol,
+                "trade_date": row["trade_date"],
+                "entry_score": float(row["entry_score"]),
+                "exit_score": float(row["exit_score"]),
+                "risk_level": str(row["risk_level"]),
+                "score": float(row["score"]),
+                "atr": float(row["atr"]) if pd.notna(row["atr"]) else 0.0,
+                "macd_trend": float(row["macd_trend"]),
+                "golden_cross": float(row["golden_cross"]),
+                "hist_momentum": float(row["hist_momentum"]),
+                "dif_slope": float(row["dif_slope"]),
+                "divergence": float(row["divergence"]),
+                "vol_price": float(row["vol_price"]),
+                "kline": float(row["kline"]),
+                "exit_strategy": {"stop_loss": float(row["stop_loss"])} if compute_exit_strategy else {},
+            })
+        return rows
+    except BaseException:
+        import traceback
+        _sys.stderr.write(f"\n[FATAL] _stock_worker_vectorized({symbol}) crashed:\n{traceback.format_exc()}\n")
+        _sys.stderr.flush()
+        return []
 
 
 # 英文列名映射（用于 parquet 缓存存储，避免中文列名编码问题）
@@ -288,8 +489,16 @@ _SIGNAL_COL_MAP = {
     "entry_score": "进场评分",
     "exit_score": "退出评分",
     "risk_level": "风险等级",
-    "stop_loss": "止损价",
     "score": "综合评分",
+    "atr": "ATR",
+    "macd_trend": "MACD趋势分",
+    "golden_cross": "金叉信号分",
+    "hist_momentum": "柱状动能分",
+    "dif_slope": "DIF斜评分",
+    "divergence": "背离信号分",
+    "vol_price": "量价配合分",
+    "kline": "K线形态分",
+    "stop_loss": "止损价",
 }
 
 # 直接使用 _SIGNAL_COL_MAP 作为重命名映射（英文 -> 中文）
@@ -417,9 +626,17 @@ def _calc_exit_score(
 
 def _build_params(cfg: Config) -> dict[str, Any]:
     ac = cfg.app_config
+    ps = ac.position_sizing
+    fb = ac.full_bull_scoring
     return {
         "regime": ac.regime_detection.model_dump(),
         "divergence": ac.divergence.model_dump(),
         "scoring": ac.scoring_params.model_dump(),
+        "position_sizing": {"risk_none_multiplier": ps.RISK_NONE_MULTIPLIER},
         "technical": ac.technical_constants.model_dump(),
+        "thresholds": {
+            "fully_bull": fb.CONCLUSION_FULL_BULL,
+            "bullish": fb.CONCLUSION_BULLISH,
+            "oscillate": fb.CONCLUSION_OSCILLATE,
+        },
     }

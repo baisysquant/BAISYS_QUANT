@@ -101,6 +101,16 @@ class TestWriteCalibrationToIni:
             kelly_fraction = 0.25
             # 流动性否决阈值
             liq_veto_ratio = 0.05
+            # T2 目标 ATR 倍数
+            atr_t2_mult = 5.0
+            # A 级评分阈值
+            conclusion_full_bull = 80
+            # R04 金叉加分
+            golden_cross_bonus = 10
+            # R41 顶背离扣分
+            divergence_penalty = 20
+            # NONE 风险仓位系数
+            risk_none_multiplier = 1.0
         """)
         original = CONFIG_INI.read_text(encoding="utf-8") if CONFIG_INI.exists() else None
 
@@ -113,6 +123,11 @@ class TestWriteCalibrationToIni:
                 "cross_decay_days": 20,
                 "kelly_fraction": 0.15,
                 "liq_veto_ratio": 0.03,
+                "atr_t2_mult": 7.0,
+                "conclusion_full_bull": 85,
+                "golden_cross_bonus": 15,
+                "divergence_penalty": 25,
+                "risk_none_multiplier": 1.5,
             }
             write_calibration_to_ini(params)
 
@@ -121,6 +136,11 @@ class TestWriteCalibrationToIni:
             assert "cross_decay_days = 20" in updated
             assert "kelly_fraction = 0.15" in updated
             assert "liq_veto_ratio = 0.03" in updated
+            assert "atr_t2_mult = 7" in updated or "atr_t2_mult = 7.0" in updated
+            assert "conclusion_full_bull = 85" in updated
+            assert "golden_cross_bonus = 15" in updated
+            assert "divergence_penalty = 25" in updated
+            assert "risk_none_multiplier = 1.5" in updated
         finally:
             if original:
                 CONFIG_INI.write_text(original, encoding="utf-8")

@@ -81,7 +81,6 @@ class MultiHeadArrangementConfig(BaseModel):
     FULL_BULL_THRESHOLD: int = Field(default=85, ge=0, le=100)
     TREND_ACCELERATION_THRESHOLD: int = Field(default=65, ge=0, le=100)
     TREND_OSCILLATION_THRESHOLD: int = Field(default=45, ge=0, le=100)
-    TREND_WATCH_THRESHOLD: int = Field(default=45, ge=0, le=100)
     MOVING_AVERAGE_PERIODS: list[int] = Field(default=[5, 10, 20, 30, 60])
 
     @field_validator("MOVING_AVERAGE_PERIODS", mode="before")
@@ -248,16 +247,7 @@ class MultiFactorAlphaConfig(BaseModel):
                                                description="质量因子缓存天数")
     FUNDAMENTALS_RETRY: int = Field(default=3, ge=0, le=10,
                                      description="估值因子 API 重试次数")
-    W_MACD: float = Field(default=0.25, ge=0.0, le=1.0,
-                           description="MACD 7 维权重")
-    W_MOMENTUM: float = Field(default=0.25, ge=0.0, le=1.0,
-                               description="动量因子权重")
-    W_MONEYFLOW: float = Field(default=0.20, ge=0.0, le=1.0,
-                                description="资金流因子权重")
-    W_QUALITY: float = Field(default=0.15, ge=0.0, le=1.0,
-                              description="质量/成长因子权重")
-    W_VALUATION: float = Field(default=0.15, ge=0.0, le=1.0,
-                                description="估值/市值因子权重")
+    # 因子权重已迁移至 config/factor_registry.yaml
 
 
 class AShareHubConfig(BaseModel):
@@ -334,6 +324,10 @@ class ScoringParamsConfig(BaseModel):
                                               description="移动止损参考高点回溯窗口（根K线）")
     EXPECTED_RETURN_LOOKBACK: int = Field(default=20, ge=5, le=120,
                                            description="预期盈亏比计算回溯窗口（根K线）")
+    GOLDEN_CROSS_BONUS: int = Field(default=10, ge=0, le=50,
+                                     description="R04: 金叉量价确认加分")
+    DIVERGENCE_PENALTY: int = Field(default=20, ge=0, le=50,
+                                     description="R41: 顶背离量缩扣分")
 
 
 class TechnicalConstantsConfig(BaseModel):
@@ -373,6 +367,13 @@ class BacktestConfig(BaseModel):
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
     SIGNAL_PIPELINES: int = Field(default=3, ge=1, le=8)
+    WFO_NUM_PATHS: int = Field(default=3, ge=1, le=10)
+
+    # 贝叶斯优化预算
+    BAYESIAN_N_INIT_SIGNAL: int = Field(default=15, ge=5, le=50)
+    BAYESIAN_N_ITER_SIGNAL: int = Field(default=35, ge=10, le=200)
+    BAYESIAN_N_INIT_PORTFOLIO: int = Field(default=20, ge=5, le=100)
+    BAYESIAN_N_ITER_PORTFOLIO: int = Field(default=150, ge=20, le=500)
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
@@ -382,6 +383,11 @@ class BacktestConfig(BaseModel):
     LIQ_VETO_RATIO_RANGE: str = "0.03,0.10,0.01"
     BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
     CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
+    ATR_T2_MULT_RANGE: str = "3.0,10.0,1.0"
+    CONCLUSION_FULL_BULL_RANGE: str = "60,95,5"
+    GOLDEN_CROSS_BONUS_RANGE: str = "5,20,5"
+    DIVERGENCE_PENALTY_RANGE: str = "10,40,5"
+    RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
 
     @field_validator("OPTIMIZE_FREQUENCY")
     @classmethod
@@ -439,18 +445,16 @@ class PositionSizingConfig(BaseModel):
                               description="B级基础仓位")
     POSITION_C: float = Field(default=0.05, ge=0.0, le=1.0,
                               description="C级基础仓位")
-    POSITION_D: float = Field(default=0.00, ge=0.0, le=1.0,
-                              description="D级基础仓位")
     MAX_INDUSTRY_EXPOSURE: float = Field(default=0.30, ge=0.0, le=1.0,
                                          description="最大行业集中度")
     RISK_BUDGET: float = Field(default=0.02, ge=0.001, le=0.10,
                                 description="波动率风险预算")
     MAX_DAY_TURNOVER: float = Field(default=0.20, ge=0.0, le=1.0,
                                     description="单日最大双边换手率")
-    ENABLE_CONVEX_OPTIMIZER: bool = Field(default=False,
-                                          description="启用凸优化器替代启发式约束")
     RISK_AVERSION: float = Field(default=1.0, ge=0.01, le=10.0,
                                  description="风险厌恶系数（越大越保守）")
+    RISK_NONE_MULTIPLIER: float = Field(default=1.0, ge=0.1, le=5.0,
+                                         description="NONE 风险等级仓位系数")
 
 
 class ApiConfig(BaseModel):
@@ -617,6 +621,14 @@ class Config:
                 ps.KELLY_FRACTION = float(bt_cal["KELLY_FRACTION"])
             if "POSITION_A" in bt_cal:
                 ps.POSITION_A = float(bt_cal["POSITION_A"])
+            if "CONCLUSION_FULL_BULL" in bt_cal:
+                self.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(bt_cal["CONCLUSION_FULL_BULL"])
+            if "GOLDEN_CROSS_BONUS" in bt_cal:
+                sc.GOLDEN_CROSS_BONUS = int(bt_cal["GOLDEN_CROSS_BONUS"])
+            if "DIVERGENCE_PENALTY" in bt_cal:
+                sc.DIVERGENCE_PENALTY = int(bt_cal["DIVERGENCE_PENALTY"])
+            if "RISK_NONE_MULTIPLIER" in bt_cal:
+                ps.RISK_NONE_MULTIPLIER = float(bt_cal["RISK_NONE_MULTIPLIER"])
 
     def reload(self) -> None:
         """热重载配置文件，保留 config_file 路径。"""
@@ -717,8 +729,6 @@ class Config:
     @property
     def TREND_OSCILLATION_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.TREND_OSCILLATION_THRESHOLD
 
-    @property
-    def TREND_WATCH_THRESHOLD(self) -> int: return self.app_config.multi_head_arrangement.TREND_WATCH_THRESHOLD
 
     @property
     def MOVING_AVERAGE_PERIODS(self) -> list[int]: return self.app_config.multi_head_arrangement.MOVING_AVERAGE_PERIODS
@@ -827,17 +837,6 @@ class Config:
         return self.app_config.multi_factor_alpha.FUNDAMENTALS_RETRY
 
     @property
-    def FACTOR_WEIGHTS(self) -> dict[str, float]:
-        m = self.app_config.multi_factor_alpha
-        return {
-            "macd": m.W_MACD,
-            "momentum": m.W_MOMENTUM,
-            "moneyflow": m.W_MONEYFLOW,
-            "quality": m.W_QUALITY,
-            "valuation": m.W_VALUATION,
-        }
-
-    @property
     def ENABLE_FUNDAMENTALS(self) -> bool:
         return self.app_config.asharehub.ENABLE_FUNDAMENTALS
 
@@ -915,6 +914,8 @@ class Config:
             "trailing_stop_lookback": s.TRAILING_STOP_LOOKBACK,
             "trailing_stop_high_lookback": s.TRAILING_STOP_HIGH_LOOKBACK,
             "expected_return_lookback": s.EXPECTED_RETURN_LOOKBACK,
+            "golden_cross_bonus": s.GOLDEN_CROSS_BONUS,
+            "divergence_penalty": s.DIVERGENCE_PENALTY,
         }
 
     @property
@@ -942,11 +943,9 @@ class Config:
             "position_a": p.POSITION_A,
             "position_b": p.POSITION_B,
             "position_c": p.POSITION_C,
-            "position_d": p.POSITION_D,
             "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": p.RISK_BUDGET,
             "max_day_turnover": p.MAX_DAY_TURNOVER,
-            "enable_convex_optimizer": p.ENABLE_CONVEX_OPTIMIZER,
             "risk_aversion": p.RISK_AVERSION,
             "liq_w_section": f.LIQ_W_SECTION,
             "liq_w_timeseries": f.LIQ_W_TIMESERIES,

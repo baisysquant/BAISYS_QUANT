@@ -66,40 +66,16 @@ def test_run_backtest(backtest_akquant_df: pd.DataFrame) -> None:
 
 
 @pytest.mark.slow
-def test_run_grid_search(backtest_akquant_df: pd.DataFrame) -> None:
-    from BackTrading.calibration import run_grid_search
+def test_run_bayesian_walk_forward(backtest_akquant_df: pd.DataFrame) -> None:
+    from BackTrading.calibration import run_bayesian_walk_forward
 
-    param_grid = {
-        "atr_stop_mult": [1.0, 2.0, 3.0],
-        "kelly_fraction": [0.1, 0.25],
-    }
-    result_df = run_grid_search(
+    result_df = run_bayesian_walk_forward(
         kline_df=backtest_akquant_df,
-        param_grid=param_grid,
-        initial_cash=1_000_000,
-        t_plus_one=False,
-        show_progress=False,
-    )
-    assert not result_df.empty
-    assert "sharpe_ratio" in result_df.columns
-    assert len(result_df) == 6
-
-
-@pytest.mark.slow
-def test_run_walk_forward(backtest_akquant_df: pd.DataFrame) -> None:
-    from BackTrading.calibration import run_walk_forward
-
-    param_grid = {
-        "atr_stop_mult": [1.0, 2.0],
-        "kelly_fraction": [0.1, 0.25],
-    }
-    result_df = run_walk_forward(
-        kline_df=backtest_akquant_df,
-        param_grid=param_grid,
         train_period=60,
         test_period=10,
+        num_paths=2,
         initial_cash=1_000_000,
-        show_progress=False,
     )
     assert not result_df.empty
-    assert "train_start" in result_df.columns or "test_start" in result_df.columns or "params" in result_df.columns
+    assert "params" in result_df.columns
+    assert "sharpe_ratio" in result_df.columns or "oos_sharpe" in result_df.columns

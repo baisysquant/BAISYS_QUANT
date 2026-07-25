@@ -20,7 +20,9 @@ from LogicAnalyzer.pipeline_state import (
 )
 from LogicAnalyzer.signals.divergence import (
     adaptive_distance,
+    detect_divergence_precomputed,
     detect_divergence_single_param,
+    find_peaks_troughs,
     signal_with_decay,
     slope_analysis,
 )
@@ -266,7 +268,10 @@ class MACDAnalyzer:
             weights = {"MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,
                        "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10}
         if thresholds is None:
-            thresholds = {"fully_bull": 80, "bullish": 60, "oscillate": 40}
+            _th = _p.get("thresholds", {})
+            thresholds = {"fully_bull": _th.get("fully_bull", 80),
+                          "bullish": _th.get("bullish", 60),
+                          "oscillate": _th.get("oscillate", 40)}
         if rule_thresholds is None:
             rule_thresholds = {"divergence": 0.3, "winner_rate_high": 80,
                                "cost_resistance_ratio": 0.95, "chip_concentrated_ratio": 0.15,
@@ -333,8 +338,15 @@ class MACDAnalyzer:
                 'exit_strategy': {}, 'macd_trend': macd_trend, 'position_adjust': 0.0,
             })
 
-        dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
-        div_type, div_idx, div_strength = detect_divergence_single_param(df, df['close'], df['DIF'], distance=dist_div)
+        if hasattr(self, '_precomputed_diverge'):
+            dist_div = self._precomputed_diverge['distance']
+            div_type, div_idx, div_strength = detect_divergence_precomputed(
+                df['close'], df['DIF'], len(df) - 1, dist_div,
+                self._precomputed_diverge['peaks'], self._precomputed_diverge['troughs'],
+            )
+        else:
+            dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
+            div_type, div_idx, div_strength = detect_divergence_single_param(df, df['close'], df['DIF'], distance=dist_div)
         div_decay = signal_with_decay(div_type, div_idx, len(df) - 1, half_life=decay_half_life)
         div_combined = '无明显背离信号'
         if div_type == Divergence.BOTTOM_DIVERGENCE and div_strength > div_strength_threshold:
@@ -376,6 +388,10 @@ class MACDAnalyzer:
             'forecast_data': df.attrs.get('forecast_data', None),
             'vol_regime': self._detect_volatility_regime(df),
             'position_adjust': 0.0,
+            'config': {
+                'golden_cross_bonus': _score_p.get('golden_cross_bonus', 10),
+                'divergence_penalty': _score_p.get('divergence_penalty', 20),
+            },
         })
 
         zero_axis_pattern = self.detect_macd_zero_axis_pattern(df)

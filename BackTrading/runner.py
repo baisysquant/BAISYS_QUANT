@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import sys
+import time
 from datetime import date, datetime
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from loguru import logger
+from scipy.stats import spearmanr
 from sqlalchemy import text
 
 from BackTrading.alert import BacktestAlert
@@ -15,7 +18,7 @@ from BackTrading.calibration import (
     CalibrationResult,
     apply_calibration_to_config,
     load_calibration,
-    run_walk_forward,
+    run_bayesian_walk_forward as run_walk_forward,
     save_calibration,
     write_calibration_to_ini,
 )
@@ -92,10 +95,18 @@ def run_backtest_pipeline(
     logger.info(f"  样本外天数: {bt.OUT_OF_SAMPLE_DAYS}")
     logger.info(f"  初始资金: {bt.INITIAL_CASH:,.0f}")
 
+    _step_times: dict[str, float] = {"start": time.time()}
+    def _log_step(name: str) -> None:
+        _step_times[name] = time.time()
+        _elapsed = _step_times[name] - _step_times.get(list(_step_times.keys())[-2] if len(_step_times) >= 2 else "start", 0)
+        _total = _step_times[name] - _step_times["start"]
+        logger.info(f"[STEP] {name} ({_elapsed:.1f}s, 累计 {_total:.1f}s)")
+
     try:
         symbols = _resolve_symbols(engine, config)
         logger.info(f"  股票数量: {len(symbols)}")
         logger.warning("生存偏差: 股票池仅含当前存活股票，已退市/ST 股票的历史负收益未被计入")
+        _log_step("resolve_symbols")
 
         kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
         if kline_df.empty:
@@ -108,13 +119,12 @@ def run_backtest_pipeline(
         train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
         logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
 
-        prepared = prepare_backtest_data(kline_df, params=_build_params(config), compute_exit_strategy=True)
-        signal_prefixes = ('进场', '退出', '风险', '止损', '综合')
-        signal_cols = [c for c in prepared.columns if c.startswith(signal_prefixes)]
-        logger.info(f"  预计算信号列: {signal_cols}")
-
+        _num_paths = bt.WFO_NUM_PATHS
+        logger.info(f"  WFO 多路径数: {_num_paths}")
+        _log_step("fetch_kline")
         wf_result = run_walk_forward(
-            kline_df=prepared,
+            kline_df=kline_df,
+            num_paths=_num_paths,
             train_period=train_period,
             test_period=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
@@ -126,6 +136,7 @@ def run_backtest_pipeline(
             point_in_time=bt.POINT_IN_TIME,
             show_progress=True,
         )
+        _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
 
         if not wf_result.empty and wf_result["sharpe_ratio"].max() > 3.0:
@@ -135,7 +146,11 @@ def run_backtest_pipeline(
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
         from BackTrading._engine_legacy import EngineConfig, run_full_backtest
+        from BackTrading.domain.models import CostModel
 
+        from UtilsManager.ConfigParser import PositionSizingConfig as _PsCfg
+        _ps: _PsCfg = config.app_config.position_sizing
+        _sc = config.app_config.scoring_params
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
             commission_rate=bt.COMMISSION_RATE,
@@ -144,8 +159,43 @@ def run_backtest_pipeline(
             max_position_pct=bt.MAX_POSITION_PCT,
             portfolio_method=bt.PORTFOLIO_METHOD,
             point_in_time=bt.POINT_IN_TIME,
+            kelly_fraction=best_params.get("kelly_fraction", _ps.KELLY_FRACTION),
+            position_a=best_params.get("position_a", _ps.POSITION_A),
+            risk_none_multiplier=best_params.get("risk_none_multiplier", _ps.RISK_NONE_MULTIPLIER),
+            atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
+            cost_model=CostModel(
+                commission_rate=bt.COMMISSION_RATE,
+                stamp_tax_rate=bt.STAMP_TAX_RATE,
+                market_slippage=bt.SLIPPAGE,
+            ),
         )
-        trade_log, equity_curve = run_full_backtest(prepared, best_params, ecfg)
+        final_params = _build_params(config)
+        final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "atr_t1_mult", "atr_t2_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
+        fb_cfg = config.app_config.full_bull_scoring
+        final_params["thresholds"] = {
+            "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg.CONCLUSION_FULL_BULL)),
+            "bullish": fb_cfg.CONCLUSION_BULLISH,
+            "oscillate": fb_cfg.CONCLUSION_OSCILLATE,
+        }
+        final_params["position_sizing"]["risk_none_multiplier"] = best_params.get("risk_none_multiplier", _ps.RISK_NONE_MULTIPLIER)
+
+        # ── 模拟交易验证：用最近交易日验证参数 OOS 稳定性 ──
+        from BackTrading.simulated_trading import validate_params as _sim_validate
+        _wf_sharpe = float(wf_result["sharpe_ratio"].mean()) if not wf_result.empty else 0.0
+        _sim_verdict = _sim_validate(
+            kline_df=kline_df, best_params=best_params,
+            oos_sharpe=_wf_sharpe, sim_days=20,
+            config=config, engine_cfg=ecfg,
+        )
+        _promote = _sim_verdict.promote
+        if not _promote:
+            logger.warning(f"模拟验证不通过，参数不写入 config.ini: {_sim_verdict.reason}")
+
+        _log_step("prepare_final_signals")
+        final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True)
+        _log_step("full_backtest")
+        trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
+        _log_step("compute_metrics")
         risk = compute_risk_metrics(equity_curve) or {}
         trade = compute_trade_metrics(trade_log) or {}
 
@@ -153,7 +203,124 @@ def run_backtest_pipeline(
         logger.info(f"  Sharpe={risk.get('sharpe_ratio', 0):.2f} | Sortino={risk.get('sortino_ratio', 0):.2f} | Calmar={risk.get('calmar_ratio', 0):.2f}")
         logger.info(f"  VaR(95%)={risk.get('var_95', 0):.2%} | CVaR(95%)={risk.get('cvar_95', 0):.2%} | MaxDD={risk.get('max_drawdown', 0):.2%}")
         logger.info(f"  交易={trade.get('total_trades', 0)} | 胜率={trade.get('win_rate', 0):.1%} | 盈亏比={trade.get('profit_factor', 0):.2f}")
+        logger.info(f"  日均换手率={risk.get('avg_turnover', 0):.2%} | 最高单日换手率={risk.get('max_turnover', 0):.2%}")
+        _avg_to = risk.get("avg_turnover", 0)
+        if _avg_to and _avg_to > 0.30:
+            logger.warning(f"日均换手率 {_avg_to:.2%} > 30%，扣费后实际收益可能打 7 折")
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
+
+        # ── 持仓打分卡：当期持仓的因子分解 ──
+        try:
+            _holdings = [t for t in trade_log if t.get("action") == "buy"][-20:]  # 最近 20 笔买入
+            if _holdings and not final_prepared.empty:
+                _last_date = final_prepared["trade_date"].max()
+                if pd.api.types.is_datetime64_any_dtype(final_prepared["trade_date"]):
+                    _fp = final_prepared.copy()
+                    _fp["trade_date"] = _fp["trade_date"].dt.strftime("%Y-%m-%d")
+                    _last_date_str = _last_date.strftime("%Y-%m-%d") if hasattr(_last_date, "strftime") else str(_last_date)
+                    _latest = _fp[_fp["trade_date"] == _last_date_str]
+                else:
+                    _latest = final_prepared[final_prepared["trade_date"] == _last_date]
+                _score_cols = ["MACD趋势分", "金叉信号分", "柱状动能分", "DIF斜评分",
+                               "背离信号分", "量价配合分", "K线形态分"]
+                _held_syms = list({t["symbol"] for t in _holdings if t["symbol"] in _latest["symbol"].values})
+                if _held_syms:
+                    _card = _latest[_latest["symbol"].isin(_held_syms)][
+                        ["symbol", "进场评分", "综合评分", "风险等级"] + _score_cols
+                    ].copy()
+                    _card.columns = ["股票", "进场分", "综合分", "风险"] + [
+                        "MACD趋势", "金叉", "动能", "DIF斜率", "背离", "量价", "K线"
+                    ]
+                    logger.info(f"  ── 持仓因子分解（{_last_date}）──")
+                    for _, r in _card.iterrows():
+                        _factors = " | ".join(f"{c}={r[c]:.0f}" for c in ["MACD趋势","金叉","动能","DIF斜率","背离","量价","K线"])
+                        logger.info(f"    {r['股票']}: 综合{r['综合分']:.0f}/进场{r['进场分']:.0f}/{r['风险']} | {_factors}")
+        except Exception:
+            pass
+
+        # ── 因子暴露归因 ──
+        try:
+            _ec_df = pd.DataFrame(equity_curve).set_index("time")
+            _ec_df.index = pd.to_datetime(_ec_df.index)
+            _port_rets = _ec_df["portfolio_value"].pct_change().dropna()
+            if len(_port_rets) > 20:
+                from BackTrading.attribution import factor_exposure as _fe
+                # 用市场指数收益率作为因子代理
+                _index_map = {"000300.SH": "沪深300", "000905.SH": "中证500", "000852.SH": "中证1000"}
+                _factor_data = {}
+                for _code, _name in _index_map.items():
+                    try:
+                        from UtilsManager.IDataProvider import BacktestDataProvider as _Bdp
+                        from DataManager.DbEngine import get_engine as _ge
+                        _e2 = _ge(config)
+                        _p = _Bdp(_e2)
+                        _idx = _p.get_index_kline(_code, start=_port_rets.index[0].strftime("%Y-%m-%d"))
+                        if _idx is not None and not _idx.empty:
+                            _idx = _idx.set_index("trade_date")
+                            _idx.index = pd.to_datetime(_idx.index)
+                            _factor_data[_name] = _idx["close"].pct_change()
+                    except Exception:
+                        continue
+                if _factor_data:
+                    _fdf = pd.DataFrame(_factor_data)
+                    _fe_result = _fe(_port_rets, _fdf)
+                    _fe_line = " | ".join(
+                        f"{k}: β={_fe_result.exposures.get(k, 0):.2f}"
+                        f"(p={_fe_result.p_values.get(k, 1):.2f})"
+                        for k in _fdf.columns
+                    )
+                    logger.info(f"  因子暴露[{_fdf.columns.tolist()}]: {_fe_line}")
+                    logger.info(f"  回归R²={_fe_result.rsquared:.2%}, adjR²={_fe_result.adj_rsquared:.2%}")
+        except Exception:
+            pass
+
+        # ── 组合风险暴露（行业 + 风格） ──
+        try:
+            if pd.api.types.is_datetime64_any_dtype(final_prepared["trade_date"]):
+                _fp2 = final_prepared.copy()
+                _fp2["trade_date"] = _fp2["trade_date"].dt.strftime("%Y-%m-%d")
+                _last_bar = _fp2[_fp2["trade_date"] == _fp2["trade_date"].max()]
+            else:
+                _last_bar = final_prepared[final_prepared["trade_date"] == final_prepared["trade_date"].max()]
+            _risk_holdings = {t["symbol"]: t.get("value", 0) for t in trade_log if t.get("action") == "buy"}
+            _total_val = sum(_risk_holdings.values()) or 1
+            _pw = pd.Series({k: v / _total_val for k, v in _risk_holdings.items()})
+            if len(_pw) > 1 and "行业" in _last_bar.columns:
+                from BackTrading.risk_model import compute_industry_exposure, industry_hhi
+                _ind_map = _last_bar.set_index("symbol")["行业"].to_dict()
+                _ind_exp = compute_industry_exposure(_pw, pd.Series({k: _ind_map.get(k, "未知") for k in _pw.index}))
+                _top_ind = sorted(_ind_exp.items(), key=lambda x: -x[1])[:5]
+                _hhi = industry_hhi(_ind_exp)
+                _ind_line = " | ".join(f"{s}: {w:.1%}" for s, w in _top_ind)
+                logger.info(f"  行业暴露 Top5: {_ind_line}")
+                if _hhi > 0.3:
+                    logger.warning(f"  行业 HHI={_hhi:.2f} > 0.3，集中度偏高")
+        except Exception:
+            pass
+
+        # ── 因子衰减检查（信号分 vs 前向收益的 Rank IC） ──
+        try:
+            _fwd_ret = final_prepared.groupby("symbol")["close"].transform(
+                lambda s: s.shift(-5) / s - 1
+            )
+            _ic_cols = ["MACD趋势分", "金叉信号分", "柱状动能分", "DIF斜评分", "背离信号分", "量价配合分", "K线形态分"]
+            _ic_factors = {c: "MACD趋势", "金叉信号": "金叉", "柱状动能": "动能",
+                           "DIF斜评分": "斜率", "背离信号": "背离", "量价配合": "量价", "K线形态分": "K线"}
+            _ics = []
+            for _c in _ic_cols:
+                if _c not in final_prepared.columns:
+                    continue
+                _valid = final_prepared[_c].notna() & _fwd_ret.notna()
+                if _valid.sum() < 20:
+                    continue
+                _rho, _ = spearmanr(final_prepared.loc[_valid, _c], _fwd_ret[_valid])
+                if not np.isnan(_rho):
+                    _ics.append((_ic_factors.get(_c, _c), _rho))
+            if _ics:
+                _ic_line = " | ".join(f"{n}: IC={r:.3f}" for n, r in _ics)
+                logger.info(f"  信号Rank IC（5日前向收益）: {_ic_line}")
+        except Exception:
+            pass
 
         top = wf_result.dropna(subset=["sharpe_ratio"]).sort_values("sharpe_ratio", ascending=False).head(5)
         sharpe_avg = float(top["sharpe_ratio"].mean())
@@ -201,8 +368,34 @@ def run_backtest_pipeline(
             num_trials=num_trials,
         )
         save_calibration(cal_result)
-        write_calibration_to_ini(best_params)
-        apply_calibration_to_config(config)
+
+        # ── 多策略组合回测 ──
+        _enable_ms = getattr(bt, "MULTI_STRATEGY_ENABLED", False)
+        if _enable_ms:
+            try:
+                from BackTrading.multi_strategy import run_multi_strategy_backtest as _rms
+                _ms_result = _rms(kline_df, ecfg, best_params, trade_log, equity_curve)
+                logger.info(f"  多策略组合完成: {len(_ms_result)} 个子策略")
+            except Exception as e:
+                logger.warning(f"  多策略组合回测异常: {e}")
+
+        # ── 压力测试 ──
+        try:
+            from BackTrading.stress_test import run_stress_tests as _rst
+            _stress_results = _rst(kline_df, ecfg, best_params)
+            _worst_dd = min((r.get("max_drawdown", 0) for r in _stress_results.values()), default=0)
+            if _worst_dd < -0.3:
+                logger.warning(f"  压力测试: 历史极端场景最大回撤 {_worst_dd:.2%} > 30%，建议评估风险")
+        except Exception as e:
+            logger.warning(f"  压力测试异常: {e}")
+
+        if _promote:
+            write_calibration_to_ini(best_params)
+            apply_calibration_to_config(config)
+            logger.info("模拟验证通过，参数已写入 config.ini 并生效")
+        else:
+            logger.warning("模拟验证不通过，config.ini 参数保持不变，可作为回测报告参考")
+            # 仍将结果写入数据库用于历史追踪
 
         record_run(
             engine=engine,
@@ -264,7 +457,7 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
         if config is not None and config.MAIN_BOARD_ONLY:
             before = len(raw_codes)
             raw_codes = [c for c in raw_codes if c[:2] in ("60", "00")]
-            logger.info(f"主板过滤: {before} → {len(raw_codes)} 只")
+            logger.info(f"主板过滤后剩余: {len(raw_codes)} / {before} 只")
 
         normalized = sorted({CodeNormalizer.add_market_prefix(c) for c in raw_codes})
         if normalized:
@@ -345,21 +538,31 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
             return {
                 "atr_stop_mult": 2.0,
                 "atr_t1_mult": 4.0,
+                "atr_t2_mult": 5.0,
                 "kelly_fraction": 0.25,
                 "position_a": 0.35,
                 "liq_veto_ratio": 0.065,
                 "boll_narrow_ratio": 0.9,
                 "cross_decay_days": 37,
+                "conclusion_full_bull": 80,
+                "golden_cross_bonus": 10,
+                "divergence_penalty": 20,
+                "risk_none_multiplier": 1.0,
             }
         bt = cfg.app_config.backtest
         return {
             "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
             "atr_t1_mult": sum(bt.parse_range("ATR_T1_MULT_RANGE")[:2]) / 2,
+            "atr_t2_mult": sum(bt.parse_range("ATR_T2_MULT_RANGE")[:2]) / 2,
             "kelly_fraction": sum(bt.parse_range("KELLY_FRACTION_RANGE")[:2]) / 2,
             "position_a": sum(bt.parse_range("POSITION_A_RANGE")[:2]) / 2,
             "liq_veto_ratio": sum(bt.parse_range("LIQ_VETO_RATIO_RANGE")[:2]) / 2,
             "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
             "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
+            "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
+            "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
+            "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
+            "risk_none_multiplier": sum(bt.parse_range("RISK_NONE_MULTIPLIER_RANGE")[:2]) / 2,
         }
 
     if wf_result.empty or "params" not in wf_result.columns:

@@ -68,11 +68,11 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
     if params is None:
         params = {}
     close = float(df['close'].iloc[-1])
-    ma5 = df['close'].rolling(5).mean().iloc[-1]
-    ma10 = df['close'].rolling(10).mean().iloc[-1]
-    ma20 = df['close'].rolling(20).mean().iloc[-1]
-    ma30 = df['close'].rolling(30).mean().iloc[-1]
-    ma60 = df['close'].rolling(60).mean().iloc[-1]
+    ma5 = float(df['MA_5'].iloc[-1])
+    ma10 = float(df['MA_10'].iloc[-1])
+    ma20 = float(df['MA_20'].iloc[-1])
+    ma30 = float(df['MA_30'].iloc[-1])
+    ma60 = float(df['MA_60'].iloc[-1])
     ma_bullish = ma5 > ma10 > ma20 > ma30 > ma60
     ma_bearish = ma5 < ma10 < ma20 < ma30 < ma60
     dif = df['DIF'].iloc[-1] if 'DIF' in df.columns else 0
@@ -124,17 +124,7 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     if close is None:
         close = float(close_series.iloc[-1])
 
-    atr_period = 14
-    if len(df) >= atr_period + 1:
-        prev_close = close_series.shift(1)
-        tr = pd.concat([
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        atr_val = float(tr.rolling(atr_period).mean().iloc[-1])
-    else:
-        atr_val = float('nan')
+    atr_val = float(df['ATR'].iloc[-1]) if 'ATR' in df.columns else float('nan')
 
     if pd.isna(atr_val) or atr_val <= 0:
         return {'stop_loss': None, 't1_target': None, 't2_target': None,
