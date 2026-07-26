@@ -37,7 +37,7 @@ class QuantPipelineStrategy(Strategy):
         self._entry_cache: dict[str, float] = {}
         self._cost = {
             "commission": float(kwargs.get("commission", 0.0003)),
-            "stamp_tax": float(kwargs.get("stamp_tax", 0.001)),
+            "stamp_tax": float(kwargs.get("stamp_tax", 0.0005)),
             "slippage": float(kwargs.get("slippage", 0.001)),
             "max_position_pct": float(kwargs.get("max_position_pct", 0.1)),
         }

@@ -30,8 +30,6 @@ from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 # config.ini 中参数名 → (section, key) 映射
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
-    "atr_t1_mult": ("BACKTEST_CALIBRATED", "atr_t1_mult"),
-    "atr_t2_mult": ("BACKTEST_CALIBRATED", "atr_t2_mult"),
     "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
     "position_a": ("BACKTEST_CALIBRATED", "position_a"),
     "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
@@ -170,7 +168,7 @@ def apply_calibration_to_config(config: object) -> None:
             rd.BOLL_NARROW_RATIO = val
         elif key == "cross_decay_days":
             sc.CROSS_DECAY_DAYS = int(val)
-        elif key in ("atr_stop_mult", "atr_t1_mult", "atr_t2_mult"):
+        elif key == "atr_stop_mult":
             setattr(sc, attr, val)
         elif key == "liq_veto_ratio":
             fr.LIQ_VETO_RATIO = val

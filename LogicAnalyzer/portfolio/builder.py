@@ -51,7 +51,7 @@ class PortfolioBuilder:
         # 交易成本参数
         tc = getattr(config, "TRADING_COST_PARAMS", None) or {}
         self._commission_rate = tc.get("commission_rate", 0.0003)
-        self._stamp_tax_rate = tc.get("stamp_tax_rate", 0.001)
+        self._stamp_tax_rate = tc.get("stamp_tax_rate", 0.0005)
         self._transfer_fee_rate = tc.get("transfer_fee_rate", 0.00001)
 
     # ── 入口 ───────────────────────────────────────────────

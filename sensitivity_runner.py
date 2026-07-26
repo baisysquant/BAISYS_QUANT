@@ -119,7 +119,6 @@ SCANS["first_pass"] = {
         "cross_decay_min": [0.2, 0.3, 0.5],
         "kline_decay_days": [5, 10, 20],
         "kline_decay_min": [0.1, 0.2, 0.3],
-        "atr_t2_mult": [3.0, 5.0, 7.0, 10.0],
         "golden_cross_bonus": [5, 10, 15, 20],
         "divergence_penalty": [10, 15, 20, 25, 30],
     },
@@ -187,7 +186,6 @@ def _build_overrides(combo: dict) -> dict:
         "cross_decay_min": "cross_decay_min",
         "kline_decay_days": "kline_decay_days",
         "kline_decay_min": "kline_decay_min",
-        "atr_t2_mult": "atr_t2_mult",
         "golden_cross_bonus": "golden_cross_bonus",
         "divergence_penalty": "divergence_penalty",
     }

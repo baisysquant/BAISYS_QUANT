@@ -170,7 +170,7 @@ def run_backtest_pipeline(
             ),
         )
         final_params = _build_params(config)
-        final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "atr_t1_mult", "atr_t2_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
+        final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
         fb_cfg = config.app_config.full_bull_scoring
         final_params["thresholds"] = {
             "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg.CONCLUSION_FULL_BULL)),
@@ -442,34 +442,24 @@ def run_backtest_pipeline(
 
 
 def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
-    """解析股票列表，支持 main_board_only 过滤。"""
+    """解析股票列表，支持 main_board_only 过滤。直接查询 kline 全历史数据避免生存者偏差。"""
     from UtilsManager.CodeNormalizer import CodeNormalizer
 
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT DISTINCT stock_code FROM stock_basic_info_sw
-            ORDER BY stock_code
-        """)).fetchall()
-    if rows:
-        raw_codes = sorted({str(r[0]).strip().zfill(6) for r in rows})
-
-        # ── 主板过滤 ──
-        if config is not None and config.MAIN_BOARD_ONLY:
-            before = len(raw_codes)
-            raw_codes = [c for c in raw_codes if c[:2] in ("60", "00")]
-            logger.info(f"主板过滤后剩余: {len(raw_codes)} / {before} 只")
-
-        normalized = sorted({CodeNormalizer.add_market_prefix(c) for c in raw_codes})
-        if normalized:
-            logger.info(f"从本地股票信息表获取 {len(normalized)} 只股票")
-            return normalized
-
-    logger.warning("股票信息表为空，回退到 stock_daily_kline 已有数据")
-    with engine.connect() as conn:
-        rows = conn.execute(text("""
             SELECT DISTINCT symbol FROM stock_daily_kline
+            ORDER BY symbol
         """)).fetchall()
-    return sorted({r[0] for r in rows})
+    raw = sorted({str(r[0]) for r in rows})
+    # 尝试从 symbol 中提取纯数字代码用于主板过滤
+    if config is not None and config.MAIN_BOARD_ONLY:
+        before = len(raw)
+        raw = [s for s in raw if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))]
+        if len(raw) < before:
+            logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
+    if not raw:
+        logger.warning("回测股票池为空，请检查数据库 stock_daily_kline 表")
+    return sorted({CodeNormalizer.add_market_prefix(s) if not s.startswith(("sh", "sz")) else s for s in raw})
 
 
 def _fetch_kline(
@@ -537,8 +527,6 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
         if cfg is None:
             return {
                 "atr_stop_mult": 2.0,
-                "atr_t1_mult": 4.0,
-                "atr_t2_mult": 5.0,
                 "kelly_fraction": 0.25,
                 "position_a": 0.35,
                 "liq_veto_ratio": 0.065,
@@ -552,8 +540,6 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
         bt = cfg.app_config.backtest
         return {
             "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
-            "atr_t1_mult": sum(bt.parse_range("ATR_T1_MULT_RANGE")[:2]) / 2,
-            "atr_t2_mult": sum(bt.parse_range("ATR_T2_MULT_RANGE")[:2]) / 2,
             "kelly_fraction": sum(bt.parse_range("KELLY_FRACTION_RANGE")[:2]) / 2,
             "position_a": sum(bt.parse_range("POSITION_A_RANGE")[:2]) / 2,
             "liq_veto_ratio": sum(bt.parse_range("LIQ_VETO_RATIO_RANGE")[:2]) / 2,

@@ -16,7 +16,7 @@ class CostModel:
     """
 
     commission_rate: float = 0.0003
-    stamp_tax_rate: float = 0.001
+    stamp_tax_rate: float = 0.0005
     market_slippage: float = 0.001
     limit_slippage: float = 0.0005
     impact_threshold: float = 0.01

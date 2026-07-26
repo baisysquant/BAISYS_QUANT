@@ -157,7 +157,7 @@ def bayesian_walk_forward_multi(
     base_cfg = EngineConfig(
         initial_cash=initial_cash,
         commission_rate=kwargs.get("commission", 0.0003),
-        stamp_tax_rate=kwargs.get("stamp_tax", 0.001),
+        stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
         slippage=kwargs.get("slippage", 0.001),
         max_position_pct=kwargs.get("max_position_pct", 0.1),
         portfolio_method=kwargs.get("portfolio_method", "score_weighted"),

@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 from typing_extensions import TypeAlias
 
 from BackTrading.engine import EngineConfig
@@ -68,8 +69,6 @@ def _run_single_backtest(
     _kelly = engine_cfg.kelly_fraction
     _pos_a = engine_cfg.position_a
     _atr_stop = engine_cfg.atr_stop_mult
-    sell_rate = engine_cfg.slippage + engine_cfg.stamp_tax_rate
-    buy_rate = engine_cfg.commission_rate + engine_cfg.slippage
 
     cash = float(init_cash)
 
@@ -89,13 +88,19 @@ def _run_single_backtest(
             slip = cm.calc_slippage(volume, adv, side="sell", order_type="market")
             rate = slip + cm.stamp_tax_rate
             return value * (1 - rate), value * rate
-        return value * (1 - sell_rate), value * sell_rate
+        commission = max(value * engine_cfg.commission_rate, engine_cfg.min_commission_per_trade)
+        fee = commission + value * (engine_cfg.transfer_fee_rate + engine_cfg.stamp_tax_rate)
+        slip_cost = value * engine_cfg.slippage
+        total_cost = fee + slip_cost
+        return value - total_cost, total_cost
 
     def _buy_cost(sym: str, value: float, volume: float) -> float:
         if cm is not None:
             adv = _adv_state.get(sym, (0.0, 0))[0]
             return cm.buy_cost(value, volume, adv)
-        return value * buy_rate
+        commission = max(value * engine_cfg.commission_rate, engine_cfg.min_commission_per_trade)
+        fee = commission + value * engine_cfg.transfer_fee_rate
+        return fee + value * engine_cfg.slippage
 
     def _process_sell(dt, s_syms, s_idx, s_close, s_vol):
         total_sold = 0.0
@@ -177,6 +182,13 @@ def _run_single_backtest(
             buy_ok = (buy_score >= _buy_threshold) & (pos_value[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
+            if len(bi) == 0 and len(date_groups) > 100 and np.any(buy_score >= _buy_threshold):
+                _diag_score = int((buy_score >= _buy_threshold).sum())
+                _diag_pos = int((pos_value[idx] == 0).sum())
+                _diag_risk = int((~np.isin(risk_str, ["HIGH", "D", "E"])).sum())
+                _diag_limit = int(not_limit_up.sum())
+                _diag_vol = int(has_volume.sum())
+                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_buy_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} 总={len(buy_ok)}")
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
@@ -185,13 +197,13 @@ def _run_single_backtest(
                 b_risk_str = risk_str[bi]
 
                 risk_int = np.array([risk_key.get(r, 2) for r in b_risk_str], dtype=np.int32)
-                w = np.clip(1.0 / risk_mult[risk_int], None, max_pos_pct) * _kelly
-                w = np.power(w, _pos_a)
+                raw_w = 1.0 / risk_mult[risk_int] * _kelly
+                w = np.power(raw_w, _pos_a)
                 order = np.argsort(-w)
                 total_w = float(w.sum()) or 1.0
 
                 existing = int((pos_value > 0).sum())
-                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else len(order)
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else min(len(order), 50)
                 bought = 0
                 for j in order:
                     if bought >= max_new:
@@ -199,8 +211,8 @@ def _run_single_backtest(
                     si = b_idx[j]
                     if pos_value[si] > 0:
                         continue
-                    # 用可用现金分配（而非总资产），避免持仓市值占比失真
-                    tv = cash * (float(w[j]) / total_w)
+                    # 用可用现金分配（扣除 0.2% 税费预留），且单票不超过总资产 max_pos_pct
+                    tv = min(cash * 0.998 * (float(w[j]) / total_w), total_value * max_pos_pct)
                     price = float(b_close[j])
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:
@@ -218,6 +230,12 @@ def _run_single_backtest(
                             "cost": round(cst, 2),
                         })
                         bought += 1
+
+                if bought == 0 and len(date_groups) > 100:
+                    _tv0 = min(cash * 0.998 * (float(w[order[0]]) / total_w), total_value * max_pos_pct)
+                    _p0 = float(b_close[order[0]])
+                    _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
+                    logger.info(f"[ENGINE-DIAG] {dt}: {len(bi)}候选 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  total_w={total_w:.2f}  max_pos_pct={max_pos_pct}")
 
             # ── ADV 更新（移后：使用今日数据为明日服务，不干扰今日买卖） ──
             for i_sym, i_vol in zip(syms_str, volume):
@@ -318,7 +336,7 @@ def _run_single_backtest(
                 total_w = float(w.sum()) or 1.0
 
                 existing = int((pos_value > 0).sum())
-                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else len(order)
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else min(len(order), 50)
                 bought = 0
                 for j in order:
                     if bought >= max_new:
@@ -326,7 +344,7 @@ def _run_single_backtest(
                     si = b_idx[j]
                     if pos_value[si] > 0:
                         continue
-                    tv = cash * (float(w[j]) / total_w)
+                    tv = min(cash * 0.998 * (float(w[j]) / total_w), total_value * max_pos_pct)
                     price = float(b_close[j])
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:

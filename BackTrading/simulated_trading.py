@@ -63,7 +63,7 @@ def validate_params(
         structured = _build_params(cfg)
         structured["scoring"].update(
             {k: v for k, v in best_params.items() if k in (
-                "atr_stop_mult", "atr_t1_mult", "atr_t2_mult",
+                "atr_stop_mult",
             )}
         )
         prepared = prepare_backtest_data(kline_df, params=structured, compute_exit_strategy=False, vectorized=True)

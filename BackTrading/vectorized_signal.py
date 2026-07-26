@@ -618,6 +618,10 @@ def compute_signals(
         "MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,
         "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10,
     }
+    # 归一化权重至总和 100，保证阈值 80/60/40 是统一的百分比语义
+    _ws = sum(weights.values())
+    if _ws > 0 and _ws != 100:
+        weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
 
     close = stock_df["close"]
     dif = stock_df["DIF"]
@@ -630,6 +634,13 @@ def compute_signals(
     decay_half_life = int(div_p.get("decay_half_life", 8))
     slope_window = int(div_p.get("slope_window", 5))
     vol_norm_denom = float(score_p.get("vol_norm_denominator", 0.15))
+    try:
+        _gs = (dif - dea).abs() / atr.replace(0, np.nan)
+        _v = _gs.dropna()
+        if len(_v) > 10:
+            vol_norm_denom = float(_v.quantile(0.75))
+    except Exception:
+        pass
     cross_decay_days = int(score_p.get("cross_decay_days", 30))
     cross_decay_min = float(score_p.get("cross_decay_min", 0.3))
     atr_stop_mult = float(

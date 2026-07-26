@@ -176,7 +176,14 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             files.extend(sorted(bucket_dir.glob("*.parquet")))
     if not files:
         return None
-    parts = [pd.read_parquet(f) for f in files]
+    parts = []
+    for f in files:
+        try:
+            parts.append(pd.read_parquet(f))
+        except Exception:
+            _logger.warning("跳过损坏的缓存文件: %s", f)
+    if not parts:
+        return None
     df = pd.concat(parts, ignore_index=True)
     # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
@@ -211,7 +218,7 @@ def prepare_backtest_data(
     vectorized: bool = False,
 ) -> pd.DataFrame:
     is_flat = params is not None and (
-        "atr_stop_mult" in params or "atr_t2_mult" in params
+        "atr_stop_mult" in params
         or "conclusion_full_bull" in params or "golden_cross_bonus" in params
     )
 
@@ -229,7 +236,6 @@ def prepare_backtest_data(
         cfg = Config()
         base = _build_params(cfg)
         base["scoring"].update({k: v for k, v in params.items() if k in (
-            "atr_t1_mult", "atr_t2_mult",
             "cross_decay_days", "cross_decay_min",
             "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
             "expected_return_lookback",
@@ -261,6 +267,16 @@ def prepare_backtest_data(
         merged = apply_ml_signal(merged)
         if _saved_atr_stop is not None and "ATR" in merged.columns:
             merged["止损价"] = merged["close"] - merged["ATR"] * _saved_atr_stop
+        _first_date = merged["trade_date"].iloc[0]
+        _first = merged[merged["trade_date"] == _first_date]
+        _fe = _first["进场评分"]
+        logger.info(f"[DIAG] 首日 {_first_date} 进场评分: min={_fe.min():.1f} max={_fe.max():.1f} mean={_fe.mean():.1f} median={_fe.median():.1f} >=60={(_fe>=60).sum()}/{len(_fe)}")
+        _dates = merged["trade_date"].unique()
+        if len(_dates) > 100:
+            _mid_date = _dates[100]
+            _mid = merged[merged["trade_date"] == _mid_date]
+            _me = _mid["进场评分"]
+            logger.info(f"[DIAG] 第100日 {_mid_date} 进场评分: min={_me.min():.1f} max={_me.max():.1f} mean={_me.mean():.1f} median={_me.median():.1f} >=60={(_me>=60).sum()}/{len(_me)}")
         return merged
 
     if done:
@@ -472,7 +488,7 @@ def _stock_worker_vectorized(
                 "divergence": float(row["divergence"]),
                 "vol_price": float(row["vol_price"]),
                 "kline": float(row["kline"]),
-                "exit_strategy": {"stop_loss": float(row["stop_loss"])} if compute_exit_strategy else {},
+                "exit_strategy": {"stop_loss": float(row["stop_loss"])} if compute_exit_strategy else {"stop_loss": 0.0},
             })
         return rows
     except BaseException:

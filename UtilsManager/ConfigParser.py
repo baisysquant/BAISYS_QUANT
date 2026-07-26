@@ -357,7 +357,7 @@ class BacktestConfig(BaseModel):
     ENABLED: bool = True
     OPTIMIZE_FREQUENCY: str = "monthly"
     BACKTEST_START_DATE: str = Field(default="20200101", pattern=r"^\d{8}$")
-    OUT_OF_SAMPLE_DAYS: int = Field(default=20, ge=5, le=120)
+    OUT_OF_SAMPLE_DAYS: int = Field(default=120, ge=20, le=504)
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
     FULL_A_SHARE_MODE: bool = Field(default=False)
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01)
@@ -372,18 +372,16 @@ class BacktestConfig(BaseModel):
     # 贝叶斯优化预算
     BAYESIAN_N_INIT_SIGNAL: int = Field(default=15, ge=5, le=50)
     BAYESIAN_N_ITER_SIGNAL: int = Field(default=35, ge=10, le=200)
-    BAYESIAN_N_INIT_PORTFOLIO: int = Field(default=20, ge=5, le=100)
-    BAYESIAN_N_ITER_PORTFOLIO: int = Field(default=150, ge=20, le=500)
+    BAYESIAN_N_INIT_PORTFOLIO: int = Field(default=50, ge=5, le=100)
+    BAYESIAN_N_ITER_PORTFOLIO: int = Field(default=250, ge=20, le=500)
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
-    ATR_T1_MULT_RANGE: str = "2.0,6.0,1.0"
     KELLY_FRACTION_RANGE: str = "0.1,0.5,0.1"
     POSITION_A_RANGE: str = "0.2,0.5,0.05"
     LIQ_VETO_RATIO_RANGE: str = "0.03,0.10,0.01"
     BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
     CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
-    ATR_T2_MULT_RANGE: str = "3.0,10.0,1.0"
     CONCLUSION_FULL_BULL_RANGE: str = "60,95,5"
     GOLDEN_CROSS_BONUS_RANGE: str = "5,20,5"
     DIVERGENCE_PENALTY_RANGE: str = "10,40,5"
@@ -419,7 +417,7 @@ class TradingCostConfig(BaseModel):
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01,
                                     description="佣金费率（默认万三）")
     STAMP_TAX_RATE: float = Field(default=0.001, ge=0, le=0.01,
-                                   description="印花税费率（卖出收取，默认千一）")
+                                    description="印花税费率（卖出收取，2023.8 起万五）")
     TRANSFER_FEE_RATE: float = Field(default=0.00001, ge=0, le=0.001,
                                       description="过户费率（双向，默认万0.1）")
 
@@ -437,7 +435,7 @@ class PositionSizingConfig(BaseModel):
                                        description="最大单票仓位")
     KELLY_FRACTION: float = Field(default=0.25, ge=0.0, le=1.0,
                                   description="半凯利系数")
-    DEFAULT_WIN_RATE: float = Field(default=0.50, ge=0.0, le=1.0,
+    DEFAULT_WIN_RATE: float = Field(default=0.55, ge=0.0, le=1.0,
                                     description="默认胜率假设")
     POSITION_A: float = Field(default=0.30, ge=0.0, le=1.0,
                               description="A级基础仓位")
@@ -611,10 +609,6 @@ class Config:
                 sc.CROSS_DECAY_DAYS = int(bt_cal["CROSS_DECAY_DAYS"])
             if "ATR_STOP_MULT" in bt_cal:
                 sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
-            if "ATR_T1_MULT" in bt_cal:
-                sc.ATR_T1_MULT = float(bt_cal["ATR_T1_MULT"])
-            if "ATR_T2_MULT" in bt_cal:
-                sc.ATR_T2_MULT = float(bt_cal["ATR_T2_MULT"])
             if "LIQ_VETO_RATIO" in bt_cal:
                 fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
             if "KELLY_FRACTION" in bt_cal:

@@ -37,8 +37,6 @@ class ParamSpace:
 # config.ini _RANGE 字段名 → 参数名映射
 _RANGE_TO_PARAM: dict[str, str] = {
     "ATR_STOP_MULT_RANGE": "atr_stop_mult",
-    "ATR_T1_MULT_RANGE": "atr_t1_mult",
-    "ATR_T2_MULT_RANGE": "atr_t2_mult",
     "KELLY_FRACTION_RANGE": "kelly_fraction",
     "POSITION_A_RANGE": "position_a",
     "LIQ_VETO_RATIO_RANGE": "liq_veto_ratio",

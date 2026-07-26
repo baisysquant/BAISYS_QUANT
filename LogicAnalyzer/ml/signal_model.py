@@ -7,6 +7,8 @@ from loguru import logger
 _RETRAIN_FREQ = 60
 _RETRAIN_EVERY = 20
 _TRAIN_WINDOW = 120  # 最多用最近 120 天训练
+_VAL_SPLIT = 0.8     # 训练窗口内 80% 训练，20% 验证（时序前 train 后 val）
+_EARLY_STOP_ROUNDS = 15
 
 _FEATURE_CN = [
     "MACD趋势分", "金叉信号分", "柱状动能分",
@@ -18,6 +20,8 @@ _EXTRA_FEATURES = ["atr_log", "ret_5d"]
 _FEATURE_ALL = _FEATURE_CN + _EXTRA_FEATURES
 
 _TARGET = "fwd_5d"
+_TARGET_CLIP_LOW = 0.01    # 去极值底部分位数
+_TARGET_CLIP_HIGH = 0.99   # 去极值顶部分位数
 
 _HAS_XGB = False
 try:
@@ -28,6 +32,15 @@ except ImportError:
     pass
 
 
+def _cross_sectional_rank(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """逐日对指定列做横截面排名，转为 [0, 1] 百分位。"""
+    df = df.copy()
+    for col in cols:
+        ranks = df.groupby("trade_date")[col].rank(pct=True)
+        df[col] = ranks.fillna(0.5).astype(np.float64)
+    return df
+
+
 def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_log"] = np.log(df.get("ATR", 0).clip(lower=1e-8))
     for sym, grp in df.groupby("symbol"):
@@ -35,6 +48,12 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
         close = grp["close"]
         df.loc[idx, "ret_5d"] = close / close.shift(5).fillna(close.iloc[:6].mean()) - 1
         df.loc[idx, _TARGET] = close.shift(-5) / close - 1
+    # 横截面标准化所有特征
+    df = _cross_sectional_rank(df, _FEATURE_ALL)
+    # 标签去极值
+    low = df[_TARGET].quantile(_TARGET_CLIP_LOW)
+    high = df[_TARGET].quantile(_TARGET_CLIP_HIGH)
+    df[_TARGET] = df[_TARGET].clip(low, high)
     return df
 
 
@@ -54,7 +73,7 @@ def _cross_sectional_z(
 class BaseSignalModel:
     """Abstract base — shared interface for Ridge and XGBoost variants."""
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> bool:
+    def fit(self, X: np.ndarray, y: np.ndarray, X_val: np.ndarray | None = None, y_val: np.ndarray | None = None) -> bool:
         raise NotImplementedError
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -70,7 +89,7 @@ class RidgeSignalModel(BaseSignalModel):
         self.l2_alpha = l2_alpha
         self.coef_: np.ndarray | None = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> bool:
+    def fit(self, X: np.ndarray, y: np.ndarray, X_val: np.ndarray | None = None, y_val: np.ndarray | None = None) -> bool:
         n, p = X.shape
         if n < p + 10:
             return False
@@ -89,14 +108,15 @@ class RidgeSignalModel(BaseSignalModel):
 
 
 class XGBSignalModel(BaseSignalModel):
-    def __init__(self, n_estimators: int = 80, max_depth: int = 4, lr: float = 0.1):
+    def __init__(self, n_estimators: int = 500, max_depth: int = 4, lr: float = 0.05):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.lr = lr
         self._model: xgb.Booster | None = None  # type: ignore[name-defined]
         self._importances: np.ndarray | None = None
+        self._best_iteration: int = 0
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> bool:
+    def fit(self, X: np.ndarray, y: np.ndarray, X_val: np.ndarray | None = None, y_val: np.ndarray | None = None) -> bool:
         if not _HAS_XGB:
             return False
         n, p = X.shape
@@ -108,18 +128,29 @@ class XGBSignalModel(BaseSignalModel):
                 "objective": "reg:squarederror",
                 "max_depth": self.max_depth,
                 "eta": self.lr,
-                "subsample": 0.3,
+                "subsample": 0.7,
                 "colsample_bytree": 0.7,
-                "alpha": 0.05,
-                "lambda": 1.0,
+                "alpha": 0.5,
+                "lambda": 2.0,
+                "min_child_weight": 5,
                 "n_jobs": -1,
                 "verbosity": 0,
             }
-            self._model = xgb.train(params, dtrain, num_boost_round=self.n_estimators)  # type: ignore[attr-defined]
+            evals = [(dtrain, "train")]
+            if X_val is not None and y_val is not None and len(y_val) >= 20:
+                dval = xgb.DMatrix(X_val, label=y_val)  # type: ignore[attr-defined]
+                evals.append((dval, "eval"))
+            self._model = xgb.train(
+                params, dtrain, num_boost_round=self.n_estimators,
+                evals=evals,
+                early_stopping_rounds=_EARLY_STOP_ROUNDS if len(evals) > 1 else None,
+                verbose_eval=False,
+            )  # type: ignore[attr-defined]
             fs = self._model.get_score(importance_type="weight")
             self._importances = np.array([fs.get(f"f{i}", 0) for i in range(p)], dtype=float)
             if self._importances.sum() > 0:
                 self._importances /= self._importances.sum()
+            self._best_iteration = getattr(self._model, "best_iteration", self.n_estimators)
             return True
         except Exception:
             return False
@@ -183,13 +214,23 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
 
         if should_retrain:
             cut_idx = max(0, i - _TRAIN_WINDOW)
-            window_mask = (df["trade_date"] >= dates[cut_idx]) & (df["trade_date"] < date)
-            train_X = df.loc[window_mask, _FEATURE_ALL].values.astype(np.float64)
-            train_y_raw = df.loc[window_mask, _TARGET].values.astype(np.float64)
-            valid = np.isfinite(train_y_raw) & np.all(np.isfinite(train_X), axis=1)
-            if valid.sum() < 20:
+            window_dates = dates[cut_idx:i]
+            split = int(len(window_dates) * _VAL_SPLIT)
+            train_dates = window_dates[:split]
+            val_dates = window_dates[split:]
+            train_mask = df["trade_date"].isin(train_dates)
+            val_mask = df["trade_date"].isin(val_dates)
+            train_X = df.loc[train_mask, _FEATURE_ALL].values.astype(np.float64)
+            train_y_raw = df.loc[train_mask, _TARGET].values.astype(np.float64)
+            train_ok = np.isfinite(train_y_raw) & np.all(np.isfinite(train_X), axis=1)
+            val_X = df.loc[val_mask, _FEATURE_ALL].values.astype(np.float64) if len(val_dates) > 0 else None
+            val_y = df.loc[val_mask, _TARGET].values.astype(np.float64) if val_X is not None else None
+            val_ok = np.isfinite(val_y) & np.all(np.isfinite(val_X), axis=1) if val_X is not None else None
+            if train_ok.sum() < 20:
                 continue
-            if not model.fit(train_X[valid], train_y_raw[valid]):
+            X_val = val_X[val_ok] if val_ok is not None and val_ok.sum() >= 20 else None
+            y_val = val_y[val_ok] if val_ok is not None and val_ok.sum() >= 20 else None
+            if not model.fit(train_X[train_ok], train_y_raw[train_ok], X_val, y_val):
                 continue
             last_train_date_idx = i
 
@@ -228,4 +269,6 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
         fi = model.feature_importances()
         fi_str = " | ".join(f"{n}: {v:.1%}" for n, v in fi[:5])
         logger.info(f"[ML] 特征重要性 Top5: {fi_str}")
+        if model._best_iteration:
+            logger.info(f"[ML] XGBoost 早停: best_iteration={model._best_iteration}")
     return df

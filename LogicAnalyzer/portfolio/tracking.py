@@ -51,7 +51,7 @@ class PositionTrackingService:
 
         tc = getattr(self.config, "TRADING_COST_PARAMS", {})
         self.buy_fee_rate = tc.get("commission_rate", 0.0003) + tc.get("transfer_fee_rate", 0.00001)
-        self.sell_fee_rate = tc.get("commission_rate", 0.0003) + tc.get("stamp_tax_rate", 0.001) + tc.get("transfer_fee_rate", 0.00001)
+        self.sell_fee_rate = tc.get("commission_rate", 0.0003) + tc.get("stamp_tax_rate", 0.0005) + tc.get("transfer_fee_rate", 0.00001)
 
     # ── 主入口 ────────────────────────────────────────────────
 

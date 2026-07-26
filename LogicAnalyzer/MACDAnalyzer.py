@@ -258,6 +258,15 @@ class MACDAnalyzer:
         slope_window = _div_p.get('slope_window', slope_window)
         div_strength_threshold = _div_p.get('strength_threshold', 0.15)
         vol_norm_denom = _score_p.get('vol_norm_denominator', 0.15)
+        # 数据驱动：|DIF-DEA|/ATR 的 75% 分位数作为归一化分母
+        try:
+            if all(c in df.columns for c in ['DIF', 'DEA', 'ATR']):
+                _gs = (df['DIF'] - df['DEA']).abs() / df['ATR'].replace(0, float('nan'))
+                _v = _gs.dropna()
+                if len(_v) > 10:
+                    vol_norm_denom = float(_v.quantile(0.75))
+        except Exception:
+            pass
         cross_decay_days = _score_p.get('cross_decay_days', 30)
         cross_decay_min = _score_p.get('cross_decay_min', 0.3)
         kline_decay_days = _score_p.get('kline_decay_days', 10)
@@ -267,6 +276,10 @@ class MACDAnalyzer:
         if weights is None:
             weights = {"MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,
                        "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10}
+        # 归一化权重至总和 100
+        _ws = sum(weights.values())
+        if _ws > 0 and _ws != 100:
+            weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
         if thresholds is None:
             _th = _p.get("thresholds", {})
             thresholds = {"fully_bull": _th.get("fully_bull", 80),

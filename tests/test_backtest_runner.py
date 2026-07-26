@@ -101,8 +101,6 @@ class TestWriteCalibrationToIni:
             kelly_fraction = 0.25
             # 流动性否决阈值
             liq_veto_ratio = 0.05
-            # T2 目标 ATR 倍数
-            atr_t2_mult = 5.0
             # A 级评分阈值
             conclusion_full_bull = 80
             # R04 金叉加分
@@ -123,7 +121,6 @@ class TestWriteCalibrationToIni:
                 "cross_decay_days": 20,
                 "kelly_fraction": 0.15,
                 "liq_veto_ratio": 0.03,
-                "atr_t2_mult": 7.0,
                 "conclusion_full_bull": 85,
                 "golden_cross_bonus": 15,
                 "divergence_penalty": 25,
@@ -136,7 +133,6 @@ class TestWriteCalibrationToIni:
             assert "cross_decay_days = 20" in updated
             assert "kelly_fraction = 0.15" in updated
             assert "liq_veto_ratio = 0.03" in updated
-            assert "atr_t2_mult = 7" in updated or "atr_t2_mult = 7.0" in updated
             assert "conclusion_full_bull = 85" in updated
             assert "golden_cross_bonus = 15" in updated
             assert "divergence_penalty = 25" in updated

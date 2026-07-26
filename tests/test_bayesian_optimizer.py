@@ -55,9 +55,9 @@ def basic_engine_cfg() -> object:
     from BackTrading.domain.models import CostModel
     return EngineConfig(
         initial_cash=1_000_000,
-        commission_rate=0.0003, stamp_tax_rate=0.001, slippage=0.001,
+        commission_rate=0.0003, stamp_tax_rate=0.0005, slippage=0.001,
         max_position_pct=0.1, portfolio_method="score_weighted", point_in_time=True,
-        cost_model=CostModel(commission_rate=0.0003, stamp_tax_rate=0.001, market_slippage=0.001),
+        cost_model=CostModel(commission_rate=0.0003, stamp_tax_rate=0.0005, market_slippage=0.001),
     )
 
 
