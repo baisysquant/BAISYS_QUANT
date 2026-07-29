@@ -189,12 +189,13 @@ class FactorCalculator:
         """
         if df.empty:
             return pd.Series(dtype=float)
+        _0 = pd.Series(0.0, index=df.index)
         composite = (
-            df.get("roe", 0).fillna(0) * 0.30
-            + df.get("gross_profit_margin", 0).fillna(0) * 0.20
-            + df.get("net_profit_margin", 0).fillna(0) * 0.20
-            + df.get("revenue_growth", 0).fillna(0) * 0.15
-            + df.get("net_profit_growth", 0).fillna(0) * 0.15
+            df.get("roe", _0).fillna(0) * 0.30
+            + df.get("gross_profit_margin", _0).fillna(0) * 0.20
+            + df.get("net_profit_margin", _0).fillna(0) * 0.20
+            + df.get("revenue_growth", _0).fillna(0) * 0.15
+            + df.get("net_profit_growth", _0).fillna(0) * 0.15
         )
         return FactorCalculator._industry_zscore(
             composite, df.get(industry_col, pd.Series(dtype=str))
@@ -528,9 +529,8 @@ class FactorCalculator:
             result[c] * ic_w.get(_COL_TO_KEY[c], 0) for c in _score_cols
         )
 
-        # 映射回 0-100 评分
-        raw = result["综合分析评分"]
-        result["综合分析评分"] = ((raw - raw.min()) / (raw.max() - raw.min() + 1e-10) * 100).clip(0, 100)
+        # 映射回 0-100 评分：横截面百分位（非 min-max，避免极值压缩）
+        result["综合分析评分"] = result["综合分析评分"].rank(pct=True) * 99 + 1
 
         # 行业截面百分位（用于步骤 14 过滤）
         result = self._add_industry_percentiles(result, industry_col)

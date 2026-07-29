@@ -135,6 +135,7 @@ def allocate_weights(
     risk_none_multiplier: float = 1.0,
     prev_weights: dict[str, float] | None = None,
     industry_col: str | None = None,
+    min_entry_score: float = 60,
 ) -> dict[str, float]:
     """在给定评分下分配组合权重。
 
@@ -143,11 +144,12 @@ def allocate_weights(
         method: risk_parity / min_variance / mean_variance / score_weighted
         max_weight: 单票权重上限
         lookback: 协方差估计的回看天数
+        min_entry_score: 进场评分最低门槛（默认 60，为 0 时完全依赖调用方过滤）
     """
     if bars.empty:
         return {}
 
-    candidates = bars[bars[entry_col] >= 60].copy()
+    candidates = bars[bars[entry_col] >= min_entry_score].copy()
     if candidates.empty:
         return {}
 

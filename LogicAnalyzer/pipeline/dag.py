@@ -196,6 +196,11 @@ class DagPipeline:
             if isinstance(df, pd.DataFrame) and not df.empty:
                 path = os.path.join(self.cache_dir, f"ckpt_{safe}_{trade_date}.parquet")
                 df = df.replace(r'^\s*$', pd.NA, regex=True)
+                df = df.replace(["N/A", "NA", "NaN", "None", "null"], pd.NA)
+                for _c in df.select_dtypes(include="object").columns:
+                    numeric_version = pd.to_numeric(df[_c], errors="coerce")
+                    if numeric_version.notna().any():
+                        df[_c] = numeric_version
                 df.to_parquet(path, index=False)
         # 保存上下文，供跨进程恢复使用
         ctx_path = os.path.join(self.cache_dir, f"ctx_{safe}_{trade_date}.json")

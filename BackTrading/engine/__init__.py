@@ -27,7 +27,7 @@ class EngineConfig:
     cross_decay_days: int = 30
     risk_none_multiplier: float = 1.0
     max_holdings: int = 0  # 0=不限制
-    buy_threshold: int = 60  # 买入评分阈值
+    buy_threshold: int = 15  # 买入评分阈值
     min_commission_per_trade: float = 5.0  # A股每笔最低佣金 5 元
     cost_model: Any = None  # CostModel | None — forward ref to avoid circular import
 

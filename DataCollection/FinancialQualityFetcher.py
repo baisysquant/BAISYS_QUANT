@@ -176,40 +176,73 @@ class FinancialQualityFetcher:
 
     def sync(self, stock_list: list[str], today_str: str | None = None,
              max_workers: int = 2) -> int:
-        """并发采集全股池，跳过缓存未过期的，返回采集数量。
+        """并发采集全股池，增量补全，返回此次采集数量。
 
-        若提供 ``today_str`` 且对应缓存文件存在，直接读缓存入库，跳过 API。
-        ``max_workers`` 控制并发管道数，默认 2 路。
-        先全部采集到内存 → 保存本地缓存 → 最后一次性批量写入 DB。
+        流程：
+        1. 合并已有数据：今日缓存（文件）∪ 数据库已有记录
+        2. 仅采集 stock_list 中缺失的股票
+        3. 新采集的追加到缓存文件（不覆盖）
+        4. 批量写入 DB
         """
-        # ── 文件缓存命中 ──────────────────────────────────────
-        if today_str:
-            cached = self._load_cache(today_str)
-            if cached is not None and not cached.empty:
-                rows = cached.to_dict("records")
-                written = self._bulk_upsert(rows)
-                logger.info(f"[FinancialQuality] 缓存命中，写入 {written} 只到数据库，跳过 API")
-                return written
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        from sqlalchemy import text
 
-        # ── 判断哪些需要采集 ──────────────────────────────────
-        stale = [s for s in stock_list if self.is_stale(s)]
-        if not stale:
-            logger.info("[FinancialQuality] 无需采集，全部未过期")
+        target_set = set(stock_list)
+        if not target_set:
             return 0
 
-        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        already: set[str] = set()
+
+        # ── 1a. 加载今日缓存（增量 checkpoint） ──
+        cached_df: pd.DataFrame | None = None
+        if today_str:
+            cached_df = self._load_cache(today_str)
+            if cached_df is not None and not cached_df.empty:
+                cached_syms = set(cached_df["symbol"].unique())
+                already |= cached_syms
+                logger.info(f"[FinancialQuality] 缓存已有 {len(cached_syms)} 只")
+
+        # ── 1b. 查询数据库最新 record_date，仅未过期的才跳过 ──
+        cutoff = (datetime.now().date() - timedelta(days=self._cache_days))
+        fresh_db_syms: set[str] = set()
+        stale_db_count = 0
+        try:
+            placeholders = ", ".join(f":s{i}" for i in range(len(stock_list)))
+            params = {f"s{i}": s for i, s in enumerate(stock_list)}
+            sql = text(
+                f"SELECT symbol, MAX(record_date) AS max_date FROM {self.TABLE_NAME} "
+                f"WHERE symbol IN ({placeholders}) "
+                "GROUP BY symbol"
+            )
+            with self._engine.connect() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            for sym, max_date in rows:
+                if max_date and max_date >= cutoff:
+                    fresh_db_syms.add(sym)
+                else:
+                    stale_db_count += 1
+            already |= fresh_db_syms
+            logger.info(f"[FinancialQuality] 数据库最新数据未过期 {len(fresh_db_syms)} 只，过期需重采 {stale_db_count} 只")
+        except Exception as e:
+            logger.warning(f"[FinancialQuality] 查询数据库失败: {e}")
+
+        # ── 2. 筛选需采集的股票 ──
+        need = sorted(target_set - already)
+        if not need:
+            logger.info(f"[FinancialQuality] 全部 {len(target_set)} 只已采集，跳过")
+            return 0
+
+        logger.info(f"[FinancialQuality] 需采集 {len(need)}/{len(target_set)} 只（{max_workers} 路并发）...")
 
         all_rows: list[dict[str, Any]] = []
-        total = len(stale)
+        total = len(need)
         done = 0
         failed = 0
 
-        logger.info(f"[FinancialQuality] 开始并发采集 {total} 只（{max_workers} 路）...")
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            fut_to_sym = {pool.submit(self.fetch_one, sym): sym for sym in stale}
+            fut_to_sym = {pool.submit(self.fetch_one, sym): sym for sym in need}
             while fut_to_sym:
                 done_set, not_done = wait(fut_to_sym, timeout=120, return_when=FIRST_COMPLETED)
-                # ── 超时：120s 内无任何完成 → 跳过剩余全部 ──
                 if not done_set and not_done:
                     for fut in not_done:
                         sym = fut_to_sym.get(fut, "?")
@@ -234,16 +267,20 @@ class FinancialQualityFetcher:
                     if done % 50 == 0 or done == total:
                         logger.info(f"[FinancialQuality] 进度 {done}/{total}，已采集 {len(all_rows)} 只，失败 {failed} 只")
 
-        skipped = total - len(all_rows)
-        # ── 保存缓存文件 ──────────────────────────────────────
+        # ── 追加到缓存文件（不覆盖已有） ──
         if today_str and all_rows:
-            self._save_cache(today_str, all_rows)
+            new_df = pd.DataFrame(all_rows)
+            if cached_df is not None and not cached_df.empty:
+                combined = pd.concat([cached_df, new_df], ignore_index=True)
+            else:
+                combined = new_df
+            self._save_cache(today_str, combined)
 
-        # ── 一次性批量写入 DB ──────────────────────────────────
+        # ── 批量写入 DB ──
         if all_rows:
             self._bulk_upsert(all_rows)
 
-        logger.info(f"[FinancialQuality] 完成，采集 {len(all_rows)}/{total} 只，失败 {failed} 只")
+        logger.info(f"[FinancialQuality] 完成，此次采集 {len(all_rows)}/{total} 只，累计 {len(already | {r['symbol'] for r in all_rows})} 只")
         return len(all_rows)
 
     def load_quality(self, symbols: list[str] | None = None) -> pd.DataFrame:

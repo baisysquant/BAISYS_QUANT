@@ -30,7 +30,7 @@ _SIGNAL_PARAM_KEYS = frozenset({
 _TUNABLE_CFG_FIELDS = frozenset({
     "atr_stop_mult", "kelly_fraction", "position_a",
     "liq_veto_ratio", "boll_narrow_ratio", "cross_decay_days",
-    "risk_none_multiplier",
+    "risk_none_multiplier", "buy_threshold", "max_holdings",
 })
 
 # ── 全局信号缓存（跨路径/跨窗口共享） ──

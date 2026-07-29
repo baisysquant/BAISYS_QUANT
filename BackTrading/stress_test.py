@@ -5,8 +5,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import _run_single_backtest
-from BackTrading.domain.models import EngineConfig
+from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
 
 # 历史极端场景（基于已知 A 股危机时段）

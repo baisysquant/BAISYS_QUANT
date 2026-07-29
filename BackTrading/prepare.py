@@ -216,6 +216,7 @@ def prepare_backtest_data(
     signal_param_hash: str | None = None,
     compute_exit_strategy: bool = False,
     vectorized: bool = False,
+    backtest_start_date: str | None = None,
 ) -> pd.DataFrame:
     is_flat = params is not None and (
         "atr_stop_mult" in params
@@ -277,6 +278,21 @@ def prepare_backtest_data(
             _mid = merged[merged["trade_date"] == _mid_date]
             _me = _mid["进场评分"]
             logger.info(f"[DIAG] 第100日 {_mid_date} 进场评分: min={_me.min():.1f} max={_me.max():.1f} mean={_me.mean():.1f} median={_me.median():.1f} >=60={(_me>=60).sum()}/{len(_me)}")
+        _last_date = _dates[-1]
+        _last = merged[merged["trade_date"] == _last_date]
+        _le = _last["进场评分"]
+        logger.info(f"[DIAG] 末日 {_last_date} 进场评分: min={_le.min():.1f} max={_le.max():.1f} mean={_le.mean():.1f} median={_le.median():.1f} >=60={(_le>=60).sum()}/{len(_le)}")
+        # 截断指标预热缓冲期：仅保留 backtest_start_date 之后的数据
+        if backtest_start_date is not None:
+            n_before = len(merged)
+            if pd.api.types.is_datetime64_any_dtype(merged["trade_date"]):
+                _cutoff = pd.Timestamp(backtest_start_date)
+                merged = merged[merged["trade_date"] >= _cutoff].copy()
+            else:
+                merged = merged[merged["trade_date"] >= backtest_start_date].copy()
+            n_cut = n_before - len(merged)
+            if n_cut > 0:
+                logger.info(f"[DIAG] 截断 {n_cut} 行指标预热缓冲数据（< {backtest_start_date}）")
         return merged
 
     if done:
@@ -449,6 +465,10 @@ def _stock_worker_vectorized(
 
         _validate_stock_data(stock_df, symbol)
 
+        if stock_df.attrs.get("_invalid", False):
+            logger.warning(f"[{symbol}] 数据无效，跳过信号计算")
+            return []
+
         # 自动适应波动率调整背离距离
         from LogicAnalyzer.signals.divergence import adaptive_distance
         _dd = adaptive_distance(stock_df["DIF"], base_distance=10) if "DIF" in stock_df.columns else 11
@@ -522,9 +542,16 @@ _REV_SIGNAL_COL_MAP = _SIGNAL_COL_MAP
 
 
 def _validate_stock_data(df: pd.DataFrame, symbol: str) -> None:
-    """数据质量检查：零价格、缺失值、涨跌停。仅 warn 不阻断。"""
+    """数据质量检查：零价格、缺失值、涨跌停。标记无效股票让下游跳过。"""
     if (df[["open", "high", "low", "close"]] <= 0).any().any():
-        logger.warning(f"[{symbol}] 存在非正价格，可能停牌或数据异常")
+        logger.warning(f"[{symbol}] 存在非正价格，可能停牌或数据异常，标记为无效")
+        df.attrs["_invalid"] = True
+        return
+    if df["close"].isna().all() or df["volume"].isna().all():
+        logger.warning(f"[{symbol}] 全部价格或成交量为空，标记为无效")
+        df.attrs["_invalid"] = True
+        return
+    df.attrs["_invalid"] = False
     nan_frac = df[["open", "high", "low", "close", "volume"]].isna().sum().sum() / (
         len(df) * 5
     )

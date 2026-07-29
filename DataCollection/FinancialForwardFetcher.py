@@ -124,7 +124,7 @@ class FinancialForwardFetcher:
             import subprocess
             r = subprocess.run(
                 [sys.executable, "-c", script],
-                timeout=60, capture_output=True, text=True,
+                timeout=60, capture_output=True, encoding="utf-8",
             )
             if r.returncode != 0 or "OK" not in r.stdout:
                 raise RuntimeError(f"subprocess failed (rc={r.returncode}): {r.stderr[:200]}")

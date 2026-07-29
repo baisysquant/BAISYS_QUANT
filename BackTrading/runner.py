@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -192,7 +192,8 @@ def run_backtest_pipeline(
             logger.warning(f"模拟验证不通过，参数不写入 config.ini: {_sim_verdict.reason}")
 
         _log_step("prepare_final_signals")
-        final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True)
+        _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
+        final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso)
         _log_step("full_backtest")
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
@@ -481,8 +482,13 @@ def _fetch_kline(
     end = date.today()
     start = datetime.strptime(aligned_start, "%Y%m%d").date()
 
+    # 前拉缓冲期确保技术指标充分预热（MACD/ATR/MA等需至少 120 个交易日）
+    _buffer_trading_days = 180
+    _buffer_calendar_days = _buffer_trading_days * 2
+    buffer_start = (start - timedelta(days=_buffer_calendar_days)).isoformat()
+
     provider = BacktestDataProvider(engine)
-    df: pd.DataFrame = provider.get_kline(symbols, start_date=start.isoformat(), end_date=end.isoformat())
+    df: pd.DataFrame = provider.get_kline(symbols, start_date=buffer_start, end_date=end.isoformat())
     if df.empty:
         return df
     df = df.sort_values(["symbol", "trade_date"])

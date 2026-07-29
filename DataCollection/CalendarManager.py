@@ -168,6 +168,12 @@ class TradingCalendarAnalyzer:
 
         return current_str
 
+    def is_trading_day(self, date_str: str) -> bool:
+        """判断给定日期是否为交易日。支持 %Y-%m-%d 和 %Y%m%d 格式。"""
+        if len(date_str) == 8:
+            date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+        return date_str in self.get_official_trading_dates()
+
     def get_trading_day_offset(self, offset_days: int, base_date: str = None) -> str:
         official_dates = self.get_official_trading_dates()
 

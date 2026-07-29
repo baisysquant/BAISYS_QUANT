@@ -167,6 +167,9 @@ class MainCostDataManager:
         if self.cache_enabled and cache_file and os.path.exists(cache_file):
             try:
                 df = pd.read_csv(cache_file)
+                for col in ["最新价", "主力成本", "机构参与度", "涨跌幅", "市盈率", "综合得分"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
                 logger.info(f"从缓存加载主力成本数据: {cache_file}")
                 return df
             except Exception as e:

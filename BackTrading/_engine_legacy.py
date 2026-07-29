@@ -46,6 +46,7 @@ def _run_single_backtest(
     sym_to_idx = {s: i for i, s in enumerate(symbols)}
     n_syms = len(symbols)
     pos_value = np.zeros(n_syms, dtype=np.float64)
+    pos_shares = np.zeros(n_syms, dtype=np.int32)
 
     if engine_cfg.point_in_time:
         pit = data.groupby("symbol", sort=False)["trade_date"].min().to_dict()
@@ -53,9 +54,9 @@ def _run_single_backtest(
         pit = None
 
     cm = engine_cfg.cost_model
-    _adv_state: dict[str, tuple[float, int]] = {}  # symbol -> (expanding_mean, count)
-    _prev_bar: dict[str, tuple[float, float]] = {}  # symbol -> (prev_close, prev_atr)
-    _buy_date: dict[str, str] = {}  # symbol -> 买入日期（T+1 检查）
+    _adv_state: dict[str, tuple[float, int]] = {}
+    _prev_bar: dict[str, tuple[float, float]] = {}
+    _buy_date: dict[str, str] = {}
 
     use_sw = engine_cfg.portfolio_method == "score_weighted"
     max_pos_pct = engine_cfg.max_position_pct
@@ -69,6 +70,8 @@ def _run_single_backtest(
     _kelly = engine_cfg.kelly_fraction
     _pos_a = engine_cfg.position_a
     _atr_stop = engine_cfg.atr_stop_mult
+    _max_order_pct = 0.1
+    _top_k = 20  # 最大候选买入数（集中资金，避免每只分到极小额度 < 100 股）
 
     cash = float(init_cash)
 
@@ -81,6 +84,19 @@ def _run_single_backtest(
         new_m = m + (vol - m) / n
         _adv_state[sym] = (new_m, n)
         return new_m
+
+    def _calc_market_value() -> float:
+        held = np.where(pos_shares > 0)[0]
+        mtm = 0.0
+        for si in held:
+            s = symbols[si]
+            if s in close_lookup:
+                mtm += pos_shares[si] * close_lookup[s]
+            else:
+                mtm += pos_value[si]
+        return mtm
+
+    close_lookup: dict[str, float] = {}
 
     def _sell_proceeds_and_cost(sym: str, value: float, volume: float) -> tuple[float, float]:
         if cm is not None:
@@ -105,14 +121,17 @@ def _run_single_backtest(
     def _process_sell(dt, s_syms, s_idx, s_close, s_vol):
         total_sold = 0.0
         for j in range(len(s_syms)):
-            pv = float(pos_value[s_idx[j]])
-            if pv <= 0:
+            si = s_idx[j]
+            sh = int(pos_shares[si])
+            if sh <= 0:
                 continue
-            pos_value[s_idx[j]] = 0.0
-            proc, cst = _sell_proceeds_and_cost(s_syms[j], pv, float(s_vol[j]))
+            mv = sh * float(s_close[j])
+            pos_value[si] = 0.0
+            pos_shares[si] = 0
+            proc, cst = _sell_proceeds_and_cost(s_syms[j], mv, float(s_vol[j]))
             nonlocal cash
             cash += proc
-            total_sold += pv
+            total_sold += mv
             trade_log.append({
                 "time": dt, "symbol": s_syms[j], "action": "sell",
                 "price": float(s_close[j]), "value": round(proc, 2),
@@ -121,8 +140,7 @@ def _run_single_backtest(
         return total_sold
 
     if use_sw:
-        # ── Fast path: no cumulative_hist needed ──
-        for dt, grp in date_groups:
+        for i_day, (dt, grp) in enumerate(date_groups):
             day_data = grp.copy()
             if pit is not None:
                 sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
@@ -138,23 +156,34 @@ def _run_single_backtest(
             sell_score = day_data["退出评分"].values
             risk_str = day_data["风险等级"].astype(str).values
 
-            # ── 涨跌停/停牌检查 ──
-            _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+            if i_day % 20 == 0:
+                _bs_nonzero = buy_score[buy_score > 0]
+                if len(_bs_nonzero) > 0:
+                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score>=15).sum())} >=60={int((buy_score>=60).sum())}")
+                else:
+                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 全为零 ({len(buy_score)} 只)")
+
+            # ── 涨跌停/停牌检查（首日无 prev_bar 时跳过 limit 过滤） ──
             _limit_ratio = np.array([
-                0.20 if s.startswith(("30", "688")) else 0.10
+                0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10
                 for s in syms_str
             ], dtype=np.float64)
-            limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
-            limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
-            not_limit_up = close < limit_up_arr
-            not_limit_down = close > limit_down_arr
+            _have_prev = i_day > 0
+            if _have_prev:
+                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
+                limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+                not_limit_up = close < limit_up_arr
+                not_limit_down = close > limit_down_arr
+            else:
+                not_limit_up = np.ones(len(close), dtype=bool)
+                not_limit_down = np.ones(len(close), dtype=bool)
             has_volume = volume > 0
 
-            # ── 止损：信号列与 ATR 独立生效 ──
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
             stop_hit_col = (stop_col > 0) & (close < stop_col)
             stop_hit_atr = np.zeros(len(day_data), dtype=bool)
-            if _atr_stop > 0 and "ATR" in day_data.columns:
+            if _atr_stop > 0 and "ATR" in day_data.columns and _have_prev:
                 prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
                 prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
                 atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
@@ -164,31 +193,38 @@ def _run_single_backtest(
                     _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
             stop_hit = stop_hit_col | stop_hit_atr
 
-            total_value = cash + float(pos_value.sum())
+            close_lookup = dict(zip(syms_str, close))
+            total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
             # ── 卖出（含 T+1 检查） ──
-            held = pos_value[idx] > 0
+            held = pos_shares[idx] > 0
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score) & (sell_score > 0)
-                sel = held & (exit_high | exit_gt | stop_hit) & not_limit_down & has_volume & _t1_ok
+                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 2)
+                sel = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
                 si = np.where(sel)[0]
                 if len(si):
                     daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+                    close_lookup = dict(zip(syms_str, close))
+                    total_value = cash + _calc_market_value()
 
             # ── 买入 ──
-            buy_ok = (buy_score >= _buy_threshold) & (pos_value[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            # 动态阈值：取评分分布前 20% 作为当日阈值
+            _pct_80 = float(np.percentile(buy_score[buy_score > 0], 80)) if buy_score.max() > _buy_threshold else _buy_threshold
+            _effective_threshold = max(_buy_threshold, _pct_80)
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi) == 0 and len(date_groups) > 100 and np.any(buy_score >= _buy_threshold):
-                _diag_score = int((buy_score >= _buy_threshold).sum())
-                _diag_pos = int((pos_value[idx] == 0).sum())
+                _diag_score = int((buy_score >= _effective_threshold).sum())
+                _diag_pos = int((pos_shares[idx] == 0).sum())
                 _diag_risk = int((~np.isin(risk_str, ["HIGH", "D", "E"])).sum())
                 _diag_limit = int(not_limit_up.sum())
                 _diag_vol = int(has_volume.sum())
-                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_buy_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} 总={len(buy_ok)}")
+                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_effective_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} 总={len(buy_ok)}")
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
@@ -196,32 +232,44 @@ def _run_single_backtest(
                 b_vol = volume[bi]
                 b_risk_str = risk_str[bi]
 
-                risk_int = np.array([risk_key.get(r, 2) for r in b_risk_str], dtype=np.int32)
-                raw_w = 1.0 / risk_mult[risk_int] * _kelly
-                w = np.power(raw_w, _pos_a)
-                order = np.argsort(-w)
-                total_w = float(w.sum()) or 1.0
+                # Top-K 等权分配：集中资金到评分最高的 _top_k 只
+                if len(bi) > _top_k:
+                    b_scores = buy_score[bi]
+                    _top_indices = np.argpartition(-b_scores, _top_k)[:_top_k]
+                    b_syms = b_syms[_top_indices]
+                    b_idx = b_idx[_top_indices]
+                    b_close = b_close[_top_indices]
+                    b_vol = b_vol[_top_indices]
+                    b_risk_str = b_risk_str[_top_indices]
+                n_candidates = len(b_syms)
+                equal_weight = 1.0 / n_candidates if n_candidates > 0 else 0.0
 
-                existing = int((pos_value > 0).sum())
-                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else min(len(order), 50)
+                existing = int((pos_shares > 0).sum())
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else _top_k
                 bought = 0
-                for j in order:
+                for j in range(n_candidates):
                     if bought >= max_new:
                         break
                     si = b_idx[j]
-                    if pos_value[si] > 0:
+                    if pos_shares[si] > 0:
                         continue
-                    # 用可用现金分配（扣除 0.2% 税费预留），且单票不超过总资产 max_pos_pct
-                    tv = min(cash * 0.998 * (float(w[j]) / total_w), total_value * max_pos_pct)
                     price = float(b_close[j])
+                    tv = min(cash * equal_weight, total_value * max_pos_pct)
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:
                         continue
+                    _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
+                    if _adv_val > 100:
+                        max_shares_vol = int(_adv_val * _max_order_pct) // 100 * 100
+                        shares = min(shares, max_shares_vol)
+                        if shares < 100:
+                            continue
                     tv = shares * price
                     cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
                     if cash >= tv + cst:
                         cash -= tv + cst
                         pos_value[si] = tv
+                        pos_shares[si] = shares
                         daily_buy_value += tv
                         _buy_date[b_syms[j]] = str(dt)
                         trade_log.append({
@@ -232,16 +280,15 @@ def _run_single_backtest(
                         bought += 1
 
                 if bought == 0 and len(date_groups) > 100:
-                    _tv0 = min(cash * 0.998 * (float(w[order[0]]) / total_w), total_value * max_pos_pct)
-                    _p0 = float(b_close[order[0]])
+                    _p0 = float(b_close[0]) if n_candidates > 0 else 0
+                    _tv0 = min(cash * equal_weight, total_value * max_pos_pct) if n_candidates > 0 else 0
                     _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
-                    logger.info(f"[ENGINE-DIAG] {dt}: {len(bi)}候选 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  total_w={total_w:.2f}  max_pos_pct={max_pos_pct}")
+                    logger.info(f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}")
 
-            # ── ADV 更新（移后：使用今日数据为明日服务，不干扰今日买卖） ──
             for i_sym, i_vol in zip(syms_str, volume):
                 _update_adv(i_sym, i_vol)
 
-            total_value = cash + float(pos_value.sum())
+            total_value = cash + _calc_market_value()
             _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
             equity_curve.append({
                 "time": dt, "portfolio_value": round(total_value, 2),
@@ -250,7 +297,7 @@ def _run_single_backtest(
     else:
         # ── Legacy path: build cumulative_hist for allocate_weights ──
         cumulative_hist: pd.DataFrame | None = None
-        for dt, grp in date_groups:
+        for i_day, (dt, grp) in enumerate(date_groups):
             day_data = grp.copy()
             if pit is not None:
                 sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
@@ -276,23 +323,35 @@ def _run_single_backtest(
             sell_score = day_data["退出评分"].values
             risk_str = day_data["风险等级"].astype(str).values
 
-            # ── 涨跌停/停牌检查 ──
-            _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+            # ── 诊断：每 20 天打印一次 buy_score 分布 ──
+            if i_day % 20 == 0:
+                _bs_nonzero = buy_score[buy_score > 0]
+                if len(_bs_nonzero) > 0:
+                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score>=15).sum())} >=60={int((buy_score>=60).sum())}")
+                else:
+                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 全为零 ({len(buy_score)} 只)")
+
+            # ── 涨跌停/停牌检查（首日无 prev_bar 时跳过 limit 过滤） ──
             _limit_ratio = np.array([
-                0.20 if s.startswith(("30", "688")) else 0.10
+                0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10
                 for s in syms_str
             ], dtype=np.float64)
-            limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
-            limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
-            not_limit_up = close < limit_up_arr
-            not_limit_down = close > limit_down_arr
+            _have_prev = i_day > 0
+            if _have_prev:
+                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
+                limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+                not_limit_up = close < limit_up_arr
+                not_limit_down = close > limit_down_arr
+            else:
+                not_limit_up = np.ones(len(close), dtype=bool)
+                not_limit_down = np.ones(len(close), dtype=bool)
             has_volume = volume > 0
 
-            # ── 止损：信号列与 ATR 独立生效 ──
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
             stop_hit_col = (stop_col > 0) & (close < stop_col)
             stop_hit_atr = np.zeros(len(day_data), dtype=bool)
-            if _atr_stop > 0 and "ATR" in day_data.columns:
+            if _atr_stop > 0 and "ATR" in day_data.columns and _have_prev:
                 prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
                 prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
                 atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
@@ -302,22 +361,28 @@ def _run_single_backtest(
                     _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
             stop_hit = stop_hit_col | stop_hit_atr
 
-            total_value = cash + float(pos_value.sum())
+            close_lookup = dict(zip(syms_str, close))
+            total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
             # ── 卖出（含 T+1 检查） ──
-            held = pos_value[idx] > 0
+            held = pos_shares[idx] > 0
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score) & (sell_score > 0)
-                sel = held & (exit_high | exit_gt | stop_hit) & not_limit_down & has_volume & _t1_ok
+                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 2)
+                sel = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
                 si = np.where(sel)[0]
                 if len(si):
                     daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+                    close_lookup = dict(zip(syms_str, close))
+                    total_value = cash + _calc_market_value()
 
             # ── 买入 ──
-            buy_ok = (buy_score >= _buy_threshold) & (pos_value[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            _pct_80 = float(np.percentile(buy_score[buy_score > 0], 80)) if buy_score.max() > _buy_threshold else _buy_threshold
+            _effective_threshold = max(_buy_threshold, _pct_80)
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi):
@@ -330,30 +395,48 @@ def _run_single_backtest(
                     cumulative_hist, method=engine_cfg.portfolio_method,
                     max_weight=max_pos_pct,
                     entry_col="进场评分", risk_col="风险等级",
+                    min_entry_score=0,
                 )
                 w = np.array([w_dict.get(s, 0.0) for s in b_syms], dtype=np.float64)
-                order = np.argsort(-w)
                 total_w = float(w.sum()) or 1.0
 
-                existing = int((pos_value > 0).sum())
-                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else min(len(order), 50)
+                # Top-K 等权分配
+                if len(b_syms) > _top_k:
+                    b_scores_local = buy_score[bi]
+                    _top_indices = np.argpartition(-b_scores_local, _top_k)[:_top_k]
+                    b_syms = b_syms[_top_indices]
+                    b_idx = b_idx[_top_indices]
+                    b_close = b_close[_top_indices]
+                    b_vol = b_vol[_top_indices]
+                n_candidates = len(b_syms)
+                equal_weight = 1.0 / n_candidates if n_candidates > 0 else 0.0
+
+                existing = int((pos_shares > 0).sum())
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else _top_k
                 bought = 0
-                for j in order:
+                for j in range(n_candidates):
                     if bought >= max_new:
                         break
                     si = b_idx[j]
-                    if pos_value[si] > 0:
+                    if pos_shares[si] > 0:
                         continue
-                    tv = min(cash * 0.998 * (float(w[j]) / total_w), total_value * max_pos_pct)
                     price = float(b_close[j])
+                    tv = min(cash * equal_weight, total_value * max_pos_pct)
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:
                         continue
+                    _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
+                    if _adv_val > 100:
+                        max_shares_vol = int(_adv_val * _max_order_pct) // 100 * 100
+                        shares = min(shares, max_shares_vol)
+                        if shares < 100:
+                            continue
                     tv = shares * price
                     cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
                     if cash >= tv + cst:
                         cash -= tv + cst
                         pos_value[si] = tv
+                        pos_shares[si] = shares
                         daily_buy_value += tv
                         _buy_date[b_syms[j]] = str(dt)
                         trade_log.append({
@@ -363,16 +446,15 @@ def _run_single_backtest(
                         })
                         bought += 1
 
-            # ── ADV 更新（移后：使用今日数据为明日服务） ──
             for i_sym, i_vol in zip(syms_str, volume):
                 _update_adv(i_sym, i_vol)
 
-            total_value = cash + float(pos_value.sum())
+            total_value = cash + _calc_market_value()
             _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
             equity_curve.append({
                 "time": dt, "portfolio_value": round(total_value, 2),
                 "turnover": round(_turnover, 6),
             })
 
-    final_value = cash + float(pos_value.sum())
-    return (final_value / init_cash) - 1
+    total_value = cash + _calc_market_value()
+    return (total_value / init_cash) - 1
