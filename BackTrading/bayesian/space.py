@@ -46,6 +46,8 @@ _RANGE_TO_PARAM: dict[str, str] = {
     "GOLDEN_CROSS_BONUS_RANGE": "golden_cross_bonus",
     "DIVERGENCE_PENALTY_RANGE": "divergence_penalty",
     "RISK_NONE_MULTIPLIER_RANGE": "risk_none_multiplier",
+    "BUY_THRESHOLD_RANGE": "buy_threshold",
+    "MAX_HOLDINGS_RANGE": "max_holdings",
 }
 
 # 影响信号计算的参数（昂贵）—— 与 prepare._compute_param_hash 保持一致

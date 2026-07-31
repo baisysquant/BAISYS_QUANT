@@ -12,7 +12,7 @@ _VAL_SPLIT = 0.8     # 训练窗口内 80% 训练，20% 验证（时序前 train
 _PURGE_DAYS = 5      # train 末尾清洗天数，防 fwd_5d 数据泄露
 _EARLY_STOP_ROUNDS = 15
 _N_SHUFFLE = 20      # label shuffle 检验洗牌次数
-_ML_SIGNAL_ENABLED = False  # ML 信号主开关：False=使用 MACD 原生评分，True=启用 XGBoost 覆写
+_ML_SIGNAL_ENABLED = True   # ML 信号主开关：True=启用 XGBoost 覆写（内置 label shuffle 检验，不达标自动回退）
 
 _FEATURE_CN = [
     "MACD趋势分", "金叉信号分", "柱状动能分",

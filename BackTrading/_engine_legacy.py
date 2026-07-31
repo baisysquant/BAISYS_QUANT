@@ -57,6 +57,7 @@ def _run_single_backtest(
     _adv_state: dict[str, tuple[float, int]] = {}
     _prev_bar: dict[str, tuple[float, float]] = {}
     _buy_date: dict[str, str] = {}
+    _sold_today: set[str] = set()
 
     use_sw = engine_cfg.portfolio_method == "score_weighted"
     max_pos_pct = engine_cfg.max_position_pct
@@ -118,30 +119,52 @@ def _run_single_backtest(
         fee = commission + value * engine_cfg.transfer_fee_rate
         return fee + value * engine_cfg.slippage
 
-    def _process_sell(dt, s_syms, s_idx, s_close, s_vol):
+    def _process_sell(dt, s_syms, s_idx, s_close, s_vol, partial: bool = False):
         total_sold = 0.0
         for j in range(len(s_syms)):
             si = s_idx[j]
             sh = int(pos_shares[si])
             if sh <= 0:
                 continue
-            mv = sh * float(s_close[j])
-            pos_value[si] = 0.0
-            pos_shares[si] = 0
+            if partial:
+                sell_shares = max(100, sh // 2) // 100 * 100
+                if sell_shares >= sh:
+                    sell_shares = sh
+            else:
+                sell_shares = sh
+            mv = sell_shares * float(s_close[j])
+            pos_shares[si] -= sell_shares
+            if pos_shares[si] <= 0:
+                pos_value[si] = 0.0
+                pos_shares[si] = 0
+                _sold_today.add(s_syms[j])
             proc, cst = _sell_proceeds_and_cost(s_syms[j], mv, float(s_vol[j]))
             nonlocal cash
             cash += proc
             total_sold += mv
             trade_log.append({
-                "time": dt, "symbol": s_syms[j], "action": "sell",
+                "time": dt, "symbol": s_syms[j], "action": "sell" if sell_shares >= sh else "sell_partial",
                 "price": float(s_close[j]), "value": round(proc, 2),
                 "cost": round(cst, 2),
             })
         return total_sold
 
+    _market_multiplier = 1.0
+
     if use_sw:
         for i_day, (dt, grp) in enumerate(date_groups):
+            _sold_today.clear()
             day_data = grp.copy()
+
+            # 市场状态过滤：根据当日全部股票的中位数评分调整仓位
+            _day_scores = day_data["进场评分"].values
+            _med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
+            if _med_score >= 30:
+                _market_multiplier = 1.0
+            elif _med_score >= 15:
+                _market_multiplier = 0.5
+            else:
+                _market_multiplier = 0.25
             if pit is not None:
                 sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
                 day_data = day_data[sym_first <= dt]
@@ -197,25 +220,36 @@ def _run_single_backtest(
             total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
-            # ── 卖出（含 T+1 检查） ──
+            # ── 卖出（含 T+1 检查 + 分批止盈止损） ──
             held = pos_shares[idx] > 0
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
-                exit_gt = (sell_score > buy_score) & (sell_score > 0)
-                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 2)
-                sel = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
-                si = np.where(sel)[0]
-                if len(si):
-                    daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+                exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
+                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
+                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
+                si_all = np.where(sel_all)[0]
+                if len(si_all):
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok
+                    si_stop = np.where(sel_stop)[0]
+                    si_partial = np.setdiff1d(si_all, si_stop)
+                    if len(si_stop):
+                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close[si_stop], volume[si_stop], partial=False)
+                    if len(si_partial):
+                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close[si_partial], volume[si_partial], partial=True)
                     close_lookup = dict(zip(syms_str, close))
                     total_value = cash + _calc_market_value()
 
             # ── 买入 ──
-            # 动态阈值：取评分分布前 20% 作为当日阈值
-            _pct_80 = float(np.percentile(buy_score[buy_score > 0], 80)) if buy_score.max() > _buy_threshold else _buy_threshold
-            _effective_threshold = max(_buy_threshold, _pct_80)
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            # 动态阈值：仅当非零评分足够多(>10只)时使用百分位，否则用固定阈值
+            _non_zero = buy_score[buy_score > 0]
+            if len(_non_zero) > 10 and buy_score.max() > _buy_threshold:
+                _pct_70 = float(np.percentile(_non_zero, 70))
+                _effective_threshold = max(_buy_threshold, _pct_70)
+            else:
+                _effective_threshold = _buy_threshold
+            _not_sold_today = np.array([s not in _sold_today for s in syms_str])
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi) == 0 and len(date_groups) > 100 and np.any(buy_score >= _buy_threshold):
@@ -224,7 +258,8 @@ def _run_single_backtest(
                 _diag_risk = int((~np.isin(risk_str, ["HIGH", "D", "E"])).sum())
                 _diag_limit = int(not_limit_up.sum())
                 _diag_vol = int(has_volume.sum())
-                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_effective_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} 总={len(buy_ok)}")
+                _diag_t1 = len(_sold_today)
+                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_effective_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} T+1禁={_diag_t1} 总={len(buy_ok)}")
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
@@ -254,7 +289,7 @@ def _run_single_backtest(
                     if pos_shares[si] > 0:
                         continue
                     price = float(b_close[j])
-                    tv = min(cash * equal_weight, total_value * max_pos_pct)
+                    tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:
                         continue
@@ -281,7 +316,7 @@ def _run_single_backtest(
 
                 if bought == 0 and len(date_groups) > 100:
                     _p0 = float(b_close[0]) if n_candidates > 0 else 0
-                    _tv0 = min(cash * equal_weight, total_value * max_pos_pct) if n_candidates > 0 else 0
+                    _tv0 = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier) if n_candidates > 0 else 0
                     _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
                     logger.info(f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}")
 
@@ -298,12 +333,22 @@ def _run_single_backtest(
         # ── Legacy path: build cumulative_hist for allocate_weights ──
         cumulative_hist: pd.DataFrame | None = None
         for i_day, (dt, grp) in enumerate(date_groups):
+            _sold_today.clear()
             day_data = grp.copy()
             if pit is not None:
                 sym_first = day_data["symbol"].astype(str).map(pit).fillna(dt)
                 day_data = day_data[sym_first <= dt]
                 if day_data.empty:
                     continue
+
+            _day_scores = day_data["进场评分"].values
+            _med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
+            if _med_score >= 30:
+                _market_multiplier = 1.0
+            elif _med_score >= 15:
+                _market_multiplier = 0.5
+            else:
+                _market_multiplier = 0.25
 
             if cumulative_hist is None:
                 cumulative_hist = day_data.copy()
@@ -370,19 +415,30 @@ def _run_single_backtest(
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
-                exit_gt = (sell_score > buy_score) & (sell_score > 0)
-                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 2)
-                sel = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
-                si = np.where(sel)[0]
-                if len(si):
-                    daily_sell_value = _process_sell(dt, syms_str[si], idx[si], close[si], volume[si])
+                exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
+                exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
+                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
+                si_all = np.where(sel_all)[0]
+                if len(si_all):
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok
+                    si_stop = np.where(sel_stop)[0]
+                    si_partial = np.setdiff1d(si_all, si_stop)
+                    if len(si_stop):
+                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close[si_stop], volume[si_stop], partial=False)
+                    if len(si_partial):
+                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close[si_partial], volume[si_partial], partial=True)
                     close_lookup = dict(zip(syms_str, close))
                     total_value = cash + _calc_market_value()
 
             # ── 买入 ──
-            _pct_80 = float(np.percentile(buy_score[buy_score > 0], 80)) if buy_score.max() > _buy_threshold else _buy_threshold
-            _effective_threshold = max(_buy_threshold, _pct_80)
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume
+            _non_zero = buy_score[buy_score > 0]
+            if len(_non_zero) > 10 and buy_score.max() > _buy_threshold:
+                _pct_70 = float(np.percentile(_non_zero, 70))
+                _effective_threshold = max(_buy_threshold, _pct_70)
+            else:
+                _effective_threshold = max(_buy_threshold, 10)
+            _not_sold_today = np.array([s not in _sold_today for s in syms_str])
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi):
@@ -421,7 +477,7 @@ def _run_single_backtest(
                     if pos_shares[si] > 0:
                         continue
                     price = float(b_close[j])
-                    tv = min(cash * equal_weight, total_value * max_pos_pct)
+                    tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
                     shares = int(tv / price) // 100 * 100 if price > 0 else 0
                     if shares < 100:
                         continue

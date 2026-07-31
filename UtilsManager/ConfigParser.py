@@ -386,6 +386,8 @@ class BacktestConfig(BaseModel):
     GOLDEN_CROSS_BONUS_RANGE: str = "5,20,5"
     DIVERGENCE_PENALTY_RANGE: str = "10,40,5"
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
+    BUY_THRESHOLD_RANGE: str = "5,30,5"
+    MAX_HOLDINGS_RANGE: str = "3,20,1"
 
     @field_validator("OPTIMIZE_FREQUENCY")
     @classmethod
@@ -398,6 +400,8 @@ class BacktestConfig(BaseModel):
 
     def parse_range(self, key: str) -> tuple[float, float, float]:
         raw = getattr(self, key.upper(), "")
+        if not raw or not raw.strip():
+            raise ValueError(f"{key} 未配置，跳过")
         parts = [float(x.strip()) for x in raw.split(",")]
         if len(parts) != 3:
             msg = f"{key} 格式应为 min,max,step，收到 {raw!r}"

@@ -23,9 +23,11 @@ def adaptive_distance(series: pd.Series, base_distance: int = 10) -> int:
     if n < 20:
         return max(3, n // 4)
     price_range = series.max() - series.min()
-    if price_range == 0:
+    if pd.isna(price_range) or price_range == 0:
         return base_distance
     volatility = series.diff().abs().mean() / price_range
+    if pd.isna(volatility) or volatility < 0:
+        return base_distance
     dynamic = max(3, int(base_distance * (1 + volatility * 10)))
     return min(dynamic, max(10, n // 5))
 
@@ -42,10 +44,13 @@ def signal_with_decay(signal_type: str | None, signal_idx: int | None,
 def detect_divergence_single_param(
     df: pd.DataFrame, price: pd.Series, indicator: pd.Series, distance: int = 25
 ) -> tuple[str | None, int | None, float]:
+    indicator_clean = indicator.bfill().ffill()
     current_idx = len(df) - 1
-    adj_dist = adaptive_distance(indicator, base_distance=distance)
-    peaks, troughs = find_peaks_troughs(indicator, distance=adj_dist)
-    return _detect_from_peaks(price, indicator, current_idx, adj_dist, peaks, troughs)
+    if len(indicator_clean) < 5 or indicator_clean.isna().all():
+        return None, None, 0.0
+    adj_dist = adaptive_distance(indicator_clean, base_distance=distance)
+    peaks, troughs = find_peaks_troughs(indicator_clean, distance=adj_dist)
+    return _detect_from_peaks(price, indicator_clean, current_idx, adj_dist, peaks, troughs)
 
 
 def detect_divergence_precomputed(

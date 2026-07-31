@@ -126,71 +126,66 @@ def _regime_series(
 
 def _divergence_scores(
     df: pd.DataFrame,
-    peaks: np.ndarray,
-    troughs: np.ndarray,
-    distance: int,
+    base_distance: int = 10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """逐 bar divergence 类型/强度/衰减 — 全向量化。
+    """逐 bar divergence 类型/强度/衰减 — 滚动计算防未来函数。
 
-    对每个 peak，向前广播 distance*2 根 bar 检查顶背离条件。
-    对每个 trough，向前广播 distance*2 根 bar 检查底背离条件。
-    取最近的（最后写入的）最强信号。
+    对每个 bar，仅用截至该 bar 的数据计算 peaks/troughs，
+    确保信号在实盘中可复现，消除全量预计算引入的前瞻偏差。
+    每 distance//2 bar 批量重算一次 find_peaks 以平衡精度与性能。
     """
+    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
+
     n = len(df)
     div_type = np.full(n, None, dtype=object)
     div_idx = np.full(n, -1, dtype=np.int32)
     div_strength = np.zeros(n, dtype=np.float64)
     close_arr = df["close"].values
     indicator_arr = df["DIF"].values
-    max_lookahead = distance * 2
+    max_lookahead = base_distance * 2
+    batch_size = max(1, base_distance // 2)
 
-    # 顶背离：从每个 peak 向前广播（确保 peak 已被 distance 根 bar 确认，避免前瞻偏差）
-    for p in peaks:
-        start = p + distance
-        end = min(p + max_lookahead + 1, n)
-        if start >= end:
-            continue
-        idx = np.arange(start, end)
-        cond = (
-            (close_arr[p] > close_arr[idx] * 0.98)
-            & (indicator_arr[p] > indicator_arr[idx])
-        )
-        valid = idx[cond]
-        if len(valid) == 0:
-            continue
-        price_ratio = close_arr[valid] / close_arr[p] - 1
-        ind_ratio = 1 - indicator_arr[valid] / indicator_arr[p]
-        strengths = np.clip((price_ratio + ind_ratio) / 2, 0.0, 1.0)
-        strong = strengths > 0.15
-        for v, s in zip(valid[strong], strengths[strong]):
-            if s > div_strength[v]:
-                div_type[v] = Divergence.TOP_DIVERGENCE
-                div_idx[v] = p
-                div_strength[v] = s
+    last_peaks: np.ndarray = np.array([], dtype=int)
+    last_troughs: np.ndarray = np.array([], dtype=int)
 
-    # 底背离：从每个 trough 向前广播
-    for t in troughs:
-        start = t + 1
-        end = min(t + max_lookahead + 1, n)
-        if start >= end:
-            continue
-        idx = np.arange(start, end)
-        cond = (
-            (close_arr[t] < close_arr[idx] * 1.02)
-            & (indicator_arr[t] < indicator_arr[idx])
-        )
-        valid = idx[cond]
-        if len(valid) == 0:
-            continue
-        price_ratio = 1 - close_arr[valid] / close_arr[t]
-        ind_ratio = indicator_arr[valid] / indicator_arr[t] - 1
-        strengths = np.clip((price_ratio + ind_ratio) / 2, 0.0, 1.0)
-        strong = strengths > 0.15
-        for v, s in zip(valid[strong], strengths[strong]):
-            if s > div_strength[v]:
-                div_type[v] = Divergence.BOTTOM_DIVERGENCE
-                div_idx[v] = t
-                div_strength[v] = s
+    for i in range(1, n):
+        if i % batch_size == 0:
+            sub = pd.Series(indicator_arr[: i + 1]).bfill().ffill()
+            if len(sub) < 5 or sub.isna().all():
+                last_peaks, last_troughs = np.array([], dtype=int), np.array([], dtype=int)
+            else:
+                adj = adaptive_distance(sub, base_distance=base_distance)
+                last_peaks, last_troughs = find_peaks_troughs(sub, distance=adj)
+
+        for p in reversed(last_peaks):
+            if p >= i:
+                continue
+            if i - p > max_lookahead:
+                break
+            if (close_arr[p] > close_arr[i] * 0.98) and (indicator_arr[p] > indicator_arr[i]):
+                price_ratio = close_arr[i] / close_arr[p] - 1
+                ind_ratio = 1 - indicator_arr[i] / indicator_arr[p]
+                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
+                if s > 0.15 and s > div_strength[i]:
+                    div_type[i] = Divergence.TOP_DIVERGENCE
+                    div_idx[i] = p
+                    div_strength[i] = s
+                break
+
+        for t in reversed(last_troughs):
+            if t >= i:
+                continue
+            if i - t > max_lookahead:
+                break
+            if (close_arr[t] < close_arr[i] * 1.02) and (indicator_arr[t] < indicator_arr[i]):
+                price_ratio = 1 - close_arr[i] / close_arr[t]
+                ind_ratio = indicator_arr[i] / indicator_arr[t] - 1
+                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
+                if s > 0.15 and s > div_strength[i]:
+                    div_type[i] = Divergence.BOTTOM_DIVERGENCE
+                    div_idx[i] = t
+                    div_strength[i] = s
+                break
 
     return div_type, div_idx, div_strength
 
@@ -592,8 +587,6 @@ def compute_signals(
     stock_df: pd.DataFrame,
     params: dict[str, Any] | None = None,
     compute_exit_strategy: bool = False,
-    precomputed_peaks: np.ndarray | None = None,
-    precomputed_troughs: np.ndarray | None = None,
     diverge_distance: int = 11,
 ) -> pd.DataFrame:
     """全向量化信号计算。
@@ -655,15 +648,10 @@ def compute_signals(
     # ── 1. MACD 趋势 ──
     trend_arr = macd_trend(dif, dea)
 
-    # ── 2. Divergence ──
-    div_type = np.full(n, None, dtype=object)
-    div_idx = np.full(n, -1, dtype=np.int32)
-    div_strength = np.zeros(n, dtype=np.float64)
-    if precomputed_peaks is not None and precomputed_troughs is not None:
-        dt, di, ds = _divergence_scores(
-            stock_df, precomputed_peaks, precomputed_troughs, diverge_distance,
-        )
-        div_type, div_idx, div_strength = dt, di, ds
+    # ── 2. Divergence（滚动计算，不使用全局 precomputed peaks/troughs 防未来函数） ──
+    div_type, div_idx, div_strength = _divergence_scores(
+        stock_df, base_distance=diverge_distance,
+    )
     div_decay = _divergence_decay(div_type, div_idx, decay_half_life)
     has_top_div = np.array(
         [t == Divergence.TOP_DIVERGENCE for t in div_type], dtype=bool,

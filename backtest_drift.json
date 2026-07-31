@@ -28,5 +28,10 @@
     "type": "failure",
     "error": "'numpy.ndarray' object has no attribute 'median'",
     "time": "2026-07-28T19:39:55.546964"
+  },
+  {
+    "type": "failure",
+    "error": "'进场评分'",
+    "time": "2026-07-30T22:30:49.434271"
   }
 ]

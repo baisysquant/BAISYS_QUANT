@@ -31,7 +31,7 @@ def _get_macd_trend_mult(macd_trend: str) -> float:
         MACDTrend.SUPER_STRONG: 1.3,
         MACDTrend.STRONG: 1.0,
         MACDTrend.WEAK: 0.5,
-        MACDTrend.SUPER_WEAK: 0.0,
+        MACDTrend.SUPER_WEAK: 0.3,
     }.get(macd_trend, 1.0)
 
 

@@ -81,6 +81,8 @@ def _oos_validate(
             position_a=params.get("position_a", engine_cfg.position_a),
             risk_none_multiplier=params.get("risk_none_multiplier", engine_cfg.risk_none_multiplier),
             liq_veto_ratio=params.get("liq_veto_ratio", engine_cfg.liq_veto_ratio),
+            buy_threshold=int(params.get("buy_threshold", engine_cfg.buy_threshold)),
+            max_holdings=int(params.get("max_holdings", engine_cfg.max_holdings)),
         )
 
         signal_params = {k: v for k, v in params.items() if k in _SIGNAL_KEYS}

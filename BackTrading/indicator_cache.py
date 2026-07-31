@@ -112,10 +112,10 @@ def _is_cache_valid(symbol: str, df: pd.DataFrame) -> bool:
 
 
 def precompute_all_indicators(stock_dir: str) -> None:
-    """Phase 0: 为 stock_dir 中所有股票预计算指标 + peak/trough。
+    """Phase 0: 为 stock_dir 中所有股票预计算技术指标（不含 peaks/troughs）。
 
-    写入磁盘缓存 + 内存缓存。幂等 — 磁盘缓存已满时第二次调用是无操作。
-    若 WFO 窗口间数据一致，仅扫描元数据，无重复计算。
+    peaks/troughs 改为在 _divergence_scores 中滚动计算以避免未来函数。
+    写入磁盘缓存 + 内存缓存。幂等。
     """
     stock_files = sorted(Path(stock_dir).glob("*.parquet"))
     if not stock_files:
@@ -123,7 +123,6 @@ def precompute_all_indicators(stock_dir: str) -> None:
         return
 
     from BackTrading.prepare import _compute_indicators
-    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
 
     computed = 0
     cached = 0
@@ -131,18 +130,13 @@ def precompute_all_indicators(stock_dir: str) -> None:
     for f in stock_files:
         symbol = f.stem
         if symbol in _IN_MEMORY:
-            # 内存缓存命中 — 数据必须与当前 stock_dir 一致
-            # 如果数据不一致，跳过此问题在当前场景不必处理
-            #（同一窗口内 stock_dir 不变，跨窗口时分桶路径一致但指纹不同）
             skipped += 1
             continue
 
-        # 尝试从磁盘加载
         if _load_from_disk(symbol):
             cached += 1
             continue
 
-        # 需要计算
         df_raw = pd.read_parquet(f)
         if len(df_raw) < 60:
             _IN_MEMORY[symbol] = pd.DataFrame()
@@ -151,13 +145,11 @@ def precompute_all_indicators(stock_dir: str) -> None:
             continue
 
         df_ind = _compute_indicators(df_raw)
-        dd = adaptive_distance(df_ind["DIF"], base_distance=10)
-        peaks, troughs = find_peaks_troughs(df_ind["DIF"], distance=dd)
 
         _IN_MEMORY[symbol] = df_ind
-        _PEAKS[symbol] = peaks
-        _TROUGHS[symbol] = troughs
-        _save_to_disk(symbol, df_ind, peaks, troughs)
+        _PEAKS[symbol] = np.array([], dtype=int)
+        _TROUGHS[symbol] = np.array([], dtype=int)
+        _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
         computed += 1
 
     _log_msg = f"Phase 0: {len(stock_files)} 只股票"
@@ -209,17 +201,14 @@ def get_precomputed(
         return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
     from BackTrading.prepare import _compute_indicators
-    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
 
     df_ind = _compute_indicators(df_raw)
-    dd = adaptive_distance(df_ind["DIF"], base_distance=10)
-    peaks, troughs = find_peaks_troughs(df_ind["DIF"], distance=dd)
 
     _IN_MEMORY[symbol] = df_ind
-    _PEAKS[symbol] = peaks
-    _TROUGHS[symbol] = troughs
-    _save_to_disk(symbol, df_ind, peaks, troughs)
-    return df_ind, peaks, troughs
+    _PEAKS[symbol] = np.array([], dtype=int)
+    _TROUGHS[symbol] = np.array([], dtype=int)
+    _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
+    return df_ind, np.array([], dtype=int), np.array([], dtype=int)
 
 
 def reset_cache() -> None:

@@ -20,8 +20,6 @@ from LogicAnalyzer.pipeline_state import (
 )
 from LogicAnalyzer.signals.divergence import (
     adaptive_distance,
-    detect_divergence_precomputed,
-    detect_divergence_single_param,
     find_peaks_troughs,
     signal_with_decay,
     slope_analysis,
@@ -314,20 +312,11 @@ class MACDAnalyzer:
         dea_val = df['DEA'].iloc[-1]
         macd_trend = self._classify_macd_trend(dif_val, dea_val)
 
-        if macd_trend == MACDTrend.SUPER_WEAK:
-            return _pipeline_output({
-                'level': 'D', 'score': 0, 'conclusion': 'D: 中长期空头，回避',
-                'regime': 'WEAK_TREND', 'risk_level': 'HIGH', 'risk_desc': 'DIF<DEA<0',
-                'signal_list': [], 'triggered_rules': [], '_notes': [],
-                'divergence': {}, 'momentum': {}, 'slope': {}, 'chip_data': None,
-            })
+        is_super_weak = macd_trend == MACDTrend.SUPER_WEAK
 
         regime = _detect_market_regime(df, boll_col=boll_bw_col if boll_bw_col else None,
                                         params=_regime_p)
-        if regime in ('WEAK_TREND',) and macd_trend != MACDTrend.SUPER_STRONG:
-            state = _make_state(df, regime, rule_thresholds)
-            state.update({'level': 'C', 'score': 0, 'conclusion': 'C: 弱势趋势，环境不配合'})
-            return _pipeline_output(state)
+        is_weak_trend = regime in ('WEAK_TREND',) and macd_trend != MACDTrend.SUPER_STRONG
 
         if macd_trend == MACDTrend.SUPER_STRONG and regime in ('OSCILLATION', 'UNCLEAR'):
             regime = 'STRONG_TREND'
@@ -351,15 +340,19 @@ class MACDAnalyzer:
                 'exit_strategy': {}, 'macd_trend': macd_trend, 'position_adjust': 0.0,
             })
 
-        if hasattr(self, '_precomputed_diverge'):
-            dist_div = self._precomputed_diverge['distance']
-            div_type, div_idx, div_strength = detect_divergence_precomputed(
-                df['close'], df['DIF'], len(df) - 1, dist_div,
-                self._precomputed_diverge['peaks'], self._precomputed_diverge['troughs'],
-            )
-        else:
-            dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
-            div_type, div_idx, div_strength = detect_divergence_single_param(df, df['close'], df['DIF'], distance=dist_div)
+        dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
+        _cache = self.__dict__.setdefault('_div_cache', {'n': 0, 'peaks': np.array([], dtype=int), 'troughs': np.array([], dtype=int)})
+        _batch = max(1, dist_div // 2)
+        if len(df) - _cache['n'] >= _batch or _cache['n'] == 0:
+            _ind = df['DIF'].bfill().ffill()
+            if len(_ind) < 5 or _ind.isna().all():
+                _cache['peaks'], _cache['troughs'] = np.array([], dtype=int), np.array([], dtype=int)
+            else:
+                _ad = adaptive_distance(_ind, base_distance=dist_div)
+                _cache['peaks'], _cache['troughs'] = find_peaks_troughs(_ind, distance=_ad)
+            _cache['n'] = len(df)
+        from LogicAnalyzer.signals.divergence import _detect_from_peaks
+        div_type, div_idx, div_strength = _detect_from_peaks(df['close'], df['DIF'], len(df) - 1, dist_div, _cache['peaks'], _cache['troughs'])
         div_decay = signal_with_decay(div_type, div_idx, len(df) - 1, half_life=decay_half_life)
         div_combined = '无明显背离信号'
         if div_type == Divergence.BOTTOM_DIVERGENCE and div_strength > div_strength_threshold:
@@ -401,6 +394,7 @@ class MACDAnalyzer:
             'forecast_data': df.attrs.get('forecast_data', None),
             'vol_regime': self._detect_volatility_regime(df),
             'position_adjust': 0.0,
+            'thresholds': thresholds,
             'config': {
                 'golden_cross_bonus': _score_p.get('golden_cross_bonus', 10),
                 'divergence_penalty': _score_p.get('divergence_penalty', 20),
@@ -432,8 +426,12 @@ class MACDAnalyzer:
 
         execute_rules(state, gate=1)
         if not signal_list:
-            state.update({'level': 'C', 'score': 0, 'conclusion': 'C: 无明确入场信号'})
-            return _pipeline_output(state)
+            signal_list.append({'type': '评分参考', 'confidence': 'low', 'desc': 'MACD综合评分(无明确信号)'})
+        state['signal_list'] = signal_list
+        if is_super_weak:
+            state.setdefault('_notes', []).append('DIF<DEA<0中长期空头')
+        if is_weak_trend:
+            state.setdefault('_notes', []).append('弱势趋势环境')
 
         execute_rules(state, gate=2)
         if state['risk_level'] == 'HIGH':
@@ -540,16 +538,16 @@ class MACDAnalyzer:
         if is_high_risk:
             state['level'] = 'D'
             conclusion_parts = ['D: 顶部风险']
-        elif total_base >= thresholds['fully_bull']:
+        elif total >= thresholds['fully_bull']:
             state['level'] = 'A'
             conclusion_parts = ['A: 综合多头']
-        elif total_base >= thresholds['bullish'] and has_top_div:
+        elif total >= thresholds['bullish'] and has_top_div:
             state['level'] = 'B'
             conclusion_parts = ['B: 偏多(注意顶部风险)']
-        elif total_base >= thresholds['bullish']:
+        elif total >= thresholds['bullish']:
             state['level'] = 'B'
             conclusion_parts = ['B: 偏多']
-        elif total_base >= thresholds['oscillate']:
+        elif total >= thresholds['oscillate']:
             state['level'] = 'C'
             conclusion_parts = ['C: 多空拉锯']
         else:

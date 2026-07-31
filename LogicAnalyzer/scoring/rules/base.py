@@ -693,7 +693,8 @@ def _act_bottom_divergence_volume_boost(state: dict) -> None:
 
 
 def _act_force_level_a(state: dict) -> None:
-    if state.get('score', 0) >= 60:
+    _th = state.get('thresholds', {}).get('fully_bull', 80)
+    if state.get('score', 0) >= _th:
         state['level'] = 'A'
         state['triggered_rules'].append('R21')
 

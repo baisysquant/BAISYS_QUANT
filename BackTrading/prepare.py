@@ -404,17 +404,7 @@ def _stock_worker(
     # 在全量数据上一次性计算，避免每根 bar 重复 800 次。
     stock_df = _compute_indicators(stock_df)
 
-    # 预计算背离检测的 peak/trough（全序列一次，避免每 bar O(i) 的 find_peaks）
-    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
-    if 'DIF' in stock_df.columns:
-        _dd = adaptive_distance(stock_df['DIF'], base_distance=10)
-        _peaks, _troughs = find_peaks_troughs(stock_df['DIF'], distance=_dd)
-
     analyzer = MACDAnalyzer()
-    if 'DIF' in stock_df.columns:
-        analyzer._precomputed_diverge = {
-            'distance': _dd, 'peaks': _peaks, 'troughs': _troughs,
-        }
     rows: list[dict[str, Any]] = []
 
     for i in range(len(stock_df)):
@@ -469,7 +459,6 @@ def _stock_worker_vectorized(
             logger.warning(f"[{symbol}] 数据无效，跳过信号计算")
             return []
 
-        # 自动适应波动率调整背离距离
         from LogicAnalyzer.signals.divergence import adaptive_distance
         _dd = adaptive_distance(stock_df["DIF"], base_distance=10) if "DIF" in stock_df.columns else 11
 
@@ -478,12 +467,11 @@ def _stock_worker_vectorized(
                 stock_df,
                 params=params,
                 compute_exit_strategy=compute_exit_strategy,
-                precomputed_peaks=_peaks,
-                precomputed_troughs=_troughs,
                 diverge_distance=_dd,
             )
         except Exception as e:
-            logger.warning(f"  [{symbol}] 向量化信号计算失败({e})，回退原始逐bar引擎")
+            import traceback
+            logger.warning(f"  [{symbol}] 向量化信号计算失败({e})\n{traceback.format_exc()}")
             try:
                 return _stock_worker(symbol, stock_dir, params, compute_exit_strategy)
             except Exception as f:
