@@ -20,8 +20,6 @@ class TopTraderFetcher:
     缓存策略：当日结果缓存到 CSV；再次运行直接读缓存。
     """
 
-    SSE_API = "stock_sse_summary"
-    SZSE_API = "stock_szse_summary"
 
     def __init__(self, config: Config) -> None:
         self.config = config

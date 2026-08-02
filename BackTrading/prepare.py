@@ -109,14 +109,17 @@ def _compute_config_hash() -> str:
 def _compute_param_hash(params: dict[str, Any]) -> str:
     """仅对影响信号计算的参数做哈希（用于信号缓存隔离）。
 
-    PORTFOLIO/RISK 类参数（atr_stop_mult / risk_none_multiplier 等）排除在外，
+    PORTFOLIO/RISK 类参数（atr_stop_mult 等）排除在外，
     它们通过 post-cache 变换注入，不触发信号重算。
+    conclusion_full_bull 影响风险等级/进出场阈值（vectorized_signal 消费），
+    必须纳入哈希，否则不同阈值会错误复用同一份信号缓存。
     """
     key_params = {
         "boll_narrow_ratio": params.get("boll_narrow_ratio", 0.8),
         "cross_decay_days": params.get("cross_decay_days", 30),
         "golden_cross_bonus": params.get("golden_cross_bonus", 10),
         "divergence_penalty": params.get("divergence_penalty", 20),
+        "conclusion_full_bull": params.get("conclusion_full_bull", 80),
     }
     s = json.dumps(key_params, sort_keys=True)
     return hashlib.md5(s.encode()).hexdigest()[:8]
@@ -181,7 +184,7 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
         try:
             parts.append(pd.read_parquet(f))
         except Exception:
-            _logger.warning("跳过损坏的缓存文件: %s", f)
+            logger.warning("跳过损坏的缓存文件: %s", f)
     if not parts:
         return None
     df = pd.concat(parts, ignore_index=True)
@@ -220,6 +223,7 @@ def prepare_backtest_data(
 ) -> pd.DataFrame:
     is_flat = params is not None and (
         "atr_stop_mult" in params
+        or "boll_narrow_ratio" in params
         or "conclusion_full_bull" in params or "golden_cross_bonus" in params
     )
 
@@ -242,6 +246,8 @@ def prepare_backtest_data(
             "expected_return_lookback",
             "golden_cross_bonus", "divergence_penalty",
         )})
+        if "boll_narrow_ratio" in params:
+            base["regime"]["boll_narrow_ratio"] = float(params["boll_narrow_ratio"])
         base["thresholds"] = {
             "fully_bull": int(params.get("conclusion_full_bull", base["thresholds"]["fully_bull"])),
             "bullish": base["thresholds"]["bullish"],
@@ -267,7 +273,8 @@ def prepare_backtest_data(
         del kline, signal
         merged = apply_ml_signal(merged)
         if _saved_atr_stop is not None and "ATR" in merged.columns:
-            merged["止损价"] = merged["close"] - merged["ATR"] * _saved_atr_stop
+            stop_raw = merged["close"] - merged["ATR"] * _saved_atr_stop
+            merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
         _first_date = merged["trade_date"].iloc[0]
         _first = merged[merged["trade_date"] == _first_date]
         _fe = _first["进场评分"]
@@ -573,11 +580,14 @@ def _compute_indicators(df_raw: pd.DataFrame) -> pd.DataFrame:
         prev_dea = dea.shift(1).fillna(0)
         golden = (dif > dea) & (prev_dif <= prev_dea)
         dead = (dif < dea) & (prev_dif >= prev_dea)
-        df["MACD_SIGNAL_DETAIL"] = None
-        df.loc[golden, "MACD_SIGNAL_DETAIL"] = "金叉"
-        df.loc[dead, "MACD_SIGNAL_DETAIL"] = "死叉"
-        df.loc[~(golden | dead), "MACD_SIGNAL_DETAIL"] = dif[~(golden | dead)].apply(
-            lambda v: "多头" if v > 0 else "空头"
+        # 与循环路径 (MACDAnalyzer) 对齐：金叉标注零轴语义（零轴上/下金叉），
+        # 供 vectorized golden_cross_score 区分零轴上/下金叉评分
+        from LogicAnalyzer.SignalConstants import MACDSignals
+        df["MACD_SIGNAL_DETAIL"] = np.where(
+            golden,
+            MACDSignals.golden_cross_label(dif, dea),
+            np.where(dead, MACDSignals.death_cross_label(dead, dif, dea),
+                     np.where(dif > 0, "多头", "空头")),
         )
         df["MACD_CROSS"] = 0
         df.loc[golden, "MACD_CROSS"] = 1

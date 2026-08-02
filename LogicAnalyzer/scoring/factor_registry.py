@@ -175,14 +175,6 @@ class FactorRegistry:
         """{factor_key: weight} 字典，用于加权融合。"""
         return {k: f.weight for k, f in self._factors.items()}
 
-    @property
-    def factor_keys(self) -> list[str]:
-        return list(self._factors.keys())
-
-    @property
-    def factor_columns(self) -> dict[str, str]:
-        """{factor_key: column_name_in_report} 映射。"""
-        return {k: f.column for k, f in self._factors.items() if f.column}
 
     def get(self, key: str) -> FactorDef | None:
         return self._factors.get(key)
@@ -190,9 +182,6 @@ class FactorRegistry:
     def by_category(self, category: str) -> dict[str, FactorDef]:
         return {k: v for k, v in self._factors.items() if v.category == category}
 
-    @property
-    def descriptions(self) -> list[str]:
-        return [f"{f.key}: {f.description} (权重={f.weight})" for f in self._factors.values()]
 
     def validate_weights(self) -> list[str]:
         """校验权重是否在合理范围内，返回警告列表。"""

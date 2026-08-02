@@ -11,7 +11,8 @@ _TRAIN_WINDOW = 120  # 最多用最近 120 天训练
 _VAL_SPLIT = 0.8     # 训练窗口内 80% 训练，20% 验证（时序前 train 后 val）
 _PURGE_DAYS = 5      # train 末尾清洗天数，防 fwd_5d 数据泄露
 _EARLY_STOP_ROUNDS = 15
-_N_SHUFFLE = 20      # label shuffle 检验洗牌次数
+_N_SHUFFLE = 40      # label shuffle 检验洗牌次数
+_MIN_VAL_IC = 0.02   # 验证集 Rank IC 最低阈值，低于此值视为无信号
 _ML_SIGNAL_ENABLED = True   # ML 信号主开关：True=启用 XGBoost 覆写（内置 label shuffle 检验，不达标自动回退）
 
 _FEATURE_CN = [
@@ -132,19 +133,6 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     df[_TARGET] = df.groupby("trade_date")["fwd_5d_raw"].rank(pct=True)
     df.drop(columns=["fwd_5d_raw"], inplace=True)
     return df
-
-
-def _cross_sectional_z(
-    s: pd.Series, group: pd.Series | None = None,
-) -> pd.Series:
-    def _z(x: pd.Series) -> pd.Series:
-        std = x.std()
-        return (x - x.mean()) / std if std > 1e-8 else pd.Series(0.0, index=x.index)
-    if group is not None and group.nunique() > 1:
-        result = s.groupby(group).transform(_z)
-    else:
-        result = _z(s)
-    return result.fillna(0).clip(-3, 3)
 
 
 class BaseSignalModel:
@@ -300,6 +288,7 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
 
     model = _pick_model()
     last_train_date_idx: int | None = None
+    model_valid = False   # label shuffle 检验通过才允许覆写评分，否则自动回退原生 MACD 评分
     total_predicted = 0
 
     for i, date in enumerate(dates):
@@ -335,13 +324,20 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
             if not model.fit(train_X[train_ok], train_y_raw[train_ok], X_val, y_val):
                 continue
             last_train_date_idx = i
-            # Label shuffle 检验
+            # Label shuffle 检验：不显著（p>=0.05 或 IC 过低）自动回退原生评分
             if X_val is not None and len(y_val) >= 50:
                 ic_val, p_val = _label_shuffle_test(model, X_val, y_val)
+                model_valid = (p_val < 0.05) and (ic_val >= _MIN_VAL_IC)
                 logger.info(f"[ML] 验证集 IC={ic_val:.4f}  label shuffle p={p_val:.4f}" +
-                            (" ✓显著" if p_val < 0.05 else " ✗不显著"))
+                            (" ✓显著" if model_valid else " ✗不显著，回退原生评分"))
+            else:
+                model_valid = False
+                logger.info("[ML] 验证集样本不足，回退原生评分")
 
         elif last_train_date_idx is None:
+            continue
+
+        if not model_valid:
             continue
 
         today_X = df.loc[today_mask, _FEATURE_ALL].values.astype(np.float64)

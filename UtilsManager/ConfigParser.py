@@ -232,7 +232,6 @@ class FullBullScoringConfig(BaseModel):
     RULE_PRICE_NEW_HIGH_DAYS: int = Field(default=20, ge=5, le=120)
 
 
-
 class UserFocusStocksConfig(BaseModel):
     """用户关注股池配置"""
 
@@ -361,8 +360,15 @@ class BacktestConfig(BaseModel):
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
     FULL_A_SHARE_MODE: bool = Field(default=False)
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01)
-    STAMP_TAX_RATE: float = Field(default=0.001, ge=0, le=0.01)
+    STAMP_TAX_RATE: float = Field(default=0.0005, ge=0, le=0.01,
+                                     description="印花税费率（卖出收取，2023.8 起万五）")
     SLIPPAGE: float = Field(default=0.001, ge=0, le=0.01)
+    TRANSFER_FEE_RATE: float = Field(default=0.00001, ge=0, le=0.001,
+                                     description="过户费（双边，万0.1）")
+    MIN_COMMISSION_PER_TRADE: float = Field(default=5.0, ge=0, le=100,
+                                            description="A股每笔最低佣金（5元）")
+    EXCLUDE_ST: bool = Field(default=True,
+                             description="回测宇宙剔除 ST/*ST 风险警示股（主板 5% 涨跌幅、流动性差）")
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
@@ -377,9 +383,6 @@ class BacktestConfig(BaseModel):
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
-    KELLY_FRACTION_RANGE: str = "0.1,0.5,0.1"
-    POSITION_A_RANGE: str = "0.2,0.5,0.05"
-    LIQ_VETO_RATIO_RANGE: str = "0.03,0.10,0.01"
     BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
     CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
     CONCLUSION_FULL_BULL_RANGE: str = "60,95,5"
@@ -463,8 +466,6 @@ class ApiConfig(BaseModel):
     """API 服务配置模型"""
 
     ENABLED: bool = Field(default=False, description="是否启用 API 服务")
-    HOST: str = Field(default="127.0.0.1", description="监听地址")
-    PORT: int = Field(default=8000, ge=1024, le=65535, description="监听端口")
     ALERT_WEBHOOK_URL: str = Field(default="", description="告警 Webhook URL")
     ALERT_CHANNEL: str = Field(default="generic", description="告警渠道(generic/wecom/feishu/dingtalk)")
     ALERT_ON_FAILURE: bool = Field(default=True, description="失败时告警")
@@ -956,7 +957,3 @@ class Config:
     def _ensure_directories(self) -> None:
         for d in (self.HOME_DIRECTORY, self.CACHE_DIRECTORY, self.TEMP_DATA_DIRECTORY, self.LOG_DIR):
             os.makedirs(d, exist_ok=True)
-
-    def get_db_connection_string(self) -> str:
-        return (f"postgresql+psycopg2://{self.DB_USER}:{self.DB_PASSWORD}"
-                f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}")

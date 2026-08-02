@@ -97,7 +97,6 @@ class BenchmarkEvaluator:
         mean_p = p_ret.mean()
         mean_b = b_ret.mean()
         std_p = p_ret.std()
-        std_b = b_ret.std()
 
         # Alpha = 组合收益 - Beta × 基准收益
         cov = p_ret.cov(b_ret)

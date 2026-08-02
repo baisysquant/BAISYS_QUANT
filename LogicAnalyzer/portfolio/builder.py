@@ -46,7 +46,6 @@ class PortfolioBuilder:
         self._max_industry = sizing.get("max_industry_exposure", 0.30)
         self._max_total = sizing.get("max_total_exposure", 1.0)
         self._max_turnover = sizing.get("max_day_turnover", 0.20)
-        self._risk_aversion = sizing.get("risk_aversion", 1.0)
 
         # 交易成本参数
         tc = getattr(config, "TRADING_COST_PARAMS", None) or {}

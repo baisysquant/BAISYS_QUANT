@@ -100,27 +100,3 @@ def build_gp(
     )
     gp.fit(X, Y)
     return gp
-
-
-def build_gp_signal_portfolio(
-    X_signal: np.ndarray,
-    X_portfolio: np.ndarray,
-    Y: np.ndarray,
-    signal_state: GPState | None = None,
-    portfolio_state: GPState | None = None,
-    n_restarts: int = 5,
-    random_state: int = 42,
-) -> tuple[GaussianProcessRegressor, GaussianProcessRegressor]:
-    """分别构建 Level 1 (信号) 和 Level 2 (组合) 的 GP 模型。
-
-    每个 Level 使用独立核（维度不同），分别 warm-start。
-    """
-    gp_signal = build_gp(
-        X_signal, Y, previous_state=signal_state,
-        n_restarts=n_restarts, random_state=random_state,
-    )
-    gp_portfolio = build_gp(
-        X_portfolio, Y, previous_state=portfolio_state,
-        n_restarts=n_restarts, random_state=random_state,
-    )
-    return gp_signal, gp_portfolio

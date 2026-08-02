@@ -255,23 +255,3 @@ class AnalysisService:
 
         filtered_df.rename(columns={ColumnNames.LATEST_PRICE: ColumnNames.CURRENT_PRICE}, inplace=True)
         return filtered_df.fillna("N/A")
-
-    def _get_first_fund_flow_col(self) -> str:
-        """
-        获取配置的第一个资金流列名
-
-        Returns:
-            str: 资金流列名
-        """
-        period_map = {
-            3: ColumnNames.FUND_FLOW_3D,
-            5: ColumnNames.FUND_FLOW_5D,
-            10: ColumnNames.FUND_FLOW_10D,
-            20: ColumnNames.FUND_FLOW_20D,
-        }
-
-        if self.config.FUND_FLOW_PERIODS:
-            first_period = self.config.FUND_FLOW_PERIODS[0]
-            return period_map.get(first_period, ColumnNames.FUND_FLOW_5D)
-
-        return ColumnNames.FUND_FLOW_5D

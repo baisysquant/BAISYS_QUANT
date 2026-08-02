@@ -41,28 +41,6 @@ def signal_with_decay(signal_type: str | None, signal_idx: int | None,
     return decay
 
 
-def detect_divergence_single_param(
-    df: pd.DataFrame, price: pd.Series, indicator: pd.Series, distance: int = 25
-) -> tuple[str | None, int | None, float]:
-    indicator_clean = indicator.bfill().ffill()
-    current_idx = len(df) - 1
-    if len(indicator_clean) < 5 or indicator_clean.isna().all():
-        return None, None, 0.0
-    adj_dist = adaptive_distance(indicator_clean, base_distance=distance)
-    peaks, troughs = find_peaks_troughs(indicator_clean, distance=adj_dist)
-    return _detect_from_peaks(price, indicator_clean, current_idx, adj_dist, peaks, troughs)
-
-
-def detect_divergence_precomputed(
-    price: pd.Series, indicator: pd.Series, current_idx: int,
-    adj_dist: int, peaks: np.ndarray, troughs: np.ndarray,
-) -> tuple[str | None, int | None, float]:
-    """使用预计算的 peak/trough 索引检测背离，避免每 bar 重跑 find_peaks。"""
-    peaks = peaks[peaks <= current_idx]
-    troughs = troughs[troughs <= current_idx]
-    return _detect_from_peaks(price, indicator, current_idx, adj_dist, peaks, troughs)
-
-
 def _detect_from_peaks(
     price: pd.Series, indicator: pd.Series, current_idx: int,
     adj_dist: int, peaks: np.ndarray, troughs: np.ndarray,
@@ -98,7 +76,6 @@ def _detect_from_peaks(
     return None, None, 0.0
 
 
-
 # ── 共享工具函数（原 MACDHelpers.py） ────────────────────────────────────
 
 
@@ -120,4 +97,3 @@ def slope_analysis(series: pd.Series, window: int = 5) -> dict:
     else:
         trend = "震荡"
     return {"slope": slope, "r2": r2, "trend": trend}
-

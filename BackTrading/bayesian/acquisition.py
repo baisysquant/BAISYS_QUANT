@@ -33,34 +33,6 @@ def expected_improvement(
     return np.maximum(ei, 0.0)
 
 
-def probability_of_improvement(
-    X: np.ndarray,
-    gp: GaussianProcessRegressor,
-    best_f: float,
-    xi: float = 0.01,
-) -> np.ndarray:
-    """Probability of Improvement.
-
-    PI(x) = Φ((μ - f* - ξ) / σ)
-    """
-    mu, sigma = gp.predict(X, return_std=True)
-    sigma = np.maximum(sigma, 1e-12)
-    return norm.cdf((mu - best_f - xi) / sigma)
-
-
-def upper_confidence_bound(
-    X: np.ndarray,
-    gp: GaussianProcessRegressor,
-    beta: float = 2.0,
-) -> np.ndarray:
-    """Upper Confidence Bound (UCB).
-
-    UCB(x) = μ + β·σ
-    """
-    mu, sigma = gp.predict(X, return_std=True)
-    return mu + beta * sigma
-
-
 def dsr_penalty(
     X: np.ndarray,
     gp: GaussianProcessRegressor,

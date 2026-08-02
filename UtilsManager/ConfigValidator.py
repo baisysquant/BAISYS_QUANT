@@ -145,9 +145,6 @@ class ValidationReport:
     def has_errors(self) -> bool:
         return any(i.severity == Severity.ERROR for i in self.issues)
 
-    @property
-    def has_warnings(self) -> bool:
-        return any(i.severity == Severity.WARNING for i in self.issues)
 
     def print_summary(self) -> None:
         if not self.issues:
@@ -193,7 +190,6 @@ class FieldRule:
     min_value: int | None = None
     max_value: int | None = None
     allowed_values: list[Any] | None = None
-    comment_range: str | None = None
     custom_validator: str | None = None
 
 
@@ -412,6 +408,9 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("commission_rate", "float", required=False, default="0.0003", min_value=0, max_value=0.01),
         FieldRule("stamp_tax_rate", "float", required=False, default="0.0005", min_value=0, max_value=0.01),
         FieldRule("slippage", "float", required=False, default="0.001", min_value=0, max_value=0.01),
+        FieldRule("transfer_fee_rate", "float", required=False, default="0.00001", min_value=0, max_value=0.001),
+        FieldRule("min_commission_per_trade", "float", required=False, default="5.0", min_value=0, max_value=100),
+        FieldRule("exclude_st", "bool", required=False, default="true"),
         FieldRule("max_position_pct", "float", required=False, default="0.1", min_value=0.01, max_value=1.0),
         FieldRule("portfolio_method", "str", required=False, default="score_weighted",
                    allowed_values=["score_weighted", "risk_parity", "min_variance", "mean_variance"]),

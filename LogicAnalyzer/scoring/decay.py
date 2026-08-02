@@ -26,7 +26,6 @@ from scipy.stats import spearmanr
 from sqlalchemy import text as sql_text
 
 
-
 class FactorDecayMonitor:
     """多因子衰减监控与自动降权。
 
@@ -311,7 +310,7 @@ class FactorDecayMonitor:
             current = self._weights.get(fname, 0.0)
 
             # 衰减恢复检测
-            is_recovered, rec_ic = self.check_recovery(fname, rolling_ic)
+            is_recovered, _ = self.check_recovery(fname, rolling_ic)
 
             status = {
                 "滚动IC均值": round(ic_mean, 4),
@@ -380,13 +379,3 @@ class FactorDecayMonitor:
                     })
         except Exception as e:
             logger.warning(f"[因子衰减] 写入 IC 历史失败: {e}")
-
-    def load_ic_history(self, days: int = 60) -> pd.DataFrame:
-        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        sql = sql_text(
-            f"SELECT * FROM {self.TABLE_NAME} "
-            "WHERE check_date >= :since "
-            "ORDER BY check_date, factor_name"
-        )
-        with self._engine.connect() as conn:
-            return pd.read_sql(sql, conn, params={"since": since})

@@ -66,10 +66,11 @@ def test_space_building() -> None:
     from UtilsManager.ConfigParser import BacktestConfig
     bc = BacktestConfig()
     spaces = build_spaces(bc)
-    assert len(spaces) == 12
+    # 死参数 (kelly_fraction/position_a/liq_veto_ratio/risk_none_multiplier) 已移出寻优空间
+    assert len(spaces) == 8
     sig, port = split_by_cost(spaces)
-    assert len(sig) == 4, f"Expected 4 signal params, got {len(sig)}"
-    assert len(port) == 8, f"Expected 8 portfolio params, got {len(port)}"
+    assert len(sig) == 5, f"Expected 5 signal params, got {len(sig)}"
+    assert len(port) == 3, f"Expected 3 portfolio params, got {len(port)}"
     desc = describe(spaces)
     assert "信号参数" in desc
     assert "组合参数" in desc

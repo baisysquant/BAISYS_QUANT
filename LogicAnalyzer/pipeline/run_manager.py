@@ -152,47 +152,5 @@ class RunManager:
         except Exception as e:
             logger.warning(f"[RunManager] 写入 finish 记录失败: {e}")
 
-    def update_summary(self, summary: dict[str, Any]) -> None:
-        """更新运行摘要（评分分布等）。"""
-        if self._engine is None or not self._run_id:
-            return
-        try:
-            import json
-            sql = sql_text(f"""
-            UPDATE public.{self.TABLE_NAME}
-            SET score_summary = CAST(:ss AS jsonb)
-            WHERE run_id = :rid
-            """)
-            with self._engine.begin() as conn:
-                conn.execute(sql, {
-                    "rid": self._run_id,
-                    "ss": json.dumps(summary),
-                })
-        except Exception:
-            pass
 
     # ── 查询 ───────────────────────────────────────────────
-
-    def get_recent_runs(self, days: int = 30) -> list[dict[str, Any]]:
-        """查询最近 N 天的运行记录。"""
-        if self._engine is None:
-            return []
-        sql = sql_text(f"""
-        SELECT run_id, trade_date, status, started_at, finished_at,
-               duration_seconds, config_hash, stock_pool_hash, stock_count
-        FROM public.{self.TABLE_NAME}
-        WHERE started_at >= NOW() - INTERVAL '{days} days'
-        ORDER BY started_at DESC
-        """)
-        with self._engine.connect() as conn:
-            rows = conn.execute(sql).fetchall()
-        return [dict(r._mapping) for r in rows]
-
-    def get_run(self, run_id: str) -> dict[str, Any] | None:
-        """查询指定 run_id 的记录。"""
-        if self._engine is None:
-            return None
-        sql = sql_text(f"SELECT * FROM public.{self.TABLE_NAME} WHERE run_id = :rid")
-        with self._engine.connect() as conn:
-            row = conn.execute(sql, {"rid": run_id}).fetchone()
-        return dict(row._mapping) if row else None

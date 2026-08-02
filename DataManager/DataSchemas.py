@@ -63,18 +63,6 @@ def create_industry_board_schema() -> DataFrameSchema:
     )
 
 
-def create_industry_constituent_schema() -> DataFrameSchema:
-    """
-    行业成分股数据 Schema
-    """
-    return DataFrameSchema(
-        {
-            "股票代码": Column(str, nullable=False, coerce=True),
-            "所属板块": Column(str, nullable=False, coerce=True),
-        }
-    )
-
-
 def create_main_cost_schema() -> DataFrameSchema:
     """
     主力成本数据 Schema
@@ -86,24 +74,6 @@ def create_main_cost_schema() -> DataFrameSchema:
             "主力成本差价": Column(float, nullable=True, coerce=True),
             "成本位置": Column(str, nullable=True, coerce=True),
             "主力控盘强度": Column(str, nullable=True, coerce=True),
-        },
-        strict=False,
-    )
-
-
-def create_kline_data_schema() -> DataFrameSchema:
-    """
-    K线历史数据 Schema
-    """
-    return DataFrameSchema(
-        {
-            "股票代码": Column(str, nullable=False, coerce=True),
-            "日期": Column("datetime64[ns]", nullable=False),
-            "开盘": Column(float, nullable=False, coerce=True),
-            "收盘": Column(float, nullable=False, coerce=True),
-            "最高": Column(float, nullable=False, coerce=True),
-            "最低": Column(float, nullable=False, coerce=True),
-            "成交量": Column(float, nullable=True, coerce=True),
         },
         strict=False,
     )
@@ -194,17 +164,6 @@ class SchemaValidator:
         except Exception as e:
             return False, [str(e)]
 
-    @staticmethod
-    def validate_industry_constituent(df: pd.DataFrame, lazy: bool = True) -> tuple[bool, list[str]]:
-        """
-        校验行业成分股数据
-        """
-        try:
-            schema = create_industry_constituent_schema()
-            schema.validate(df, lazy=lazy)
-            return True, []
-        except Exception as e:
-            return False, [str(e)]
 
     @staticmethod
     def validate_main_cost(df: pd.DataFrame, lazy: bool = True) -> tuple[bool, list[str]]:
@@ -218,17 +177,6 @@ class SchemaValidator:
         except Exception as e:
             return False, [str(e)]
 
-    @staticmethod
-    def validate_kline_data(df: pd.DataFrame, lazy: bool = True) -> tuple[bool, list[str]]:
-        """
-        校验K线数据
-        """
-        try:
-            schema = create_kline_data_schema()
-            schema.validate(df, lazy=lazy)
-            return True, []
-        except Exception as e:
-            return False, [str(e)]
 
     @staticmethod
     def validate_final_report(df: pd.DataFrame, lazy: bool = True) -> tuple[bool, list[str]]:

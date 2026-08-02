@@ -87,36 +87,6 @@ class DataValidator:
 
         return True, []
 
-    def validate_stock_code_format(
-        self, df: pd.DataFrame, code_col: str = "股票代码", data_name: str = "股票数据"
-    ) -> tuple[pd.DataFrame, int]:
-        """
-        验证并标准化股票代码格式
-
-        检查股票代码是否为6位数字格式，自动修复常见格式问题。
-
-        Args:
-            df: 包含股票代码的 DataFrame
-            code_col: 股票代码列名
-            data_name: 数据名称，用于日志记录
-
-        Returns:
-            Tuple[pd.DataFrame, int]: (标准化后的DataFrame, 修复的股票数量)
-        """
-        if df.empty or code_col not in df.columns:
-            return df, 0
-
-        from UtilsManager.CodeNormalizer import CodeNormalizer
-
-        original_codes = df[code_col].copy()
-        df[code_col] = df[code_col].apply(CodeNormalizer.normalize)
-
-        fixed_count = (original_codes != df[code_col]).sum()
-
-        if fixed_count > 0 and self.logger:
-            logger.info(f"[数据验证] {data_name}: 修复了 {fixed_count} 个股票代码格式")
-
-        return df, fixed_count
 
     def validate_price_data(
         self, df: pd.DataFrame, price_cols: list[str] | None = None, data_name: str = "价格数据"
@@ -179,68 +149,6 @@ class DataValidator:
 
         return not has_anomaly, anomaly_counts
 
-    def validate_date_range(
-        self,
-        df: pd.DataFrame,
-        date_col: str = "日期",
-        expected_date: str | None = None,
-        tolerance_days: int = 3,
-        data_name: str = "时间序列数据",
-    ) -> tuple[bool, str]:
-        """
-        验证日期范围的合理性
-
-        Args:
-            df: 包含日期列的 DataFrame
-            date_col: 日期列名
-            expected_date: 期望的日期（YYYYMMDD格式），如果不提供则不检查
-            tolerance_days: 允许的日期偏差天数
-            data_name: 数据名称，用于日志记录
-
-        Returns:
-            Tuple[bool, str]: (验证是否通过, 错误信息)
-        """
-        if df.empty or date_col not in df.columns:
-            return True, ""
-
-        try:
-            # 尝试解析日期列
-            dates = pd.to_datetime(df[date_col], errors="coerce")
-
-            if dates.isna().all():
-                error_msg = f"{data_name}: 无法解析日期列 '{date_col}'"
-                if self.logger:
-                    logger.warning(f"[数据验证] {error_msg}")
-                return False, error_msg
-
-            # 检查日期范围
-            max_date = dates.max()
-
-            if expected_date:
-                try:
-                    expected_dt = pd.to_datetime(expected_date, format="%Y%m%d")
-                    date_diff = abs((max_date - expected_dt).days)
-
-                    if date_diff > tolerance_days:
-                        error_msg = (
-                            f"{data_name}: 最新日期 {max_date.strftime('%Y-%m-%d')} "
-                            f"与期望日期 {expected_date} 相差 {date_diff} 天 "
-                            f"(允许偏差: {tolerance_days} 天)"
-                        )
-                        if self.logger:
-                            logger.warning(f"[数据验证] {error_msg}")
-                        return False, error_msg
-                except Exception as e:
-                    if self.logger:
-                        logger.warning(f"[数据验证] {data_name}: 日期解析失败 - {e}")
-
-            return True, ""
-
-        except Exception as e:
-            error_msg = f"{data_name}: 日期验证失败 - {e}"
-            if self.logger:
-                logger.error(f"[数据验证] {error_msg}")
-            return False, error_msg
 
     def validate_data_completeness(
         self,
@@ -292,68 +200,3 @@ class DataValidator:
                     )
 
         return not has_excessive_nulls, null_ratios
-
-    def comprehensive_validate(
-        self,
-        df: pd.DataFrame,
-        data_name: str = "数据",
-        required_cols: list[str] | None = None,
-        price_cols: list[str] | None = None,
-        check_completeness: bool = True,
-    ) -> dict[str, Any]:
-        """
-        综合验证 DataFrame 的质量
-
-        执行多项验证检查，返回详细的验证报告。
-
-        Args:
-            df: 待验证的 DataFrame
-            data_name: 数据名称
-            required_cols: 必需列名列表
-            price_cols: 价格列名列表
-            check_completeness: 是否检查数据完整性
-
-        Returns:
-            Dict: 验证报告，包含以下字段：
-                - passed: bool, 整体验证是否通过
-                - checks: Dict, 各项检查结果
-                - warnings: List[str], 警告信息列表
-        """
-        report = {"passed": True, "checks": {}, "warnings": []}
-
-        # 1. 非空验证
-        try:
-            not_empty = self.validate_dataframe_not_empty(df, data_name)
-            report["checks"]["not_empty"] = not_empty
-        except (ValueError, TypeError) as e:
-            report["passed"] = False
-            report["checks"]["not_empty"] = False
-            report["warnings"].append(str(e))
-            return report
-
-        # 2. 必需列验证
-        if required_cols:
-            cols_valid, missing_cols = self.validate_required_columns(df, required_cols, data_name)
-            report["checks"]["required_columns"] = cols_valid
-            if missing_cols:
-                report["warnings"].append(f"缺少列: {missing_cols}")
-                report["passed"] = False
-
-        # 3. 价格数据验证
-        if price_cols:
-            price_valid, anomaly_counts = self.validate_price_data(df, price_cols, data_name)
-            report["checks"]["price_data"] = price_valid
-            if anomaly_counts:
-                report["warnings"].append(f"价格异常: {anomaly_counts}")
-
-        # 4. 数据完整性验证
-        if check_completeness:
-            completeness_valid, null_ratios = self.validate_data_completeness(df, data_name=data_name)
-            report["checks"]["completeness"] = completeness_valid
-            if not completeness_valid:
-                report["warnings"].append("存在过多空值")
-
-        return report
-
-
-

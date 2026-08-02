@@ -174,30 +174,6 @@ class TradingCalendarAnalyzer:
             date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
         return date_str in self.get_official_trading_dates()
 
-    def get_trading_day_offset(self, offset_days: int, base_date: str = None) -> str:
-        official_dates = self.get_official_trading_dates()
-
-        if base_date is None:
-            base_date = self.get_last_trading_day()
-
-        sorted_dates = sorted(list(official_dates))
-
-        try:
-            base_index = sorted_dates.index(base_date)
-        except ValueError:
-            logger.warning(f"[Calendar WARN] 基准日期 {base_date} 不在交易日列表中，使用最后交易日")
-            base_index = len(sorted_dates) - 1
-
-        target_index = base_index + offset_days
-
-        if target_index < 0:
-            target_index = 0
-        elif target_index >= len(sorted_dates):
-            target_index = len(sorted_dates) - 1
-
-        return sorted_dates[target_index]
-
 
 # --- 实例化供外部调用 ---
 # trading_calendar = TradingCalendarAnalyzer()
-

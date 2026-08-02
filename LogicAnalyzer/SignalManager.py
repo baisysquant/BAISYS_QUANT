@@ -43,30 +43,6 @@ class TASignalProcessor:
         self.config        = config
         self.executor      = executor
 
-    def _classify_cci_level(self, cci_value: float) -> str:
-        """
-        根据 CCI 值分类
-        
-        CCI (Commodity Channel Index) 商品通道指标分类标准：
-        - > 200: 极度超买
-        - 100 ~ 200: 强势超买
-        - -100 ~ 100: 正常区间（无信号）
-        - -200 ~ -100: 弱势超卖
-        - < -200: 极度超卖
-        
-        Args:
-            cci_value: CCI 指标值
-            
-        Returns:
-            str: CCI 状态描述字符串，如 '极度超买 (250.35)' 或空字符串
-        """
-        if pd.isna(cci_value):
-            return 'N/A'
-        if   cci_value >  200: return f'极度超买 ({cci_value:.2f})'
-        elif cci_value >= 100: return f'强势超买 ({cci_value:.2f})'
-        elif cci_value >  -100: return ''
-        elif cci_value >= -200: return f'弱势超卖 ({cci_value:.2f})'
-        else:                   return f'极度超卖 ({cci_value:.2f})'
 
     def _process_single_stock(
         self,
@@ -119,7 +95,7 @@ class TASignalProcessor:
 
         try:
             df = self.macd_analyzer._custom_macd(df)
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, IndexError) as e:
             logger.debug("股票 %s MACD计算跳过: %s", pure_code, e)
             return None
 
@@ -133,7 +109,7 @@ class TASignalProcessor:
                 result['kline_pattern_score'] = kp['score']
                 df.attrs['kline_pattern_score'] = kp['score']
                 df.attrs['_kline_pattern_details'] = {'details': kp['details']}
-        except (KeyError, ValueError, TypeError, AttributeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
             logger.debug("股票 %s K线形态检测跳过: %s", pure_code, e)
 
         weights = getattr(self.config, 'FULL_BULL_WEIGHTS', None)
@@ -190,7 +166,7 @@ class TASignalProcessor:
             result['macd_trend_raw'] = pipeline_result.get('macd_trend', '')
             result['amount'] = float(df['AMOUNT'].iloc[-1]) if 'AMOUNT' in df.columns else 0
             result['amount_ma20'] = float(df['AMOUNT_MA20'].iloc[-1]) if 'AMOUNT_MA20' in df.columns else 0
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, IndexError) as e:
             logger.debug("股票 %s 管线分析跳过: %s", pure_code, e)
 
         try:
@@ -199,14 +175,14 @@ class TASignalProcessor:
                 val = df[detail_col].iloc[-1]
                 if pd.notna(val) and val != '':
                     result['macd_signal'] = val
-        except (KeyError, ValueError, TypeError) as e:
+        except (KeyError, ValueError, TypeError, IndexError) as e:
             logger.debug("股票 %s MACD信号详情跳过: %s", pure_code, e)
 
         try:
             kdj_signal = self.kdj_analyzer.calculate_kdj_signal_from_df(df)
             if kdj_signal:
                 result['kdj_signal'] = kdj_signal
-        except (KeyError, ValueError, TypeError, AttributeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
             logger.debug("股票 %s KDJ分析跳过: %s", pure_code, e)
 
         try:
@@ -214,7 +190,7 @@ class TASignalProcessor:
             if cci_result:
                 result['cci_analysis'] = cci_result
                 result['cci_signal'] = cci_result.get('simple_signal', '')
-        except (KeyError, ValueError, TypeError, AttributeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
             logger.debug("股票 %s 专业CCI分析跳过: %s", pure_code, e)
 
         try:
@@ -222,7 +198,7 @@ class TASignalProcessor:
             if rsi_result:
                 result['rsi_analysis'] = rsi_result
                 result['rsi_signal'] = rsi_result.get('simple_signal', '')
-        except (KeyError, ValueError, TypeError, AttributeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
             logger.debug("股票 %s 专业RSI分析跳过: %s", pure_code, e)
 
         try:
@@ -234,7 +210,7 @@ class TASignalProcessor:
                 bbu = next((c for c in df.columns if c.startswith('BBU_')), None)
                 if bbl and bbu and 'close' in df.columns:
                     df['BOLL_BANDWIDTH'] = (df[bbu] - df[bbl]) / df['close']
-        except (KeyError, ValueError, TypeError, AttributeError) as e:
+        except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
             logger.debug("股票 %s 专业BOLL分析跳过: %s", pure_code, e)
 
         return result
@@ -648,7 +624,7 @@ class TASignalProcessor:
                     r = future.result()
                     if r:
                         results.append(r)
-                except (KeyError, ValueError, TypeError, AttributeError) as e:
+                except (KeyError, ValueError, TypeError, AttributeError, IndexError) as e:
                     logger.warning("股票 %s 管线线程异常: %s", code, e)
         finally:
             if self.executor is None:

@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 
 def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]:
@@ -13,7 +14,17 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
         return {}
 
     vals = df["portfolio_value"].values.astype(float)
+    # 非有限值（0 除、NaN、Inf）直接剔除对应点，避免静默污染全部指标
+    finite_mask = np.isfinite(vals)
+    if finite_mask.sum() < 2:
+        return {}
+    if not finite_mask.all():
+        vals = vals[finite_mask]
+    if vals[0] <= 0:
+        return {}
+
     returns = (vals[1:] - vals[:-1]) / vals[:-1]
+    returns = returns[np.isfinite(returns)]
     n = len(returns)
     if n < 2:
         return {}
@@ -21,39 +32,53 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
     total_ret = vals[-1] / vals[0] - 1
     ann_factor = 252
     mu = returns.mean() * ann_factor
-    sigma = returns.std() * math.sqrt(ann_factor)
+    sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
 
     sharpe = mu / sigma if sigma > 0 else 0.0
 
     downside = returns[returns < 0]
-    downside_std = downside.std() * math.sqrt(ann_factor) if len(downside) > 0 else 1e-10
-    sortino = mu / downside_std if downside_std > 0 else 0.0
+    # 无亏损日时 Sortino 应为无穷大（风险为零），而不是伪分母导致的 10^12 量级失真
+    if len(downside) == 0:
+        sortino = float("inf") if mu > 0 else 0.0
+    else:
+        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
+        sortino = mu / downside_std if downside_std > 0 else (float("inf") if mu > 0 else 0.0)
 
     peak = np.maximum.accumulate(vals)  # type: ignore[arg-type]
     dd = (vals - peak) / peak
     max_dd = float(dd.min())
 
-    peak_idx = np.argmax(peak)
-    trough_idx = np.argmin(vals[peak_idx:]) + peak_idx if peak_idx < len(vals) - 1 else peak_idx
+    # 数据异常告警：回撤 < -100% 意味着期中出现负净资产（正常价格数据不可能），
+    # 通常由负复权价/负市值导致，提示检查上游数据而非真实亏损
+    if max_dd < -1.0:
+        logger.warning(f"净资产曲线 max_drawdown={max_dd:.4f} < -100%，存在负净资产点，"
+                       f"疑似复权价数据异常（close_adj<=0），请检查数据源")
+
+    peak_idx = int(np.argmax(peak))
+    trough_idx = int(np.argmin(vals[peak_idx:])) + peak_idx if peak_idx < len(vals) - 1 else peak_idx
     dd_duration = int(trough_idx - peak_idx) if trough_idx > peak_idx else 0
 
     sorted_ret = np.sort(returns)
     var_95 = float(np.percentile(sorted_ret, 5))
     cvar_95 = float(sorted_ret[sorted_ret <= var_95].mean()) if np.any(sorted_ret <= var_95) else var_95
 
-    calmar = total_ret / abs(max_dd) if max_dd != 0 else 0.0
+    # 几何年化（CAGR）与年化 Calmar：跨期可比，避免算术年化高估
+    years = n / ann_factor
+    cagr = (1 + total_ret) ** (1 / years) - 1 if years > 0 and total_ret > -1 else total_ret
+    calmar = cagr / abs(max_dd) if max_dd != 0 else 0.0
 
     # ── 换手率 ──
-    turnover = df["turnover"].values if "turnover" in df.columns else np.array([0.0])
-    avg_turnover = float(turnover.mean())
-    max_turnover = float(turnover.max())
+    turnover = df["turnover"].values.astype(float) if "turnover" in df.columns else np.array([0.0])
+    turnover = turnover[np.isfinite(turnover)]
+    avg_turnover = float(turnover.mean()) if len(turnover) else 0.0
+    max_turnover = float(turnover.max()) if len(turnover) else 0.0
 
     return {
         "total_return": round(total_ret, 6),
-        "annual_return": round(mu, 6),
+        "annual_return": round(cagr, 6),
         "annual_vol": round(sigma, 6),
         "sharpe_ratio": round(sharpe, 4),
-        "sortino_ratio": round(sortino, 4),
+        "sortino_ratio": round(sortino, 4) if math.isfinite(sortino) else None,
         "calmar_ratio": round(calmar, 4),
         "max_drawdown": round(max_dd, 6),
         "max_drawdown_duration": dd_duration,
@@ -66,14 +91,15 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
 
 def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
     buys = [t for t in trade_log if t.get("action") == "buy"]
-    sells = [t for t in trade_log if t.get("action") == "sell"]
+    sells = [t for t in trade_log if t.get("action", "").startswith("sell")]
 
     if not buys or not sells:
         return {"total_trades": 0}
 
     total = len(buys) + len(sells)
 
-    # FIFO 按 symbol 配对：每个 symbol 独立队列，买入顺序匹配卖出顺序
+    # FIFO 按 symbol 配对：买入队列按成交顺序，卖出（含 sell_partial）按股数消耗买入，
+    # 成本/金额按比例分摊，避免半仓卖出与全仓买入错配导致的 PnL 失真。
     from collections import defaultdict
     buy_queue: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for b in buys:
@@ -82,13 +108,28 @@ def compute_trade_metrics(trade_log: list[dict[str, Any]]) -> dict[str, Any]:
     pnl = []
     for s in sells:
         sym = s["symbol"]
-        if sym not in buy_queue or not buy_queue[sym]:
+        shares = float(s.get("shares", 0))
+        proceeds = float(s.get("value", 0))
+        q = buy_queue.get(sym)
+        if not q:
             continue
-        b = buy_queue[sym].pop(0)
-        # 使用 value（实际成交金额）而非 price 计算 PnL
-        # buy["value"] = 买入分配金额, sell["value"] = 卖出税后收入
-        # PnL = 卖出收入 - 买入成本 - 买入佣金滑点
-        pnl.append(s.get("value", 0) - b.get("value", 0) - b.get("cost", 0))
+        if shares <= 0:
+            # 旧日志无 shares 字段：退化为整笔配对
+            b = q.pop(0)
+            pnl.append(proceeds - b.get("value", 0) - b.get("cost", 0))
+            continue
+        remaining = shares
+        while remaining > 1e-9 and q:
+            b = q[0]
+            b_sh = float(b.get("shares", shares))
+            take = min(remaining, b_sh)
+            frac = take / b_sh if b_sh > 0 else 1.0
+            pnl.append(proceeds * (take / shares) - b.get("value", 0) * frac - b.get("cost", 0) * frac)
+            remaining -= take
+            if b_sh - take <= 1e-9:
+                q.pop(0)
+            else:
+                b["shares"] = b_sh - take
 
     wins = [p for p in pnl if p > 0]
     losses = [p for p in pnl if p <= 0]

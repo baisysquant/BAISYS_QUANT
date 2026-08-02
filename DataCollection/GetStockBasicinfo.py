@@ -229,13 +229,3 @@ class StockBasicInfoService:
         except (DatabaseError, DBAPIError, OperationalError) as e:
             self.logger.error(f"同步成分股信息失败: {e!s}")
             return False
-
-    def get_stock_count(self) -> int:
-        """获取表中的记录总数"""
-        if not self.db_manager:
-            self._initialize_database()
-        try:
-            return self.db_manager.get_table_count(self.TABLE_NAME)
-        except (DatabaseError, DBAPIError, OperationalError) as e:
-            self.logger.error(f"获取记录总数失败: {e!s}")
-            return 0

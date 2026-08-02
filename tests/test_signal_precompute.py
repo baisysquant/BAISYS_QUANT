@@ -49,11 +49,11 @@ class TestParamHash:
         assert h1 == h2  # atr_stop_mult 不影响信号，hash 相同
 
     @pytest.mark.unit
-    def test_param_hash_excludes_conclusion_full_bull(self):
+    def test_param_hash_includes_conclusion_full_bull(self):
         from BackTrading.prepare import _compute_param_hash
         h1 = _compute_param_hash({"conclusion_full_bull": 70})
         h2 = _compute_param_hash({"conclusion_full_bull": 90})
-        assert h1 == h2  # conclusion_full_bull 不影响信号，hash 相同
+        assert h1 != h2  # conclusion_full_bull 决定风险等级/进出场阈值，影响信号，hash 必须不同
 
     @pytest.mark.unit
     def test_param_hash_includes_golden_cross_bonus(self):

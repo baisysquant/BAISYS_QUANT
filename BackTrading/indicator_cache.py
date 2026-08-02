@@ -100,17 +100,6 @@ def _save_to_disk(symbol: str, df: pd.DataFrame, peaks: np.ndarray, troughs: np.
         json.dump(meta, f)
 
 
-def _is_cache_valid(symbol: str, df: pd.DataFrame) -> bool:
-    mpath = _meta_path(symbol)
-    if not mpath.exists():
-        return False
-    try:
-        with open(mpath) as f:
-            return json.load(f).get("fingerprint") == _data_fingerprint(df)
-    except Exception:
-        return False
-
-
 def precompute_all_indicators(stock_dir: str) -> None:
     """Phase 0: 为 stock_dir 中所有股票预计算技术指标（不含 peaks/troughs）。
 
@@ -209,12 +198,3 @@ def get_precomputed(
     _TROUGHS[symbol] = np.array([], dtype=int)
     _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
     return df_ind, np.array([], dtype=int), np.array([], dtype=int)
-
-
-def reset_cache() -> None:
-    """清空内存缓存（主要在测试中使用）。"""
-    global _PRECOMPUTE_DONE
-    _PRECOMPUTE_DONE = False
-    _IN_MEMORY.clear()
-    _PEAKS.clear()
-    _TROUGHS.clear()

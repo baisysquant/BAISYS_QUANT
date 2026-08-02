@@ -406,7 +406,6 @@ class FactorCalculator:
             return report
 
         result = report.copy()
-        symbol_map = {s: i for i, s in result.get("股票代码", pd.Series(dtype=str)).items()}
         logger.info(f"[v] fuse_scores start: result.shape={result.shape}, cols={list(result.columns)}")
 
         # 1. 将外部因子数据 merge 到 report

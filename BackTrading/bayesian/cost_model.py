@@ -24,13 +24,15 @@ _SIGNAL_PARAM_KEYS = frozenset({
     "cross_decay_days",
     "golden_cross_bonus",
     "divergence_penalty",
+    "conclusion_full_bull",
 })
 
 # EngineConfig 中可被优化的字段（必须是 EngineConfig 的 dataclass 字段）
+# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
+# 为引擎死参数（审计确认仓位恒等权），不纳入寻优。
 _TUNABLE_CFG_FIELDS = frozenset({
-    "atr_stop_mult", "kelly_fraction", "position_a",
-    "liq_veto_ratio", "boll_narrow_ratio", "cross_decay_days",
-    "risk_none_multiplier", "buy_threshold", "max_holdings",
+    "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
+    "buy_threshold", "max_holdings",
 })
 
 # ── 全局信号缓存（跨路径/跨窗口共享） ──
@@ -83,11 +85,15 @@ class FidelityController:
         base_engine_cfg: EngineConfig,
         compute_exit_strategy: bool = True,
         vectorized: bool = True,
+        eval_start_date: str | None = None,
     ):
         self._kline = kline_df
         self._base_cfg = base_engine_cfg
         self._compute_exit = compute_exit_strategy
         self._vectorized = vectorized
+        # 信号预热历史与评估区间分离：传入时 prepare 计算完信号后截断至该日期，
+        # 保证引擎只交易 [eval_start_date, 末尾]，预热行不产生交易。
+        self._eval_start_date = eval_start_date
         # 实例级缓存（信号参数 hash → DataFrame），上限 2 防 OOM
         self._signal_cache: dict[str, pd.DataFrame] = {}
         self._INSTANCE_CACHE_MAX = 2
@@ -138,6 +144,7 @@ class FidelityController:
                             self._kline, params=params,
                             compute_exit_strategy=self._compute_exit,
                             vectorized=self._vectorized,
+                            backtest_start_date=self._eval_start_date,
                         )
                         with _GLOBAL_CACHE_LOCK:
                             if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
@@ -197,6 +204,7 @@ class FidelityController:
                     self._kline, params=signal_params,
                     compute_exit_strategy=self._compute_exit,
                     vectorized=self._vectorized,
+                    backtest_start_date=self._eval_start_date,
                 )
                 with _GLOBAL_CACHE_LOCK:
                     if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:

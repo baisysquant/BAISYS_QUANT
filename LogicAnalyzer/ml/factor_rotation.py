@@ -117,10 +117,6 @@ class FactorRotationPlatform:
         sub = sub.sort_values(["symbol", "trade_date"])
         fwd = sub.groupby("symbol")["close"].transform(lambda s: s.shift(-5) / s - 1)
         last = sub.groupby("symbol").last().reset_index()
-        fwd_last = last.merge(
-            sub[["symbol", "trade_date"]].groupby("symbol").last().reset_index(),
-            on="symbol", how="left",
-        )
         _map = sub.drop_duplicates(subset="symbol").set_index("symbol")["close"].index
         result = report["股票代码"].map(
             sub.groupby("symbol").last()["close"].pipe(lambda s: s.shift(-5) / s - 1).to_dict()

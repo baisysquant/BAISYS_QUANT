@@ -27,6 +27,7 @@ from UtilsManager.IDataProvider import BacktestDataProvider
 from BackTrading.prepare import _build_params, prepare_backtest_data
 from UtilsManager.ConfigParser import Config
 from DataManager.DbEngine import get_engine
+from sqlalchemy import text
 
 
 _BACKTEST_LOCK_KEY = 987654321
@@ -115,12 +116,22 @@ def run_backtest_pipeline(
 
         logger.info(f"  K 线行数: {len(kline_df)}")
 
-        total_trading_days = int(kline_df["trade_date"].nunique())
-        train_period = max(total_trading_days - bt.OUT_OF_SAMPLE_DAYS, 30)
-        logger.info(f"  交易日数: {total_trading_days} | 训练窗口: {train_period}天")
-
-        _num_paths = bt.WFO_NUM_PATHS
-        logger.info(f"  WFO 多路径数: {_num_paths}")
+        # 窗口坐标轴以正式回测起点为准（起点前为信号预热历史，不参与 WFO 交易）
+        def _ds(d) -> str:
+            return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+        _bt_cut = f"{bt.BACKTEST_START_DATE[:4]}-{bt.BACKTEST_START_DATE[4:6]}-{bt.BACKTEST_START_DATE[6:8]}"
+        total_trading_days = sum(1 for d in kline_df["trade_date"].unique() if _ds(d) >= _bt_cut)
+        _oos = bt.OUT_OF_SAMPLE_DAYS
+        # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS <= n，
+        # 否则路径 2/3 必然越界跳过（如 IS=805+OOS=60 在 865 天数据上只有 1 条路径有效）。
+        _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
+        _max_np = max(1, (total_trading_days - 120) // _oos) if total_trading_days > _oos + 120 else 1
+        _num_paths = min(_np_cfg, _max_np)
+        train_period = max(120, min(total_trading_days - _oos, total_trading_days - _oos * _num_paths))
+        logger.info(
+            f"  交易日数: {total_trading_days} | IS训练窗口: {train_period}天 | OOS: {_oos}天"
+            f" | WFO路径数: {_num_paths}（配置 {_np_cfg}，数据上限 {_max_np}）"
+        )
         _log_step("fetch_kline")
         wf_result = run_walk_forward(
             kline_df=kline_df,
@@ -135,6 +146,7 @@ def run_backtest_pipeline(
             portfolio_method=bt.PORTFOLIO_METHOD,
             point_in_time=bt.POINT_IN_TIME,
             show_progress=True,
+            backtest_start_date=_bt_cut,
         )
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
@@ -151,6 +163,9 @@ def run_backtest_pipeline(
         from UtilsManager.ConfigParser import PositionSizingConfig as _PsCfg
         _ps: _PsCfg = config.app_config.position_sizing
         _sc = config.app_config.scoring_params
+        # 组合参数若未被寻优（兜底路径），取配置区间中位，保证最终回测与校准参数一致
+        _bt_mid = sum(bt.parse_range("BUY_THRESHOLD_RANGE")[:2]) / 2
+        _mh_mid = sum(bt.parse_range("MAX_HOLDINGS_RANGE")[:2]) / 2
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
             commission_rate=bt.COMMISSION_RATE,
@@ -159,25 +174,27 @@ def run_backtest_pipeline(
             max_position_pct=bt.MAX_POSITION_PCT,
             portfolio_method=bt.PORTFOLIO_METHOD,
             point_in_time=bt.POINT_IN_TIME,
-            kelly_fraction=best_params.get("kelly_fraction", _ps.KELLY_FRACTION),
-            position_a=best_params.get("position_a", _ps.POSITION_A),
-            risk_none_multiplier=best_params.get("risk_none_multiplier", _ps.RISK_NONE_MULTIPLIER),
             atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
+            buy_threshold=int(best_params.get("buy_threshold", _bt_mid)),
+            max_holdings=int(best_params.get("max_holdings", _mh_mid)),
             cost_model=CostModel(
                 commission_rate=bt.COMMISSION_RATE,
                 stamp_tax_rate=bt.STAMP_TAX_RATE,
                 market_slippage=bt.SLIPPAGE,
+                min_commission_per_trade=bt.MIN_COMMISSION_PER_TRADE,
+                transfer_fee_rate=bt.TRANSFER_FEE_RATE,
             ),
         )
         final_params = _build_params(config)
         final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
+        if "boll_narrow_ratio" in best_params:
+            final_params["regime"]["boll_narrow_ratio"] = float(best_params["boll_narrow_ratio"])
         fb_cfg = config.app_config.full_bull_scoring
         final_params["thresholds"] = {
             "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg.CONCLUSION_FULL_BULL)),
             "bullish": fb_cfg.CONCLUSION_BULLISH,
             "oscillate": fb_cfg.CONCLUSION_OSCILLATE,
         }
-        final_params["position_sizing"]["risk_none_multiplier"] = best_params.get("risk_none_multiplier", _ps.RISK_NONE_MULTIPLIER)
 
         # ── 模拟交易验证：用最近交易日验证参数 OOS 稳定性 ──
         from BackTrading.simulated_trading import validate_params as _sim_validate
@@ -191,10 +208,18 @@ def run_backtest_pipeline(
         if not _promote:
             logger.warning(f"模拟验证不通过，参数不写入 config.ini: {_sim_verdict.reason}")
 
-        _log_step("prepare_final_signals")
+        # 加载 ST 历史状态（用于逐日动态剔除）
         _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
+        _end_date = kline_df["trade_date"].max()
+        if pd.api.types.is_datetime64_any_dtype(kline_df["trade_date"]):
+            _end_date = _end_date.strftime("%Y-%m-%d")
+        st_history = _load_st_history(engine, symbols, _bt_start_iso, _end_date)
+
+        _log_step("prepare_final_signals")
         final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso)
         _log_step("full_backtest")
+        # 将 ST 历史传给引擎
+        best_params["_st_history"] = st_history
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
         risk = compute_risk_metrics(equity_curve) or {}
@@ -443,12 +468,19 @@ def run_backtest_pipeline(
 
 
 def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
-    """解析股票列表，支持 main_board_only 过滤。直接查询 kline 全历史数据避免生存者偏差。"""
+    """解析股票列表，支持 main_board_only 过滤。
+    
+    为消除生存者偏差，股票池包含所有曾有过交易记录的股票（含已退市）。
+    ST/*ST/退市的逐日动态剔除由引擎配合 stock_st_history 完成，此处不做静态剔除。
+    """
     from UtilsManager.CodeNormalizer import CodeNormalizer
 
     with engine.connect() as conn:
+        # 合并：K 线已有数据的股票 + ST历史表中的股票（含退市）
         rows = conn.execute(text("""
             SELECT DISTINCT symbol FROM stock_daily_kline
+            UNION
+            SELECT DISTINCT symbol FROM stock_st_history
             ORDER BY symbol
         """)).fetchall()
     raw = sorted({str(r[0]) for r in rows})
@@ -458,9 +490,45 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
         raw = [s for s in raw if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))]
         if len(raw) < before:
             logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
+    # 注意：不再做静态 ST 剔除，逐日动态剔除由引擎根据 stock_st_history 完成
+    # 保留 EXCLUDE_ST 配置兼容性，仅记录日志
+    if config is not None and config.app_config.backtest.EXCLUDE_ST:
+        logger.info("EXCLUDE_ST=True：将由引擎按 stock_st_history 逐日动态剔除 ST/*ST/退市股票")
     if not raw:
         logger.warning("回测股票池为空，请检查数据库 stock_daily_kline 表")
     return sorted({CodeNormalizer.add_market_prefix(s) if not s.startswith(("sh", "sz")) else s for s in raw})
+
+
+def _load_st_history(engine: Any, symbols: list[str], start_date: str, end_date: str) -> dict[str, dict[str, tuple[bool, bool]]]:
+    """
+    加载股票在日期范围内的 ST/退市状态历史。
+    
+    Returns:
+        dict: {symbol: {trade_date: (is_st, is_delisting)}}
+    """
+    try:
+        # 只加载回测股票池中股票的 ST 历史，减少数据量
+        sym_placeholders = ",".join([f"'{s}'" for s in symbols])
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT symbol, trade_date, is_st, is_delisting
+                FROM stock_st_history
+                WHERE symbol IN ({sym_placeholders})
+                  AND trade_date >= :start_date
+                  AND trade_date <= :end_date
+            """), {"start_date": start_date, "end_date": end_date}).fetchall()
+        
+        st_history = {}
+        for symbol, trade_date, is_st, is_delisting in rows:
+            if symbol not in st_history:
+                st_history[symbol] = {}
+            st_history[symbol][str(trade_date)] = (is_st, is_delisting)
+        
+        logger.info(f"加载 ST 历史状态: {len(st_history)} 只股票，{len(rows)} 条记录")
+        return st_history
+    except Exception as e:
+        logger.warning(f"加载 ST 历史失败，将使用静态剔除: {e}")
+        return {}
 
 
 def _fetch_kline(
@@ -496,8 +564,16 @@ def _fetch_kline(
 
 
 def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: str) -> None:
-    """补齐 + 刷新 stock_daily_kline 数据。检查每只股票数据是否齐全，检测除权除息并重拉。"""
+    """补齐 + 刷新 stock_daily_kline 数据。检查每只股票数据是否齐全，检测除权除息并重拉。
+
+    同时执行一次性"指标预热回填"：已有数据但最早交易日晚于预热起点的股票，
+    强制从预热起点回填历史 K 线（MACD/ATR/MA 等指标至少需要 120 个交易日前文）。
+    """
     from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+
+    start = datetime.strptime(backtest_start_date, "%Y%m%d").date()
+    _buffer_calendar_days = 360
+    buffer_start_iso = (start - timedelta(days=_buffer_calendar_days)).isoformat()
 
     syncer = IncrementalSyncEngine(engine, default_start=backtest_start_date)
 
@@ -510,7 +586,7 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
     missing = [s for s in symbols if s not in existing]
     if missing:
         logger.info(f"  stock_daily_kline 缺少 {len(missing)} 只股票，开始补齐...")
-        n = syncer.sync_all(missing)
+        n = syncer.sync_all(missing, force_start_iso=buffer_start_iso)
         logger.info(f"  补齐完成，新增 {n} 行")
 
     # 对已有数据的股票执行增量刷新：检查最新日期、除权除息检测
@@ -519,6 +595,30 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
         logger.info(f"  检查 {len(existing_symbols)} 只股票数据完整性...")
         total = syncer.sync_all(existing_symbols)
         logger.info(f"  刷新完成，新增 {total} 行")
+
+    # 一次性指标预热回填：数据起点晚于预热起点的股票（缺早期历史，指标前文不足）
+    if existing_symbols:
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT symbol, MIN(trade_date) AS first_d FROM stock_daily_kline "
+                    "GROUP BY symbol"
+                )).fetchall()
+            first_by_symbol = {r[0]: r[1] for r in rows}
+            need_warmup = [
+                s for s in existing_symbols
+                if s in first_by_symbol and first_by_symbol[s] is not None
+                and pd.Timestamp(first_by_symbol[s]).strftime("%Y-%m-%d") > buffer_start_iso
+            ]
+            if need_warmup:
+                logger.info(
+                    f"  {len(need_warmup)} 只股票历史不足 {buffer_start_iso}（指标预热），"
+                    f"强制回填中（示例: {need_warmup[:5]}）..."
+                )
+                w_total = syncer.sync_all(need_warmup, force_start_iso=buffer_start_iso)
+                logger.info(f"  预热回填完成，新增 {w_total} 行")
+        except Exception as e:
+            logger.warning(f"  预热回填失败（回测继续，指标前文可能不足）: {e}")
 
 
 def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config | None = None) -> dict[str, float]:
@@ -533,28 +633,24 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
         if cfg is None:
             return {
                 "atr_stop_mult": 2.0,
-                "kelly_fraction": 0.25,
-                "position_a": 0.35,
-                "liq_veto_ratio": 0.065,
                 "boll_narrow_ratio": 0.9,
                 "cross_decay_days": 37,
                 "conclusion_full_bull": 80,
                 "golden_cross_bonus": 10,
                 "divergence_penalty": 20,
-                "risk_none_multiplier": 1.0,
+                "buy_threshold": 17,
+                "max_holdings": 11,
             }
         bt = cfg.app_config.backtest
         return {
             "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
-            "kelly_fraction": sum(bt.parse_range("KELLY_FRACTION_RANGE")[:2]) / 2,
-            "position_a": sum(bt.parse_range("POSITION_A_RANGE")[:2]) / 2,
-            "liq_veto_ratio": sum(bt.parse_range("LIQ_VETO_RATIO_RANGE")[:2]) / 2,
             "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
             "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
             "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
             "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
             "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
-            "risk_none_multiplier": sum(bt.parse_range("RISK_NONE_MULTIPLIER_RANGE")[:2]) / 2,
+            "buy_threshold": sum(bt.parse_range("BUY_THRESHOLD_RANGE")[:2]) / 2,
+            "max_holdings": sum(bt.parse_range("MAX_HOLDINGS_RANGE")[:2]) / 2,
         }
 
     if wf_result.empty or "params" not in wf_result.columns:

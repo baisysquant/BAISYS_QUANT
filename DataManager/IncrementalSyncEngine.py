@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -86,9 +87,14 @@ class IncrementalSyncEngine:
         except Exception as e:
             logger.warning(f"缓存清理失败: {e}")
 
-    def sync_all(self, symbols_prefixed: list[str]) -> int:
+    def sync_all(self, symbols_prefixed: list[str], force_start_iso: str | None = None) -> int:
+        """同步股票日线数据。
+
+        force_start_iso: 传入时忽略 stale 检查，强制从该日期起全量回填
+        （用于指标预热历史补全；写入幂等，可安全覆盖已存在区间）。
+        """
         try:
-            remaining = self._get_stale_symbols(symbols_prefixed)
+            remaining = self._get_stale_symbols(symbols_prefixed) if force_start_iso is None else list(symbols_prefixed)
 
             cached = self._load_failed_set()
             if cached:
@@ -102,9 +108,9 @@ class IncrementalSyncEngine:
                 logger.info("所有股票已有最新交易日数据,无需同步")
                 return 0
 
-            start_iso = self._calc_start_iso(remaining)
+            start_iso = force_start_iso or self._calc_start_iso(remaining)
             end_iso = self._trade_date.isoformat()
-            logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}")
+            logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}" + ("（强制回填）" if force_start_iso else ""))
 
             mid = len(remaining) // 2
             half_a = remaining[:mid]
@@ -275,11 +281,18 @@ class IncrementalSyncEngine:
             "high": [], "low": [], "volume": [], "amount": [],
             "adj_factor": [], "close_normal": [],
         }
+        skipped = 0
         for d in filtered:
             raw = raw_map[d]
             hfq = hfq_map[d]
             close_raw = float(raw[2])
             close_hfq = float(hfq[2])
+            if not (math.isfinite(close_raw) and close_raw > 0
+                    and math.isfinite(close_hfq) and close_hfq > 0):
+                # 上游价格异常（负值/NaN/零，如 sh600076 2024-06-24 负后复权价）：
+                # 丢弃该交易日，防止负复权价写入 DB 导致回测负市值污染
+                skipped += 1
+                continue
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
             out["open"].append(float(hfq[1]))
@@ -290,6 +303,8 @@ class IncrementalSyncEngine:
             out["amount"].append(float(raw[8]) * 10000)
             out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
             out["close_normal"].append(close_raw)
+        if skipped:
+            logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[int, list[str]]:
@@ -521,14 +536,6 @@ class IncrementalSyncEngine:
             logger.info(f"跳过 {skipped} 只(已有 {self._trade_date_str} 数据),需处理 {len(stale)} 只")
         return stale
 
-    def _has_no_close_normal(self, symbol: str) -> bool:
-        """DB 中 close_normal 为 NULL(从未写入原始不复权收盘价),需全量刷新."""
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                text(f"SELECT close_normal FROM {TABLE} WHERE symbol = :sym ORDER BY trade_date DESC LIMIT 1"),
-                {"sym": symbol},
-            ).scalar()
-        return row is None
 
     # ── trading day alignment ────────────────────────────────────
 
@@ -552,13 +559,6 @@ class IncrementalSyncEngine:
 
     # ── database ────────────────────────────────────────────────
 
-    def _get_latest_date(self, symbol: str) -> date | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                text(f"SELECT MAX(trade_date::date) FROM {TABLE} WHERE symbol = :sym"),
-                {"sym": symbol},
-            ).scalar()
-        return row if row is not None else None
 
     def _write_batch(self, df: pd.DataFrame) -> None:
         """幂等写入：(symbol, trade_date) 唯一约束 + ON CONFLICT DO UPDATE."""

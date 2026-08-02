@@ -11,6 +11,14 @@ import pandas as pd
 
 from LogicAnalyzer.SignalConstants import Divergence, MACDSignals, MACDTrend
 
+# A 股最小价格变动单位
+_TICK_SIZE = 0.01
+
+
+def _round_to_tick(price: float | np.ndarray) -> float | np.ndarray:
+    """价格按最小变动单位 0.01 元四舍五入。"""
+    return np.floor(price * 100 + 0.5) / 100
+
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. MACD 趋势分类
@@ -79,7 +87,6 @@ def _regime_series(
     osc_min_bars = int(params.get("oscillation_min_bars", 30))
     if len(df) > osc_min_bars:
         hist_std_ratio = float(params.get("oscillation_hist_std_ratio", 0.1))
-        recent_hist_std = hist.rolling(osc_min_bars).std()
         close_std = close.rolling(osc_min_bars).std()
         oscillation = is_narrow & (hist.abs() < hist_std_ratio * close_std)
 
@@ -411,9 +418,10 @@ def golden_cross_score(
     dif: pd.Series,
     dea: pd.Series,
     w_cross: int,
-    vol_norm_denom: float,
+    vol_norm_denom: float | np.ndarray,
     cross_decay_days: int,
     cross_decay_min: float,
+    golden_cross_bonus: int = 10,
 ) -> np.ndarray:
     """逐 bar 金叉评分 — 衰减部分全向量化。"""
     n = len(df)
@@ -432,11 +440,14 @@ def golden_cross_score(
         1.0,
     )
 
+    # R04 金叉加分：仅作用于金叉触发当日，按信号强度缩放
+    bonus = float(golden_cross_bonus) * vol_factor
+
     score = np.zeros(n, dtype=np.int32)
     mask_za = golden_zero_above.values
-    score[mask_za] = (w_cross * vol_factor[mask_za]).astype(int)
+    score[mask_za] = (w_cross * vol_factor[mask_za] + bonus[mask_za]).astype(int)
     mask_zb = golden_zero_below.values
-    score[mask_zb] = (w_cross // 2 * vol_factor[mask_zb]).astype(int)
+    score[mask_zb] = (w_cross // 2 * vol_factor[mask_zb] + bonus[mask_zb]).astype(int)
     mask_bull = is_bull.values & ~mask_za & ~mask_zb
     score[mask_bull] = (w_cross * 0.75 * vol_factor[mask_bull]).astype(int)
 
@@ -499,7 +510,7 @@ def _exit_score(
     es = np.zeros(n, dtype=np.float64)
     es[risk_level == "HIGH"] = 100.0
     es[risk_level == "D"] = 100.0
-    stop = close.shift(1) - atr.shift(1) * atr_stop_mult
+    stop = _round_to_tick(close.shift(1) - atr.shift(1) * atr_stop_mult)
     stop_hit = (stop > 0) & (close < stop)
     es[stop_hit] = np.maximum(es[stop_hit], 90.0)
     return es
@@ -529,6 +540,7 @@ def _composite_score(
     w_div: int,
     w_vol: int,
     w_kp: int,
+    divergence_penalty: int = 20,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """逐 bar 综合评分和 level/conclusion。"""
     n = len(macd_trend_arr)
@@ -546,11 +558,15 @@ def _composite_score(
     eff = div_strength * div_decay
     div_score[bot_div] = (w_div * (0.5 + 0.5 * eff[bot_div])).astype(int)
 
+    # R41 顶背离扣分（按背离强度缩放）
+    top_div = np.char.find(div_type.astype(str), Divergence.TOP_DIVERGENCE) >= 0
+    div_penalty = np.where(top_div, float(divergence_penalty) * eff, 0.0)
+
     # 量价
     vol_bonus = np.where(has_top_div, 0, vol_score)
     vol_bonus = np.clip(vol_bonus, -w_vol, w_vol)
 
-    total_base = trend_scores + golden_score + mom_score + slope_score + div_score + kp_score
+    total_base = trend_scores + golden_score + mom_score + slope_score + div_score + kp_score - div_penalty
     total_max_base = sum(weights.values())
     total_base = np.clip(total_base, 0, total_max_base)
     total = np.clip(total_base + vol_bonus, 0, total_max_base + w_vol)
@@ -629,9 +645,12 @@ def compute_signals(
     vol_norm_denom = float(score_p.get("vol_norm_denominator", 0.15))
     try:
         _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-        _v = _gs.dropna()
-        if len(_v) > 10:
-            vol_norm_denom = float(_v.quantile(0.75))
+        # 扩展窗口分位数（因果）：只用截至当日的数据归一化，避免全样本
+        # 75% 分位数引入未来波动率分布的前视偏差。
+        _denom = _gs.expanding(min_periods=20).quantile(0.75)
+        _denom = _denom.fillna(vol_norm_denom).clip(lower=1e-9)
+        if len(_denom) > 0 and float(_denom.iloc[-1]) > 0:
+            vol_norm_denom = _denom.values
     except Exception:
         pass
     cross_decay_days = int(score_p.get("cross_decay_days", 30))
@@ -678,6 +697,7 @@ def compute_signals(
     golden_score = golden_cross_score(
         stock_df, macd_cross, dif, dea,
         w_cross, vol_norm_denom, cross_decay_days, cross_decay_min,
+        golden_cross_bonus=int(score_p.get("golden_cross_bonus", 10)),
     )
 
     # ── 9. 风险等级 ──
@@ -698,12 +718,13 @@ def compute_signals(
         vol_score, kp_score, regime, has_top_div,
         weights, thresholds,
         w_cross, w_mom, w_slope, w_div, w_vol, w_kp,
+        divergence_penalty=int(score_p.get("divergence_penalty", 20)),
     )
 
     # ── 止损价 ──
     stop_loss = np.where(
         (atr > 0) & (~pd.isna(atr)),
-        close - atr * atr_stop_mult,
+        _round_to_tick(close - atr * atr_stop_mult),
         0.0,
     ).astype(np.float64)
 

@@ -28,19 +28,6 @@ class FinancialQualityFetcher:
         self._cache_days = config.FINANCIAL_QUALITY_CACHE_DAYS
         self._engine = get_engine(config)
 
-    def is_stale(self, symbol: str) -> bool:
-        """检查指定股票的财务数据是否已过期。"""
-        sql = (
-            f"SELECT MAX(record_date) FROM {self.TABLE_NAME} "
-            "WHERE symbol = :sym"
-        )
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                __import__("sqlalchemy").text(sql), {"sym": symbol}
-            ).scalar()
-        if result is None:
-            return True
-        return (datetime.now().date() - result).days > self._cache_days
 
     def fetch_one(self, symbol: str) -> dict[str, Any] | None:
         """调用 akShare 获取单只股票的财务摘要，提取质量/成长指标。"""
@@ -98,30 +85,6 @@ class FinancialQualityFetcher:
         except (TypeError, ValueError):
             return None
 
-    def sync_one(self, symbol: str) -> bool:
-        """采集单只股票并 UPSERT 到数据库。"""
-        row = self.fetch_one(symbol)
-        if row is None:
-            return False
-
-        from sqlalchemy import text
-
-        sql = text(
-            f"INSERT INTO {self.TABLE_NAME} "
-            "(symbol, record_date, roe, gross_profit_margin, net_profit_margin, "
-            "revenue_growth_rate, net_profit_growth_rate) "
-            "VALUES (:symbol, :record_date, :roe, :gross_profit_margin, :net_profit_margin, "
-            ":revenue_growth_rate, :net_profit_growth_rate) "
-            "ON CONFLICT (symbol, record_date) DO UPDATE SET "
-            "roe = EXCLUDED.roe, "
-            "gross_profit_margin = EXCLUDED.gross_profit_margin, "
-            "net_profit_margin = EXCLUDED.net_profit_margin, "
-            "revenue_growth_rate = EXCLUDED.revenue_growth_rate, "
-            "net_profit_growth_rate = EXCLUDED.net_profit_growth_rate"
-        )
-        with self._engine.begin() as conn:
-            conn.execute(sql, row)
-        return True
 
     # ── 文件缓存 ──────────────────────────────────────────────────
 

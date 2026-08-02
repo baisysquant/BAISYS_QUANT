@@ -41,41 +41,7 @@ class DataFetchError(QuantBaseException):
         self.source = source
 
 
-class DataValidationError(QuantBaseException):
-    """数据验证失败异常"""
-
-    def __init__(self, data_name: str, reason: str) -> None:
-        super().__init__(
-            message=f"数据验证失败 [{data_name}]: {reason}", error_code="DATA_VALIDATION_ERROR", recoverable=True
-        )
-        self.data_name = data_name
-
-
-class CacheError(QuantBaseException):
-    """缓存操作异常"""
-
-    def __init__(self, operation: str, message: str) -> None:
-        super().__init__(
-            message=f"缓存{operation}失败: {message}",
-            error_code="CACHE_ERROR",
-            recoverable=True,  # 缓存失败可以降级为重新获取
-        )
-        self.operation = operation
-
-
 # ==================== 数据处理层异常 ====================
-
-
-class DataProcessingError(QuantBaseException):
-    """数据处理异常"""
-
-    def __init__(self, step: str, message: str) -> None:
-        super().__init__(
-            message=f"数据处理步骤 [{step}] 失败: {message}",
-            error_code="DATA_PROCESSING_ERROR",
-            recoverable=False,  # 数据处理失败通常不可恢复
-        )
-        self.step = step
 
 
 class CalculationError(QuantBaseException):
@@ -91,18 +57,6 @@ class CalculationError(QuantBaseException):
 
 
 # ==================== 配置层异常 ====================
-
-
-class ConfigError(QuantBaseException):
-    """配置错误异常"""
-
-    def __init__(self, config_key: str, message: str) -> None:
-        super().__init__(
-            message=f"配置项 [{config_key}] 错误: {message}",
-            error_code="CONFIG_ERROR",
-            recoverable=False,  # 配置错误必须修复后才能继续
-        )
-        self.config_key = config_key
 
 
 # ==================== 数据库层异常 ====================

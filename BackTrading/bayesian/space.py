@@ -35,27 +35,29 @@ class ParamSpace:
 
 
 # config.ini _RANGE 字段名 → 参数名映射
+# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
+# 已在引擎审计中确认为死参数（引擎仓位恒等权，不消费这些字段），
+# 保留在寻优空间只会空转浪费预算并产出无意义的"最优值"，故不纳入。
 _RANGE_TO_PARAM: dict[str, str] = {
     "ATR_STOP_MULT_RANGE": "atr_stop_mult",
-    "KELLY_FRACTION_RANGE": "kelly_fraction",
-    "POSITION_A_RANGE": "position_a",
-    "LIQ_VETO_RATIO_RANGE": "liq_veto_ratio",
     "BOLL_NARROW_RATIO_RANGE": "boll_narrow_ratio",
     "CROSS_DECAY_DAYS_RANGE": "cross_decay_days",
     "CONCLUSION_FULL_BULL_RANGE": "conclusion_full_bull",
     "GOLDEN_CROSS_BONUS_RANGE": "golden_cross_bonus",
     "DIVERGENCE_PENALTY_RANGE": "divergence_penalty",
-    "RISK_NONE_MULTIPLIER_RANGE": "risk_none_multiplier",
     "BUY_THRESHOLD_RANGE": "buy_threshold",
     "MAX_HOLDINGS_RANGE": "max_holdings",
 }
 
 # 影响信号计算的参数（昂贵）—— 与 prepare._compute_param_hash 保持一致
+# 注：conclusion_full_bull 直接决定风险等级/进出场阈值（vectorized_signal），
+# 必须纳入信号哈希做缓存隔离，否则评估会复用旧阈值的信号。
 _SIGNAL_PARAMS: set[str] = {
     "boll_narrow_ratio",
     "cross_decay_days",
     "golden_cross_bonus",
     "divergence_penalty",
+    "conclusion_full_bull",
 }
 
 
@@ -99,11 +101,6 @@ def split_by_cost(spaces: dict[str, ParamSpace]) -> tuple[dict[str, ParamSpace],
         else:
             portfolio[name] = sp
     return signal, portfolio
-
-
-def fallback_midpoints(spaces: dict[str, ParamSpace]) -> dict[str, float]:
-    """取每个参数范围的中位数作为兜底值。"""
-    return {name: (sp.low + sp.high) / 2 for name, sp in spaces.items()}
 
 
 def describe(spaces: dict[str, ParamSpace]) -> str:

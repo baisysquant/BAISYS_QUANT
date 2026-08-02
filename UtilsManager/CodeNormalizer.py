@@ -85,21 +85,6 @@ class CodeNormalizer:
         """
         return series.apply(CodeNormalizer.normalize)
 
-    @staticmethod
-    def normalize_dataframe(df: pd.DataFrame, column: str = "股票代码") -> pd.DataFrame:
-        """
-        标准化DataFrame中指定列的股票代码
-
-        Args:
-            df: 包含股票代码的DataFrame
-            column: 股票代码列名，默认为"股票代码"
-
-        Returns:
-            pd.DataFrame: 标准化后的DataFrame（原地修改）
-        """
-        if column in df.columns:
-            df[column] = df[column].apply(CodeNormalizer.normalize)
-        return df
 
     @staticmethod
     def add_market_prefix(code: str) -> str:

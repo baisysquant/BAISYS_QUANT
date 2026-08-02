@@ -98,6 +98,17 @@ class DataProcessingService:
         # 步骤6：筛选有信号的股票
         final_df = self.filter_signal_stocks(final_df)
 
+        # 步骤6.5：补齐仓位计算必需列（防止技术信号缺失时 KeyError 级联终止流水线）
+        if not final_df.empty:
+            _required = [ColumnNames.COMPREHENSIVE_LEVEL, ColumnNames.COMPREHENSIVE_SCORE,
+                         ColumnNames.RISK_LEVEL, ColumnNames.EXIT_RRR, ColumnNames.STOP_LOSS,
+                         ColumnNames.LATEST_PRICE, ColumnNames.MACD_TREND_TYPE]
+            _missing = [c for c in _required if c not in final_df.columns]
+            if _missing:
+                self.logger.warning(f"[仓位计算] 缺少列 {_missing}，已补 NaN 占位")
+                for c in _missing:
+                    final_df[c] = None
+
         # 步骤7：计算建议仓位比例（基于 Kelly + 多因子混合模型）
         if not final_df.empty:
             pos_config = getattr(self.config, 'POSITION_SIZING', None) or {}

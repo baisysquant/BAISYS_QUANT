@@ -33,15 +33,6 @@ def _safe_float(val: Any, default: float = 0.0) -> float:  # noqa: ANN401
         return default
 
 
-def _safe_str(val: Any, default: str = "") -> str:  # noqa: ANN401
-    if isinstance(val, str):
-        return val
-    try:
-        return str(val)
-    except (TypeError, ValueError):
-        return default
-
-
 def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.DataFrame:
     """对合并后的 DataFrame 逐行计算建议仓位比例。
 
@@ -105,7 +96,10 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
     vol_caps = _risk_budget / atr_pcts.where((closes > 0) & (stops > 0) & (stops < closes) & (atr_pcts > 0.001), float('nan'))
     vol_caps = vol_caps.clip(0, _max_single).fillna(_max_single)
 
-    pos_adjs = pd.to_numeric(result.get("position_adjust", 0), errors='coerce').fillna(0).clip(-1.0, 1.0)
+    if "position_adjust" in result.columns:
+        pos_adjs = pd.to_numeric(result["position_adjust"], errors='coerce').fillna(0).clip(-1.0, 1.0)
+    else:
+        pos_adjs = pd.Series(0, index=result.index)
 
     positions = bases * risk_map_s * regime_map_s * kelly_mods * (1 + pos_adjs)
     positions = positions.clip(0, _max_single)

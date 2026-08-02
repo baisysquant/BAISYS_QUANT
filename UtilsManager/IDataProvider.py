@@ -22,7 +22,7 @@ class IDataProvider(ABC):
 
 
 class LiveDataProvider(IDataProvider):
-    """实时/日更模式 — 从 stock_daily_kline 读取，OHLC 除以 adj_factor 转为不复权。"""
+    """实时/日更模式 — 从 stock_daily_kline 读取，返回不复权价和复权价。"""
 
     def __init__(self, db_engine: Engine) -> None:
         self._db_engine = db_engine
@@ -45,7 +45,11 @@ class LiveDataProvider(IDataProvider):
                    high / adj_factor AS high,
                    low / adj_factor AS low,
                    close / adj_factor AS close,
-                   volume, amount, close_normal
+                   open AS open_adj,
+                   high AS high_adj,
+                   low AS low_adj,
+                   close AS close_adj,
+                   volume, amount, close_normal, adj_factor
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date
@@ -65,7 +69,7 @@ class LiveDataProvider(IDataProvider):
 
 
 class BacktestDataProvider(IDataProvider):
-    """回测模式 — 从 stock_daily_kline 读取，end_date 截断到 replay_date。"""
+    """回测模式 — 从 stock_daily_kline 读取，end_date 截断到 replay_date，返回双价格。"""
 
     def __init__(self, db_engine: Engine, replay_date: str | None = None) -> None:
         self._db_engine = db_engine
@@ -92,7 +96,11 @@ class BacktestDataProvider(IDataProvider):
                    high / adj_factor AS high,
                    low / adj_factor AS low,
                    close / adj_factor AS close,
-                   volume, amount, close_normal
+                   open AS open_adj,
+                   high AS high_adj,
+                   low AS low_adj,
+                   close AS close_adj,
+                   volume, amount, close_normal, adj_factor
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date

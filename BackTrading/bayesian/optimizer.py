@@ -51,10 +51,6 @@ def _from_normalized(
     return out
 
 
-def _to_tensor(x: dict[str, float], spaces: dict[str, ParamSpace]) -> np.ndarray:
-    return _to_normalized(x, spaces)
-
-
 # ── Sobol 初始采样 ──
 
 def _sobol_samples(n: int, d: int, seed: int = 42) -> np.ndarray:
@@ -110,6 +106,7 @@ def optimize_window(
     previous_gp_state: GPState | None = None,
     progress_cb: Any = None,
     compute_exit_strategy: bool = True,
+    eval_start_date: str | None = None,
 ) -> tuple[dict[str, float], GPState | None, list[dict[str, float]]]:
     """单窗口贝叶斯优化（4 阶段）。
 
@@ -133,14 +130,13 @@ def optimize_window(
     import pandas as pd  # type: ignore[import]
 
     signal_sp, portfolio_sp = split_by_cost(spaces)
-    full_names = list(spaces.keys())
     signal_names = list(signal_sp.keys())
     portfolio_names = list(portfolio_sp.keys())
 
     n_signal = len(signal_sp)
     n_total = len(spaces)
 
-    controller = FidelityController(kline_df, engine_cfg, compute_exit_strategy, vectorized=True)
+    controller = FidelityController(kline_df, engine_cfg, compute_exit_strategy, vectorized=True, eval_start_date=eval_start_date)
     _opt_t0 = time.time()
 
     best_sharpe_local = -1e10

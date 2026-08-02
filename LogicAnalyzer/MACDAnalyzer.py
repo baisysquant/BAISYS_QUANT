@@ -341,18 +341,16 @@ class MACDAnalyzer:
             })
 
         dist_div = adaptive_distance(df['DIF'], base_distance=_div_p.get('base_distance', 10))
-        _cache = self.__dict__.setdefault('_div_cache', {'n': 0, 'peaks': np.array([], dtype=int), 'troughs': np.array([], dtype=int)})
-        _batch = max(1, dist_div // 2)
-        if len(df) - _cache['n'] >= _batch or _cache['n'] == 0:
-            _ind = df['DIF'].bfill().ffill()
-            if len(_ind) < 5 or _ind.isna().all():
-                _cache['peaks'], _cache['troughs'] = np.array([], dtype=int), np.array([], dtype=int)
-            else:
-                _ad = adaptive_distance(_ind, base_distance=dist_div)
-                _cache['peaks'], _cache['troughs'] = find_peaks_troughs(_ind, distance=_ad)
-            _cache['n'] = len(df)
+        # 每只股票独立计算 peaks/troughs（pipeline_analysis 每股只调用一次；
+        # 不得复用跨股票的 _div_cache，否则短历史新股会用到长历史股的越界索引）
+        _ind = df['DIF'].bfill().ffill()
+        if len(_ind) < 5 or _ind.isna().all():
+            _peaks, _troughs = np.array([], dtype=int), np.array([], dtype=int)
+        else:
+            _ad = adaptive_distance(_ind, base_distance=dist_div)
+            _peaks, _troughs = find_peaks_troughs(_ind, distance=_ad)
         from LogicAnalyzer.signals.divergence import _detect_from_peaks
-        div_type, div_idx, div_strength = _detect_from_peaks(df['close'], df['DIF'], len(df) - 1, dist_div, _cache['peaks'], _cache['troughs'])
+        div_type, div_idx, div_strength = _detect_from_peaks(df['close'], df['DIF'], len(df) - 1, dist_div, _peaks, _troughs)
         div_decay = signal_with_decay(div_type, div_idx, len(df) - 1, half_life=decay_half_life)
         div_combined = '无明显背离信号'
         if div_type == Divergence.BOTTOM_DIVERGENCE and div_strength > div_strength_threshold:
@@ -589,35 +587,3 @@ class MACDAnalyzer:
         execute_rules(state, gate=4)
 
         return _pipeline_output(state)
-
-    def analyze_full_bull(
-        self,
-        df: pd.DataFrame,
-        decay_half_life: int = 8,
-        slope_window: int = 5,
-        recalc_macd: bool = True,
-        weights: dict[str, int] | None = None,
-        thresholds: dict[str, int] | None = None,
-    ) -> dict:
-        if recalc_macd:
-            df = self._custom_macd(df)
-        else:
-            required = {"DIF", "DEA", "MACD_HIST", "MACD_SIGNAL_DETAIL"}
-            if not required.issubset(df.columns):
-                df = self._custom_macd(df)
-
-        result = self.pipeline_analysis(
-            df, weights=weights, thresholds=thresholds,
-            decay_half_life=decay_half_life, slope_window=slope_window,
-        )
-        return {
-            "score": result.get("score", 0),
-            "score_base": result.get("score_base", 0),
-            "conclusion": result.get("conclusion", ""),
-            "details": result.get("details", {}),
-            "divergence": result.get("divergence", {}),
-            "momentum": result.get("momentum", ""),
-            "slope": result.get("slope", {}),
-            "winrate_ref": result.get("winrate_ref", ""),
-            "macd_trend": result.get("macd_trend", ""),
-        }

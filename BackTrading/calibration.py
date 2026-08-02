@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field, asdict
@@ -28,17 +29,17 @@ from loguru import logger
 from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 
 # config.ini 中参数名 → (section, key) 映射
+# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
+# 为引擎死参数（审计确认引擎仓位恒等权），不再寻优亦不再回写。
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
-    "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
-    "position_a": ("BACKTEST_CALIBRATED", "position_a"),
-    "liq_veto_ratio": ("BACKTEST_CALIBRATED", "liq_veto_ratio"),
     "boll_narrow_ratio": ("BACKTEST_CALIBRATED", "boll_narrow_ratio"),
     "cross_decay_days": ("BACKTEST_CALIBRATED", "cross_decay_days"),
     "conclusion_full_bull": ("BACKTEST_CALIBRATED", "conclusion_full_bull"),
     "golden_cross_bonus": ("BACKTEST_CALIBRATED", "golden_cross_bonus"),
     "divergence_penalty": ("BACKTEST_CALIBRATED", "divergence_penalty"),
-    "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
+    "buy_threshold": ("BACKTEST_CALIBRATED", "buy_threshold"),
+    "max_holdings": ("BACKTEST_CALIBRATED", "max_holdings"),
 }
 
 
@@ -72,6 +73,13 @@ class CalibrationResult:
 
 
 CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
+CONFIG_INI = PROJECT_ROOT / "config.ini"
+
+# 写入 config.ini 时需取整的整数参数
+_INT_KEYS = frozenset({
+    "cross_decay_days", "conclusion_full_bull",
+    "golden_cross_bonus", "divergence_penalty",
+})
 
 
 def run_bayesian_walk_forward(
@@ -110,7 +118,8 @@ def run_bayesian_walk_forward(
     n_dates = len(kline_df["trade_date"].unique())
     logger.info(f"  交易日数: {n_dates} | IS={train_period} | OOS={test_period}")
     if test_period < 60:
-        logger.warning(f"OOS 窗口仅 {test_period} 天，Sharpe 估计标准误约 {1.96/ (test_period-1)**0.5:.2f}，建议 ≥60 天")
+        se = 1.96 / max(test_period - 1, 1) ** 0.5
+        logger.warning(f"OOS 窗口仅 {test_period} 天，Sharpe 估计标准误约 {se:.2f}，建议 ≥60 天")
 
     # ── 正式调用贝叶斯 WFO 引擎 ─────────────────────────
     from BackTrading.bayesian.meta_optimizer import bayesian_walk_forward_multi
@@ -129,10 +138,12 @@ def run_bayesian_walk_forward(
 
 
 def save_calibration(result: CalibrationResult) -> None:
-    CALIBRATION_FILE.write_text(
+    tmp_path = CALIBRATION_FILE.with_name(CALIBRATION_FILE.name + ".tmp")
+    tmp_path.write_text(
         json.dumps(asdict(result), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    os.replace(tmp_path, CALIBRATION_FILE)
 
 
 def load_calibration() -> CalibrationResult | None:
@@ -170,18 +181,12 @@ def apply_calibration_to_config(config: object) -> None:
             sc.CROSS_DECAY_DAYS = int(val)
         elif key == "atr_stop_mult":
             setattr(sc, attr, val)
-        elif key == "liq_veto_ratio":
-            fr.LIQ_VETO_RATIO = val
-        elif key in ("kelly_fraction", "position_a"):
-            setattr(ps, attr, val)
         elif key == "conclusion_full_bull":
             cfg.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(val)
         elif key == "golden_cross_bonus":
             sc.GOLDEN_CROSS_BONUS = int(val)
         elif key == "divergence_penalty":
             sc.DIVERGENCE_PENALTY = int(val)
-        elif key == "risk_none_multiplier":
-            ps.RISK_NONE_MULTIPLIER = float(val)
 
 
 def _get_git_commit() -> str:
@@ -195,44 +200,86 @@ def _get_git_commit() -> str:
         return ""
 
 
-def write_calibration_to_ini(config: object) -> None:
-    from UtilsManager.ConfigParser import Config
+def _format_val(key: str, val: Any) -> str:
+    """按字段语义格式化配置值：整数参数取整，浮点去尾零，避免 int('37.0') 崩溃。"""
+    if key in _INT_KEYS:
+        return str(int(round(float(val))))
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    s = f"{v:.10f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"
 
-    assert isinstance(config, Config), f"需要 Config 实例，收到 {type(config).__name__}"
-    result = load_calibration()
-    if result is None:
-        logger.warning("未找到校准结果，跳过写入 config.ini")
-        return
-    overrides = result.params
-    if not overrides:
+
+def write_calibration_to_ini(params: dict) -> None:
+    """将校准参数写入 config.ini 的 [BACKTEST_CALIBRATED]。
+
+    已有键原位替换（保留行尾注释），新键追加到 section 末尾；
+    整型参数取整写入，避免下次加载时 int() 解析崩溃；原子写防半截文件。
+    """
+    if not params:
         logger.info("无校准参数，跳过写入")
         return
-
-    ini_path = Path(config.config_path) if hasattr(config, "config_path") and config.config_path else Path("config.ini")
+    ini_path = CONFIG_INI
     if not ini_path.exists():
         logger.warning(f"config.ini 不存在: {ini_path}")
         return
 
-    raw = ini_path.read_text(encoding="utf-8")
+    text = ini_path.read_text(encoding="utf-8")
     section_header = "[BACKTEST_CALIBRATED]"
+    lines = text.splitlines(keepends=True)
 
-    if section_header not in raw:
-        raw += f"\n\n{section_header}\n"
+    # 定位 section（或在其后插入）
+    sec_idx = None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("["):
+            if s == section_header:
+                sec_idx = i
+                break
+            if sec_idx is not None:
+                break
+    if sec_idx is None:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += f"\n{section_header}\n"
+        lines = text.splitlines(keepends=True)
+        sec_idx = len(lines) - 1
 
-    def _update_section(text: str, section: str, key: str, value: Any) -> str:
-        pat = re.compile(rf"^({key}\s*=\s*).*", re.MULTILINE)
-        in_section = False
-        new_lines: list[str] = []
-        for line in text.splitlines(keepends=True):
-            if line.strip().startswith("["):
-                in_section = line.strip().startswith(section)
-            if in_section and pat.match(line):
-                line = pat.sub(rf"\g<1>{value}", line)
-            new_lines.append(line)
-        return "".join(new_lines)
+    written: set[str] = set()
+    out: list[str] = []
+    in_section = False
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("["):
+            in_section = s == section_header
+            out.append(ln)
+            continue
+        if in_section and "=" in s and not s.startswith(("#", ";")):
+            key = s.split("=", 1)[0].strip().lower()
+            if key in params:
+                comment = ""
+                cm = re.search(r"#.*$", ln)
+                if cm:
+                    comment = cm.group(0)
+                body = f"{key} = {_format_val(key, params[key])}"
+                ln = body + ("  " + comment if comment else "") + ("\n" if ln.endswith("\n") else "")
+                written.add(key)
+        out.append(ln)
 
-    for key, val in overrides.items():
-        raw = _update_section(raw, section_header, key, val)
+    # 追加未写出的键（插到 section 内容末尾）
+    missing = {k for k in params if k not in written}
+    if missing:
+        insert_at = len(out)
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].strip().startswith("["):
+                insert_at = i + 1
+                break
+        extra = "".join(f"{k} = {_format_val(k, params[k])}\n" for k in sorted(missing))
+        out.insert(insert_at, extra)
 
-    ini_path.write_text(raw, encoding="utf-8")
+    tmp_path = ini_path.with_name(ini_path.name + ".tmp")
+    tmp_path.write_text("".join(out), encoding="utf-8")
+    os.replace(tmp_path, ini_path)
     logger.info(f"校准参数已写入 {ini_path} [{section_header}]")

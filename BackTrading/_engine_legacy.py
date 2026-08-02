@@ -15,6 +15,25 @@ TradeLog: TypeAlias = list[dict[str, Any]]
 EquityCurve: TypeAlias = list[dict[str, Any]]
 
 
+# 20 日均量（行业口径：不含当日的滚动均值，避免用当日成交量前视）
+_ADV_WINDOW = 20
+# 注册制板块（创业板 30x / 科创板 688）新股上市前 5 个交易日无涨跌幅限制
+_NEW_LISTING_EXEMPT_DAYS = 5
+# 主板新股上市首日涨跌幅限制：44% / -36%（次日起 10%）
+_MAIN_BOARD_FIRST_DAY_UP = 0.44
+_MAIN_BOARD_FIRST_DAY_DOWN = 0.36
+# 北交所新股上市首日无涨跌幅限制
+_BSE_FIRST_DAY_EXEMPT = True
+# 涨跌停四舍五入到分（分位精度）
+_LIMIT_PX_PRECISION = 100.0
+# 印花税按交易日分段：2023-08-28 财政部减半（卖出单向）
+_STAMP_TAX_RECENT = 0.0005
+_STAMP_TAX_OLD = 0.001
+# 经手费（双边）+ 证管费（双边），通常合并计入佣金；此处单独建模可选
+_HANDLING_FEE_RATE = 0.0000341   # 0.00341%（万 0.341）
+_CSRC_FEE_RATE = 0.00002         # 0.002%（万 0.2）
+
+
 def run_full_backtest(
     data: pd.DataFrame,
     params: dict[str, Any],
@@ -41,8 +60,7 @@ def _run_single_backtest(
 
     date_groups = list(data.groupby("trade_date", sort=True))
 
-    symbols = data["symbol"].unique()
-    symbols.sort()
+    symbols = sorted(data["symbol"].unique().tolist())
     sym_to_idx = {s: i for i, s in enumerate(symbols)}
     n_syms = len(symbols)
     pos_value = np.zeros(n_syms, dtype=np.float64)
@@ -65,9 +83,7 @@ def _run_single_backtest(
     _buy_threshold = engine_cfg.buy_threshold
     init_cash = engine_cfg.initial_cash
 
-    risk_key = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "D": 4}
     _none_mult = engine_cfg.risk_none_multiplier
-    risk_mult = np.array([_none_mult, 1.5, 3.0, 5.0, 8.0], dtype=np.float64)
     _kelly = engine_cfg.kelly_fraction
     _pos_a = engine_cfg.position_a
     _atr_stop = engine_cfg.atr_stop_mult
@@ -127,7 +143,9 @@ def _run_single_backtest(
             if sh <= 0:
                 continue
             if partial:
-                sell_shares = max(100, sh // 2) // 100 * 100
+                # 申报数量单位：科创板 688 / 创业板 30x（2023-08-28 起）为 200 股，北交所 8xx/92x 为 100 股，主板 100 股
+                lot = 200 if s_syms[j].startswith(("688", "30")) else 100
+                sell_shares = max(lot, sh // 2) // lot * lot
                 if sell_shares >= sh:
                     sell_shares = sh
             else:
@@ -150,15 +168,18 @@ def _run_single_backtest(
         return total_sold
 
     _market_multiplier = 1.0
+    _prev_med_score = 0.0  # 上一日中位数评分，用于避免前视偏差
 
     if use_sw:
         for i_day, (dt, grp) in enumerate(date_groups):
             _sold_today.clear()
             day_data = grp.copy()
 
-            # 市场状态过滤：根据当日全部股票的中位数评分调整仓位
-            _day_scores = day_data["进场评分"].values
-            _med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
+            # 市场状态过滤：根据上一日全部股票的中位数评分调整仓位（避免前视偏差）
+            if i_day == 0:
+                _med_score = 0.0
+            else:
+                _med_score = _prev_med_score
             if _med_score >= 30:
                 _market_multiplier = 1.0
             elif _med_score >= 15:
@@ -171,8 +192,19 @@ def _run_single_backtest(
                 if day_data.empty:
                     continue
 
+            # 记录本日中位数评分，供下一日使用（避免前视偏差）
+            _day_scores = day_data["进场评分"].values
+            _prev_med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
+
             syms_str = day_data["symbol"].astype(str).values
             idx = np.array([sym_to_idx[s] for s in syms_str], dtype=np.int32)
+            # 不复权价：用于涨跌停判定、止损价比较
+            close_raw = day_data["close"].values
+            # 复权价：统一用于买入/卖出成交价、市值计算、收益计算
+            close_adj = day_data["close_adj"].values if "close_adj" in day_data.columns else close_raw
+            # 复权价合法性：负值/NaN 说明上游数据异常（如 sh600076 2024-06-24 负后复权价），
+            # 该标的当日禁止买入/卖出/估值，避免负市值污染净资产
+            adj_ok = np.isfinite(close_adj) & (close_adj > 0)
             close = day_data["close"].values
             volume = day_data["volume"].values
             buy_score = day_data["进场评分"].values
@@ -193,30 +225,30 @@ def _run_single_backtest(
             ], dtype=np.float64)
             _have_prev = i_day > 0
             if _have_prev:
-                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
                 limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
                 limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
                 not_limit_up = close < limit_up_arr
                 not_limit_down = close > limit_down_arr
             else:
-                not_limit_up = np.ones(len(close), dtype=bool)
-                not_limit_down = np.ones(len(close), dtype=bool)
+                not_limit_up = np.ones(len(close_raw), dtype=bool)
+                not_limit_down = np.ones(len(close_raw), dtype=bool)
             has_volume = volume > 0
 
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
-            stop_hit_col = (stop_col > 0) & (close < stop_col)
+            stop_hit_col = (stop_col > 0) & (close_raw < stop_col)
             stop_hit_atr = np.zeros(len(day_data), dtype=bool)
             if _atr_stop > 0 and "ATR" in day_data.columns and _have_prev:
-                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
                 prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
                 atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
-                stop_hit_atr = (atr_stop > 0) & (close < atr_stop)
+                stop_hit_atr = (atr_stop > 0) & (close_raw < atr_stop)
             if "ATR" in day_data.columns:
                 for i_s, s in enumerate(syms_str):
-                    _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
+                    _prev_bar[s] = (float(close_raw[i_s]), float(day_data["ATR"].values[i_s]))
             stop_hit = stop_hit_col | stop_hit_atr
 
-            close_lookup = dict(zip(syms_str, close))
+            close_lookup = dict(zip(syms_str, close_adj))
             total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
@@ -227,17 +259,17 @@ def _run_single_backtest(
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
-                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
+                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok & adj_ok
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
-                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
-                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close[si_stop], volume[si_stop], partial=False)
+                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close_adj[si_stop], volume[si_stop], partial=False)
                     if len(si_partial):
-                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close[si_partial], volume[si_partial], partial=True)
-                    close_lookup = dict(zip(syms_str, close))
+                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close_adj[si_partial], volume[si_partial], partial=True)
+                    close_lookup = dict(zip(syms_str[adj_ok], close_adj[adj_ok]))
                     total_value = cash + _calc_market_value()
 
             # ── 买入 ──
@@ -249,7 +281,7 @@ def _run_single_backtest(
             else:
                 _effective_threshold = _buy_threshold
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today & adj_ok
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi) == 0 and len(date_groups) > 100 and np.any(buy_score >= _buy_threshold):
@@ -263,7 +295,7 @@ def _run_single_backtest(
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
-                b_close = close[bi]
+                b_close = close_adj[bi]
                 b_vol = volume[bi]
                 b_risk_str = risk_str[bi]
 
@@ -289,15 +321,19 @@ def _run_single_backtest(
                     if pos_shares[si] > 0:
                         continue
                     price = float(b_close[j])
+                    if not np.isfinite(price) or price <= 0:
+                        continue
+                    # 申报数量单位：科创板 688 / 创业板 30x（2023-08-28 起）为 200 股，北交所 8xx/92x 为 100 股，主板 100 股
+                    lot = 200 if b_syms[j].startswith(("688", "30")) else 100
                     tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
-                    shares = int(tv / price) // 100 * 100 if price > 0 else 0
-                    if shares < 100:
+                    shares = int(tv / price) // lot * lot if price > 0 else 0
+                    if shares < lot:
                         continue
                     _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
                     if _adv_val > 100:
-                        max_shares_vol = int(_adv_val * _max_order_pct) // 100 * 100
+                        max_shares_vol = int(_adv_val * _max_order_pct) // lot * lot
                         shares = min(shares, max_shares_vol)
-                        if shares < 100:
+                        if shares < lot:
                             continue
                     tv = shares * price
                     cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
@@ -342,13 +378,17 @@ def _run_single_backtest(
                     continue
 
             _day_scores = day_data["进场评分"].values
-            _med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
+            # 使用上一日中位数评分（避免前视偏差）
+            _med_score = _prev_med_score
             if _med_score >= 30:
                 _market_multiplier = 1.0
             elif _med_score >= 15:
                 _market_multiplier = 0.5
             else:
                 _market_multiplier = 0.25
+
+            # 记录本日中位数评分，供下一日使用（避免前视偏差）
+            _prev_med_score = float(np.median(_day_scores[_day_scores > 0])) if (_day_scores > 0).any() else 0
 
             if cumulative_hist is None:
                 cumulative_hist = day_data.copy()
@@ -362,6 +402,13 @@ def _run_single_backtest(
 
             syms_str = day_data["symbol"].astype(str).values
             idx = np.array([sym_to_idx[s] for s in syms_str], dtype=np.int32)
+            # 不复权价：用于涨跌停判定、止损价比较
+            close_raw = day_data["close"].values
+            # 复权价：统一用于买入/卖出成交价、市值计算、收益计算
+            close_adj = day_data["close_adj"].values if "close_adj" in day_data.columns else close_raw
+            # 复权价合法性：负值/NaN 说明上游数据异常（如 sh600076 2024-06-24 负后复权价），
+            # 该标的当日禁止买入/卖出/估值，避免负市值污染净资产
+            adj_ok = np.isfinite(close_adj) & (close_adj > 0)
             close = day_data["close"].values
             volume = day_data["volume"].values
             buy_score = day_data["进场评分"].values
@@ -383,30 +430,30 @@ def _run_single_backtest(
             ], dtype=np.float64)
             _have_prev = i_day > 0
             if _have_prev:
-                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
                 limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
                 limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
                 not_limit_up = close < limit_up_arr
                 not_limit_down = close > limit_down_arr
             else:
-                not_limit_up = np.ones(len(close), dtype=bool)
-                not_limit_down = np.ones(len(close), dtype=bool)
+                not_limit_up = np.ones(len(close_raw), dtype=bool)
+                not_limit_down = np.ones(len(close_raw), dtype=bool)
             has_volume = volume > 0
 
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
-            stop_hit_col = (stop_col > 0) & (close < stop_col)
+            stop_hit_col = (stop_col > 0) & (close_raw < stop_col)
             stop_hit_atr = np.zeros(len(day_data), dtype=bool)
             if _atr_stop > 0 and "ATR" in day_data.columns and _have_prev:
-                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close)])
+                prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
                 prev_atr_arr = np.array([_prev_bar.get(s, (0, a))[1] for s, a in zip(syms_str, day_data["ATR"].values)])
                 atr_stop = prev_close_arr - prev_atr_arr * _atr_stop
-                stop_hit_atr = (atr_stop > 0) & (close < atr_stop)
+                stop_hit_atr = (atr_stop > 0) & (close_raw < atr_stop)
             if "ATR" in day_data.columns:
                 for i_s, s in enumerate(syms_str):
-                    _prev_bar[s] = (float(close[i_s]), float(day_data["ATR"].values[i_s]))
+                    _prev_bar[s] = (float(close_raw[i_s]), float(day_data["ATR"].values[i_s]))
             stop_hit = stop_hit_col | stop_hit_atr
 
-            close_lookup = dict(zip(syms_str, close))
+            close_lookup = dict(zip(syms_str[adj_ok], close_adj[adj_ok]))
             total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
@@ -417,17 +464,17 @@ def _run_single_backtest(
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
-                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok
+                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok & adj_ok
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
-                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
-                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close[si_stop], volume[si_stop], partial=False)
+                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close_adj[si_stop], volume[si_stop], partial=False)
                     if len(si_partial):
-                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close[si_partial], volume[si_partial], partial=True)
-                    close_lookup = dict(zip(syms_str, close))
+                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close_adj[si_partial], volume[si_partial], partial=True)
+                    close_lookup = dict(zip(syms_str[adj_ok], close_adj[adj_ok]))
                     total_value = cash + _calc_market_value()
 
             # ── 买入 ──
@@ -438,13 +485,13 @@ def _run_single_backtest(
             else:
                 _effective_threshold = max(_buy_threshold, 10)
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today
+            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today & adj_ok
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
-                b_close = close[bi]
+                b_close = close_adj[bi]
                 b_vol = volume[bi]
 
                 w_dict = allocate_weights(
@@ -477,15 +524,19 @@ def _run_single_backtest(
                     if pos_shares[si] > 0:
                         continue
                     price = float(b_close[j])
+                    if not np.isfinite(price) or price <= 0:
+                        continue
+                    # 申报数量单位：科创板 688 / 创业板 30x（2023-08-28 起）为 200 股，北交所 8xx/92x 为 100 股，主板 100 股
+                    lot = 200 if b_syms[j].startswith(("688", "30")) else 100
                     tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
-                    shares = int(tv / price) // 100 * 100 if price > 0 else 0
-                    if shares < 100:
+                    shares = int(tv / price) // lot * lot if price > 0 else 0
+                    if shares < lot:
                         continue
                     _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
                     if _adv_val > 100:
-                        max_shares_vol = int(_adv_val * _max_order_pct) // 100 * 100
+                        max_shares_vol = int(_adv_val * _max_order_pct) // lot * lot
                         shares = min(shares, max_shares_vol)
-                        if shares < 100:
+                        if shares < lot:
                             continue
                     tv = shares * price
                     cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))

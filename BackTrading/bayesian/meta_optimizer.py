@@ -30,6 +30,18 @@ def _datetime64_to_string_guard(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _to_date_str(d) -> str:
+    if hasattr(d, "strftime"):
+        return d.strftime("%Y-%m-%d")
+    d_str = str(d)
+    return d_str.split("T")[0][:10] if "T" in d_str else d_str[:10]
+
+
+# 信号上下文预热天数：MACD/ATR/MA 等指标至少需要 120 个交易日的前文，
+# 训练/OOS 切片前额外补足这段历史，保证窗口首日起信号有效。
+_SIGNAL_WARMUP_DAYS = 120
+
+
 def _window_dates(
     unique_dates: list,
     train_period: int,
@@ -58,15 +70,19 @@ def _oos_validate(
     params_list: list[dict[str, float]],
     engine_cfg: EngineConfig,
     top_m: int = 5,
+    eval_start_date: str | None = None,
 ) -> list[dict[str, Any]]:
     """对 top-M 参数组合做 OOS 验证。
 
-    Returns:
-        OOS 结果列表（含 sharpe_ratio 等指标）。
+    eval_start_date: 信号预热历史已并入 test_data 时，用该日期截断，
+    保证回测引擎只交易 [eval_start_date, 末尾] 的 OOS 区间。
     """
     from LogicAnalyzer.backtest_metrics import compute_risk_metrics, compute_trade_metrics
 
-    _SIGNAL_KEYS = frozenset({"boll_narrow_ratio", "cross_decay_days", "golden_cross_bonus", "divergence_penalty"})
+    _SIGNAL_KEYS = frozenset({
+        "boll_narrow_ratio", "cross_decay_days",
+        "golden_cross_bonus", "divergence_penalty", "conclusion_full_bull",
+    })
 
     oos_results = []
     for rank_idx, params in enumerate(params_list[:top_m]):
@@ -77,19 +93,21 @@ def _oos_validate(
         from dataclasses import replace as _replace_dc
         _ec = _replace_dc(engine_cfg,
             atr_stop_mult=params.get("atr_stop_mult", engine_cfg.atr_stop_mult),
-            kelly_fraction=params.get("kelly_fraction", engine_cfg.kelly_fraction),
-            position_a=params.get("position_a", engine_cfg.position_a),
-            risk_none_multiplier=params.get("risk_none_multiplier", engine_cfg.risk_none_multiplier),
-            liq_veto_ratio=params.get("liq_veto_ratio", engine_cfg.liq_veto_ratio),
             buy_threshold=int(params.get("buy_threshold", engine_cfg.buy_threshold)),
             max_holdings=int(params.get("max_holdings", engine_cfg.max_holdings)),
         )
 
         signal_params = {k: v for k, v in params.items() if k in _SIGNAL_KEYS}
         if signal_params:
-            _prepared = prepare_backtest_data(test_data, params=signal_params, compute_exit_strategy=True, vectorized=True)
+            _prepared = prepare_backtest_data(
+                test_data, params=signal_params, compute_exit_strategy=True,
+                vectorized=True, backtest_start_date=eval_start_date,
+            )
         else:
             _prepared = test_data
+            # 无信号参数时也按 eval_start_date 截断，避免预热段产生交易
+            if eval_start_date and "trade_date" in _prepared.columns:
+                _prepared = _prepared[_prepared["trade_date"] >= eval_start_date]
         _run_single_backtest(_prepared, params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
@@ -110,16 +128,6 @@ def _oos_validate(
             "total_trades": trade.get("total_trades", 0),
         })
     return oos_results
-
-
-def _build_param_grid_for_compat(spaces: dict[str, ParamSpace]) -> dict[str, list[float]]:
-    """将 spaces 转为 param_grid（向后兼容，仅用于日志）。"""
-    grid = {}
-    for name, sp in spaces.items():
-        if sp.step and sp.step > 0:
-            ticks = [sp.low + i * sp.step for i in range(sp.n_ticks)]
-            grid[name] = [round(t, 6) for t in ticks]
-    return grid
 
 
 def bayesian_walk_forward_multi(
@@ -177,13 +185,19 @@ def bayesian_walk_forward_multi(
         n_init_signal, n_iter_signal = 15, 35
         n_init_portfolio, n_iter_portfolio = 20, 150
 
-    n_dates = len(kline_df["trade_date"].unique())
+    # 窗口切分以"正式回测起点"为坐标轴；起点之前为信号预热历史（不参与交易）
+    backtest_start_date = kwargs.get("backtest_start_date")
+    all_dates_str = sorted({_to_date_str(d) for d in kline_df["trade_date"].unique()})
+    if backtest_start_date:
+        _cut = backtest_start_date[:10]
+        unique_dates = [d for d in all_dates_str if d >= _cut]
+    else:
+        unique_dates = all_dates_str
+    _trim_offset = len(all_dates_str) - len(unique_dates)
+    n_dates = len(unique_dates)
     logger.info(f"  n_dates={n_dates}, train_period={train_period}, test_period={test_period}, required={train_period + test_period}")
     if n_dates < train_period + test_period:
-        raise ValueError(f"数据不足: {n_dates} 个交易日，需要至少 {train_period + test_period}")
-
-    unique_dates = sorted(kline_df["trade_date"].unique())
-    logger.info(f"  unique_dates 类型: {type(unique_dates[0]).__name__ if len(unique_dates) > 0 else 'EMPTY'}")
+        raise ValueError(f"数据不足: {n_dates} 个交易日（正式回测起点后），需要至少 {train_period + test_period}")
     show_progress = kwargs.get("show_progress", False)
 
     # ── 多路径收集 ──
@@ -214,18 +228,21 @@ def bayesian_walk_forward_multi(
             # ── datetime guard ──
             _df = _datetime64_to_string_guard(kline_df.copy())
             # 统一使用字符串格式进行匹配
-            def _to_date_str(d):
-                if hasattr(d, "strftime"):
-                    return d.strftime("%Y-%m-%d")
-                d_str = str(d)
-                # 去除可能的时间部分
-                if "T" in d_str:
-                    d_str = d_str.split("T")[0]
-                return d_str
             train_dates_str = [_to_date_str(d) for d in train_dates]
             test_dates_str = [_to_date_str(d) for d in test_dates]
-            train_data = _df[_df["trade_date"].isin(train_dates_str)]
-            test_data = _df[_df["trade_date"].isin(test_dates_str)]
+            # ── 信号上下文预热：窗口起点前补 _SIGNAL_WARMUP_DAYS 天历史 ──
+            # 指标（MACD/ATR/MA）与 ML 需要前文；预热行仅用于信号计算，
+            # 通过 eval_start_date 在 prepare/引擎侧截断，不参与交易。
+            # 关键：训练切片止于训练期末（tr_e），绝不包含 OOS 区间，
+            # 否则训练期目标函数混入样本外收益，OOS/PBO/DSR 全部失真。
+            ctx_s_full = _trim_offset + max(0, tr_s - _SIGNAL_WARMUP_DAYS)
+            train_mask = _df["trade_date"].isin(all_dates_str[ctx_s_full:_trim_offset + tr_e])
+            train_data = _df[train_mask]
+            ctx_s_test = _trim_offset + max(0, te_s - _SIGNAL_WARMUP_DAYS)
+            test_mask = _df["trade_date"].isin(all_dates_str[ctx_s_test:_trim_offset + te_e])
+            test_data = _df[test_mask]
+            train_eval_start = train_dates_str[0]
+            test_eval_start = test_dates_str[0]
 
             if train_data.empty:
                 logger.warning(f"  [{path_idx + 1}-{win_idx}] 训练数据为空(train_dates={train_dates[0]}~{train_dates[-1]}), 跳过")
@@ -248,6 +265,7 @@ def bayesian_walk_forward_multi(
                     n_iter_portfolio=n_iter_portfolio,
                     previous_gp_state=previous_gp_state,
                     seed=42 + path_idx * 100 + win_idx,
+                    eval_start_date=train_eval_start,
                 )
             except Exception as opt_err:
                 logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] 窗口优化失败: {opt_err}")
@@ -258,8 +276,8 @@ def bayesian_walk_forward_multi(
             previous_gp_state = warm_start_gp(gp_state, n_signal)
 
             # ── OOS 验证（top-K 参数，PBO 需要多组 OOS 结果） ──
-            if test_data.empty:
-                logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 数据为空, 跳过 OOS 验证")
+            if not test_dates:
+                logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 区间为空, 跳过 OOS 验证")
                 continue
 
             oos_params = top_k_params[:min(_K_FOR_OOS, len(top_k_params))]
@@ -269,6 +287,7 @@ def bayesian_walk_forward_multi(
                     oos_params,
                     base_cfg,
                     top_m=len(oos_params),
+                    eval_start_date=test_eval_start,
                 )
             except Exception as oos_err:
                 logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] OOS 验证失败: {oos_err}")
