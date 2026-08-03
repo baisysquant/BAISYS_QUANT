@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from typing import Any
+from collections import deque
+from typing import Any, TypeAlias
 
 import numpy as np
 import pandas as pd
 from loguru import logger
-from typing_extensions import TypeAlias
 
 from BackTrading.engine import EngineConfig
-from LogicAnalyzer.portfolio.backtest_weights import allocate_weights
 
 ParamsDict: TypeAlias = dict[str, Any]
 TradeLog: TypeAlias = list[dict[str, Any]]
@@ -17,6 +16,9 @@ EquityCurve: TypeAlias = list[dict[str, Any]]
 
 # 20 日均量（行业口径：不含当日的滚动均值，避免用当日成交量前视）
 _ADV_WINDOW = 20
+# 固定滑点强制下限（1.8 交易摩擦合规：A股隐性成本不低于单边 0.05%，
+# 配置/回退路径任何低于此值的基础滑点一律抬升，防止 Alpha 虚高）
+_MIN_SLIPPAGE_FLOOR = 0.0005
 # 注册制板块（创业板 30x / 科创板 688）新股上市前 5 个交易日无涨跌幅限制
 _NEW_LISTING_EXEMPT_DAYS = 5
 # 主板新股上市首日涨跌幅限制：44% / -36%（次日起 10%）
@@ -30,8 +32,8 @@ _LIMIT_PX_PRECISION = 100.0
 _STAMP_TAX_RECENT = 0.0005
 _STAMP_TAX_OLD = 0.001
 # 经手费（双边）+ 证管费（双边），通常合并计入佣金；此处单独建模可选
-_HANDLING_FEE_RATE = 0.0000341   # 0.00341%（万 0.341）
-_CSRC_FEE_RATE = 0.00002         # 0.002%（万 0.2）
+_HANDLING_FEE_RATE = 0.0000341  # 0.00341%（万 0.341）
+_CSRC_FEE_RATE = 0.00002  # 0.002%（万 0.2）
 
 
 def run_full_backtest(
@@ -66,13 +68,11 @@ def _run_single_backtest(
     pos_value = np.zeros(n_syms, dtype=np.float64)
     pos_shares = np.zeros(n_syms, dtype=np.int32)
 
-    if engine_cfg.point_in_time:
-        pit = data.groupby("symbol", sort=False)["trade_date"].min().to_dict()
-    else:
-        pit = None
+    pit = data.groupby("symbol", sort=False)["trade_date"].min().to_dict() if engine_cfg.point_in_time else None
 
     cm = engine_cfg.cost_model
-    _adv_state: dict[str, tuple[float, int]] = {}
+    # 滚动 20 日成交量（不含当日，前视合规）：value = (deque, run_sum)
+    _adv_state: dict[str, tuple[Any, float]] = {}
     _prev_bar: dict[str, tuple[float, float]] = {}
     _buy_date: dict[str, str] = {}
     _sold_today: set[str] = set()
@@ -93,14 +93,27 @@ def _run_single_backtest(
     cash = float(init_cash)
 
     def _update_adv(sym: str, vol: float) -> float:
-        if sym not in _adv_state:
-            _adv_state[sym] = (vol, 1)
-            return vol
-        m, n = _adv_state[sym]
-        n += 1
-        new_m = m + (vol - m) / n
-        _adv_state[sym] = (new_m, n)
-        return new_m
+        """滚动 _ADV_WINDOW 日均量（不含当日）。当日 bar 结束后入账，供次日使用。"""
+        dq, run = _adv_state.get(sym, (None, 0.0))
+        if dq is None:
+            dq = deque(maxlen=_ADV_WINDOW)
+        if len(dq) == dq.maxlen:
+            run -= dq[0]
+        dq.append(vol)
+        run += vol
+        _adv_state[sym] = (dq, run)
+        return run / len(dq)
+
+    def _current_adv(sym: str) -> float:
+        """当前可用 ADV（前一日及之前 _ADV_WINDOW 日滚动均值）；无数据返回 0。"""
+        dq, run = _adv_state.get(sym, (None, 0.0))
+        return (run / len(dq)) if dq else 0.0
+
+    def _stamp_rate(dt: str | None) -> float:
+        """印花税按交易日分段：2023-08-28 财政部减半前 0.1%，其后 0.05%（卖出端）。"""
+        if dt is None:
+            return cm.stamp_tax_rate if cm is not None else engine_cfg.stamp_tax_rate
+        return _STAMP_TAX_RECENT if str(dt) >= "2023-08-28" else _STAMP_TAX_OLD
 
     def _calc_market_value() -> float:
         held = np.where(pos_shares > 0)[0]
@@ -115,27 +128,51 @@ def _run_single_backtest(
 
     close_lookup: dict[str, float] = {}
 
-    def _sell_proceeds_and_cost(sym: str, value: float, volume: float) -> tuple[float, float]:
+    def _sell_proceeds_and_cost(
+        sym: str,
+        value: float,
+        volume: float,
+        amount_ma20: float | None = None,
+        dt: str | None = None,
+        volatility_multiplier: float = 1.0,
+    ) -> tuple[float, float]:
+        stamp = _stamp_rate(dt)
         if cm is not None:
-            adv = _adv_state.get(sym, (0.0, 0))[0]
-            slip = cm.calc_slippage(volume, adv, side="sell", order_type="market")
-            rate = slip + cm.stamp_tax_rate
-            return value * (1 - rate), value * rate
+            adv = _current_adv(sym)
+            total = cm.sell_cost(
+                value,
+                volume,
+                adv,
+                amount_ma20=amount_ma20,
+                stamp_tax_rate=stamp,
+                volatility_multiplier=volatility_multiplier,
+            )
+            return value - total, total
         commission = max(value * engine_cfg.commission_rate, engine_cfg.min_commission_per_trade)
-        fee = commission + value * (engine_cfg.transfer_fee_rate + engine_cfg.stamp_tax_rate)
-        slip_cost = value * engine_cfg.slippage
-        total_cost = fee + slip_cost
-        return value - total_cost, total_cost
+        slip_rate = max(engine_cfg.slippage, _MIN_SLIPPAGE_FLOOR) * max(volatility_multiplier, 1.0)
+        total = commission + value * (engine_cfg.transfer_fee_rate + stamp + slip_rate)
+        return value - total, total
 
-    def _buy_cost(sym: str, value: float, volume: float) -> float:
+    def _buy_cost(
+        sym: str, value: float, volume: float, amount_ma20: float | None = None, volatility_multiplier: float = 1.0
+    ) -> float:
         if cm is not None:
-            adv = _adv_state.get(sym, (0.0, 0))[0]
-            return cm.buy_cost(value, volume, adv)
+            adv = _current_adv(sym)
+            return cm.buy_cost(value, volume, adv, amount_ma20=amount_ma20, volatility_multiplier=volatility_multiplier)
         commission = max(value * engine_cfg.commission_rate, engine_cfg.min_commission_per_trade)
-        fee = commission + value * engine_cfg.transfer_fee_rate
-        return fee + value * engine_cfg.slippage
+        slip_rate = max(engine_cfg.slippage, _MIN_SLIPPAGE_FLOOR) * max(volatility_multiplier, 1.0)
+        return commission + value * (engine_cfg.transfer_fee_rate + slip_rate)
 
-    def _process_sell(dt, s_syms, s_idx, s_close, s_vol, partial: bool = False):
+    def _process_sell(
+        dt,
+        s_syms,
+        s_idx,
+        s_close,
+        s_vol,
+        partial: bool = False,
+        s_amount: np.ndarray | None = None,
+        s_amp_mult: np.ndarray | None = None,
+    ):
         total_sold = 0.0
         for j in range(len(s_syms)):
             si = s_idx[j]
@@ -156,15 +193,31 @@ def _run_single_backtest(
                 pos_value[si] = 0.0
                 pos_shares[si] = 0
                 _sold_today.add(s_syms[j])
-            proc, cst = _sell_proceeds_and_cost(s_syms[j], mv, float(s_vol[j]))
+            proc, cst = _sell_proceeds_and_cost(
+                s_syms[j],
+                mv,
+                float(s_vol[j]),
+                amount_ma20=float(s_amount[j]) if s_amount is not None else None,
+                dt=str(dt),
+                volatility_multiplier=float(s_amp_mult[j]) if s_amp_mult is not None else 1.0,
+            )
             nonlocal cash
             cash += proc
             total_sold += mv
-            trade_log.append({
-                "time": dt, "symbol": s_syms[j], "action": "sell" if sell_shares >= sh else "sell_partial",
-                "price": float(s_close[j]), "value": round(proc, 2),
-                "cost": round(cst, 2),
-            })
+            trade_log.append(
+                {
+                    "time": dt,
+                    "symbol": s_syms[j],
+                    "action": "sell" if sell_shares >= sh else "sell_partial",
+                    "price": float(s_close[j]),
+                    "value": round(proc, 2),
+                    "cost": round(cst, 2),
+                    # 1.9 流动性拟真字段：实际成交数量（A股最小交易单位整数倍）
+                    "qty": int(sell_shares),
+                    # 1.7 执行滞后自检字段：同一信号日的复权收盘价（收益乘数锚点）
+                    "close_adj": float(s_close[j]),
+                }
+            )
         return total_sold
 
     _market_multiplier = 1.0
@@ -176,10 +229,7 @@ def _run_single_backtest(
             day_data = grp.copy()
 
             # 市场状态过滤：根据上一日全部股票的中位数评分调整仓位（避免前视偏差）
-            if i_day == 0:
-                _med_score = 0.0
-            else:
-                _med_score = _prev_med_score
+            _med_score = 0.0 if i_day == 0 else _prev_med_score
             if _med_score >= 30:
                 _market_multiplier = 1.0
             elif _med_score >= 15:
@@ -207,6 +257,11 @@ def _run_single_backtest(
             adj_ok = np.isfinite(close_adj) & (close_adj > 0)
             close = day_data["close"].values
             volume = day_data["volume"].values
+            # 1.9 流动性拟真：单日振幅 = (high-low)/前收，>5% 剧烈波动日基础滑点翻倍
+            high_arr = day_data["high"].values if "high" in day_data.columns else None
+            low_arr = day_data["low"].values if "low" in day_data.columns else None
+            # 20 日均成交额（元）：用于流动性分档冲击成本
+            amount_ma20 = day_data["AMOUNT_MA20"].values if "AMOUNT_MA20" in day_data.columns else None
             buy_score = day_data["进场评分"].values
             sell_score = day_data["退出评分"].values
             risk_str = day_data["风险等级"].astype(str).values
@@ -214,25 +269,37 @@ def _run_single_backtest(
             if i_day % 20 == 0:
                 _bs_nonzero = buy_score[buy_score > 0]
                 if len(_bs_nonzero) > 0:
-                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score>=15).sum())} >=60={int((buy_score>=60).sum())}")
+                    logger.info(
+                        f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score >= 15).sum())} >=60={int((buy_score >= 60).sum())}"
+                    )
                 else:
                     logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 全为零 ({len(buy_score)} 只)")
 
             # ── 涨跌停/停牌检查（首日无 prev_bar 时跳过 limit 过滤） ──
-            _limit_ratio = np.array([
-                0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10
-                for s in syms_str
-            ], dtype=np.float64)
+            _limit_ratio = np.array(
+                [0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10 for s in syms_str],
+                dtype=np.float64,
+            )
             _have_prev = i_day > 0
             if _have_prev:
                 _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
-                limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
-                limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+                limit_up_arr = (
+                    np.floor(_prev_close_arr * (1 + _limit_ratio) * _LIMIT_PX_PRECISION + 0.5) / _LIMIT_PX_PRECISION
+                )
+                limit_down_arr = (
+                    np.floor(_prev_close_arr * (1 - _limit_ratio) * _LIMIT_PX_PRECISION + 0.5) / _LIMIT_PX_PRECISION
+                )
                 not_limit_up = close < limit_up_arr
                 not_limit_down = close > limit_down_arr
+                # 1.9 流动性拟真：单日振幅>5% → 剧烈波动日，基础滑点整体翻倍
+                _vol_mult = np.ones(len(close_raw), dtype=np.float64)
+                if high_arr is not None and low_arr is not None:
+                    _amp = (high_arr - low_arr) / np.maximum(_prev_close_arr, 1e-9)
+                    _vol_mult = np.where(_amp > 0.05, 2.0, 1.0)
             else:
                 not_limit_up = np.ones(len(close_raw), dtype=bool)
                 not_limit_down = np.ones(len(close_raw), dtype=bool)
+                _vol_mult = np.ones(len(close_raw), dtype=np.float64)
             has_volume = volume > 0
 
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
@@ -259,16 +326,39 @@ def _run_single_backtest(
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
-                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok & adj_ok
+                sel_all = (
+                    held
+                    & (exit_high | exit_gt | exit_score_low | stop_hit)
+                    & not_limit_down
+                    & has_volume
+                    & _t1_ok
+                    & adj_ok
+                )
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
                     sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
-                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close_adj[si_stop], volume[si_stop], partial=False)
+                        daily_sell_value += _process_sell(
+                            dt,
+                            syms_str[si_stop],
+                            idx[si_stop],
+                            close_adj[si_stop],
+                            volume[si_stop],
+                            partial=False,
+                            s_amount=amount_ma20[si_stop] if amount_ma20 is not None else None,
+                        )
                     if len(si_partial):
-                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close_adj[si_partial], volume[si_partial], partial=True)
+                        daily_sell_value += _process_sell(
+                            dt,
+                            syms_str[si_partial],
+                            idx[si_partial],
+                            close_adj[si_partial],
+                            volume[si_partial],
+                            partial=True,
+                            s_amount=amount_ma20[si_partial] if amount_ma20 is not None else None,
+                        )
                     close_lookup = dict(zip(syms_str[adj_ok], close_adj[adj_ok]))
                     total_value = cash + _calc_market_value()
 
@@ -281,7 +371,15 @@ def _run_single_backtest(
             else:
                 _effective_threshold = _buy_threshold
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today & adj_ok
+            buy_ok = (
+                (buy_score >= _effective_threshold)
+                & (pos_shares[idx] == 0)
+                & (~np.isin(risk_str, ["HIGH", "D", "E"]))
+                & not_limit_up
+                & has_volume
+                & _not_sold_today
+                & adj_ok
+            )
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi) == 0 and len(date_groups) > 100 and np.any(buy_score >= _buy_threshold):
@@ -291,12 +389,15 @@ def _run_single_backtest(
                 _diag_limit = int(not_limit_up.sum())
                 _diag_vol = int(has_volume.sum())
                 _diag_t1 = len(_sold_today)
-                logger.info(f"[ENGINE-DIAG] {dt}: 评分≥{_effective_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} T+1禁={_diag_t1} 总={len(buy_ok)}")
+                logger.info(
+                    f"[ENGINE-DIAG] {dt}: 评分≥{_effective_threshold}={_diag_score} 空仓={_diag_pos} 低风险={_diag_risk} 非涨停={_diag_limit} 有量={_diag_vol} T+1禁={_diag_t1} 总={len(buy_ok)}"
+                )
             if len(bi):
                 b_syms = syms_str[bi]
                 b_idx = idx[bi]
                 b_close = close_adj[bi]
                 b_vol = volume[bi]
+                b_amount = amount_ma20[bi] if amount_ma20 is not None else None
                 b_risk_str = risk_str[bi]
 
                 # Top-K 等权分配：集中资金到评分最高的 _top_k 只
@@ -329,42 +430,64 @@ def _run_single_backtest(
                     shares = int(tv / price) // lot * lot if price > 0 else 0
                     if shares < lot:
                         continue
-                    _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
+                    _adv_val = _current_adv(b_syms[j])
                     if _adv_val > 100:
                         max_shares_vol = int(_adv_val * _max_order_pct) // lot * lot
                         shares = min(shares, max_shares_vol)
                         if shares < lot:
                             continue
                     tv = shares * price
-                    cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
+                    cst = _buy_cost(
+                        b_syms[j], tv, float(b_vol[j]),
+                        amount_ma20=float(b_amount[j]) if b_amount is not None else None,
+                        volatility_multiplier=float(_vol_mult[bi[j]]),
+                    )
                     if cash >= tv + cst:
                         cash -= tv + cst
                         pos_value[si] = tv
                         pos_shares[si] = shares
                         daily_buy_value += tv
                         _buy_date[b_syms[j]] = str(dt)
-                        trade_log.append({
-                            "time": dt, "symbol": b_syms[j], "action": "buy",
-                            "price": float(b_close[j]), "value": round(tv, 2),
-                            "cost": round(cst, 2),
-                        })
+                        trade_log.append(
+                            {
+                                "time": dt,
+                                "symbol": b_syms[j],
+                                "action": "buy",
+                                "price": float(b_close[j]),
+                                "value": round(tv, 2),
+                                "cost": round(cst, 2),
+                                # 1.9 流动性拟真字段：实际成交数量（A股最小交易单位整数倍）
+                                "qty": int(shares),
+                                # 1.7 执行滞后自检字段：同一信号日的复权收盘价（收益乘数锚点）
+                                "close_adj": float(b_close[j]),
+                            }
+                        )
                         bought += 1
 
                 if bought == 0 and len(date_groups) > 100:
                     _p0 = float(b_close[0]) if n_candidates > 0 else 0
-                    _tv0 = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier) if n_candidates > 0 else 0
+                    _tv0 = (
+                        min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
+                        if n_candidates > 0
+                        else 0
+                    )
                     _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
-                    logger.info(f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}")
+                    logger.info(
+                        f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}"
+                    )
 
             for i_sym, i_vol in zip(syms_str, volume):
                 _update_adv(i_sym, i_vol)
 
             total_value = cash + _calc_market_value()
             _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
-            equity_curve.append({
-                "time": dt, "portfolio_value": round(total_value, 2),
-                "turnover": round(_turnover, 6),
-            })
+            equity_curve.append(
+                {
+                    "time": dt,
+                    "portfolio_value": round(total_value, 2),
+                    "turnover": round(_turnover, 6),
+                }
+            )
     else:
         # ── Legacy path: build cumulative_hist for allocate_weights ──
         cumulative_hist: pd.DataFrame | None = None
@@ -411,6 +534,11 @@ def _run_single_backtest(
             adj_ok = np.isfinite(close_adj) & (close_adj > 0)
             close = day_data["close"].values
             volume = day_data["volume"].values
+            # 1.9 流动性拟真：单日振幅 = (high-low)/前收，>5% 剧烈波动日基础滑点翻倍
+            high_arr = day_data["high"].values if "high" in day_data.columns else None
+            low_arr = day_data["low"].values if "low" in day_data.columns else None
+            # 20 日均成交额（元）：用于流动性分档冲击成本
+            amount_ma20 = day_data["AMOUNT_MA20"].values if "AMOUNT_MA20" in day_data.columns else None
             buy_score = day_data["进场评分"].values
             sell_score = day_data["退出评分"].values
             risk_str = day_data["风险等级"].astype(str).values
@@ -419,25 +547,37 @@ def _run_single_backtest(
             if i_day % 20 == 0:
                 _bs_nonzero = buy_score[buy_score > 0]
                 if len(_bs_nonzero) > 0:
-                    logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score>=15).sum())} >=60={int((buy_score>=60).sum())}")
+                    logger.info(
+                        f"[ENGINE-SCORE] {dt}: 进场评分 非零={len(_bs_nonzero)}/{len(buy_score)} mean={_bs_nonzero.mean():.1f} median={float(np.median(_bs_nonzero)):.1f} min={_bs_nonzero.min():.0f} max={_bs_nonzero.max():.0f} >=15={int((buy_score >= 15).sum())} >=60={int((buy_score >= 60).sum())}"
+                    )
                 else:
                     logger.info(f"[ENGINE-SCORE] {dt}: 进场评分 全为零 ({len(buy_score)} 只)")
 
             # ── 涨跌停/停牌检查（首日无 prev_bar 时跳过 limit 过滤） ──
-            _limit_ratio = np.array([
-                0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10
-                for s in syms_str
-            ], dtype=np.float64)
+            _limit_ratio = np.array(
+                [0.20 if s.startswith(("30", "688")) else 0.30 if s.startswith("8") else 0.10 for s in syms_str],
+                dtype=np.float64,
+            )
             _have_prev = i_day > 0
             if _have_prev:
                 _prev_close_arr = np.array([_prev_bar.get(s, (c, 0))[0] for s, c in zip(syms_str, close_raw)])
-                limit_up_arr = _prev_close_arr * (1 + _limit_ratio)
-                limit_down_arr = _prev_close_arr * (1 - _limit_ratio)
+                limit_up_arr = (
+                    np.floor(_prev_close_arr * (1 + _limit_ratio) * _LIMIT_PX_PRECISION + 0.5) / _LIMIT_PX_PRECISION
+                )
+                limit_down_arr = (
+                    np.floor(_prev_close_arr * (1 - _limit_ratio) * _LIMIT_PX_PRECISION + 0.5) / _LIMIT_PX_PRECISION
+                )
                 not_limit_up = close < limit_up_arr
                 not_limit_down = close > limit_down_arr
+                # 1.9 流动性拟真：单日振幅>5% → 剧烈波动日，基础滑点整体翻倍
+                _vol_mult = np.ones(len(close_raw), dtype=np.float64)
+                if high_arr is not None and low_arr is not None:
+                    _amp = (high_arr - low_arr) / np.maximum(_prev_close_arr, 1e-9)
+                    _vol_mult = np.where(_amp > 0.05, 2.0, 1.0)
             else:
                 not_limit_up = np.ones(len(close_raw), dtype=bool)
                 not_limit_down = np.ones(len(close_raw), dtype=bool)
+                _vol_mult = np.ones(len(close_raw), dtype=np.float64)
             has_volume = volume > 0
 
             stop_col = day_data["止损价"].values if "止损价" in day_data.columns else np.zeros(len(day_data))
@@ -464,16 +604,41 @@ def _run_single_backtest(
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
-                sel_all = held & (exit_high | exit_gt | exit_score_low | stop_hit) & not_limit_down & has_volume & _t1_ok & adj_ok
+                sel_all = (
+                    held
+                    & (exit_high | exit_gt | exit_score_low | stop_hit)
+                    & not_limit_down
+                    & has_volume
+                    & _t1_ok
+                    & adj_ok
+                )
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
                     sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
-                        daily_sell_value += _process_sell(dt, syms_str[si_stop], idx[si_stop], close_adj[si_stop], volume[si_stop], partial=False)
+                        daily_sell_value += _process_sell(
+                            dt,
+                            syms_str[si_stop],
+                            idx[si_stop],
+                            close_adj[si_stop],
+                            volume[si_stop],
+                            partial=False,
+                            s_amount=amount_ma20[si_stop] if amount_ma20 is not None else None,
+                            s_amp_mult=_vol_mult[si_stop],
+                        )
                     if len(si_partial):
-                        daily_sell_value += _process_sell(dt, syms_str[si_partial], idx[si_partial], close_adj[si_partial], volume[si_partial], partial=True)
+                        daily_sell_value += _process_sell(
+                            dt,
+                            syms_str[si_partial],
+                            idx[si_partial],
+                            close_adj[si_partial],
+                            volume[si_partial],
+                            partial=True,
+                            s_amount=amount_ma20[si_partial] if amount_ma20 is not None else None,
+                            s_amp_mult=_vol_mult[si_partial],
+                        )
                     close_lookup = dict(zip(syms_str[adj_ok], close_adj[adj_ok]))
                     total_value = cash + _calc_market_value()
 
@@ -485,7 +650,15 @@ def _run_single_backtest(
             else:
                 _effective_threshold = max(_buy_threshold, 10)
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
-            buy_ok = (buy_score >= _effective_threshold) & (pos_shares[idx] == 0) & (~np.isin(risk_str, ["HIGH", "D", "E"])) & not_limit_up & has_volume & _not_sold_today & adj_ok
+            buy_ok = (
+                (buy_score >= _effective_threshold)
+                & (pos_shares[idx] == 0)
+                & (~np.isin(risk_str, ["HIGH", "D", "E"]))
+                & not_limit_up
+                & has_volume
+                & _not_sold_today
+                & adj_ok
+            )
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
             if len(bi):
@@ -493,15 +666,7 @@ def _run_single_backtest(
                 b_idx = idx[bi]
                 b_close = close_adj[bi]
                 b_vol = volume[bi]
-
-                w_dict = allocate_weights(
-                    cumulative_hist, method=engine_cfg.portfolio_method,
-                    max_weight=max_pos_pct,
-                    entry_col="进场评分", risk_col="风险等级",
-                    min_entry_score=0,
-                )
-                w = np.array([w_dict.get(s, 0.0) for s in b_syms], dtype=np.float64)
-                total_w = float(w.sum()) or 1.0
+                b_amount = amount_ma20[bi] if amount_ma20 is not None else None
 
                 # Top-K 等权分配
                 if len(b_syms) > _top_k:
@@ -532,25 +697,38 @@ def _run_single_backtest(
                     shares = int(tv / price) // lot * lot if price > 0 else 0
                     if shares < lot:
                         continue
-                    _adv_val = _adv_state.get(b_syms[j], (1e9, 0))[0]
+                    _adv_val = _current_adv(b_syms[j])
                     if _adv_val > 100:
                         max_shares_vol = int(_adv_val * _max_order_pct) // lot * lot
                         shares = min(shares, max_shares_vol)
                         if shares < lot:
                             continue
                     tv = shares * price
-                    cst = _buy_cost(b_syms[j], tv, float(b_vol[j]))
+                    cst = _buy_cost(
+                        b_syms[j], tv, float(b_vol[j]),
+                        amount_ma20=float(b_amount[j]) if b_amount is not None else None,
+                        volatility_multiplier=float(_vol_mult[bi[j]]),
+                    )
                     if cash >= tv + cst:
                         cash -= tv + cst
                         pos_value[si] = tv
                         pos_shares[si] = shares
                         daily_buy_value += tv
                         _buy_date[b_syms[j]] = str(dt)
-                        trade_log.append({
-                            "time": dt, "symbol": b_syms[j], "action": "buy",
-                            "price": float(b_close[j]), "value": round(tv, 2),
-                            "cost": round(cst, 2),
-                        })
+                        trade_log.append(
+                            {
+                                "time": dt,
+                                "symbol": b_syms[j],
+                                "action": "buy",
+                                "price": float(b_close[j]),
+                                "value": round(tv, 2),
+                                "cost": round(cst, 2),
+                                # 1.9 流动性拟真字段：实际成交数量（A股最小交易单位整数倍）
+                                "qty": int(shares),
+                                # 1.7 执行滞后自检字段：同一信号日的复权收盘价（收益乘数锚点）
+                                "close_adj": float(b_close[j]),
+                            }
+                        )
                         bought += 1
 
             for i_sym, i_vol in zip(syms_str, volume):
@@ -558,10 +736,39 @@ def _run_single_backtest(
 
             total_value = cash + _calc_market_value()
             _turnover = (daily_buy_value + daily_sell_value) / (2 * total_value) if total_value > 0 else 0.0
-            equity_curve.append({
-                "time": dt, "portfolio_value": round(total_value, 2),
-                "turnover": round(_turnover, 6),
-            })
+            equity_curve.append(
+                {
+                    "time": dt,
+                    "portfolio_value": round(total_value, 2),
+                    "turnover": round(_turnover, 6),
+                }
+            )
 
     total_value = cash + _calc_market_value()
+
+    # ── 1.7 信号执行滞后自检：收益乘数对齐（每笔成交已带同日 close_adj 字段，
+    # ── 热路径 O(成交数) 校验；任何开盘/盘中价成交会吃掉当日收益） ──
+    try:
+        from LogicAnalyzer.ml.execution_lag_integrity import check_price_vs_close_adj
+
+        _lag = check_price_vs_close_adj(trade_log)
+        if not _lag.passed:
+            logger.warning(f"[执行滞后合规] FAIL: {_lag.details[0] if _lag.details else ''}")
+        else:
+            logger.info("[执行滞后合规] 收益乘数对齐 PASS（全部成交=信号日收盘价，收益自次日起计）")
+    except Exception as _lag_e:
+        logger.debug(f"[执行滞后合规] 自检跳过: {_lag_e}")
+
+    # ── 1.8 交易摩擦合规自检（热路径 O(1)：显性成本/滑点下限/动态冲击） ──
+    try:
+        from LogicAnalyzer.ml.trading_friction_integrity import check_trading_friction_config
+
+        _fric = check_trading_friction_config(engine_cfg)
+        if not _fric.passed:
+            logger.warning(f"[交易摩擦合规] FAIL: {'；'.join(_fric.details[:3])}")
+        else:
+            logger.info("[交易摩擦合规] 显性成本+滑点下限+动态冲击全部合规")
+    except Exception as _fric_e:
+        logger.debug(f"[交易摩擦合规] 自检跳过: {_fric_e}")
+
     return (total_value / init_cash) - 1

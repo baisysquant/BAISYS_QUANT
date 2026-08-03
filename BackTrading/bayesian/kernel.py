@@ -51,8 +51,24 @@ def save_gp_state(gp: GaussianProcessRegressor, X: np.ndarray, Y: np.ndarray) ->
 
 
 def restore_gp_state(state: GPState | None, n_dims: int) -> GPState | None:
-    """校验并还原 GP 状态（检查维度匹配）。"""
+    """校验并还原 GP 状态（支持多子空间嵌套状态，按维度匹配）。
+
+    兼容两种结构：
+      - 嵌套：{"sub_states": {n_signal: {...}, n_total: {...}, ...}}（optimize_window
+        同时保存信号/全空间/组合三个子空间的 GP，Phase 2/3 按各自维度取用）
+      - 扁平：{"n_dims": d, "kernel_params": ...}（旧格式，仍按 n_dims 精确匹配）
+    """
     if state is None:
+        return None
+    sub = state.get("sub_states")
+    if isinstance(sub, dict) and sub:
+        inner = sub.get(n_dims)
+        if inner is None:
+            inner = sub.get(str(n_dims))
+        if inner is not None:
+            logger.debug(f"GP warm-start: 使用 {n_dims} 维子空间状态")
+            return inner
+        logger.warning(f"GP 状态无 {n_dims} 维子空间，忽略 warm-start")
         return None
     if state.get("n_dims") != n_dims:
         logger.warning(f"GP 状态维度 {state.get('n_dims')} 不匹配当前 {n_dims}，忽略 warm-start")

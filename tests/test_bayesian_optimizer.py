@@ -114,6 +114,32 @@ def test_gp_build() -> None:
     assert wrong is None
 
 
+def test_gp_state_sub_states_by_dim() -> None:
+    """嵌套子空间状态（信号/组合/全空间）按维度取用，缺维才告警返回 None。"""
+    from BackTrading.bayesian.kernel import build_gp, restore_gp_state, save_gp_state
+
+    np.random.seed(42)
+    X5 = np.random.uniform(0, 1, (12, 5))
+    Y = np.sin(3 * X5[:, 0]) + 0.1 * np.random.randn(12)
+    X3 = X5[:, :3]
+    X8 = np.hstack([X5, np.random.uniform(0, 1, (12, 3))])
+
+    state = {
+        "sub_states": {
+            5: save_gp_state(build_gp(X5, Y, n_restarts=3), X5, Y),
+            3: save_gp_state(build_gp(X3, Y, n_restarts=3), X3, Y),
+            8: save_gp_state(build_gp(X8, Y, n_restarts=3), X8, Y),
+        },
+        "n_dims": 5,
+    }
+    for d in (3, 5, 8):
+        restored = restore_gp_state(state, d)
+        assert restored is not None
+        assert restored["n_dims"] == d
+    assert restore_gp_state(state, 6) is None
+    assert restore_gp_state(None, 5) is None
+
+
 def test_acquisition() -> None:
     from BackTrading.bayesian.acquisition import (
         expected_improvement, mixed_acquisition, optimize_acquisition,

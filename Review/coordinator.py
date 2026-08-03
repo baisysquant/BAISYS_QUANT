@@ -191,9 +191,11 @@ class StockAnalysisCoordinator:
             ("因子衰减监控", self._step_15_factor_decay,
              ["组合构建", "获取K线数据及最新价"], False),
             ("跟仓回测分析", self._step_16_position_backtest, [], False),
+            ("风险分析", self._step_risk_analysis,
+             ["基准对比", "组合构建", "获取K线数据及最新价"], False),
             ("生成Excel报告", self._step_17_generate_report,
              ["组合构建", "运行行业分析", "准备处理数据字典",
-              "跟仓回测分析", "基准对比"], False),
+              "跟仓回测分析", "基准对比", "风险分析"], False),
             ("同步结果到数据库", self._step_18_sync_to_database,
              ["组合构建", "运行行业分析", "获取原始数据"], False),
         ]
@@ -972,6 +974,38 @@ class StockAnalysisCoordinator:
         self.logger.info(f"[跟仓回测] 生成 {len(df)} 条记录，等待写入 Excel")
         return True
 
+    def _step_risk_analysis(self, ctx: PipelineContext) -> bool:
+        """风险分析（非致命）：VaR/ES、Brinson 归因、因子风险归因，产出 risk_sheets。"""
+        benchmark_result = ctx.get("benchmark_result", {})
+        portfolio_rets: pd.Series = pd.Series(dtype=float)
+        benchmark_rets: pd.Series = pd.Series(dtype=float)
+        if isinstance(benchmark_result, dict) and "error" not in benchmark_result:
+            combined = benchmark_result.get("日收益率数据")
+            if isinstance(combined, pd.DataFrame) and not combined.empty:
+                if "portfolio" in combined.columns:
+                    portfolio_rets = combined["portfolio"].dropna()
+                if "benchmark" in combined.columns:
+                    benchmark_rets = combined["benchmark"].dropna()
+
+        holdings_df = ctx.get("consolidated_report", pd.DataFrame())
+        hist_df = self._ensure_hist_df(ctx)
+
+        try:
+            risk_sheets = self.report_service.build_risk_sheets(
+                portfolio_returns=portfolio_rets,
+                benchmark_returns=benchmark_rets,
+                holdings_df=holdings_df,
+                kline_df=hist_df,
+            )
+        except Exception as e:
+            self.logger.warning(f"[风险分析] 生成风险报告失败: {e}")
+            return True
+
+        ctx.set("risk_sheets", risk_sheets)
+        if not risk_sheets:
+            self.logger.info("[风险分析] 无可用数据，跳过风险报告")
+        return True
+
     def _step_17_generate_report(self, ctx: PipelineContext) -> bool:
         consolidated_report: pd.DataFrame = ctx.get("consolidated_report", pd.DataFrame())
         industry_df: pd.DataFrame = ctx.get("industry_df", pd.DataFrame())
@@ -994,10 +1028,12 @@ class StockAnalysisCoordinator:
 
         position_backtest_report: pd.DataFrame = ctx.get("position_backtest_report", pd.DataFrame())
         benchmark_report: pd.DataFrame = ctx.get("benchmark_report", pd.DataFrame())
+        risk_sheets: dict = ctx.get("risk_sheets", {})
         sheets_data = self._prepare_sheets_data(
             consolidated_report, industry_df, processed_data,
             position_backtest_report=position_backtest_report,
             benchmark_report=benchmark_report,
+            risk_sheets=risk_sheets,
         )
         self.report_service.generate_excel_report(sheets_data, self.today_str)
         self._validate_report_integrity(consolidated_report)
@@ -1106,6 +1142,7 @@ class StockAnalysisCoordinator:
         processed_data: dict[str, pd.DataFrame],
         position_backtest_report: pd.DataFrame | None = None,
         benchmark_report: pd.DataFrame | None = None,
+        risk_sheets: dict[str, pd.DataFrame] | None = None,
     ) -> dict[str, pd.DataFrame]:
         sheets = {
             "数据汇总": consolidated_report,
@@ -1117,6 +1154,8 @@ class StockAnalysisCoordinator:
             sheets[POSITION_BT_SHEET] = position_backtest_report
         if benchmark_report is not None and not benchmark_report.empty:
             sheets["基准对比"] = benchmark_report
+        if risk_sheets:
+            sheets.update({k: v for k, v in risk_sheets.items() if v is not None and not v.empty})
         return sheets
 
     def _sync_results_to_database(

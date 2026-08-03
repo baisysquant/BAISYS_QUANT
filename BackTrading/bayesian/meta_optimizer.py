@@ -255,7 +255,7 @@ def bayesian_walk_forward_multi(
 
             # ── 贝叶斯优化 IS ──
             try:
-                best_params, gp_state, top_k_params = optimize_window(
+                best_params, gp_state, top_k_params, is_sharpe = optimize_window(
                     kline_df=train_data,
                     engine_cfg=base_cfg,
                     spaces=spaces,

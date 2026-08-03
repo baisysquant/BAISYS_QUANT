@@ -44,8 +44,26 @@ _GLOBAL_CACHE_LOCK = threading.Lock()
 
 
 def _signal_hash(params: dict[str, Any]) -> str:
-    """只取信号参数的子集做哈希。"""
-    sub = {k: params[k] for k in _SIGNAL_PARAM_KEYS if k in params}
+    """只取信号参数的子集做哈希。
+
+    同时支持扁平 dict 和结构化 dict。
+    """
+    def _get(key: str, default: Any) -> Any:
+        if key in params:
+            return params[key]
+        if key == "boll_narrow_ratio" and "regime" in params:
+            return params["regime"].get(key, default)
+        if key == "conclusion_full_bull" and "thresholds" in params:
+            return params["thresholds"].get("fully_bull", default)
+        if key in ("cross_decay_days", "golden_cross_bonus", "divergence_penalty") and "scoring" in params:
+            return params["scoring"].get(key, default)
+        return default
+
+    sub = {
+        k: _get(k, 0 if k == "boll_narrow_ratio" else (80 if k == "conclusion_full_bull" else 0))
+        for k in _SIGNAL_PARAM_KEYS
+        if k in params or _get(k, None) is not None
+    }
     return hashlib.md5(json.dumps(sub, sort_keys=True).encode()).hexdigest()[:8]
 
 

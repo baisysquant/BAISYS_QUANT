@@ -367,6 +367,22 @@ class BacktestConfig(BaseModel):
                                      description="过户费（双边，万0.1）")
     MIN_COMMISSION_PER_TRADE: float = Field(default=5.0, ge=0, le=100,
                                             description="A股每笔最低佣金（5元）")
+    # ── 冲击成本（未提供 AMOUNT_MA20 时的统一参数） ──
+    IMPACT_BASE: float = Field(default=0.002, ge=0, le=0.05,
+                               description="大单冲击成本基数（阈值处）")
+    IMPACT_THRESHOLD: float = Field(default=0.01, ge=1e-5, le=1.0,
+                                    description="冲击成本启用阈值（占ADV比例）")
+    IMPACT_CAP: float = Field(default=0.05, ge=0, le=1.0,
+                              description="冲击成本上限（防极端流动性下滑点>100%）")
+    # ── 流动性分档冲击成本（按 AMOUNT_MA20 分档，业界做法） ──
+    LIQUIDITY_TIER_EDGES: str = Field(default="5e6,2e7,1e8",
+                                      description="流动性分档边界（AMOUNT_MA20 元，逗号分隔，档数=边界数+1）")
+    LIQUIDITY_TIER_IMPACT_BASE: str = Field(default="0.008,0.003,0.0015,0.001",
+                                            description="各档冲击成本基数（小票高、大票低）")
+    LIQUIDITY_TIER_THRESHOLD: str = Field(default="0.005,0.01,0.01,0.02",
+                                          description="各档冲击启用阈值（占ADV比例）")
+    LIQUIDITY_TIER_CAP: str = Field(default="0.10,0.05,0.05,0.03",
+                                    description="各档冲击成本上限")
     EXCLUDE_ST: bool = Field(default=True,
                              description="回测宇宙剔除 ST/*ST 风险警示股（主板 5% 涨跌幅、流动性差）")
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)

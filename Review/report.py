@@ -89,13 +89,20 @@ class ReportService:
         from DataManager.ColumnNames import get_final_column_order as _f
         return _f(fund_flow_periods)
 
-    def generate_excel_report(self, sheets_data: dict[str, pd.DataFrame], today_str: str) -> str:
+    def generate_excel_report(
+        self,
+        sheets_data: dict[str, pd.DataFrame],
+        today_str: str,
+        risk_sheets: dict[str, pd.DataFrame] | None = None,
+    ) -> str:
         """
         生成Excel审计报告
 
         Args:
             sheets_data: 包含多个sheet数据的字典
             today_str: 当前交易日字符串
+            risk_sheets: 风险分析 sheet 字典（VaR/Brinson/因子风险），
+                非空时并入 sheets_data；可用 build_risk_sheets() 生成。
 
         Returns:
             str: 报告文件路径
@@ -103,6 +110,11 @@ class ReportService:
         Raises:
             Exception: 当报告生成失败时抛出异常
         """
+        if risk_sheets:
+            sheets_data = {
+                **sheets_data,
+                **{k: v for k, v in risk_sheets.items() if v is not None and not v.empty},
+            }
         self.logger.info("\n>>> 正在生成 Excel 报告...")
         trade_date = today_str.replace("-", "") if today_str else datetime.datetime.now().strftime("%Y%m%d")
         report_path = os.path.join(self.config.HOME_DIRECTORY, f"审计报告_{trade_date}.xlsx")
@@ -222,6 +234,115 @@ class ReportService:
         except Exception as e:
             # 报告生成失败是不可恢复的致命错误
             raise ReportGenerationError("Excel审计报告", str(e))
+
+    def build_risk_sheets(
+        self,
+        portfolio_returns: pd.Series | None = None,
+        benchmark_returns: pd.Series | None = None,
+        holdings_df: pd.DataFrame | None = None,
+        kline_df: pd.DataFrame | None = None,
+        industry_map: pd.Series | None = None,
+        orth_result: dict | None = None,
+    ) -> dict[str, pd.DataFrame]:
+        """组合三个风险分析模块，生成可写入 Excel 的风险报告 sheet 字典。
+
+        包含：
+          - "风险VaR分析"  —— 历史模拟法 VaR(95%/99%) / ES（基于组合日收益率）
+          - "Brinson归因"  —— 行业配置 vs 个股选择收益归因（基于持仓 + K线）
+          - "因子风险归因" —— 正交化因子暴露风险归因（基于正交化结果）
+
+        各模块独立容错：单个模块失败仅记日志，不影响其余模块与主报告。
+
+        Args:
+            portfolio_returns: 组合日收益率 Series（VaR 用）。
+            benchmark_returns: 基准日收益率 Series（暂用于日志/扩展）。
+            holdings_df: 持仓明细 DataFrame（Brinson 用，需含 股票代码/目标权重/行业）。
+            kline_df: 全市场日 K 线（Brinson 基准构建用）。
+            industry_map: 股票代码 → 行业 映射 Series（Brinson 基准构成用）。
+            orth_result: FactorOrthogonalizer().run() 的返回 dict（因子风险归因用）。
+
+        Returns:
+            dict[str, pd.DataFrame]: sheet 名 → DataFrame；无可用数据时为空 dict。
+        """
+        from LogicAnalyzer.risk.brinson import BrinsonDecomposition
+        from LogicAnalyzer.risk.factor_risk import FactorRiskModel
+        from LogicAnalyzer.risk.historical_var import HistoricalVaR
+
+        sheets: dict[str, pd.DataFrame] = {}
+
+        # ── 1. 历史模拟 VaR / ES ──
+        if portfolio_returns is not None and not portfolio_returns.empty:
+            try:
+                var_sheet = HistoricalVaR().build_report(portfolio_returns)
+                if not var_sheet.empty:
+                    sheets["风险VaR分析"] = var_sheet
+                    self.logger.info("[风险分析] VaR/ES 报告已生成")
+            except Exception as e:
+                self.logger.warning(f"[风险分析] VaR/ES 计算失败: {e}")
+
+        # ── 2. Brinson 归因 ──
+        if holdings_df is not None and not holdings_df.empty and kline_df is not None:
+            try:
+                br = BrinsonDecomposition()
+                result = br.from_holdings(
+                    holdings_df=holdings_df,
+                    kline_df=kline_df,
+                    industry_map=industry_map,
+                )
+                if "error" not in result:
+                    br_sheet = br.build_report(result)
+                    if not br_sheet.empty:
+                        sheets["Brinson归因"] = br_sheet
+                        self.logger.info("[风险分析] Brinson 归因报告已生成")
+                else:
+                    self.logger.warning(f"[风险分析] Brinson 归因失败: {result['error']}")
+            except Exception as e:
+                self.logger.warning(f"[风险分析] Brinson 归因异常: {e}")
+
+        # ── 3. 因子风险归因 ──
+        if orth_result is not None:
+            try:
+                weights = None
+                if holdings_df is not None and not holdings_df.empty:
+                    wcol = "目标权重" if "目标权重" in holdings_df.columns else None
+                    ccol = "股票代码" if "股票代码" in holdings_df.columns else None
+                    if wcol and ccol:
+                        weights = pd.Series(
+                            pd.to_numeric(holdings_df[wcol], errors="coerce").to_numpy(),
+                            index=holdings_df[ccol].astype(str),
+                        )
+                risk = FactorRiskModel().from_orthogonalizer(
+                    orth_result, weights=weights
+                )
+                if "error" not in risk:
+                    sheets["因子风险归因"] = self._factor_risk_sheet(risk)
+                    self.logger.info("[风险分析] 因子风险归因报告已生成")
+                else:
+                    self.logger.warning(f"[风险分析] 因子风险归因失败: {risk['error']}")
+            except Exception as e:
+                self.logger.warning(f"[风险分析] 因子风险归因异常: {e}")
+
+        return sheets
+
+    @staticmethod
+    def _factor_risk_sheet(risk: dict) -> pd.DataFrame:
+        """将因子风险归因结果拼装为单一 sheet 表（含组合总览 + 因子 + 个股）。"""
+        summary = pd.DataFrame(
+            [
+                {"模块": "组合总览", "指标": "组合日波动", "数值": f"{risk['组合日波动']:.4%}"},
+                {"模块": "组合总览", "指标": "组合年化波动", "数值": f"{risk['组合年化波动']:.4%}"},
+                {"模块": "组合总览", "指标": "因子风险占比", "数值": f"{risk['因子风险占比']:.2%}"},
+                {"模块": "组合总览", "指标": "特质风险占比", "数值": f"{risk['特质风险占比']:.2%}"},
+                {"模块": "组合总览", "指标": "特质波动来源", "数值": "常数估计" if risk["特质波动为估计"] else "实际数据"},
+            ]
+        )
+        factor_df = risk["因子风险贡献"].copy()
+        factor_df.insert(0, "模块", "因子风险贡献")
+        factor_df = factor_df.rename(columns={"因子": "指标"})
+        stock_df = risk["个股特质风险TopN"].copy()
+        stock_df.insert(0, "模块", "个股特质风险TopN")
+        stock_df = stock_df.rename(columns={"股票": "指标"})
+        return pd.concat([summary, factor_df, stock_df], ignore_index=True).fillna("")
 
     def _convert_adjusted_to_normal_prices(
         self, sheets_data: dict[str, pd.DataFrame], trade_date: str

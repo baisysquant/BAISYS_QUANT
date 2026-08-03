@@ -6,7 +6,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, run_full_backtest, _run_single_backtest
+from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
 from LogicAnalyzer.backtest_metrics import compute_risk_metrics
 
@@ -20,6 +20,18 @@ class SimTradeVerdict:
     degradation: float = 0.0     # 1 - sim/oos，负值表示 sim 优于 oos
     promote: bool = False
     reason: str = ""
+
+
+def _cost_model_from_config(config: Any) -> Any:
+    """从 Config 构建 CostModel（含流动性分档冲击成本），无配置时返回 None（回落统一成本）。"""
+    if config is None:
+        return None
+    try:
+        from BackTrading.domain.models import CostModel
+        return CostModel.from_backtest_config(config.app_config.backtest)
+    except Exception as e:
+        logger.warning(f"[模拟验证] CostModel 构建失败，回落统一成本: {e}")
+        return None
 
 
 def validate_params(
@@ -94,6 +106,7 @@ def validate_params(
             position_a=best_params.get("position_a", 0.3),
             risk_none_multiplier=best_params.get("risk_none_multiplier", 1.0),
             atr_stop_mult=best_params.get("atr_stop_mult", 1.5),
+            cost_model=_cost_model_from_config(config),
         )
 
     tl: list[dict[str, Any]] = []

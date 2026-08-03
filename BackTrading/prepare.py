@@ -109,17 +109,33 @@ def _compute_config_hash() -> str:
 def _compute_param_hash(params: dict[str, Any]) -> str:
     """仅对影响信号计算的参数做哈希（用于信号缓存隔离）。
 
+    同时支持扁平 dict（顶层有参数名）和结构化 dict（参数嵌套在 scoring/regime 中）。
+
     PORTFOLIO/RISK 类参数（atr_stop_mult 等）排除在外，
     它们通过 post-cache 变换注入，不触发信号重算。
     conclusion_full_bull 影响风险等级/进出场阈值（vectorized_signal 消费），
     必须纳入哈希，否则不同阈值会错误复用同一份信号缓存。
     """
+    def _get(key: str, default: Any) -> Any:
+        """从扁平或结构化 params 中提取信号参数值。"""
+        # 扁平 dict：顶层直接有 key
+        if key in params:
+            return params[key]
+        # 结构化 dict：从嵌套路径提取
+        if key == "boll_narrow_ratio" and "regime" in params:
+            return params["regime"].get(key, default)
+        if key == "conclusion_full_bull" and "thresholds" in params:
+            return params["thresholds"].get("fully_bull", default)
+        if key in ("cross_decay_days", "golden_cross_bonus", "divergence_penalty") and "scoring" in params:
+            return params["scoring"].get(key, default)
+        return default
+
     key_params = {
-        "boll_narrow_ratio": params.get("boll_narrow_ratio", 0.8),
-        "cross_decay_days": params.get("cross_decay_days", 30),
-        "golden_cross_bonus": params.get("golden_cross_bonus", 10),
-        "divergence_penalty": params.get("divergence_penalty", 20),
-        "conclusion_full_bull": params.get("conclusion_full_bull", 80),
+        "boll_narrow_ratio": _get("boll_narrow_ratio", 0.8),
+        "cross_decay_days": _get("cross_decay_days", 30),
+        "golden_cross_bonus": _get("golden_cross_bonus", 10),
+        "divergence_penalty": _get("divergence_penalty", 20),
+        "conclusion_full_bull": _get("conclusion_full_bull", 80),
     }
     s = json.dumps(key_params, sort_keys=True)
     return hashlib.md5(s.encode()).hexdigest()[:8]

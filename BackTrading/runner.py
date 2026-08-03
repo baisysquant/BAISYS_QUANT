@@ -177,13 +177,7 @@ def run_backtest_pipeline(
             atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
             buy_threshold=int(best_params.get("buy_threshold", _bt_mid)),
             max_holdings=int(best_params.get("max_holdings", _mh_mid)),
-            cost_model=CostModel(
-                commission_rate=bt.COMMISSION_RATE,
-                stamp_tax_rate=bt.STAMP_TAX_RATE,
-                market_slippage=bt.SLIPPAGE,
-                min_commission_per_trade=bt.MIN_COMMISSION_PER_TRADE,
-                transfer_fee_rate=bt.TRANSFER_FEE_RATE,
-            ),
+            cost_model=CostModel.from_backtest_config(bt),
         )
         final_params = _build_params(config)
         final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})

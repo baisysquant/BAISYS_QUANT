@@ -107,7 +107,7 @@ def optimize_window(
     progress_cb: Any = None,
     compute_exit_strategy: bool = True,
     eval_start_date: str | None = None,
-) -> tuple[dict[str, float], GPState | None, list[dict[str, float]]]:
+) -> tuple[dict[str, float], GPState | None, list[dict[str, float]], float]:
     """单窗口贝叶斯优化（4 阶段）。
 
     Args:
@@ -348,15 +348,31 @@ def optimize_window(
     best_params = best_params_local
     best_sharpe = best_sharpe_local
 
-    # 提取 GP 状态用于 warm-start
+    # 提取 GP 状态用于 warm-start：信号 / 组合 / 全空间三个子空间分别保存
+    # （对应 Phase 2 全空间、Phase 3 组合、Phase 4 信号 GP 的维度），
+    # restore_gp_state 按维度取用，避免维度不匹配导致 warm-start 永远失效。
     gp_state = None
     if len(X_hist) > 0:
         try:
             X_all_final = np.array([x for x in X_hist])
             Y_all_final = np.array(Y_hist)
+            sub_states: dict[int, GPState] = {}
             if n_signal > 0:
-                gp_final = build_gp(X_all_final[:, :n_signal], Y_all_final, n_restarts=3)
-                gp_state = save_gp_state(gp_final, X_all_final[:, :n_signal], Y_all_final)
+                sub_states[n_signal] = save_gp_state(
+                    build_gp(X_all_final[:, :n_signal], Y_all_final, n_restarts=3),
+                    X_all_final[:, :n_signal], Y_all_final,
+                )
+            if n_portfolio > 0:
+                sub_states[n_portfolio] = save_gp_state(
+                    build_gp(X_all_final[:, n_signal:], Y_all_final, n_restarts=3),
+                    X_all_final[:, n_signal:], Y_all_final,
+                )
+            if n_total > 0:
+                sub_states[n_total] = save_gp_state(
+                    build_gp(X_all_final, Y_all_final, n_restarts=3),
+                    X_all_final, Y_all_final,
+                )
+            gp_state = {"sub_states": sub_states, "n_dims": n_signal}
         except Exception as exc:
             logger.warning(f"保存 GP 状态失败: {exc}")
 
@@ -371,4 +387,4 @@ def optimize_window(
     else:
         top_k_params = [best_params]
 
-    return best_params, gp_state, top_k_params
+    return best_params, gp_state, top_k_params, best_sharpe
