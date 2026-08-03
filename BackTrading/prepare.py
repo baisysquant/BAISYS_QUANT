@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -217,7 +218,20 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
 
 
 def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFrame:
-    result = kline_df.merge(signal_df, on=["symbol", "trade_date"], how="left")
+    """Merge K线 with signal data — 只提取信号列，减少内存压力。"""
+    # 只保留信号计算产生的列，避免加载不需要的中间指标
+    _signal_cols = [c for c in signal_df.columns if c in (
+        "进场评分", "退出评分", "综合评分", "止损价", "风险等级",
+        "entry_score", "exit_score", "score", "atr", "macd_trend",
+        "golden_cross", "hist_momentum", "dif_slope", "divergence",
+        "vol_price", "kline", "exit_strategy",
+    ) or c.startswith("MACD_") or c.startswith("MA_") or c.startswith("ATR_")]
+    if not _signal_cols:
+        # fallback: 合并全部信号列
+        _signal_cols = list(signal_df.columns)
+    signal_subset = signal_df[["symbol", "trade_date"] + _signal_cols].copy()
+    result = kline_df.merge(signal_subset, on=["symbol", "trade_date"], how="left")
+    del signal_subset, signal_df
     for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
@@ -287,10 +301,28 @@ def prepare_backtest_data(
     def _finalize(kline, signal) -> pd.DataFrame:
         merged = _merge_signal(kline, signal)
         del kline, signal
+        gc.collect()
         merged = apply_ml_signal(merged)
         if _saved_atr_stop is not None and "ATR" in merged.columns:
             stop_raw = merged["close"] - merged["ATR"] * _saved_atr_stop
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
+
+        # 截断指标预热缓冲期：仅保留 backtest_start_date 之后的数据
+        # 先过滤再返回，避免 .copy() 触发 _consolidate_inplace OOM（~846 MiB）
+        if backtest_start_date is not None:
+            if pd.api.types.is_datetime64_any_dtype(merged["trade_date"]):
+                _cutoff = pd.Timestamp(backtest_start_date)
+                mask = merged["trade_date"] >= _cutoff
+            else:
+                mask = merged["trade_date"] >= backtest_start_date
+            n_before = len(merged)
+            merged = merged.loc[mask]
+            gc.collect()
+            n_cut = n_before - len(merged)
+            if n_cut > 0:
+                logger.info(f"[DIAG] 截断 {n_cut} 行指标预热缓冲数据（< {backtest_start_date}）")
+
+        # 延迟诊断日志到截断后（减少中间切片体积）
         _first_date = merged["trade_date"].iloc[0]
         _first = merged[merged["trade_date"] == _first_date]
         _fe = _first["进场评分"]
@@ -305,17 +337,6 @@ def prepare_backtest_data(
         _last = merged[merged["trade_date"] == _last_date]
         _le = _last["进场评分"]
         logger.info(f"[DIAG] 末日 {_last_date} 进场评分: min={_le.min():.1f} max={_le.max():.1f} mean={_le.mean():.1f} median={_le.median():.1f} >=60={(_le>=60).sum()}/{len(_le)}")
-        # 截断指标预热缓冲期：仅保留 backtest_start_date 之后的数据
-        if backtest_start_date is not None:
-            n_before = len(merged)
-            if pd.api.types.is_datetime64_any_dtype(merged["trade_date"]):
-                _cutoff = pd.Timestamp(backtest_start_date)
-                merged = merged[merged["trade_date"] >= _cutoff].copy()
-            else:
-                merged = merged[merged["trade_date"] >= backtest_start_date].copy()
-            n_cut = n_before - len(merged)
-            if n_cut > 0:
-                logger.info(f"[DIAG] 截断 {n_cut} 行指标预热缓冲数据（< {backtest_start_date}）")
         return merged
 
     if done:
