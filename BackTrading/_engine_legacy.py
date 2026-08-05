@@ -68,6 +68,40 @@ def _run_single_backtest(
     pos_value = np.zeros(n_syms, dtype=np.float64)
     pos_shares = np.zeros(n_syms, dtype=np.int32)
 
+    # ── ST/退市逐日动态剔除（stock_st_history 由 runner 注入 params） ──
+    # 业务规则：
+    #   - 退市日：无条件禁止买入并强平持仓（退市股无法交易，必须剔除）。
+    #     退市为终态：自最早退市日起该股永久禁买，避免"强平→次日复购→再强平"的
+    #     循环刷交易（stock_st_history 常为最近快照，K 线可能延伸到标记日之后）
+    #   - ST/*ST 日：仅当 _exclude_st=True 时禁止买入并强平（A股 ST 涨跌幅 5%，
+    #     部分策略不允许持仓）；exclude_st=False 时 ST 股全程正常参与交易
+    # 预构建 {交易日: 被剔除 symbol 集合}，逐日 O(1) 查询；
+    # 掩码用 np.isin 按当日行生成，长度与股票池/PIT 过滤后行数无关
+    _st_hist = params.get("_st_history") if isinstance(params, dict) else None
+    _exclude_st = bool(params.get("_exclude_st", True)) if isinstance(params, dict) else True
+    _st_blocked_syms_by_day: dict[str, set[str]] = {}
+    if _st_hist:
+        _delisted_on: dict[str, str] = {}
+        for _s, _recs in _st_hist.items():
+            if not _recs:
+                continue
+            _del_days = [d for d, (_st_f, _dl) in _recs.items() if _dl]
+            if _del_days:
+                _delisted_on[_s] = min(_del_days)
+        if _delisted_on:
+            _all_days = [str(dt) for dt, _g in date_groups]
+            for _s, _first_del in _delisted_on.items():
+                for _d_str in _all_days:
+                    if _d_str >= _first_del:
+                        _st_blocked_syms_by_day.setdefault(_d_str, set()).add(_s)
+        if _exclude_st:
+            for _s, _recs in _st_hist.items():
+                if not _recs:
+                    continue
+                for _d_str, (_st_f, _dl) in _recs.items():
+                    if _st_f and not _dl:
+                        _st_blocked_syms_by_day.setdefault(_d_str, set()).add(_s)
+
     pit = data.groupby("symbol", sort=False)["trade_date"].min().to_dict() if engine_cfg.point_in_time else None
 
     cm = engine_cfg.cost_model
@@ -196,7 +230,7 @@ def _run_single_backtest(
             proc, cst = _sell_proceeds_and_cost(
                 s_syms[j],
                 mv,
-                float(s_vol[j]),
+                float(sell_shares),
                 amount_ma20=float(s_amount[j]) if s_amount is not None else None,
                 dt=str(dt),
                 volatility_multiplier=float(s_amp_mult[j]) if s_amp_mult is not None else 1.0,
@@ -319,13 +353,33 @@ def _run_single_backtest(
             total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
-            # ── 卖出（含 T+1 检查 + 分批止盈止损） ──
+            # ── 卖出（含 T+1 检查 + 分批止盈止损 + ST/退市强平） ──
             held = pos_shares[idx] > 0
+            _blocked_syms = _st_blocked_syms_by_day.get(str(dt))
+            _st_blocked_idx = (
+                np.isin(syms_str, list(_blocked_syms)) if _blocked_syms else None
+            )
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
+                # ST/退市强平：无视 T+1/跌停/停牌（退市或按策略剔除的标的必须离场）
+                force_exit = np.zeros(len(held), dtype=bool)
+                if _st_blocked_idx is not None:
+                    force_exit = held & _st_blocked_idx & adj_ok
+                si_force = np.where(force_exit)[0]
+                if len(si_force):
+                    daily_sell_value += _process_sell(
+                        dt,
+                        syms_str[si_force],
+                        idx[si_force],
+                        close_adj[si_force],
+                        volume[si_force],
+                        partial=False,
+                        s_amount=amount_ma20[si_force] if amount_ma20 is not None else None,
+                    )
+                    total_value = cash + _calc_market_value()
                 sel_all = (
                     held
                     & (exit_high | exit_gt | exit_score_low | stop_hit)
@@ -333,10 +387,11 @@ def _run_single_backtest(
                     & has_volume
                     & _t1_ok
                     & adj_ok
+                    & ~force_exit
                 )
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
-                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok & ~force_exit
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
@@ -371,6 +426,10 @@ def _run_single_backtest(
             else:
                 _effective_threshold = _buy_threshold
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
+            _st_ok = (
+                ~_st_blocked_idx if _st_blocked_idx is not None
+                else np.ones(len(syms_str), dtype=bool)
+            )
             buy_ok = (
                 (buy_score >= _effective_threshold)
                 & (pos_shares[idx] == 0)
@@ -379,6 +438,7 @@ def _run_single_backtest(
                 & has_volume
                 & _not_sold_today
                 & adj_ok
+                & _st_ok
             )
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
@@ -438,7 +498,7 @@ def _run_single_backtest(
                             continue
                     tv = shares * price
                     cst = _buy_cost(
-                        b_syms[j], tv, float(b_vol[j]),
+                        b_syms[j], tv, float(shares),
                         amount_ma20=float(b_amount[j]) if b_amount is not None else None,
                         volatility_multiplier=float(_vol_mult[bi[j]]),
                     )
@@ -597,13 +657,33 @@ def _run_single_backtest(
             total_value = cash + _calc_market_value()
             daily_sell_value = 0.0
 
-            # ── 卖出（含 T+1 检查） ──
+            # ── 卖出（含 T+1 检查 + ST/退市强平） ──
             held = pos_shares[idx] > 0
+            _blocked_syms = _st_blocked_syms_by_day.get(str(dt))
+            _st_blocked_idx = (
+                np.isin(syms_str, list(_blocked_syms)) if _blocked_syms else None
+            )
             if held.any():
                 _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
                 exit_high = np.isin(risk_str, ["HIGH", "D"])
                 exit_gt = (sell_score > buy_score + 20) & (sell_score > 0)
                 exit_score_low = (buy_score > 0) & (buy_score < _buy_threshold // 3)
+                # ST/退市强平：无视 T+1/跌停/停牌
+                force_exit = np.zeros(len(held), dtype=bool)
+                if _st_blocked_idx is not None:
+                    force_exit = held & _st_blocked_idx & adj_ok
+                si_force = np.where(force_exit)[0]
+                if len(si_force):
+                    daily_sell_value += _process_sell(
+                        dt,
+                        syms_str[si_force],
+                        idx[si_force],
+                        close_adj[si_force],
+                        volume[si_force],
+                        partial=False,
+                        s_amount=amount_ma20[si_force] if amount_ma20 is not None else None,
+                    )
+                    total_value = cash + _calc_market_value()
                 sel_all = (
                     held
                     & (exit_high | exit_gt | exit_score_low | stop_hit)
@@ -611,10 +691,11 @@ def _run_single_backtest(
                     & has_volume
                     & _t1_ok
                     & adj_ok
+                    & ~force_exit
                 )
                 si_all = np.where(sel_all)[0]
                 if len(si_all):
-                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok
+                    sel_stop = held & stop_hit & not_limit_down & has_volume & _t1_ok & adj_ok & ~force_exit
                     si_stop = np.where(sel_stop)[0]
                     si_partial = np.setdiff1d(si_all, si_stop)
                     if len(si_stop):
@@ -650,6 +731,10 @@ def _run_single_backtest(
             else:
                 _effective_threshold = max(_buy_threshold, 10)
             _not_sold_today = np.array([s not in _sold_today for s in syms_str])
+            _st_ok = (
+                ~_st_blocked_idx if _st_blocked_idx is not None
+                else np.ones(len(syms_str), dtype=bool)
+            )
             buy_ok = (
                 (buy_score >= _effective_threshold)
                 & (pos_shares[idx] == 0)
@@ -658,6 +743,7 @@ def _run_single_backtest(
                 & has_volume
                 & _not_sold_today
                 & adj_ok
+                & _st_ok
             )
             bi = np.where(buy_ok)[0]
             daily_buy_value = 0.0
@@ -705,7 +791,7 @@ def _run_single_backtest(
                             continue
                     tv = shares * price
                     cst = _buy_cost(
-                        b_syms[j], tv, float(b_vol[j]),
+                        b_syms[j], tv, float(shares),
                         amount_ma20=float(b_amount[j]) if b_amount is not None else None,
                         volatility_multiplier=float(_vol_mult[bi[j]]),
                     )

@@ -105,6 +105,8 @@ class FidelityController:
         compute_exit_strategy: bool = True,
         vectorized: bool = True,
         eval_start_date: str | None = None,
+        st_history: dict | None = None,
+        exclude_st: bool = True,
     ):
         self._kline = kline_df
         self._base_cfg = base_engine_cfg
@@ -113,6 +115,9 @@ class FidelityController:
         # 信号预热历史与评估区间分离：传入时 prepare 计算完信号后截断至该日期，
         # 保证引擎只交易 [eval_start_date, 末尾]，预热行不产生交易。
         self._eval_start_date = eval_start_date
+        # ST/退市逐日动态剔除（与 runner 最终回测口径一致，注入引擎 params）
+        self._st_history = st_history
+        self._exclude_st = exclude_st
         # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
         #（跨参数组合的命中率本来就低，多窗口下每份 ~0.7GiB 是 OOM 主因）
         self._signal_cache: dict[str, pd.DataFrame] = {}
@@ -187,9 +192,14 @@ class FidelityController:
         trade_log: list[dict[str, Any]] = []
         equity_curve: list[dict[str, Any]] = []
         eval_cfg = _make_eval_cfg(self._base_cfg, params)
+        # 注入 ST/退市动态剔除数据（在信号哈希计算之后，不污染信号缓存键）
+        engine_params = dict(params)
+        if self._st_history:
+            engine_params["_st_history"] = self._st_history
+            engine_params["_exclude_st"] = self._exclude_st
         _t_b = time.perf_counter()
         total_return = _run_single_backtest(
-            data, params, eval_cfg, trade_log, equity_curve
+            data, engine_params, eval_cfg, trade_log, equity_curve
         )
         logger.debug(f"  [evaluate] 回测耗时 {time.perf_counter()-_t_b:.1f}s, 交易 {len(trade_log)} 笔")
 

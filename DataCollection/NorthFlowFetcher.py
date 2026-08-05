@@ -18,7 +18,13 @@ class NorthFlowFetcher:
 
     通过 akshare stock_hsgt_north_flow_em 获取每日北向资金个股净买入。
     缓存策略：当日结果缓存到 CSV；再次运行直接读缓存。
+
+    注意：港交所自 2024-08-16 起停止披露北向资金每日净买入，东方财富
+    个股北向持股报表亦已下线（RPT_MUTUAL_STOCK_HOLDRANKS 仅剩港股通）。
+    接口不可用时置空降级（一次性告警），不逐日重试刷屏。
     """
+
+    _unavailable: bool = False
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -45,6 +51,9 @@ class NorthFlowFetcher:
         if trade_date is None:
             trade_date = self._today_str()
 
+        if NorthFlowFetcher._unavailable:
+            return pd.DataFrame()
+
         cache_path = self._cache_path(trade_date)
         if os.path.exists(cache_path):
             cached = pd.read_csv(cache_path, dtype={"symbol": str})
@@ -65,6 +74,13 @@ class NorthFlowFetcher:
 
         try:
             df: pd.DataFrame = ak.stock_hsgt_north_flow_em(symbol="北上", start_date=date_str, end_date=date_str)
+        except AttributeError:
+            NorthFlowFetcher._unavailable = True
+            logger.warning(
+                "akshare 北向资金接口 stock_hsgt_north_flow_em 不存在：港交所自 2024-08-16 起停止披露"
+                "北向资金每日净买入，东方财富个股北向持股报表已下线，北向资金因子将置空降级"
+            )
+            return pd.DataFrame()
         except Exception:
             logger.warning(f"akshare 北向资金接口异常（可能非交易日或无数据）[{date_str}]")
             return pd.DataFrame()

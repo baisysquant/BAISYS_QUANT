@@ -106,7 +106,6 @@ def run_backtest_pipeline(
     try:
         symbols = _resolve_symbols(engine, config)
         logger.info(f"  股票数量: {len(symbols)}")
-        logger.warning("生存偏差: 股票池仅含当前存活股票，已退市/ST 股票的历史负收益未被计入")
         _log_step("resolve_symbols")
 
         kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
@@ -115,6 +114,43 @@ def run_backtest_pipeline(
             return None
 
         logger.info(f"  K 线行数: {len(kline_df)}")
+
+        # ── ST/退市历史早加载（供 WFO / 模拟验证 / 最终回测全链路使用） ──
+        _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
+        _end_date = kline_df["trade_date"].max()
+        if pd.api.types.is_datetime64_any_dtype(kline_df["trade_date"]):
+            _end_date = _end_date.strftime("%Y-%m-%d")
+        st_history = _load_st_history(engine, symbols, _bt_start_iso, _end_date)
+
+        # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）
+        _delisted_syms = {
+            s for s, recs in st_history.items()
+            if any(_is_del for _is_st, _is_del in recs.values())
+        }
+        _kline_syms = set(kline_df["symbol"].astype(str))
+        _missing_delisted = sorted(_delisted_syms - _kline_syms)
+        if _delisted_syms:
+            logger.info(
+                f"  股票池含 {len(_delisted_syms)} 只有退市/ST 历史标记的股票，"
+                f"其中 {len(_delisted_syms & _kline_syms)} 只已纳入 K 线"
+            )
+            if _missing_delisted:
+                logger.warning(
+                    f"生存偏差: {len(_missing_delisted)} 只退市股的历史 K 线缺失"
+                    f"（如 {_missing_delisted[:5]}），其退市前负收益未被计入，"
+                    f"建议扩展数据同步范围（含已退市股票）"
+                )
+            else:
+                logger.info(
+                    "生存偏差受控: 退市/ST 股历史 K 线已纳入股票池，"
+                    "退市前负收益计入回测；ST/退市日的逐日剔除由引擎按 stock_st_history 执行"
+                )
+        else:
+            logger.warning(
+                "生存偏差: stock_st_history 无退市标记记录，股票池可能仅含当前存活股票，"
+                "已退市/ST 股票的历史负收益未被计入"
+            )
+        _log_step("load_st_history")
 
         # 窗口坐标轴以正式回测起点为准（起点前为信号预热历史，不参与 WFO 交易）
         def _ds(d) -> str:
@@ -147,6 +183,8 @@ def run_backtest_pipeline(
             point_in_time=bt.POINT_IN_TIME,
             show_progress=True,
             backtest_start_date=_bt_cut,
+            st_history=st_history,
+            exclude_st=bool(bt.EXCLUDE_ST),
         )
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
@@ -156,6 +194,10 @@ def run_backtest_pipeline(
 
         best_params = _extract_best_params(wf_result, config=config)
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
+
+        # ST/退市逐日动态剔除数据注入（引擎按 params 消费，WFO 已同口径）
+        best_params["_st_history"] = st_history
+        best_params["_exclude_st"] = bool(bt.EXCLUDE_ST)
 
         from BackTrading._engine_legacy import EngineConfig, run_full_backtest
         from BackTrading.domain.models import CostModel
@@ -202,18 +244,10 @@ def run_backtest_pipeline(
         if not _promote:
             logger.warning(f"模拟验证不通过，参数不写入 config.ini: {_sim_verdict.reason}")
 
-        # 加载 ST 历史状态（用于逐日动态剔除）
-        _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
-        _end_date = kline_df["trade_date"].max()
-        if pd.api.types.is_datetime64_any_dtype(kline_df["trade_date"]):
-            _end_date = _end_date.strftime("%Y-%m-%d")
-        st_history = _load_st_history(engine, symbols, _bt_start_iso, _end_date)
-
         _log_step("prepare_final_signals")
         final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso)
         _log_step("full_backtest")
-        # 将 ST 历史传给引擎
-        best_params["_st_history"] = st_history
+        # ST 历史已早加载并注入 best_params（见上方 _st_history 注入）
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
         risk = compute_risk_metrics(equity_curve) or {}
@@ -617,9 +651,11 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
         if len(raw) < before:
             logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
     # 注意：不再做静态 ST 剔除，逐日动态剔除由引擎根据 stock_st_history 完成
-    # 保留 EXCLUDE_ST 配置兼容性，仅记录日志
+    # EXCLUDE_ST 控制 ST/*ST 日是否剔除（退市日无条件剔除，见 _engine_legacy）
     if config is not None and config.app_config.backtest.EXCLUDE_ST:
-        logger.info("EXCLUDE_ST=True：将由引擎按 stock_st_history 逐日动态剔除 ST/*ST/退市股票")
+        logger.info("EXCLUDE_ST=True：引擎按 stock_st_history 逐日剔除 ST/*ST 日的买入与持仓（退市日无条件剔除）")
+    elif config is not None:
+        logger.info("EXCLUDE_ST=False：ST/*ST 股全程参与交易（退市日仍强制剔除）")
     if not raw:
         logger.warning("回测股票池为空，请检查数据库 stock_daily_kline 表")
     return sorted({CodeNormalizer.add_market_prefix(s) if not s.startswith(("sh", "sz")) else s for s in raw})
@@ -648,7 +684,8 @@ def _load_st_history(engine: Any, symbols: list[str], start_date: str, end_date:
         for symbol, trade_date, is_st, is_delisting in rows:
             if symbol not in st_history:
                 st_history[symbol] = {}
-            st_history[symbol][str(trade_date)] = (is_st, is_delisting)
+            # 统一日期键为 YYYY-MM-DD（兼容 date/datetime/str 三种入库格式）
+            st_history[symbol][str(trade_date)[:10]] = (bool(is_st), bool(is_delisting))
         
         logger.info(f"加载 ST 历史状态: {len(st_history)} 只股票，{len(rows)} 条记录")
         return st_history

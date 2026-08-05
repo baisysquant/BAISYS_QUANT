@@ -149,6 +149,7 @@ def test_engine_applies_tiered_impact_costs() -> None:
         max_position_pct=0.5,
         max_holdings=2,
         point_in_time=False,
+        initial_cash=100_000_000.0,
     )
     tl: list[dict] = []
     ec: list[dict] = []
@@ -159,20 +160,21 @@ def test_engine_applies_tiered_impact_costs() -> None:
     assert set(buys) == {"600001", "600002"}
     assert set(sells) == {"600001", "600002"}
 
-    # 引擎将当日成交量作为 order volume → 参与率 ≈ 1.0，两档均触达各自冲击上限
-    # 微盘档 cap=10% 显著高于大盘档 cap=3%，小票成本更高（纠正小票收益虚高）
+    # 引擎将实际订单股数（受 ADV×10% 上限约束 = 20,000 股）作为 order volume
+    # 买入参与率 10%：微盘档（threshold 0.5%）冲击打满 cap 10%；大盘档（threshold 2%）
+    # 冲击 0.001×(0.10/0.02)^1.5 ≈ 1.12%。卖出为分批半仓（10,000 股）→ 参与率 5%
+    # → 大盘档冲击 0.001×(0.05/0.02)^1.5 ≈ 0.40%。小票成本仍显著高于大票。
     assert buys["600001"]["cost"] > buys["600002"]["cost"]
     assert sells["600001"]["cost"] > sells["600002"]["cost"]
 
+    sell_part = 0.05  # partial 卖半仓 → 参与率 5%
+    impact_large = cm.liquidity_tier_impact_base[3] * (
+        sell_part / cm.liquidity_tier_threshold[3]
+    ) ** 1.5
     expected_large = (
         sells["600002"]["value"]
-        * (
-            cm.market_slippage
-            + cm.liquidity_tier_cap[3]  # 大盘档冲击上限 3%
-            + cm.stamp_tax_rate
-            + cm.transfer_fee_rate
-        )
-        + cm.min_commission_per_trade
+        * (cm.market_slippage + impact_large + cm.stamp_tax_rate + cm.transfer_fee_rate)
+        + max(sells["600002"]["value"] * cm.commission_rate, cm.min_commission_per_trade)
     )
     assert sells["600002"]["cost"] == pytest.approx(expected_large, rel=0.05)
     assert sells["600001"]["cost"] / sells["600001"]["value"] > 0.09

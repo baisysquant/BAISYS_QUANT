@@ -72,6 +72,8 @@ def _oos_validate(
     engine_cfg: EngineConfig,
     top_m: int = 5,
     eval_start_date: str | None = None,
+    st_history: dict | None = None,
+    exclude_st: bool = True,
 ) -> list[dict[str, Any]]:
     """对 top-M 参数组合做 OOS 验证。
 
@@ -109,7 +111,11 @@ def _oos_validate(
             # 无信号参数时也按 eval_start_date 截断，避免预热段产生交易
             if eval_start_date and "trade_date" in _prepared.columns:
                 _prepared = _prepared[_prepared["trade_date"] >= eval_start_date]
-        _run_single_backtest(_prepared, params, _ec, tl, ec)
+        engine_params = dict(params)
+        if st_history:
+            engine_params["_st_history"] = st_history
+            engine_params["_exclude_st"] = exclude_st
+        _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
         sr = risk.get("sharpe_ratio")
@@ -211,6 +217,9 @@ def bayesian_walk_forward_multi(
     if n_dates < train_period + test_period:
         raise ValueError(f"数据不足: {n_dates} 个交易日（正式回测起点后），需要至少 {train_period + test_period}")
     show_progress = kwargs.get("show_progress", False)
+    # ST/退市逐日动态剔除（runner 注入，寻优与最终回测口径一致）
+    st_history = kwargs.get("st_history")
+    exclude_st = bool(kwargs.get("exclude_st", True))
 
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
@@ -278,6 +287,8 @@ def bayesian_walk_forward_multi(
                     previous_gp_state=previous_gp_state,
                     seed=42 + path_idx * 100 + win_idx,
                     eval_start_date=train_eval_start,
+                    st_history=st_history,
+                    exclude_st=exclude_st,
                 )
             except Exception as opt_err:
                 logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] 窗口优化失败: {opt_err}")
@@ -300,6 +311,8 @@ def bayesian_walk_forward_multi(
                     base_cfg,
                     top_m=len(oos_params),
                     eval_start_date=test_eval_start,
+                    st_history=st_history,
+                    exclude_st=exclude_st,
                 )
             except Exception as oos_err:
                 logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] OOS 验证失败: {oos_err}")

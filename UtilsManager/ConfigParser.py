@@ -327,6 +327,11 @@ class ScoringParamsConfig(BaseModel):
                                      description="R04: 金叉量价确认加分")
     DIVERGENCE_PENALTY: int = Field(default=20, ge=0, le=50,
                                      description="R41: 顶背离量缩扣分")
+    INDUSTRY_VALUATION_AGG_METHOD: str = Field(
+        default="aggregate_profitable",
+        description="行业估值聚合口径: aggregate_profitable(剔除亏损股, 中证口径) / "
+                    "aggregate_full(整体法含负利润, 申万口径, 行业整体亏损时 PE 为负)",
+    )
 
 
 class TechnicalConstantsConfig(BaseModel):

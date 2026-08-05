@@ -64,6 +64,79 @@ class SWIndustryDataPipeline:
         
         return df_hist.rename(columns=rename_dict)
 
+    @staticmethod
+    def _aggregate_industry_valuation(
+        ah_df: pd.DataFrame,
+        fundamentals_df: pd.DataFrame,
+        df_val: pd.DataFrame,
+        agg_method: str = "aggregate_profitable",
+    ) -> pd.DataFrame:
+        """按申万二级行业市值加权聚合个股估值（AShareHub 无行业板块估值接口）。
+
+        口径（与 agg_method 相关）：
+          - aggregate_profitable（中证口径）：PE(静态/TTM)/PB 为市值加权调和平均
+            （= 行业总市值 / 行业盈利股总盈利），剔除亏损股（pe/pb <= 0 或 NaN）；
+            行业全亏损时 PE 为空
+          - aggregate_full（申万口径）：整体法含负利润 —— 亏损股利润计入分母，
+            PE = 行业总市值 / 全样本总盈利，行业整体亏损时 PE 为负；盈亏平衡时为空
+          - 股息率：总市值加权平均（= 行业总股息 / 行业总市值），剔除缺失个股
+          - 市值权重用 total_mv（万元，与接口口径一致）
+        """
+        l2_map = ah_df[["symbol", "l2_code"]].dropna().drop_duplicates("symbol")
+        est = fundamentals_df.merge(l2_map, on="symbol", how="inner")
+        if est.empty:
+            return df_val
+
+        est["_mv"] = pd.to_numeric(est["total_mv"], errors="coerce")
+        mv_ok = est["_mv"].notna() & (est["_mv"] > 0)
+        est["_pe"] = pd.to_numeric(est["pe"], errors="coerce")
+        est["_pe_ttm"] = pd.to_numeric(est["pe_ttm"], errors="coerce")
+        est["_pb"] = pd.to_numeric(est["pb"], errors="coerce")
+        est["_dv"] = pd.to_numeric(est["dv_ratio"], errors="coerce")
+
+        def _harmonic(sub: pd.DataFrame, col: str, include_loss: bool) -> float:
+            has_val = sub[col].notna()
+            if include_loss:
+                # 整体法（申万口径）：分子=全行业总市值（含无估值/亏损股），
+                # 分母=Σ(市值/PE) 仅计有 PE 的股票（亏损股负利润计入）
+                m_denom = has_val & (sub[col] != 0)
+                if not m_denom.any():
+                    return np.nan
+                _mv_sum = sub.loc[mv_ok[sub.index], "_mv"].sum()
+                _e_sum = (sub.loc[m_denom, "_mv"] / sub.loc[m_denom, col]).sum()
+            else:
+                # 剔除亏损口径（中证口径）：分子分母同步剔除亏损股与无 PE 股
+                m = mv_ok[sub.index] & has_val & (sub[col] > 0)
+                if not m.any():
+                    return np.nan
+                _mv_sum = sub.loc[m, "_mv"].sum()
+                _e_sum = (sub.loc[m, "_mv"] / sub.loc[m, col]).sum()
+            if abs(_e_sum) < 1e-12:
+                return np.nan
+            return float(_mv_sum / _e_sum)
+
+        def _wmean(sub: pd.DataFrame, col: str) -> float:
+            m = mv_ok[sub.index] & sub[col].notna()
+            if not m.any():
+                return np.nan
+            return float((sub.loc[m, "_mv"] * sub.loc[m, col]).sum() / sub.loc[m, "_mv"].sum())
+
+        _include_loss = agg_method == "aggregate_full"
+        agg = est.groupby("l2_code", group_keys=False).apply(
+            lambda g: pd.Series({
+                "pe_static": _harmonic(g, "_pe", _include_loss),
+                "pe_ttm": _harmonic(g, "_pe_ttm", _include_loss),
+                "pb": _harmonic(g, "_pb", _include_loss),
+                "div_yield": _wmean(g, "_dv"),
+            }),
+            include_groups=False,
+        )
+        out = df_val.copy()
+        out["_l2"] = out["code"].astype(str)
+        for col in ("pe_static", "pe_ttm", "pb", "div_yield"):
+            out[col] = out["_l2"].map(agg[col])
+        return out.drop(columns=["_l2"])
+
     def fetch_and_cache_all(self, force_update: bool = False) -> pd.DataFrame | None:
         """遍历所有申万二级行业，拉取250天数据并缓存到本地"""
         hist_cache_exists = os.path.exists(self.cache_file) or os.path.exists(self.cache_csv_file)
@@ -107,18 +180,40 @@ class SWIndustryDataPipeline:
             '行业代码': 'code',
             '行业名称': 'name',
         }
-        
-        missing_valuation_cols = [k for k in ['静态市盈率', 'TTM(滚动)市盈率', '市净率', '静态股息率'] if k not in df_info.columns]
-        if missing_valuation_cols:
-            logger.warning(f"估值数据不可用 (AShareHub 未提供)，使用默认值。")
-        
-        available_valuation_cols = {k: v for k, v in valuation_cols_map.items() if k in df_info.columns}
-        df_val = df_info[list(available_valuation_cols.keys())].copy()
-        df_val.columns = list(available_valuation_cols.values())
+
+        df_val = df_info[list(valuation_cols_map.keys())].copy()
+        df_val.columns = list(valuation_cols_map.values())
         df_val['pe_static'] = None
         df_val['pe_ttm'] = None
         df_val['pb'] = None
         df_val['div_yield'] = None
+        # AShareHub 无行业板块估值接口（industry_list 仅返回分类映射）：
+        # 改用个股每日估值 /v2/market/fundamentals（pe/pe_ttm/pb/dv_ratio/total_mv），
+        # 按申万二级行业市值加权聚合出行业估值
+        try:
+            fundamentals_df = self.ah_client.fundamentals(trade_date=self.today_str)
+            if fundamentals_df is None or fundamentals_df.empty:
+                # 交易日可能已变化，回退尝试前 3 个自然日
+                _today_dt = datetime.datetime.strptime(self.today_str, "%Y%m%d")
+                for _back in range(1, 4):
+                    _d = (_today_dt - datetime.timedelta(days=_back)).strftime("%Y%m%d")
+                    fundamentals_df = self.ah_client.fundamentals(trade_date=_d)
+                    if fundamentals_df is not None and not fundamentals_df.empty:
+                        break
+            if fundamentals_df is not None and not fundamentals_df.empty:
+                _agg_method = getattr(
+                    self.config.app_config.scoring_params, "INDUSTRY_VALUATION_AGG_METHOD",
+                    "aggregate_profitable",
+                )
+                df_val = self._aggregate_industry_valuation(
+                    ah_df, fundamentals_df, df_val, agg_method=_agg_method,
+                )
+                logger.info(f"行业估值聚合完成: {len(df_val)} 个行业（个股→市值加权，口径={_agg_method}）")
+            else:
+                logger.warning("估值数据不可用 (AShareHub fundamentals 返回空)，使用默认值。")
+        except Exception as e:
+            logger.warning(f"估值数据不可用 (AShareHub fundamentals 调用失败: {e})，使用默认值。")
+
         # --- 智能提取纯数字代码 ---
         # 使用正则表达式，提取字符串开头的连续数字部分
         df_val['code'] = df_val['code'].astype(str).apply(lambda x: re.match(r'^(\d+)', x).group(1) if re.match(r'^(\d+)', x) else x)
