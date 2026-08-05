@@ -229,6 +229,20 @@ def run_backtest_pipeline(
             logger.warning(f"日均换手率 {_avg_to:.2%} > 30%，扣费后实际收益可能打 7 折")
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
+        # ══ 统计显著性基础校验（Statistical Significance）══
+        # 三项硬 gate：样本量 / 持仓周期健康度 / 牛熊覆盖
+        _sig_pass = True
+        try:
+            from LogicAnalyzer.statistical_significance import run_significance_check as _sig_check
+            _sig_summary = _sig_check(trade_log, kline_df)
+            if not _sig_summary.passed:
+                _sig_pass = False
+                logger.warning(
+                    f"[统计显著性] 综合判定 FAIL — {_sig_summary.reason}"
+                )
+        except Exception as e:
+            logger.warning(f"[统计显著性] 自检异常: {e}，不阻断（建议人工复核）")
+
         # ── 持仓打分卡：当期持仓的因子分解 ──
         try:
             _holdings = [t for t in trade_log if t.get("action") == "buy"][-20:]  # 最近 20 笔买入
@@ -364,6 +378,109 @@ def run_backtest_pipeline(
         if dsr < 0.5:
             logger.warning(f"DSR={dsr:.2%}<50%，统计显著性不足")
 
+        # ══ 多重测试惩罚（Multiple Testing Deception）══
+        # 统计同区间调参次数，超限则对 Sharpe/Sortino 施加统计学硬扣减
+        from BackTrading.calibration_log import (
+            count_tuning_attempts as _count_attempts,
+            apply_multiple_testing_penalty as _apply_penalty,
+            MAX_TUNING_ATTEMPTS as _max_attempts,
+            MULTIPLE_TESTING_PENALTY as _penalty_rate,
+        )
+        _raw_sharpe = risk.get("sharpe_ratio", sharpe_avg)
+        _raw_sortino = risk.get("sortino_ratio", 0)
+        _attempt_count = _count_attempts(engine, bt.BACKTEST_START_DATE, bt.OUT_OF_SAMPLE_DAYS) + 1  # +1 包含本次
+        _pun_sharpe, _pun_sortino, _warning_level = _apply_penalty(
+            _raw_sharpe, _raw_sortino, _attempt_count,
+            bt.BACKTEST_START_DATE, bt.OUT_OF_SAMPLE_DAYS,
+        )
+        # 用惩罚后的值替代原始值
+        if _warning_level != "INFO":
+            risk["sharpe_ratio"] = _pun_sharpe
+            risk["sortino_ratio"] = _pun_sortino
+            logger.warning(
+                f"[多重测试惩罚] 原始 Sharpe={_raw_sharpe:.4f} → 惩罚后={_pun_sharpe:.4f} | "
+                f"原始 Sortino={_raw_sortino:.4f} → 惩罚后={_pun_sortino:.4f}"
+            )
+        logger.info(
+            f"[多重测试惩罚] 同区间累计调参 {_attempt_count} 次，阈值 {_max_attempts}，"
+            f"惩罚率 {_penalty_rate:.0%}，级别={_warning_level}"
+        )
+        # 高危级别额外阻断
+        _overfitting_critical = _warning_level == "CRITICAL"
+
+        # ══ 邻近参数抖动自检（Parameter Robustness Check）══
+        # Sharpe > 2.0 时自动触发 ±10% 参数扰动测试
+        _robust_pass = True
+        try:
+            from BackTrading.parameter_robustness import run_robustness_check as _robust_check
+            _robust_report = _robust_check(
+                kline_df, best_params, _pun_sharpe, config, ecfg,
+            )
+            if _robust_report.triggered and not _robust_report.overall_robust:
+                _robust_pass = False
+                if _robust_report.warning_level == "CRITICAL":
+                    logger.critical(
+                        f"[参数稳健性] 🔴 CRITICAL: {len(_robust_report.failed_params)} 个参数扰动后 "
+                        f"Sharpe 断崖式下跌，策略不具备统计稳健性: {_robust_report.failed_params}"
+                    )
+                else:
+                    logger.warning(
+                        f"[参数稳健性] ⚠️ {len(_robust_report.failed_params)} 个参数扰动后 "
+                        f"Sharpe 显著下跌，建议谨慎: {_robust_report.failed_params}"
+                    )
+        except Exception as e:
+            logger.warning(f"[参数稳健性] 自检异常: {e}，不阻断（建议人工复核）")
+
+        # ── 样本外衰减校验（审计 gate：IS vs OOS 夏普/索提诺衰减 ≤ 30%） ──
+        from BackTrading.overfitting import validate_oos_decay as _validate_oos_decay
+
+        _oos_decay_pass = True
+        try:
+            # 按 OOS 天数从净值曲线尾部拆分 IS / OOS
+            _oos_n = max(bt.OUT_OF_SAMPLE_DAYS, 20)
+            _eq = pd.DataFrame(equity_curve) if isinstance(equity_curve, list) else equity_curve
+            if not _eq.empty and "trade_date" in _eq.columns:
+                # 确保日期为字符串统一比较
+                if pd.api.types.is_datetime64_any_dtype(_eq["trade_date"]):
+                    _eq = _eq.copy()
+                    _eq["trade_date"] = _eq["trade_date"].dt.strftime("%Y-%m-%d")
+
+                _all_dates = sorted(_eq["trade_date"].unique())
+                _total_td = len(_all_dates)
+                _is_end = max(_total_td - _oos_n, 1)
+                _is_dates = set(_all_dates[:_is_end])
+                _oos_dates = set(_all_dates[_is_end:])
+
+                if len(_oos_dates) >= 2:
+                    _is_curve = _eq[_eq["trade_date"].isin(_is_dates)]
+                    _oos_curve = _eq[_eq["trade_date"].isin(_oos_dates)]
+
+                    _report = _validate_oos_decay(
+                        _is_curve, _oos_curve,
+                        is_days=len(_is_dates),
+                        oos_days=len(_oos_dates),
+                    )
+                    if not _report.passed:
+                        _oos_decay_pass = False
+                        logger.warning(
+                            f"[OOS衰减校验] FAIL | IS_Sharpe={_report.is_sharpe:.2f} → "
+                            f"OOS_Sharpe={_report.oos_sharpe:.2f} (衰减 {_report.sharpe_decay:.1%}) | "
+                            f"IS_Sortino={_report.is_sortino:.2f} → OOS_Sortino={_report.oos_sortino:.2f} "
+                            f"(衰减 {_report.sortino_decay:.1%})"
+                        )
+                        logger.warning(f"[OOS衰减校验] {_report.reason}")
+                else:
+                    logger.info(f"[OOS衰减校验] OOS 交易日仅 {len(_oos_dates)} 天 < 2 天，跳过")
+            else:
+                logger.info("[OOS衰减校验] 净值曲线为空，跳过")
+        except Exception as e:
+            logger.warning(f"[OOS衰减校验] 执行异常: {e}，不阻断（建议人工复核）")
+
+        if not _oos_decay_pass:
+            logger.warning("=" * 50)
+            logger.warning("[OOS衰减校验] 未通过 —— 参数组不予写入 config.ini，结果已废弃")
+            logger.warning("=" * 50)
+
         cal_result = CalibrationResult(
             params=best_params,
             score=sharpe_avg,
@@ -387,7 +504,14 @@ def run_backtest_pipeline(
             dsr=round(dsr, 4),
             num_trials=num_trials,
         )
-        save_calibration(cal_result)
+
+        # ── 统计显著性 + OOS 衰减校验通过才写入校准结果 ──
+        if _oos_decay_pass and _sig_pass:
+            save_calibration(cal_result)
+        elif not _sig_pass:
+            logger.warning("=" * 50)
+            logger.warning("[统计显著性] 未通过 —— 校准结果不予保存，参数组已废弃")
+            logger.warning("=" * 50)
 
         # ── 多策略组合回测 ──
         _enable_ms = getattr(bt, "MULTI_STRATEGY_ENABLED", False)
@@ -409,10 +533,18 @@ def run_backtest_pipeline(
         except Exception as e:
             logger.warning(f"  压力测试异常: {e}")
 
-        if _promote:
+        if _promote and _oos_decay_pass and not _overfitting_critical and _sig_pass and _robust_pass:
             write_calibration_to_ini(best_params)
             apply_calibration_to_config(config)
             logger.info("模拟验证通过，参数已写入 config.ini 并生效")
+        elif _overfitting_critical:
+            logger.warning("多重测试惩罚 CRITICAL，config.ini 参数保持不变，结果已废弃")
+        elif not _sig_pass:
+            logger.warning("统计显著性未通过，config.ini 参数保持不变，结果已废弃")
+        elif not _robust_pass:
+            logger.warning("参数稳健性自检不通过，config.ini 参数保持不变，结果已废弃")
+        elif not _oos_decay_pass:
+            logger.warning("OOS 衰减校验未通过，config.ini 参数保持不变，结果已废弃")
         else:
             logger.warning("模拟验证不通过，config.ini 参数保持不变，可作为回测报告参考")
             # 仍将结果写入数据库用于历史追踪

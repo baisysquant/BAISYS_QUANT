@@ -12,6 +12,7 @@ from BackTrading.bayesian.kernel import GPState
 from BackTrading.bayesian.optimizer import optimize_window
 from BackTrading.bayesian.space import ParamSpace, build_spaces, split_by_cost
 from BackTrading.bayesian.transfer import warm_start_gp
+from BackTrading.domain.models import CostModel
 from BackTrading.prepare import prepare_backtest_data
 
 
@@ -117,6 +118,7 @@ def _oos_validate(
             "params": params,
             "is_rank": rank_idx + 1,
             "oos_sharpe": sr,
+            "oos_equity": ec,
             "total_return": risk.get("total_return", 0),
             "max_drawdown": risk.get("max_drawdown", 0),
             "annual_return": risk.get("annual_return", 0),
@@ -163,15 +165,25 @@ def bayesian_walk_forward_multi(
 
     signal_sp, portfolio_sp = split_by_cost(spaces)
 
-    # ── 构建基座 EngineConfig ──
+    # ── 构建基座 EngineConfig（挂载 CostModel：ADV 动态冲击成本 + 流动性分档） ──
+    # 与 runner.py 最终回测路径同源（同 kwargs 费率），保证寻优期间摩擦口径一致；
+    # 否则引擎回退固定费率，大单冲击成本被系统性低估（1.8 交易摩擦合规 FAIL）。
+    _slip = kwargs.get("slippage", 0.001)
     base_cfg = EngineConfig(
         initial_cash=initial_cash,
         commission_rate=kwargs.get("commission", 0.0003),
         stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
-        slippage=kwargs.get("slippage", 0.001),
+        slippage=_slip,
         max_position_pct=kwargs.get("max_position_pct", 0.1),
         portfolio_method=kwargs.get("portfolio_method", "score_weighted"),
         point_in_time=kwargs.get("point_in_time", True),
+        cost_model=CostModel(
+            commission_rate=kwargs.get("commission", 0.0003),
+            stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
+            market_slippage=_slip,
+            limit_slippage=_slip * 0.5,
+            min_commission_per_trade=kwargs.get("min_commission", 5.0),
+        ),
     )
 
     # 从 config 读取 BO 预算
@@ -255,7 +267,7 @@ def bayesian_walk_forward_multi(
 
             # ── 贝叶斯优化 IS ──
             try:
-                best_params, gp_state, top_k_params, is_sharpe = optimize_window(
+                best_params, gp_state, top_k_params, is_sharpe, is_equity = optimize_window(
                     kline_df=train_data,
                     engine_cfg=base_cfg,
                     spaces=spaces,
@@ -297,8 +309,35 @@ def bayesian_walk_forward_multi(
             oos = oos_results[0] if oos_results else {}
             oos_sharpe = oos.get("oos_sharpe", 0) or 0
 
-            # ── 收集 IS Sharpe ──
-            train_sharpe = 0.0
+            # ── OOS 衰减 gate（业务规则：IS→OOS 风险调整收益衰减 > 30% 即废弃） ──
+            # IS 净值曲线 = 优化器最优候选在训练集上的回测曲线（严格不含 OOS）；
+            # OOS 净值曲线 = rank-1 参数在独立测试集上的回测曲线。
+            _decay_pass = True
+            _decay_report = None
+            if is_equity is not None and oos_results:
+                _oos_curve = oos_results[0].get("oos_equity")
+                if _oos_curve:
+                    try:
+                        from BackTrading.overfitting import validate_oos_decay as _vd_oos
+                        _decay_report = _vd_oos(
+                            is_equity, _oos_curve,
+                            is_days=len(train_dates), oos_days=len(test_dates),
+                        )
+                        _decay_pass = _decay_report.passed
+                    except Exception as _de:
+                        logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验异常: {_de}，窗口照常保留")
+            if not _decay_pass:
+                logger.warning("=" * 64)
+                logger.warning(
+                    f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
+                    f"（IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}），"
+                    f"疑似超参数过度网格搜索或特征工程隐性泄露，该窗口结果直接废弃"
+                )
+                logger.warning("=" * 64)
+                continue
+
+            # ── 收集 IS Sharpe（优化器返回的真实样本内绩效） ──
+            train_sharpe = float(is_sharpe)
 
             entry: dict[str, Any] = {
                 "window": win_idx,
@@ -321,6 +360,9 @@ def bayesian_walk_forward_multi(
                 "num_combos": n_init_signal + n_iter_signal + n_init_portfolio + n_iter_portfolio,
                 "oos_combos": oos_results,
             }
+            if _decay_report is not None:
+                entry["sharpe_decay"] = round(_decay_report.sharpe_decay, 4)
+                entry["sortino_decay"] = round(_decay_report.sortino_decay, 4)
             all_path_results.setdefault(win_idx, []).append(entry)
 
     # ── 按窗口聚合（多路径取中位数） ──
@@ -354,4 +396,28 @@ def bayesian_walk_forward_multi(
 
     result = pd.DataFrame(agg_rows)
     logger.info(f"贝叶斯 WFO 完成: {len(result)} 个窗口, {num_paths} 条路径")
+
+    # ── 聚合 IS/OOS 衰减 gate（跨窗口均值口径：OOS 均值相对 IS 均值衰减 > 30% 整体废弃） ──
+    # 逐窗口 gate 已废弃超限窗口；此处兜底覆盖"单窗口衰减未超限、但整体泛化性崩坏"的情形。
+    if len(agg_rows) > 0:
+        _is_vals = [r["train_sharpe"] for r in agg_rows
+                    if isinstance(r.get("train_sharpe"), (int, float))]
+        _oos_vals = [r["sharpe_ratio"] for r in agg_rows
+                     if isinstance(r.get("sharpe_ratio"), (int, float))]
+        if _is_vals and _oos_vals:
+            _agg_is = float(np.mean(_is_vals))
+            _agg_oos = float(np.mean(_oos_vals))
+            if _agg_is > 0 and _agg_oos > 0:
+                _agg_decay = 1.0 - _agg_oos / _agg_is
+                if _agg_decay > 0.30:
+                    logger.critical(
+                        f"[OOS衰减校验] 聚合衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
+                        f"OOS均值={_agg_oos:.2f}）> 30%，判定超参数过度网格搜索或特征工程隐性泄露，"
+                        f"本次寻优结果整体废弃，回退配置中位数"
+                    )
+                    mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                    return pd.DataFrame([{
+                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
+                        "num_combos": 1, "num_paths": num_paths,
+                    }])
     return result

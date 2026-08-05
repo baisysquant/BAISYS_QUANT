@@ -42,6 +42,16 @@ def _read_cfg(obj: Any) -> dict[str, float]:
     return {k: float(getattr(obj, k)) for k in _ATTRS if getattr(obj, k, None) is not None}
 
 
+def _resolve_cost_obj(cm_or_cfg: Any) -> Any:
+    """取实际执行成本的对象：EngineConfig 挂载的 CostModel 优先，否则返回原对象。
+
+    引擎运行期成本由 engine_cfg.cost_model 驱动（挂载后启用 ADV 动态冲击），
+    合规检查必须对同一个对象审计，否则挂载了 CostModel 仍误报未配置。
+    """
+    cm = getattr(cm_or_cfg, "cost_model", None)
+    return cm if cm is not None else cm_or_cfg
+
+
 def _slippage_rates(obj: Any) -> tuple[float, float]:
     """统一取 (市价滑点, 限价滑点)：EngineConfig 只暴露 slippage（限价=0.5×），CostModel 有独立字段。"""
     cfg = _read_cfg(obj)
@@ -240,8 +250,9 @@ def run_trading_friction_check(
         check_double_sided_explicit_costs(cm_or_cfg, _log=_log),
         check_slippage_floor(cm_or_cfg, _log=_log),
     ]
-    if hasattr(cm_or_cfg, "calc_slippage"):
-        reports.append(check_dynamic_impact(cm_or_cfg, _log=_log))
+    cost_obj = _resolve_cost_obj(cm_or_cfg)
+    if hasattr(cost_obj, "calc_slippage"):
+        reports.append(check_dynamic_impact(cost_obj, _log=_log))
     else:
         rep = SplitReport(check_name="大单动态冲击成本（ADV 占比平方根模型）", passed=False)
         rep.details.append("未配置 CostModel：缺少 ADV 动态冲击成本，大单摩擦被低估")
@@ -264,19 +275,20 @@ def check_trading_friction_config(
     """
     check = SplitReport(check_name="交易摩擦配置合规（热路径）", passed=True)
     try:
-        r1 = check_double_sided_explicit_costs(cm_or_cfg, _log=False)
-        r2 = check_slippage_floor(cm_or_cfg, _log=False)
+        cost_obj = _resolve_cost_obj(cm_or_cfg)
+        r1 = check_double_sided_explicit_costs(cost_obj, _log=False)
+        r2 = check_slippage_floor(cost_obj, _log=False)
         for r in (r1, r2):
             if not r.passed:
                 check.passed = False
                 check.details.extend(r.details)
-        if not hasattr(cm_or_cfg, "calc_slippage"):
+        if not hasattr(cost_obj, "calc_slippage"):
             check.passed = False
             check.details.append(
                 "未配置 CostModel：缺少 ADV 动态冲击成本（平方根模型），大单摩擦被低估"
             )
         else:
-            r3 = check_dynamic_impact(cm_or_cfg, _log=False)
+            r3 = check_dynamic_impact(cost_obj, _log=False)
             if not r3.passed:
                 check.passed = False
                 check.details.extend(r3.details)

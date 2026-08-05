@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -16,10 +17,10 @@ from UtilsManager.ConfigParser import Config
 class EventDrivenFetcher:
     """事件驱动因子获取器 — 回购 / 大股东增减持 / 分红。
 
-    用 akshare 获取：
-      - stock_repurchase_em          → 回购明细（金额、进度）
-      - stock_holder_trade_em        → 大股东增减持（方向、金额）
-      - stock_dividends_em           → 分红实施（每股分红）
+    数据源：
+      - akshare stock_repurchase_em              → 回购明细（金额、进度）
+      - asharehub client.holder_trade()          → 股东增减持明细（逐笔 IN/DE）
+      - akshare stock_fhps_detail_em             → 分红派息实施
     """
 
     CACHE_DIR: str | None = None
@@ -31,6 +32,8 @@ class EventDrivenFetcher:
         else:
             self.CACHE_DIR = os.path.expanduser("~/Downloads/CoreNews_Reports/cache")
         os.makedirs(self.CACHE_DIR, exist_ok=True)
+        # asharehub API key 从 Config 读取（已自动解密）
+        self._asharehub_key = getattr(config, "ASHAREHUB_API_KEY", "")
 
     def fetch_repurchases(self) -> pd.DataFrame:
         """获取全市场回购数据。
@@ -80,7 +83,7 @@ class EventDrivenFetcher:
         return result
 
     def fetch_holder_trades(self) -> pd.DataFrame:
-        """获取全市场大股东增减持数据。
+        """获取全市场大股东增减持数据（asharehub 接口）。
 
         Returns:
             DataFrame with columns: symbol, 净增减持_万元（正=增持，负=减持）
@@ -93,37 +96,59 @@ class EventDrivenFetcher:
                 logger.info(f"[事件驱动] 增减持缓存命中 ({len(cached)} 条)")
                 return cached
 
-        try:
-            import akshare as ak
-            df = ak.stock_holder_trade_em()
-        except Exception as e:
-            logger.warning(f"[事件驱动] akshare 增减持获取失败: {e}")
+        if not self._asharehub_key:
+            logger.warning("[事件驱动] asharehub API key 未配置，跳过增减持获取")
             if os.path.exists(cache_path):
                 return pd.read_csv(cache_path, dtype={"symbol": str})
             return pd.DataFrame()
 
-        if df.empty:
-            return df
-
-        code_col = [c for c in df.columns if "代码" in c or "code" in c.lower()]
-        direction_col = [c for c in df.columns if "方向" in c or "type" in c.lower() or "买卖" in c]
-        amt_col = [c for c in df.columns if "金额" in c or "amount" in c.lower() or "市值" in c]
-
-        result = pd.DataFrame()
-        if code_col:
-            result["symbol"] = df[code_col[0]].astype(str).str.strip().str.zfill(6)
-        else:
+        try:
+            from asharehub import AShareHub
+            client = AShareHub(api_key=self._asharehub_key)
+            df = client.holder_trade()
+        except Exception as e:
+            logger.warning(f"[事件驱动] asharehub 增减持获取失败: {e}")
+            if os.path.exists(cache_path):
+                return pd.read_csv(cache_path, dtype={"symbol": str})
             return pd.DataFrame()
 
-        if direction_col and amt_col:
-            _amt = pd.to_numeric(df[amt_col[0]], errors="coerce").fillna(0)
-            _dir = df[direction_col[0]].astype(str)
-            # 增持为正，减持为负
-            _is_buy = _dir.apply(lambda s: "增" in s or "买" in s)
-            result["净增减持_万元"] = (_amt * _is_buy.map({True: 1, False: -1})).fillna(0)
-        else:
-            result["净增减持_万元"] = 0.0
+        if df is None or df.empty:
+            return pd.DataFrame()
 
+        # asharehub 返回列: symbol, ann_date, holder_name, holder_type, in_de,
+        #                   change_vol, change_ratio, after_share, after_ratio, avg_price, ...
+        # 转换 symbol 格式：000001.SZ → sz000001, 600000.SH → sh600000
+        def _convert_symbol(s):
+            s = str(s).strip()
+            if "." in s:
+                code, market = s.split(".")
+                code = code.zfill(6)
+                return f"sh{code}" if market.upper() == "SH" else f"sz{code}"
+            # 无前缀直接补全
+            s = s.zfill(6)
+            if s.startswith("6"):
+                return f"sh{s}"
+            return f"sz{s}"
+
+        result = df.copy()
+        result["symbol"] = result["symbol"].apply(_convert_symbol)
+
+        # 计算增减持金额（万元）：变动股数 × 成交均价 / 10000
+        result["变动金额_万元"] = (
+            pd.to_numeric(result.get("change_vol", 0), errors="coerce") *
+            pd.to_numeric(result.get("avg_price", 0), errors="coerce")
+        ) / 10000.0
+        result["变动金额_万元"] = result["变动金额_万元"].fillna(0)
+
+        # 方向：IN=增持(正)，DE=减持(负)
+        result["方向"] = result.get("in_de", "").str.upper()
+        result["净增减持_万元"] = np.where(
+            result["方向"] == "IN",
+            result["变动金额_万元"],
+            -result["变动金额_万元"]
+        )
+
+        # 按股票汇总
         result = result.groupby("symbol", as_index=False)["净增减持_万元"].sum()
         result.to_csv(cache_path, index=False, encoding="utf-8-sig")
         logger.info(f"[事件驱动] 增减持获取完成 ({len(result)} 条)")
@@ -145,7 +170,7 @@ class EventDrivenFetcher:
 
         try:
             import akshare as ak
-            df = ak.stock_dividends_em()
+            df = ak.stock_fhps_detail_em()
         except Exception as e:
             logger.warning(f"[事件驱动] akshare 分红获取失败: {e}")
             if os.path.exists(cache_path):

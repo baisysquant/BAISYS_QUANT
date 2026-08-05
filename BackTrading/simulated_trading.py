@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,9 +18,21 @@ class SimTradeVerdict:
 
     sim_sharpe: float = 0.0
     oos_sharpe: float = 0.0
-    degradation: float = 0.0     # 1 - sim/oos，负值表示 sim 优于 oos
+    sim_sortino: float = 0.0
+    oos_sortino: float = 0.0
+    sharpe_degradation: float = 0.0     # 1 - sim/oos，负值表示 sim 优于 oos
+    sortino_degradation: float = 0.0
     promote: bool = False
     reason: str = ""
+
+    # 兼容性：保留旧字段名（degradation = sharpe_degradation）
+    @property
+    def degradation(self) -> float:
+        return self.sharpe_degradation
+
+
+# 衰减容忍度：30%（审计要求，原 50% 过松）
+_DECAY_THRESHOLD = 0.30
 
 
 def _cost_model_from_config(config: Any) -> Any:
@@ -41,6 +54,7 @@ def validate_params(
     sim_days: int = 20,
     config: Any | None = None,
     engine_cfg: EngineConfig | None = None,
+    oos_sortino: float = 0.0,  # 审计新增：样本外 Sortino
 ) -> SimTradeVerdict:
     """用最近 sim_days 个交易日验证 best_params 的稳定性。
 
@@ -51,6 +65,7 @@ def validate_params(
         sim_days: 用于验证的最近交易日数。
         config: Config 实例（可选，用于构建结构化 params）。
         engine_cfg: EngineConfig 实例（可选，构建最终回测引擎）。
+        oos_sortino: WFO 在样本外窗口上的 Sortino（审计新增，默认 0=跳过 Sortino 校验）。
 
     Returns:
         SimTradeVerdict 包含决策和原因。
@@ -114,26 +129,42 @@ def validate_params(
     _run_single_backtest(sim_data, best_params, engine_cfg, tl, ec)
     risk = compute_risk_metrics(ec) or {}
     sim_sharpe = risk.get("sharpe_ratio", 0.0) or 0.0
+    sim_sortino = risk.get("sortino_ratio")
+    if sim_sortino is None or not math.isfinite(sim_sortino):
+        sim_sortino = 0.0
 
-    degradation = 1.0 - (sim_sharpe / oos_sharpe) if oos_sharpe > 0.01 else 0.0
-    promote = sim_sharpe > 0.0 and degradation < 0.5
+    # ── Sharpe 衰减校验（审计要求：阈值 30%） ──
+    sharpe_deg = 1.0 - (sim_sharpe / oos_sharpe) if oos_sharpe > 0.01 else 0.0
+
+    # ── Sortino 衰减校验（若 oos_sortino 未传入则跳过） ──
+    sortino_deg = 0.0
+    if oos_sortino > 0.01:
+        sortino_deg = 1.0 - (sim_sortino / oos_sortino)
+
+    # ── 判定：任一指标衰减超 30% 则拒绝 ──
+    promote = sim_sharpe > 0.0 and sharpe_deg < _DECAY_THRESHOLD and sortino_deg < _DECAY_THRESHOLD
 
     if promote:
         reason = (
             f"模拟验证通过: sim_Sharpe={sim_sharpe:.2f} / oos_Sharpe={oos_sharpe:.2f}"
-            f" 退化率={degradation:.0%} < 50%"
+            f" (衰减 {sharpe_deg:.0%}) | sim_Sortino={sim_sortino:.2f}"
+            f" 退化率={sharpe_deg:.0%} < {_DECAY_THRESHOLD:.0%}"
         )
     else:
         reason = (
-            f"模拟验证失败: sim_Sharpe={sim_sharpe:.2f} / oos_Sharpe={oos_sharpe:.2f}"
-            f" 退化率={degradation:.0%} >= 50%（或 sim Sharpe ≤ 0）"
+            f"模拟验证不通过: sim_Sharpe={sim_sharpe:.2f} / oos_Sharpe={oos_sharpe:.2f}"
+            f" (衰减 {sharpe_deg:.0%}) | sim_Sortino={sim_sortino:.2f}"
+            f" 退化率 >= {_DECAY_THRESHOLD:.0%}（或 sim Sharpe ≤ 0），参数组不予上线"
         )
 
     logger.info(f"  {reason}")
     return SimTradeVerdict(
         sim_sharpe=sim_sharpe,
         oos_sharpe=oos_sharpe,
-        degradation=degradation,
+        sim_sortino=sim_sortino,
+        oos_sortino=oos_sortino,
+        sharpe_degradation=sharpe_deg,
+        sortino_degradation=sortino_deg,
         promote=promote,
         reason=reason,
     )

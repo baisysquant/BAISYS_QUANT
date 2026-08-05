@@ -35,11 +35,12 @@ _TUNABLE_CFG_FIELDS = frozenset({
     "buy_threshold", "max_holdings",
 })
 
-# ── 全局信号缓存（跨路径/跨窗口共享） ──
+# ── 全局信号缓存（跨路径跨窗口共享） ──
 # key: (config_hash, data_fingerprint, param_hash) → DataFrame
-# 注意：每个条目 ~0.7 GiB（1.8M 行 × 50 列），磁盘缓存已保底，此处仅做最近参数加速
+# 注意：每个条目 ~0.7 GiB（1.8M 行 × 50 列），磁盘缓存已保底，
+# 内存仅保留最近 1 份，防止多窗口同时驻留多份大盘在 Windows 上触发 OOM 终止。
 _GLOBAL_SIGNAL_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
-_GLOBAL_CACHE_MAX = 2
+_GLOBAL_CACHE_MAX = 1
 _GLOBAL_CACHE_LOCK = threading.Lock()
 
 
@@ -112,9 +113,10 @@ class FidelityController:
         # 信号预热历史与评估区间分离：传入时 prepare 计算完信号后截断至该日期，
         # 保证引擎只交易 [eval_start_date, 末尾]，预热行不产生交易。
         self._eval_start_date = eval_start_date
-        # 实例级缓存（信号参数 hash → DataFrame），上限 2 防 OOM
+        # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
+        #（跨参数组合的命中率本来就低，多窗口下每份 ~0.7GiB 是 OOM 主因）
         self._signal_cache: dict[str, pd.DataFrame] = {}
-        self._INSTANCE_CACHE_MAX = 2
+        self._INSTANCE_CACHE_MAX = 1
         self._last_signal_hash: str | None = None
         # 自动检测数据是否已含信号列
         self._has_signals = self._SIGNAL_COLS.issubset(set(kline_df.columns))
@@ -158,12 +160,14 @@ class FidelityController:
                     global_key = (self._config_hash(), self._data_key, sig_hash)
                     data = _GLOBAL_SIGNAL_CACHE.get(global_key)
                     if data is None:
+                        _t_p = time.perf_counter()
                         data = prepare_backtest_data(
                             self._kline, params=params,
                             compute_exit_strategy=self._compute_exit,
                             vectorized=self._vectorized,
                             backtest_start_date=self._eval_start_date,
                         )
+                        logger.debug(f"  [evaluate] 信号准备耗时 {time.perf_counter()-_t_p:.1f}s（data={len(data)} 行, hash={sig_hash}）")
                         with _GLOBAL_CACHE_LOCK:
                             if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
                                 _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))
@@ -183,9 +187,11 @@ class FidelityController:
         trade_log: list[dict[str, Any]] = []
         equity_curve: list[dict[str, Any]] = []
         eval_cfg = _make_eval_cfg(self._base_cfg, params)
+        _t_b = time.perf_counter()
         total_return = _run_single_backtest(
             data, params, eval_cfg, trade_log, equity_curve
         )
+        logger.debug(f"  [evaluate] 回测耗时 {time.perf_counter()-_t_b:.1f}s, 交易 {len(trade_log)} 笔")
 
         # ── 计算 Sharpe ──
         try:
@@ -218,12 +224,14 @@ class FidelityController:
             global_key = (self._config_hash(), self._data_key, sig_hash)
             data = _GLOBAL_SIGNAL_CACHE.get(global_key)
             if data is None:
+                _t_p = time.perf_counter()
                 data = prepare_backtest_data(
                     self._kline, params=signal_params,
                     compute_exit_strategy=self._compute_exit,
                     vectorized=self._vectorized,
                     backtest_start_date=self._eval_start_date,
                 )
+                logger.debug(f"  [warm_cache] 信号准备耗时 {time.perf_counter()-_t_p:.1f}s（data={len(data)} 行, hash={sig_hash}）")
                 with _GLOBAL_CACHE_LOCK:
                     if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
                         _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))

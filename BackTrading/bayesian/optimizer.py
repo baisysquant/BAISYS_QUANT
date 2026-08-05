@@ -125,7 +125,8 @@ def optimize_window(
         compute_exit_strategy: 传给 FidelityController。
 
     Returns:
-        (best_params, gp_state_for_next_window, top_k_params_for_oos)
+        (best_params, gp_state_for_next_window, top_k_params_for_oos, best_sharpe, best_is_equity)
+        best_is_equity: 最优候选在训练集(IS)上的净值曲线，供 OOS 衰减校验使用。
     """
     import pandas as pd  # type: ignore[import]
 
@@ -141,18 +142,20 @@ def optimize_window(
 
     best_sharpe_local = -1e10
     best_params_local: dict[str, float] = {}
+    best_equity_local: Any = None
     X_hist: list[np.ndarray] = []
     Y_hist: list[float] = []
     params_hist: list[dict[str, float]] = []
 
-    def _track(sharpe: float, params: dict[str, float], x: np.ndarray) -> None:
-        nonlocal best_sharpe_local, best_params_local
+    def _track(sharpe: float, params: dict[str, float], x: np.ndarray, equity: Any = None) -> None:
+        nonlocal best_sharpe_local, best_params_local, best_equity_local
         X_hist.append(x)
         Y_hist.append(sharpe)
         params_hist.append(params.copy())
         if sharpe > best_sharpe_local:
             best_sharpe_local = sharpe
             best_params_local = params.copy()
+            best_equity_local = list(equity) if equity else None
 
     # ═══════════════════════════════════════════════════════════
     # Phase 1: Sobol + 预热缓存（组合空间 × Level2，信号用默认参数）
@@ -174,7 +177,7 @@ def optimize_window(
             x_norm = _to_normalized(params, spaces)
             result = controller.evaluate(params, fidelity=0)
             sharpe = result["sharpe"]
-            _track(sharpe, params, x_norm)
+            _track(sharpe, params, x_norm, result.get("equity"))
             if progress_cb:
                 progress_cb(1, i, n_init, sharpe)
             logger.debug(f"  Sobol[{i}] sharpe={sharpe:.4f}")
@@ -186,7 +189,7 @@ def optimize_window(
             x_norm = sobol_x[i].reshape(1, -1)
             result = controller.evaluate(params, fidelity=0)
             sharpe = result["sharpe"]
-            _track(sharpe, params, x_norm.ravel())
+            _track(sharpe, params, x_norm.ravel(), result.get("equity"))
             if progress_cb:
                 progress_cb(1, i, n_init, sharpe)
             logger.debug(f"  Sobol[{i}] sharpe={sharpe:.4f}")
@@ -243,7 +246,7 @@ def optimize_window(
             result = controller.evaluate(params, fidelity=1)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
-            _track(sharpe, params, x_norm)
+            _track(sharpe, params, x_norm, result.get("equity"))
 
             X_all = np.array(X_hist)
             Y_arr = np.array(Y_hist)
@@ -279,7 +282,7 @@ def optimize_window(
             x_norm = _to_normalized(params, spaces)
             result = controller.evaluate(params, fidelity=0)
             sharpe = result["sharpe"]
-            _track(sharpe, params, x_norm)
+            _track(sharpe, params, x_norm, result.get("equity"))
             if progress_cb:
                 progress_cb(3, i, n_init_portfolio + n_iter_portfolio, sharpe)
 
@@ -311,7 +314,7 @@ def optimize_window(
             result = controller.evaluate(params, fidelity=0)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
-            _track(sharpe, params, x_norm)
+            _track(sharpe, params, x_norm, result.get("equity"))
             if progress_cb:
                 progress_cb(3, n_init_portfolio + i, n_init_portfolio + n_iter_portfolio, sharpe)
             logger.debug(f"  Bayes-Port[{i}/{n_iter_portfolio}] sharpe={sharpe:.4f} best={best_sharpe_local:.4f}")
@@ -341,7 +344,7 @@ def optimize_window(
             result = controller.evaluate(params, fidelity=1)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
-            _track(sharpe, params, x_norm)
+            _track(sharpe, params, x_norm, result.get("equity"))
             logger.debug(f"  Refine sharpe={sharpe:.4f}")
 
     # ── 最终结果 ──
@@ -387,4 +390,4 @@ def optimize_window(
     else:
         top_k_params = [best_params]
 
-    return best_params, gp_state, top_k_params, best_sharpe
+    return best_params, gp_state, top_k_params, best_sharpe, best_equity_local

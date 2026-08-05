@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,10 @@ _IN_MEMORY: dict[str, pd.DataFrame] = {}
 _PEAKS: dict[str, np.ndarray] = {}
 _TROUGHS: dict[str, np.ndarray] = {}
 _PRECOMPUTE_DONE: bool = False
+# 背离检测缓存：div_type/div_idx/div_strength 只依赖股票自身 DIF 数据，与参数无关，
+# 在 Phase 0 一次性预计算，后续每次 evaluation（不同参数组合）直接复用，
+# 避免每轮贝叶斯迭代都重跑 O(n²) 的逐 bar Python 循环。
+_DIVERGENCE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
@@ -75,6 +80,73 @@ def _meta_path(symbol: str) -> Path:
     return cr / symbol[:2].lower() / f"{symbol}.meta.json"
 
 
+# ── 背离检测缓存（参数无关，Phase 0 预计算） ──────────────────────
+
+def _divergence_path(symbol: str) -> Path:
+    cr = _cache_root()
+    return cr / symbol[:2].lower() / f"{symbol}.divergence.npz"
+
+
+def precompute_divergence(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """因果逐 bar 背离检测（与 vectorized_signal._divergence_scores 完全一致）。
+
+    结果仅依赖 DIF 数据，与任何评分参数无关，可安全跨参数迭代复用。
+    """
+    from BackTrading.vectorized_signal import _divergence_scores
+    from LogicAnalyzer.signals.divergence import adaptive_distance
+
+    _dd = adaptive_distance(df["DIF"], base_distance=10) if "DIF" in df.columns else 11
+    return _divergence_scores(df, base_distance=_dd)
+
+
+def _load_divergence_from_disk(symbol: str) -> bool:
+    p = _divergence_path(symbol)
+    if not p.exists():
+        return False
+    try:
+        with np.load(p, allow_pickle=True) as z:
+            _DIVERGENCE[symbol] = (
+                z["div_type"], z["div_idx"], z["div_strength"],
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _save_divergence_to_disk(symbol: str, div: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+    p = _divergence_path(symbol)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(p, div_type=div[0], div_idx=div[1], div_strength=div[2])
+
+
+def get_divergence(
+    symbol: str,
+    df: pd.DataFrame | None = None,
+    stock_dir: str | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """获取预计算的背离检测结果（内存 → 磁盘 → 实时计算兜底）。
+
+    与 get_precomputed 的 fallback 语义一致；df 为空时仅查缓存。
+    计算失败时返回 None，由调用方回退到逐 bar 实时计算。
+    """
+    if symbol in _DIVERGENCE:
+        return _DIVERGENCE[symbol]
+    if _load_divergence_from_disk(symbol):
+        return _DIVERGENCE[symbol]
+    if df is None or df.empty:
+        return None
+    try:
+        div = precompute_divergence(df)
+    except Exception:
+        return None
+    _DIVERGENCE[symbol] = div
+    try:
+        _save_divergence_to_disk(symbol, div)
+    except Exception:
+        pass
+    return div
+
+
 def _load_from_disk(symbol: str) -> bool:
     """从磁盘加载到内存缓存。"""
     ipath = _indicators_path(symbol)
@@ -100,10 +172,25 @@ def _save_to_disk(symbol: str, df: pd.DataFrame, peaks: np.ndarray, troughs: np.
         json.dump(meta, f)
 
 
+def _precompute_divergences_parallel(symbols: list[str]) -> None:
+    """并行预计算背离检测（背离仅依赖 DIF，与参数无关，跨迭代复用）。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    workers = min(8, max(1, (os.cpu_count() or 4) // 2))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(get_divergence, s, _IN_MEMORY[s]) for s in symbols]
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception:
+                pass
+
+
 def precompute_all_indicators(stock_dir: str) -> None:
     """Phase 0: 为 stock_dir 中所有股票预计算技术指标（不含 peaks/troughs）。
 
     peaks/troughs 改为在 _divergence_scores 中滚动计算以避免未来函数。
+    背离检测与参数无关，在此并行预计算并落盘（内存 → 磁盘 → 实时计算三级缓存）。
     写入磁盘缓存 + 内存缓存。幂等。
     """
     stock_files = sorted(Path(stock_dir).glob("*.parquet"))
@@ -140,6 +227,20 @@ def precompute_all_indicators(stock_dir: str) -> None:
         _TROUGHS[symbol] = np.array([], dtype=int)
         _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
         computed += 1
+
+    # 背离检测结果只依赖 DIF、与评分参数无关：Phase 0 并行预计算并落盘，
+    # 后续每轮贝叶斯迭代（不同参数）直接复用，避免重跑 O(n²) 逐 bar 循环。
+    # 缺失背离的股票（含磁盘加载 / 长 K 线股票）一次补齐；已缓存的零开销跳过。
+    missing = [
+        s for s in _IN_MEMORY
+        if s not in _DIVERGENCE and len(_IN_MEMORY[s]) >= 60
+    ]
+    if missing:
+        _t0 = time.perf_counter()
+        _precompute_divergences_parallel(missing)
+        logger.info(
+            f"Phase 0: 背离预计算 {len(missing)} 只耗时 {time.perf_counter() - _t0:.1f}s"
+        )
 
     _log_msg = f"Phase 0: {len(stock_files)} 只股票"
     parts = []

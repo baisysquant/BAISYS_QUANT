@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 from scipy import stats
 
 
 def _ann_factor() -> int:
     return 252
+
+
+# OOS 最少交易日数：低于此样本量时 Sharpe 估计噪声过大，衰减比不可判定
+_MIN_OOS_DAYS = 10
 
 
 def probabilistic_sharpe_ratio(
@@ -117,3 +123,205 @@ def compute_dsr_from_equity_curve(
     kurt = float(pd.Series(returns).kurtosis()) + 3.0  # type: ignore[arg-type]
 
     return deflated_sharpe_ratio(sharpe, n, num_trials, skew, kurt)
+
+
+# ──────────────────────────────────────────────────────────────
+# Out-of-Sample 衰减校验（López de Prado 2018 准则 #1）
+# ──────────────────────────────────────────────────────────────
+
+@dataclass
+class OOSDecayReport:
+    """样本外衰减校验报告。
+
+    业务定义：检验模型是否在历史特征上发生过度拟合（Overfitting）。
+    样本外夏普比率相对于样本内夏普比率的衰减幅度不得超过 30%。
+    若超过此阈值，判定模型对 XGBoost 等超参数进行了过度网格搜索，
+    或特征工程存在隐性泄露，结果直接废弃。
+    """
+
+    # ── 输入 ──
+    is_sharpe: float = 0.0
+    oos_sharpe: float = 0.0
+    is_sortino: float = 0.0
+    oos_sortino: float = 0.0
+
+    # ── 计算 ──
+    sharpe_decay: float = 0.0        # 1 - oos / is，正值表示衰减
+    sortino_decay: float = 0.0
+    sharpe_ratio: float = 1.0        # oos / is，>0.7 表示未超阈
+
+    # ── 判定 ──
+    passed: bool = False
+    reason: str = ""
+    details: list[str] = field(default_factory=list)
+    is_sample_days: int = 0
+    oos_sample_days: int = 0
+
+    # ── 序列化 ──
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "is_sharpe": round(self.is_sharpe, 4),
+            "oos_sharpe": round(self.oos_sharpe, 4),
+            "sharpe_decay_pct": f"{self.sharpe_decay:.1%}",
+            "is_sortino": round(self.is_sortino, 4),
+            "oos_sortino": round(self.oos_sortino, 4),
+            "sortino_decay_pct": f"{self.sortino_decay:.1%}",
+            "passed": "PASS" if self.passed else "FAIL",
+            "reason": self.reason,
+            "is_days": self.is_sample_days,
+            "oos_days": self.oos_sample_days,
+        }
+
+    def log(self) -> None:
+        status = "PASS" if self.passed else "FAIL"
+        logger.info(
+            f"[OOS衰减校验] {status} | IS_Sharpe={self.is_sharpe:.2f} → "
+            f"OOS_Sharpe={self.oos_sharpe:.2f} (衰减 {self.sharpe_decay:.1%}) | "
+            f"IS_Sortino={self.is_sortino:.2f} → OOS_Sortino={self.oos_sortino:.2f} "
+            f"(衰减 {self.sortino_decay:.1%}) | {self.reason}"
+        )
+
+
+def _compute_risk_from_curve(
+    equity_curve: list[dict[str, Any]] | pd.DataFrame,
+) -> tuple[float, float]:
+    """从净值曲线计算年化 Sharpe 和 Sortino。
+
+    Returns:
+        (sharpe, sortino)
+    """
+    if isinstance(equity_curve, pd.DataFrame):
+        vals = equity_curve["portfolio_value"].values.astype(float)
+    else:
+        vals = np.array([e.get("portfolio_value", 0) for e in equity_curve], dtype=float)
+
+    finite_mask = np.isfinite(vals)
+    if finite_mask.sum() < 2:
+        return 0.0, 0.0
+    vals = vals[finite_mask]
+    if vals[0] <= 0:
+        return 0.0, 0.0
+
+    returns = (vals[1:] - vals[:-1]) / vals[:-1]
+    returns = returns[np.isfinite(returns)]
+    n = len(returns)
+    if n < 2:
+        return 0.0, 0.0
+
+    ann_factor = _ann_factor()
+    mu = returns.mean() * ann_factor
+    sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
+    sharpe = mu / sigma if sigma > 0 else 0.0
+
+    downside = returns[returns < 0]
+    if len(downside) == 0:
+        sortino = float("inf") if mu > 0 else 0.0
+    else:
+        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
+        sortino = mu / downside_std if downside_std > 0 else (float("inf") if mu > 0 else 0.0)
+
+    # 将无穷大的 Sortino 转为一个可比较的大数（避免除法异常）
+    if not math.isfinite(sortino):
+        sortino = 999.0
+
+    return float(sharpe), float(sortino)
+
+
+def validate_oos_decay(
+    is_equity_curve: list[dict[str, Any]] | pd.DataFrame,
+    oos_equity_curve: list[dict[str, Any]] | pd.DataFrame,
+    *,
+    decay_threshold: float = 0.30,
+    is_days: int = 0,
+    oos_days: int = 0,
+) -> OOSDecayReport:
+    """样本外衰减校验 —— 核心 gate。
+
+    Args:
+        is_equity_curve: 样本内（训练集）净值曲线。
+        oos_equity_curve: 样本外（独立测试集）净值曲线。
+        decay_threshold: 衰减容忍度，默认 30%。
+        is_days: 样本内交易日数（报告用）。
+        oos_days: 样本外交易日数（报告用）。
+
+    Returns:
+        OOSDecayReport —— passed=False 时结果应直接废弃。
+
+    Raises:
+        ValueError: 当样本内 Sharpe ≤ 0 时，拒绝计算衰减比（模型本身无信号）。
+    """
+    report = OOSDecayReport(
+        is_sample_days=is_days,
+        oos_sample_days=oos_days,
+    )
+
+    is_sharpe, is_sortino = _compute_risk_from_curve(is_equity_curve)
+    oos_sharpe, oos_sortino = _compute_risk_from_curve(oos_equity_curve)
+
+    report.is_sharpe = is_sharpe
+    report.is_sortino = is_sortino
+    report.oos_sharpe = oos_sharpe
+    report.oos_sortino = oos_sortino
+
+    # ── Guard: IS Sharpe ≤ 0 → 无信号，直接 FAIL ──
+    if is_sharpe <= 0:
+        report.passed = False
+        report.reason = "样本内 Sharpe ≤ 0，模型本身无超额收益信号，拒绝衰减计算"
+        report.log()
+        return report
+
+    # ── Guard: OOS Sharpe ≤ 0 → 样本外完全失效，直接 FAIL ──
+    if oos_sharpe <= 0:
+        report.sharpe_decay = 1.0  # 100% 衰减
+        report.sortino_decay = 1.0
+        report.passed = False
+        report.reason = "样本外 Sharpe ≤ 0，模型在样本外完全失效"
+        report.log()
+        return report
+
+    # ── Guard: OOS 样本量不足 → Sharpe 估计噪声过大，衰减比不可判定，拒绝通过 ──
+    if oos_days and oos_days < _MIN_OOS_DAYS:
+        report.passed = False
+        report.reason = (
+            f"样本外交易日仅 {oos_days} 天（<{_MIN_OOS_DAYS}），"
+            f"Sharpe 估计噪声过大，无法可靠判定衰减"
+        )
+        report.log()
+        return report
+
+    # ── 衰减计算 ──
+    sharpe_decay = 1.0 - (oos_sharpe / is_sharpe)
+    report.sharpe_decay = sharpe_decay
+    report.sharpe_ratio = oos_sharpe / is_sharpe
+
+    if math.isfinite(is_sortino) and 0 < is_sortino < 900:
+        sortino_decay = 1.0 - (oos_sortino / is_sortino)
+    else:
+        # IS 无下行样本（Sortino 截断为 999 大数）或不可计算时，
+        # Sortino 比无可比性，衰减记为 0 不参与 gate（由 Sharpe 独立判定）。
+        sortino_decay = 0.0
+    report.sortino_decay = max(sortino_decay, 0.0)  # Sortino 衰减下限 0（OOS 更好不报错）
+
+    # ── 判定：任一指标衰减超限则 FAIL ──
+    if sharpe_decay > decay_threshold:
+        report.passed = False
+        report.reason = (
+            f"Sharpe 衰减 {sharpe_decay:.1%} > {decay_threshold:.0%}，"
+            f"疑似超参数过度网格搜索或特征工程隐性泄露，结果废弃"
+        )
+    elif sortino_decay > decay_threshold:
+        report.passed = False
+        report.reason = (
+            f"Sortino 衰减 {sortino_decay:.1%} > {decay_threshold:.0%}，"
+            f"下行风险在样本外显著恶化，结果废弃"
+        )
+    else:
+        report.passed = True
+        report.reason = (
+            f"Sharpe 衰减 {sharpe_decay:.1%} ≤ {decay_threshold:.0%}，"
+            f"Sortino 衰减 {sortino_decay:.1%} ≤ {decay_threshold:.0%}，"
+            f"模型泛化性通过"
+        )
+
+    report.log()
+    return report

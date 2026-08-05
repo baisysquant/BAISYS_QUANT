@@ -604,6 +604,7 @@ def compute_signals(
     params: dict[str, Any] | None = None,
     compute_exit_strategy: bool = False,
     diverge_distance: int = 11,
+    precomputed_divergence: tuple | None = None,
 ) -> pd.DataFrame:
     """全向量化信号计算。
 
@@ -614,6 +615,9 @@ def compute_signals(
         precomputed_peaks: 预计算的 DIF peak 索引数组。
         precomputed_troughs: 预计算的 DIF trough 索引数组。
         diverge_distance: 背离检测距离参数。
+        precomputed_divergence: 预计算的背离结果 (div_type, div_idx, div_strength)，
+            由 Phase 0 缓存提供（只依赖 DIF 数据，与参数无关），
+            传入后跳过 _divergence_scores 的逐 bar Python 循环。
 
     Returns:
         DataFrame，字段与 _stock_worker 的 rows 条目一致。
@@ -668,9 +672,12 @@ def compute_signals(
     trend_arr = macd_trend(dif, dea)
 
     # ── 2. Divergence（滚动计算，不使用全局 precomputed peaks/troughs 防未来函数） ──
-    div_type, div_idx, div_strength = _divergence_scores(
-        stock_df, base_distance=diverge_distance,
-    )
+    if precomputed_divergence is not None:
+        div_type, div_idx, div_strength = precomputed_divergence
+    else:
+        div_type, div_idx, div_strength = _divergence_scores(
+            stock_df, base_distance=diverge_distance,
+        )
     div_decay = _divergence_decay(div_type, div_idx, decay_half_life)
     has_top_div = np.array(
         [t == Divergence.TOP_DIVERGENCE for t in div_type], dtype=bool,

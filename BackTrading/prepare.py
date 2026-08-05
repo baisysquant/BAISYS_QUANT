@@ -38,7 +38,7 @@ try:
 except Exception:
     CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
 
-from BackTrading.indicator_cache import get_precomputed, precompute_all_indicators
+from BackTrading.indicator_cache import get_precomputed, get_divergence, precompute_all_indicators
 
 
 def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
@@ -196,24 +196,38 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             files.extend(sorted(bucket_dir.glob("*.parquet")))
     if not files:
         return None
-    parts = []
-    for f in files:
+    # 分块 concat：一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
+    #（parts 列表 + 合并结果），容易在 Windows 上触发 OOM/原生崩溃。
+    # 这里按块合并、逐块释放，同时提前丢弃 exit_strategy 字典列（每行一个 dict，
+    # 是内存大头，提取出止损价后不再需要）。
+    _CHUNK = 400
+    parts: list[pd.DataFrame] = []
+    df: pd.DataFrame | None = None
+    for idx, f in enumerate(files):
         try:
-            parts.append(pd.read_parquet(f))
+            part = pd.read_parquet(f)
         except Exception:
             logger.warning("跳过损坏的缓存文件: %s", f)
+            continue
+        if "exit_strategy" in part.columns:
+            if "止损价" not in part.columns:
+                part["止损价"] = part["exit_strategy"].apply(
+                    lambda x: float(x.get("stop_loss", 0)) if isinstance(x, dict) else 0.0
+                )
+            part = part.drop(columns=["exit_strategy"])
+        parts.append(part)
+        if len(parts) >= _CHUNK:
+            merged = pd.concat(parts, ignore_index=True)
+            parts = [merged]
+        del part
     if not parts:
         return None
     df = pd.concat(parts, ignore_index=True)
+    del parts
     # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
     if rename_map:
         df.rename(columns=rename_map, inplace=True)
-    # 兼容旧版：若 exit_strategy 列存在且为 dict，提取 stop_loss
-    if "exit_strategy" in df.columns and "止损价" not in df.columns:
-        df["止损价"] = df["exit_strategy"].apply(
-            lambda x: float(x.get("stop_loss", 0)) if isinstance(x, dict) else 0.0
-        )
     return df
 
 
@@ -302,7 +316,10 @@ def prepare_backtest_data(
         merged = _merge_signal(kline, signal)
         del kline, signal
         gc.collect()
+        _t_ml = time.time()
+        logger.info(f"  ML 信号覆写开始（{len(merged)} 行, {merged['symbol'].nunique()} 只），XGBoost 重训可能较久...")
         merged = apply_ml_signal(merged)
+        logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s")
         if _saved_atr_stop is not None and "ATR" in merged.columns:
             stop_raw = merged["close"] - merged["ATR"] * _saved_atr_stop
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
@@ -385,6 +402,9 @@ def prepare_backtest_data(
                 return
             pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
             pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
+            _p0 = time.time()
+            done = 0
+            failures: set[str] = set()
             try:
                 fut_to_sym: dict[Any, str] = {}
                 for sym in syms:
@@ -398,11 +418,23 @@ def prepare_backtest_data(
                         if rows:
                             _save_stock_signal(cache_dir, sym, rows)
                     except Exception as e:
+                        failures.add(sym)
                         logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")
+                    done += 1
+                    if done % 500 == 0:
+                        logger.info(f"  管道{idx+1} 进度 {done}/{len(syms)} 只（耗时 {time.time()-_p0:.0f}s, 失败 {len(failures)}）")
                     pbar.update(1)
             finally:
-                pool.shutdown(wait=False)
+                # wait=True：等所有 worker 真正结束再返回，防止残留线程在
+                # _load_signal_cache 阶段仍用 pyarrow 写 parquet，与主线程
+                # 并发读触发 Windows 原生崩溃（0xC0000005 静默终止）。
+                pool.shutdown(wait=True)
             pbar.close()
+            logger.info(f"  管道{idx+1} 完成: 成功 {done-len(failures)}/{len(syms)} 只, 失败 {len(failures)}（耗时 {time.time()-_p0:.0f}s）")
+            if failures:
+                with open(os.path.join(cache_dir, "_pipeline_failures.txt"), "a", encoding="utf-8") as _f:
+                    for _s in sorted(failures):
+                        _f.write(f"{_s}\n")
 
         chunks = [missing[i::signal_pipelines] for i in range(signal_pipelines)]
         pool_t = ThreadPoolExecutor(max_workers=signal_pipelines)
@@ -414,7 +446,7 @@ def prepare_backtest_data(
                 except Exception:
                     logger.warning(f" 管道 Future 异常，继续等待其他管道")
         finally:
-            pool_t.shutdown(wait=False)
+            pool_t.shutdown(wait=True)
         _t1 = time.time()
         logger.info(f"所有管道完成，耗时 {_t1-_t0:.1f}s")
     finally:
@@ -423,7 +455,14 @@ def prepare_backtest_data(
 
     # ── 加载缓存合并 ──
     logger.info(f"加载信号缓存合并...")
-    signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+    _t_load = time.time()
+    try:
+        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+    except MemoryError:
+        logger.error("读取信号缓存内存不足(MemoryError)，尝试强制 GC 后重试一次")
+        gc.collect()
+        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+    logger.info(f"读取信号缓存耗时 {time.time()-_t_load:.1f}s")
     if signal_df is None or signal_df.empty:
         logger.warning(f"所有信号计算失败（signal_df={type(signal_df).__name__}），返回原始 K 线")
         return kline_df
@@ -505,6 +544,8 @@ def _stock_worker_vectorized(
 
         from LogicAnalyzer.signals.divergence import adaptive_distance
         _dd = adaptive_distance(stock_df["DIF"], base_distance=10) if "DIF" in stock_df.columns else 11
+        # 背离检测只依赖 DIF 数据，Phase 0 已缓存，跨参数迭代直接复用
+        _div = get_divergence(symbol, stock_df, stock_dir)
 
         try:
             signal_df = _compute_signals_vec(
@@ -512,6 +553,7 @@ def _stock_worker_vectorized(
                 params=params,
                 compute_exit_strategy=compute_exit_strategy,
                 diverge_distance=_dd,
+                precomputed_divergence=_div,
             )
         except Exception as e:
             import traceback

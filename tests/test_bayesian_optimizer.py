@@ -169,7 +169,7 @@ def test_acquisition() -> None:
 
 def test_optimize_window(bayesian_test_df, basic_spaces, basic_engine_cfg) -> None:
     from BackTrading.bayesian.optimizer import optimize_window
-    best_params, gp_state = optimize_window(
+    best_params, gp_state, _topk, is_sharpe, is_equity = optimize_window(
         kline_df=bayesian_test_df, engine_cfg=basic_engine_cfg,
         spaces=basic_spaces,
         n_init_signal=4, n_iter_signal=3,
@@ -183,7 +183,7 @@ def test_optimize_window(bayesian_test_df, basic_spaces, basic_engine_cfg) -> No
 
 def test_optimize_window_with_signal_params(bayesian_test_df, basic_engine_cfg, spaces_with_signal) -> None:
     from BackTrading.bayesian.optimizer import optimize_window
-    best_params, gp_state = optimize_window(
+    best_params, gp_state, _topk, is_sharpe, is_equity = optimize_window(
         kline_df=bayesian_test_df, engine_cfg=basic_engine_cfg,
         spaces=spaces_with_signal,
         n_init_signal=4, n_iter_signal=3,

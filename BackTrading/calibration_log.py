@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, datetime
 from typing import Any
 
@@ -9,6 +10,10 @@ from loguru import logger
 from sqlalchemy import text
 
 TABLE = "backtest_calibration_log"
+
+# ── 多重测试惩罚配置（Multiple Testing Deception） ──
+MAX_TUNING_ATTEMPTS = 10            # 同区间调参尝试上限
+MULTIPLE_TESTING_PENALTY = 0.20     # 超限后 Sharpe/Sortino 硬扣减比例
 
 
 CREATE_TABLE_SQL = f"""
@@ -214,3 +219,92 @@ def record_run(
             "num_trials": num_trials,
         }))
     logger.info(f"回测记录已写入 {TABLE}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 多重测试惩罚（Multiple Testing Deception）
+# ═══════════════════════════════════════════════════════════════
+
+def count_tuning_attempts(
+    engine: Any,
+    backtest_start_date: str,
+    out_of_sample_days: int,
+) -> int:
+    """统计同区间（相同数据起始日期 + 相同 OOS 天数）的调参尝试次数。
+
+    包含所有状态的记录（success/failure），因为即使失败也是用户的一次试错。
+    调用时机决定口径：在 record_run 之前调用时需自行 +1（含本次）；
+    在 record_run 之后调用则直接取返回值（已含本次）。
+
+    Args:
+        engine: SQLAlchemy engine。
+        backtest_start_date: 回测起始日期（如 20230101）。
+        out_of_sample_days: 样本外天数。
+
+    Returns:
+        累计调参次数。
+    """
+    sql = text(f"""
+        SELECT COUNT(*)
+        FROM {TABLE}
+        WHERE backtest_start_date = :bstart
+          AND out_of_sample_days = :oos_days
+    """)
+    with engine.connect() as conn:
+        count = conn.execute(sql, {"bstart": backtest_start_date, "oos_days": out_of_sample_days}).scalar()
+    return int(count) if count else 0
+
+
+def apply_multiple_testing_penalty(
+    sharpe: float,
+    sortino: float,
+    attempt_count: int,
+    backtest_start_date: str,
+    out_of_sample_days: int,
+) -> tuple[float, float, str]:
+    """对高频调参施加统计学惩罚。
+
+    业务规则：
+    - attempt_count <= MAX_TUNING_ATTEMPTS: 无惩罚
+    - attempt_count > MAX_TUNING_ATTEMPTS: Sharpe 和 Sortino 各硬扣 20%
+    - attempt_count > 30: 标记 CRITICAL
+
+    Args:
+        sharpe: 原始 Sharpe。
+        sortino: 原始 Sortino。
+        attempt_count: 同区间累计调参次数（含本次）。
+        backtest_start_date: 回测起始日期。
+        out_of_sample_days: 样本外天数。
+
+    Returns:
+        (punished_sharpe, punished_sortino, warning_level)
+        warning_level 为 INFO / WARNING / CRITICAL
+    """
+    period_key = f"{backtest_start_date}/OOS{out_of_sample_days}"
+
+    if attempt_count <= MAX_TUNING_ATTEMPTS:
+        logger.info(
+            f"[多重测试] 同区间调参 {attempt_count}/{MAX_TUNING_ATTEMPTS} 次，未超限，无需惩罚"
+        )
+        return sharpe, sortino, "INFO"
+
+    # ── 超限惩罚 ──
+    punished_sharpe = sharpe * (1.0 - MULTIPLE_TESTING_PENALTY)
+    punished_sortino = sortino * (1.0 - MULTIPLE_TESTING_PENALTY)
+
+    warning_level = "WARNING"
+    if attempt_count > 30:
+        warning_level = "CRITICAL"
+        logger.critical(
+            f"[多重测试惩罚] 🔴 CRITICAL：同区间 {period_key} 已调参 {attempt_count} 次！"
+            f" Sharpe {sharpe:.4f} → {punished_sharpe:.4f}（扣减 {MULTIPLE_TESTING_PENALTY:.0%}）"
+            f" 该策略存在严重过拟合风险，建议重新审视特征工程和参数空间设计"
+        )
+
+    logger.warning(
+        f"[多重测试惩罚] ⚠️ 高危：同区间 {period_key} 已调参 {attempt_count} 次（上限 {MAX_TUNING_ATTEMPTS}），"
+        f"触发统计学惩罚 Sharpe {sharpe:.4f} → {punished_sharpe:.4f}（扣减 {MULTIPLE_TESTING_PENALTY:.0%}）"
+        f" Sortino {sortino:.4f} → {punished_sortino:.4f}"
+    )
+
+    return punished_sharpe, punished_sortino, warning_level

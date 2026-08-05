@@ -93,6 +93,11 @@ _FEATURE_CN = [
     "DIF斜评分", "背离信号分", "量价配合分", "K线形态分",
 ]
 
+# 全面板自检（特征窗口/标签/预处理隔离）只依赖原始行情行数与日期范围，
+# 同一进程内同一面板重复跑毫无意义（每次迭代的 merged 面板规模相同），
+# 按面板键记忆化，避免每轮贝叶斯迭代都数次重算 2.7M 行特征矩阵。
+_PANEL_SELFCHECK_KEY: tuple | None = None
+
 _FEATURE_ALL = [
     # 保留验证过的 CN 特征（4 个 IC 相对较高的）
     "MACD趋势分", "金叉信号分", "DIF斜评分", "量价配合分",
@@ -235,40 +240,57 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     raw_in = df
     df = _compute_feature_matrix(df)
 
-    # ── 标签合规自检（1.1 标签前瞻性清除） ──
+    # ── 面板性自检（1.1/1.2/1.5）：只依赖原始行情，按面板键每进程只跑一次 ──
+    global _PANEL_SELFCHECK_KEY
     try:
-        report = validate_labels(
-            df, "fwd_5d_raw", LabelConvention.TAIL_CLOSE, _LABEL_HORIZON
+        _panel_key = (
+            len(raw_in),
+            int(raw_in["symbol"].nunique()) if "symbol" in raw_in.columns else 0,
+            str(raw_in["trade_date"].min()) if len(raw_in) else "",
+            str(raw_in["trade_date"].max()) if len(raw_in) else "",
         )
-        if not report.passed:
-            logger.warning(
-                f"[标签合规] fwd_5d_raw 存在前瞻性泄露："
-                f"违规 {report.n_violations}/{report.n_checked} 行"
+    except Exception:
+        _panel_key = (len(raw_in), 0, "", "")
+    first_run = (_panel_key != _PANEL_SELFCHECK_KEY)
+    _PANEL_SELFCHECK_KEY = _panel_key
+
+    # ── 标签合规自检（1.1 标签前瞻性清除） ──
+    if first_run:
+        try:
+            report = validate_labels(
+                df, "fwd_5d_raw", LabelConvention.TAIL_CLOSE, _LABEL_HORIZON
             )
-    except Exception as e:
-        logger.warning(f"[标签合规] 自检执行失败: {e}")
+            if not report.passed:
+                logger.warning(
+                    f"[标签合规] fwd_5d_raw 存在前瞻性泄露："
+                    f"违规 {report.n_violations}/{report.n_checked} 行"
+                )
+        except Exception as e:
+            logger.warning(f"[标签合规] 自检执行失败: {e}")
 
     # ── 特征窗口自检（1.2 特征未来函数阻断） ──
-    try:
-        result = run_feature_window_check(_compute_feature_matrix, raw_in, _FEATURE_ALL)
-        if not result["passed"]:
-            failed = "；".join(r.check_name for r in result["reports"] if not r.passed)
-            logger.warning(f"[特征窗口] 自检未通过: {failed}（特征使用了当日及以后数据）")
-    except Exception as e:
-        logger.warning(f"[特征窗口] 自检执行失败: {e}")
+    if first_run:
+        try:
+            result = run_feature_window_check(_compute_feature_matrix, raw_in, _FEATURE_ALL)
+            if not result["passed"]:
+                failed = "；".join(r.check_name for r in result["reports"] if not r.passed)
+                logger.warning(f"[特征窗口] 自检未通过: {failed}（特征使用了当日及以后数据）")
+        except Exception as e:
+            logger.warning(f"[特征窗口] 自检执行失败: {e}")
 
     # ── 预处理信息隔离自检（1.5 预处理信息隔离） ──
-    try:
-        iso_report = check_train_features_invariant(
-            _compute_feature_matrix, raw_in, _FEATURE_ALL
-        )
-        if not iso_report.passed:
-            logger.warning(
-                f"[预处理隔离] 训练行特征随测试行漂移（分布参数含测试/全局数据）: "
-                f"{'；'.join(iso_report.details[:3])}"
+    if first_run:
+        try:
+            iso_report = check_train_features_invariant(
+                _compute_feature_matrix, raw_in, _FEATURE_ALL
             )
-    except Exception as e:
-        logger.warning(f"[预处理隔离] 重构自检执行失败: {e}")
+            if not iso_report.passed:
+                logger.warning(
+                    f"[预处理隔离] 训练行特征随测试行漂移（分布参数含测试/全局数据）: "
+                    f"{'；'.join(iso_report.details[:3])}"
+                )
+        except Exception as e:
+            logger.warning(f"[预处理隔离] 重构自检执行失败: {e}")
 
     # 横截面标准化所有特征
     df = _cross_sectional_rank(df, _FEATURE_ALL)
