@@ -51,7 +51,15 @@ class NewsSentimentFetcher:
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df.columns = [c.encode("latin1").decode("utf-8", errors="replace") if isinstance(c, str) else c for c in df.columns]
+        # 修复列名编码问题（某些版本返回 gbk 编码的列名）
+        df.columns = [
+            c.encode("gbk", errors="replace").decode("gbk", errors="replace")
+            if isinstance(c, str) and any(ord(ch) > 127 for ch in c)
+            else c
+            for c in df.columns
+        ]
+        # 清理不可见字符
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
 
         col_map = {
             "股票代码": "symbol",
