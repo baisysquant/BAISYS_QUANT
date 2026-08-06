@@ -768,10 +768,16 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
                     "GROUP BY symbol"
                 )).fetchall()
             first_by_symbol = {r[0]: r[1] for r in rows}
+            # 容差 10 个日历日：预热起点恰逢非交易日/停牌时最早数据略晚于起点属正常，
+            # 避免回填完成后因 1-2 天边界差反复触发全市场强制回填
+            _warmup_tolerance = 10
+            _warmup_cutoff = (
+                pd.Timestamp(buffer_start_iso) + timedelta(days=_warmup_tolerance)
+            ).strftime("%Y-%m-%d")
             need_warmup = [
                 s for s in existing_symbols
                 if s in first_by_symbol and first_by_symbol[s] is not None
-                and pd.Timestamp(first_by_symbol[s]).strftime("%Y-%m-%d") > buffer_start_iso
+                and pd.Timestamp(first_by_symbol[s]).strftime("%Y-%m-%d") > _warmup_cutoff
             ]
             if need_warmup:
                 logger.info(

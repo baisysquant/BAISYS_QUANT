@@ -98,6 +98,7 @@ class IncrementalSyncEngine:
 
             cached = self._load_failed_set()
             if cached:
+                cached = self._drop_dead_symbols(cached)
                 old_len = len(remaining)
                 remaining = sorted(set(remaining) | cached)
                 added = len(remaining) - old_len
@@ -121,7 +122,9 @@ class IncrementalSyncEngine:
             results: dict = {"a": [0, []], "b": [0, []]}
 
             def run(label: str, half: list[str]):
-                ins, fails = self._run_pipeline(half, start_iso, end_iso, label=label)
+                ins, fails = self._run_pipeline(
+                    half, start_iso, end_iso, label=label, force=force_start_iso is not None
+                )
                 results[label.lower()] = [ins, fails]
 
             ta = threading.Thread(target=run, args=("A", half_a), daemon=True)
@@ -157,7 +160,7 @@ class IncrementalSyncEngine:
 
     # ── Dual Pipeline ───────────────────────────────────────────
 
-    def _run_pipeline(self, symbols: list[str], start_iso: str, end_iso: str, label: str = "") -> tuple[int, list[str]]:
+    def _run_pipeline(self, symbols: list[str], start_iso: str, end_iso: str, label: str = "", force: bool = False) -> tuple[int, list[str]]:
         start = start_iso.replace("-", "")
         end = end_iso.replace("-", "")
         total_batches = (len(symbols) + BATCH_SIZE - 1) // BATCH_SIZE
@@ -169,7 +172,7 @@ class IncrementalSyncEngine:
             batch_no = i // BATCH_SIZE + 1
             desc = f"  P{label} batch {batch_no}/{total_batches}"
             logger.info(f"管道{label} {desc}: {len(batch)} 只")
-            count, failures = self._process_batch(batch, start, end, desc=desc)
+            count, failures = self._process_batch(batch, start, end, desc=desc, force=force)
             all_failures.extend(failures)
             inserted += count
             if i + BATCH_SIZE < len(symbols):
@@ -264,9 +267,89 @@ class IncrementalSyncEngine:
         if raw_rows and hfq_rows:
             return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
 
+        # 腾讯对部分股票(次新股/新上市)不提供后复权数据,响应中只有 day 无 hfqday。
+        # 优先用 asharehub 复权因子重建后复权价(raw × factor)；
+        # 因子不可用或全为 1.0(从未除权,后复权=不复权)时降级为不复权写入。
+        if raw_rows:
+            factor_map = self._fetch_ah_factor_map(symbol, start, end)
+            if factor_map:
+                non_one = [d for d, f in factor_map.items() if abs(f - 1.0) > 1e-9]
+                if non_one:
+                    logger.warning(
+                        f"腾讯API {symbol} 无后复权数据,使用 asharehub 复权因子重建({len(non_one)} 个除权因子)"
+                    )
+                    return self._build_qq_df_from_factor(symbol, start, end, raw_rows, factor_map)
+            logger.warning(
+                f"腾讯API {symbol} 无后复权数据,降级为不复权写入(adj_factor=1.0,asharehub 因子全为1或不可用)"
+            )
+            return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
+
         # 腾讯API 失败时直接返回 None，由批处理器标记为失败股票，下次重试
         logger.warning(f"腾讯API {symbol} 返回空,标记为失败，将在下次同步时重试")
         return None
+
+    def _fetch_ah_factor_map(self, symbol: str, start: str, end: str) -> dict[str, float] | None:
+        """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。"""
+        try:
+            from UtilsManager.ConfigParser import Config
+            from asharehub import AShareHub
+            cfg = Config()
+            key = getattr(cfg, "ASHAREHUB_API_KEY", "") or ""
+            if not key:
+                return None
+            code = symbol[2:]
+            market = symbol[:2]
+            suffix = {"sh": "SH", "sz": "SZ", "bj": "BJ"}.get(market, "SH")
+            client = AShareHub(api_key=key)
+            df = client.adj_factor(
+                symbol=f"{code}.{suffix}",
+                start_date=start.replace("-", ""),
+                end_date=end.replace("-", ""),
+            )
+            if df is None or df.empty:
+                return None
+            return {str(r["trade_date"]): float(r["adj_factor"]) for _, r in df.iterrows()}
+        except Exception as e:
+            logger.warning(f"asharehub 复权因子获取失败 {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    def _build_qq_df_from_factor(self, symbol: str, start: str, end: str,
+                                 raw_rows: list[list], factor_map: dict[str, float]) -> pd.DataFrame | None:
+        """用不复权行情 × asharehub 复权因子重建后复权 DataFrame（含除权日连续价格）。"""
+        raw_map = {str(r[0]): r for r in raw_rows}
+        filtered = [d for d in sorted(raw_map) if start <= d.replace("-", "") <= end]
+        if not filtered:
+            return None
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "volume": [], "amount": [],
+            "adj_factor": [], "close_normal": [],
+        }
+        skipped = 0
+        for d in filtered:
+            raw = raw_map[d]
+            d_compact = d.replace("-", "")
+            factor = factor_map.get(d_compact)
+            if factor is None or not (math.isfinite(factor) and factor > 0):
+                skipped += 1
+                continue
+            close_raw = float(raw[2])
+            if not (math.isfinite(close_raw) and close_raw > 0):
+                skipped += 1
+                continue
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d)
+            out["open"].append(float(raw[1]) * factor)
+            out["close"].append(close_raw * factor)
+            out["high"].append(float(raw[3]) * factor)
+            out["low"].append(float(raw[4]) * factor)
+            out["volume"].append(int(float(raw[5]) * 100))
+            out["amount"].append(float(raw[8]) * 10000)
+            out["adj_factor"].append(factor)
+            out["close_normal"].append(close_raw)
+        if skipped:
+            logger.warning(f"asharehub 因子重建 {symbol} 跳过 {skipped}/{len(filtered)} 天(因子缺失)")
+        return pd.DataFrame(out)
 
     def _build_qq_df(self, symbol: str, start: str, end: str,
                      raw_rows: list[list], hfq_rows: list[list]) -> pd.DataFrame | None:
@@ -307,8 +390,13 @@ class IncrementalSyncEngine:
             logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
 
-    def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "") -> tuple[int, list[str]]:
-        """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入."""
+    def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "", force: bool = False) -> tuple[int, list[str]]:
+        """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入.
+
+        force=True 时忽略 DB 已有数据/除权检测,将拉取区间全量覆盖写入
+        （幂等 upsert,用于指标预热历史回填;否则已有数据只写增量,
+        早期历史会被丢弃导致回填永不生效）。
+        """
         # Step 1: concurrent fetch
         all_data: dict[str, pd.DataFrame] = {}
         failed: list[str] = []
@@ -332,11 +420,11 @@ class IncrementalSyncEngine:
             logger.info(f"  {desc} 完成: 成功 0 只, 失败 {len(failed)} 只")
             return 0, failed
 
-        # Step 2: bulk DB reads
+        # Step 2: bulk DB reads (force 模式全量覆盖,无需读取已有状态)
         syms = list(all_data.keys())
-        latest_map = self._batch_get_latest_date(syms)
-        adj_map = self._batch_get_latest_adj(syms)
-        has_cn_set = self._batch_has_close_normal(syms)
+        latest_map = self._batch_get_latest_date(syms) if not force else {}
+        adj_map = self._batch_get_latest_adj(syms) if not force else {}
+        has_cn_set = self._batch_has_close_normal(syms) if not force else set()
 
         # Step 3: identify split stocks
         to_write: list[pd.DataFrame] = []
@@ -345,6 +433,11 @@ class IncrementalSyncEngine:
 
         for sym in syms:
             grp = all_data[sym].sort_values("trade_date")
+            if force:
+                # 强制回填:全量覆盖拉取区间,跳过增量/除权检测
+                to_write.append(grp)
+                written_symbols.add(sym)
+                continue
             latest = latest_map.get(sym)
             has_cn = sym in has_cn_set
 
@@ -427,7 +520,7 @@ class IncrementalSyncEngine:
     def filter_st_stocks(df: pd.DataFrame) -> pd.DataFrame:
         if "name" not in df.columns:
             return df
-        pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])|退市"
+        pattern = r"(?:\s*(?:\*|★|※|•|·))?(?:[Ss][Tt])|退市|IPO终止"
         return df[~df["name"].astype(str).str.contains(pattern, na=False)].copy()
 
     def filter_main_board(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -582,6 +675,35 @@ class IncrementalSyncEngine:
 
     def _failed_cache_path(self) -> str:
         return os.path.join(self._cache_dir, f"failed_symbols_{self._trade_date_str}.txt")
+
+    def _drop_dead_symbols(self, symbols: set[str]) -> set[str]:
+        """剔除永不上市/已退市的股票(名称含 IPO终止/退市),避免每次同步都无效重试."""
+        if not symbols:
+            return symbols
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT stock_code FROM stock_basic_info_sw WHERE stock_code = ANY(:codes)"),
+                    {"codes": sorted(symbols)},
+                ).fetchall()
+                known = {str(r[0]) for r in rows}
+                # 保留:仍在池中且名称不含 IPO终止/退市 的;池外代码保留原逻辑(可能是新上市未入库)
+                if known:
+                    name_rows = conn.execute(
+                        text("SELECT stock_code FROM stock_basic_info_sw "
+                             "WHERE stock_code = ANY(:codes) AND (stock_name LIKE '%IPO终止%' OR stock_name LIKE '%退市%')"),
+                        {"codes": sorted(known)},
+                    ).fetchall()
+                    dead = {str(r[0]) for r in name_rows}
+                else:
+                    dead = set()
+            kept = set(symbols) - dead
+            if dead:
+                logger.info(f"跳过 {len(dead)} 只 IPO终止/退市 股票,不再重试")
+            return kept
+        except Exception as e:
+            logger.warning(f"剔除失效股票异常: {e},按原名单重试")
+            return symbols
 
     def _load_failed_set(self) -> set[str]:
         path = self._failed_cache_path()

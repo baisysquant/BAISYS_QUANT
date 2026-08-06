@@ -11,7 +11,6 @@ from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
 from BackTrading.bayesian.kernel import GPState
 from BackTrading.bayesian.optimizer import optimize_window
 from BackTrading.bayesian.space import ParamSpace, build_spaces, split_by_cost
-from BackTrading.bayesian.transfer import warm_start_gp
 from BackTrading.domain.models import CostModel
 from BackTrading.prepare import prepare_backtest_data
 
@@ -295,8 +294,10 @@ def bayesian_walk_forward_multi(
                 continue
 
             # ── 跨窗口迁移 ──
-            n_signal = len(signal_sp)
-            previous_gp_state = warm_start_gp(gp_state, n_signal)
+            # 传递嵌套子空间状态（信号/组合/全空间），
+            # optimize_window 内部按 Phase 维度（n_signal/n_portfolio/n_total）分别取用，
+            # 不可在此解包为单一维度，否则后续窗口维度不匹配、warm-start 永远失效。
+            previous_gp_state = gp_state
 
             # ── OOS 验证（top-K 参数，PBO 需要多组 OOS 结果） ──
             if not test_dates:
