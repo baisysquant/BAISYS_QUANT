@@ -41,6 +41,11 @@ def _to_date_str(d) -> str:
 # 训练/OOS 切片前额外补足这段历史，保证窗口首日起信号有效。
 _SIGNAL_WARMUP_DAYS = 120
 
+# OOS 连续失效提前终止阈值：单窗口优化约 2~3 小时（350 次评估），
+# 连续 N 个窗口 OOS 全废（Sharpe≤0/无交易）说明策略在当前区间系统性泛化失效，
+# 继续跑完剩余窗口只空耗算力且结果必然废弃，达到阈值立即兜底返回。
+_MAX_CONSECUTIVE_OOS_FAILURES = 3
+
 
 def _window_dates(
     unique_dates: list,
@@ -240,6 +245,7 @@ def bayesian_walk_forward_multi(
             continue
 
         previous_gp_state: GPState | None = None
+        _consecutive_oos_failures = 0
 
         for win_idx, (tr_s, tr_e, te_s, te_e) in enumerate(windows):
             train_dates = unique_dates[tr_s:tr_e]
@@ -341,6 +347,12 @@ def bayesian_walk_forward_multi(
                     except Exception as _de:
                         logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验异常: {_de}，窗口照常保留")
             if not _decay_pass:
+                _oos_trades = oos.get("total_trades", 0) or 0
+                if _oos_trades == 0:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] OOS 区间 {len(test_dates)} 天无任何交易，"
+                        f"信号未触发（非过拟合），窗口结果无效"
+                    )
                 logger.warning("=" * 64)
                 logger.warning(
                     f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
@@ -348,6 +360,18 @@ def bayesian_walk_forward_multi(
                     f"疑似超参数过度网格搜索或特征工程隐性泄露，该窗口结果直接废弃"
                 )
                 logger.warning("=" * 64)
+                _consecutive_oos_failures += 1
+                if _consecutive_oos_failures >= _MAX_CONSECUTIVE_OOS_FAILURES:
+                    logger.critical(
+                        f"连续 {_consecutive_oos_failures} 个窗口 OOS 全部失效"
+                        f"（单窗口耗时 ~2-3h），策略在当前数据区间系统性泛化失败，"
+                        f"提前终止 WFO，回退配置中位数兜底"
+                    )
+                    mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                    return pd.DataFrame([{
+                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
+                        "num_combos": 1, "num_paths": num_paths,
+                    }])
                 continue
 
             # ── 收集 IS Sharpe（优化器返回的真实样本内绩效） ──
@@ -378,6 +402,7 @@ def bayesian_walk_forward_multi(
                 entry["sharpe_decay"] = round(_decay_report.sharpe_decay, 4)
                 entry["sortino_decay"] = round(_decay_report.sortino_decay, 4)
             all_path_results.setdefault(win_idx, []).append(entry)
+            _consecutive_oos_failures = 0
 
     # ── 按窗口聚合（多路径取中位数） ──
     if not all_path_results:

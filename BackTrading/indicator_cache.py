@@ -31,6 +31,23 @@ _PRECOMPUTE_DONE: bool = False
 # 避免每轮贝叶斯迭代都重跑 O(n²) 的逐 bar Python 循环。
 _DIVERGENCE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
+# ── 批次隔离：WFO 多窗口/多路径下，不同数据切片的指标必须隔离 ──
+# 2026-08-07 事故根因：窗口 [1-0] IS 的指标(2023-01-03~2025-11-10)常驻 _IN_MEMORY，
+# 后续 OOS 验证的 worker 命中旧内存缓存，用 IS 日期算信号 → OOS 段信号全 NaN → 0 交易。
+# _ACTIVE_FINGERPRINT = 当前已载入内存缓存的整批数据指纹（prepare 的 data_fp）；
+# _SYMBOL_FPS = {symbol: 该股载入时的数据指纹}，供内存命中 O(1) 校验。
+_ACTIVE_FINGERPRINT: str | None = None
+_SYMBOL_FPS: dict[str, str] = {}
+
+
+def _reset_memory_caches() -> None:
+    """清空全部内存缓存（跨数据批次切换时调用，防指标污染）。"""
+    _IN_MEMORY.clear()
+    _PEAKS.clear()
+    _TROUGHS.clear()
+    _DIVERGENCE.clear()
+    _SYMBOL_FPS.clear()
+
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
     """快速指纹：只依赖原始 OHLCV，不依赖参数。"""
@@ -99,10 +116,18 @@ def precompute_divergence(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.
     return _divergence_scores(df, base_distance=_dd)
 
 
-def _load_divergence_from_disk(symbol: str) -> bool:
+def _load_divergence_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
     p = _divergence_path(symbol)
     if not p.exists():
         return False
+    if expected_fp:
+        meta_path = _divergence_path(symbol).with_suffix(".meta.json")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if meta.get("fingerprint") != expected_fp:
+            return False
     try:
         with np.load(p, allow_pickle=True) as z:
             _DIVERGENCE[symbol] = (
@@ -113,10 +138,17 @@ def _load_divergence_from_disk(symbol: str) -> bool:
         return False
 
 
-def _save_divergence_to_disk(symbol: str, div: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+def _save_divergence_to_disk(symbol: str, div: tuple[np.ndarray, np.ndarray, np.ndarray], fp: str | None = None) -> None:
     p = _divergence_path(symbol)
     p.parent.mkdir(parents=True, exist_ok=True)
     np.savez(p, div_type=div[0], div_idx=div[1], div_strength=div[2])
+    if fp:
+        try:
+            _divergence_path(symbol).with_suffix(".meta.json").write_text(
+                json.dumps({"fingerprint": fp}), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
 
 def get_divergence(
@@ -129,9 +161,14 @@ def get_divergence(
     与 get_precomputed 的 fallback 语义一致；df 为空时仅查缓存。
     计算失败时返回 None，由调用方回退到逐 bar 实时计算。
     """
-    if symbol in _DIVERGENCE:
+    if symbol in _DIVERGENCE and (
+        _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT or _ACTIVE_FINGERPRINT is None
+    ):
         return _DIVERGENCE[symbol]
-    if _load_divergence_from_disk(symbol):
+    _fp = _data_fingerprint(df) if df is not None and not df.empty else None
+    if _load_divergence_from_disk(symbol, expected_fp=_fp):
+        if _fp is not None:
+            _SYMBOL_FPS[symbol] = _fp
         return _DIVERGENCE[symbol]
     if df is None or df.empty:
         return None
@@ -140,20 +177,34 @@ def get_divergence(
     except Exception:
         return None
     _DIVERGENCE[symbol] = div
+    if _fp is not None:
+        _SYMBOL_FPS[symbol] = _fp
     try:
-        _save_divergence_to_disk(symbol, div)
+        _save_divergence_to_disk(symbol, div, fp=_fp)
     except Exception:
         pass
     return div
 
 
-def _load_from_disk(symbol: str) -> bool:
-    """从磁盘加载到内存缓存。"""
+def _load_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
+    """从磁盘加载到内存缓存。
+
+    expected_fp: 当前输入数据的指纹，与 meta 中保存的指纹不一致时
+    判定缓存失效（数据日期范围/内容已变化），强制重算，防止窗口切片
+    缓存污染全量调用（WFO 场景 2025-11 后信号全 0 的根因）。
+    """
     ipath = _indicators_path(symbol)
     ppath = _peaks_path(symbol)
     tpath = _troughs_path(symbol)
     if not (ipath.exists() and ppath.exists() and tpath.exists()):
         return False
+    if expected_fp:
+        try:
+            meta = json.loads(_meta_path(symbol).read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        if meta.get("fingerprint") != expected_fp:
+            return False
     try:
         _IN_MEMORY[symbol] = pd.read_parquet(ipath)
         _PEAKS[symbol] = np.load(ppath)
@@ -186,13 +237,21 @@ def _precompute_divergences_parallel(symbols: list[str]) -> None:
                 pass
 
 
-def precompute_all_indicators(stock_dir: str) -> None:
+def precompute_all_indicators(stock_dir: str, fingerprint: str | None = None) -> None:
     """Phase 0: 为 stock_dir 中所有股票预计算技术指标（不含 peaks/troughs）。
 
     peaks/troughs 改为在 _divergence_scores 中滚动计算以避免未来函数。
     背离检测与参数无关，在此并行预计算并落盘（内存 → 磁盘 → 实时计算三级缓存）。
     写入磁盘缓存 + 内存缓存。幂等。
+
+    fingerprint: 当前整批数据（股票池+日期区间）的指纹。与上一批不一致时清空
+    内存缓存，防止 WFO 跨窗口复用旧切片指标（2026-08-07 OOS 0 交易根因）。
     """
+    global _ACTIVE_FINGERPRINT
+    if fingerprint is not None and fingerprint != _ACTIVE_FINGERPRINT:
+        _reset_memory_caches()
+        _ACTIVE_FINGERPRINT = fingerprint
+
     stock_files = sorted(Path(stock_dir).glob("*.parquet"))
     if not stock_files:
         logger.warning("Phase 0: stock_dir 中无 parquet 文件，跳过预计算")
@@ -209,15 +268,18 @@ def precompute_all_indicators(stock_dir: str) -> None:
             skipped += 1
             continue
 
-        if _load_from_disk(symbol):
+        df_raw = pd.read_parquet(f)
+        _fp = _data_fingerprint(df_raw)
+        if _load_from_disk(symbol, expected_fp=_fp):
+            _SYMBOL_FPS[symbol] = _fp
             cached += 1
             continue
 
-        df_raw = pd.read_parquet(f)
         if len(df_raw) < 60:
             _IN_MEMORY[symbol] = pd.DataFrame()
             _PEAKS[symbol] = np.array([], dtype=int)
             _TROUGHS[symbol] = np.array([], dtype=int)
+            _SYMBOL_FPS[symbol] = _fp
             continue
 
         df_ind = _compute_indicators(df_raw)
@@ -225,6 +287,7 @@ def precompute_all_indicators(stock_dir: str) -> None:
         _IN_MEMORY[symbol] = df_ind
         _PEAKS[symbol] = np.array([], dtype=int)
         _TROUGHS[symbol] = np.array([], dtype=int)
+        _SYMBOL_FPS[symbol] = _fp
         _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
         computed += 1
 
@@ -267,12 +330,21 @@ def get_precomputed(
         (indicator_df, peaks, troughs)
         若股票不足 60 根 K 线，返回 (空 DataFrame, [], [])。
     """
-    # 1. 内存缓存
-    if symbol in _IN_MEMORY:
+    # 1. 内存缓存（校验所属批次指纹，防止跨窗口切片污染）
+    if symbol in _IN_MEMORY and _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT:
+        return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+    elif symbol in _IN_MEMORY and _ACTIVE_FINGERPRINT is None:
         return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
-    # 2. 磁盘缓存
-    if _load_from_disk(symbol):
+    # 2. 磁盘缓存（校验指纹：数据范围/内容变化时缓存失效，防止 WFO 窗口切片污染）
+    if stock_dir is not None:
+        fpath = os.path.join(stock_dir, f"{symbol}.parquet")
+        if os.path.exists(fpath):
+            _fp = _data_fingerprint(pd.read_parquet(fpath))
+            if _load_from_disk(symbol, expected_fp=_fp):
+                _SYMBOL_FPS[symbol] = _fp
+                return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+    elif _load_from_disk(symbol):
         return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
     # 3. Fallback：实时计算（只在非向量化模式或无 Phase 0 时触发）
@@ -288,6 +360,7 @@ def get_precomputed(
         _IN_MEMORY[symbol] = pd.DataFrame()
         _PEAKS[symbol] = np.array([], dtype=int)
         _TROUGHS[symbol] = np.array([], dtype=int)
+        _SYMBOL_FPS[symbol] = _data_fingerprint(df_raw)
         return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
     from BackTrading.prepare import _compute_indicators
@@ -297,5 +370,6 @@ def get_precomputed(
     _IN_MEMORY[symbol] = df_ind
     _PEAKS[symbol] = np.array([], dtype=int)
     _TROUGHS[symbol] = np.array([], dtype=int)
+    _SYMBOL_FPS[symbol] = _data_fingerprint(df_raw)
     _save_to_disk(symbol, df_ind, np.array([], dtype=int), np.array([], dtype=int))
     return df_ind, np.array([], dtype=int), np.array([], dtype=int)

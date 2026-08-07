@@ -142,17 +142,39 @@ def _compute_param_hash(params: dict[str, Any]) -> str:
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
-def _cache_dir_for(trade_date: str, param_hash: str | None = None, config_hash: str | None = None) -> Path:
+def _data_fingerprint(kline_df: pd.DataFrame) -> str:
+    """信号缓存隔离用数据指纹：区分不同日期范围/股票列表的输入数据。
+
+    修复 WFO 污染：信号缓存 key 原先只有 (trade_date, config, param)，
+    窗口切片的 prepare（如 2023-01~2025-11）生成的缓存会被更大范围的
+    调用命中（key 相同），导致 2025-11 之后的信号全部 fillna(0)。
+    """
+    try:
+        dates = kline_df["trade_date"]
+        syms = sorted(kline_df["symbol"].astype(str).dropna().unique())
+        raw = (
+            f"{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
+            f"{hashlib.md5('|'.join(syms).encode()).hexdigest()[:8]}"
+        )
+        return hashlib.md5(raw.encode()).hexdigest()[:10]
+    except Exception:
+        return "unknown"
+
+
+def _cache_dir_for(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> Path:
     """信号缓存目录路径。
-    
-    格式: signal_cache_{trade_date}_{config_hash}_{param_hash}/
-    config_hash 自动计算（无需传入），param_hash 区分同一天不同回测参数组合。
+
+    格式: signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/
+    config_hash 自动计算（无需传入），param_hash 区分同一天不同回测参数组合，
+    data_fp 区分不同数据范围/股票列表（防止窗口切片缓存污染全量调用）。
     """
     if config_hash is None:
         config_hash = _compute_config_hash()
     base = CACHE_DIR / f"signal_cache_{trade_date}_{config_hash}"
     if param_hash:
         base = CACHE_DIR / f"signal_cache_{trade_date}_{config_hash}_{param_hash}"
+    if data_fp:
+        base = CACHE_DIR / f"{base.name}_{data_fp}"
     return base
 
 
@@ -169,8 +191,8 @@ def _symbol_cache_path(cache_dir: Path, symbol: str) -> Path:
     return bucket_dir / f"{symbol}.parquet"
 
 
-def _completed_symbols(trade_date: str, param_hash: str | None = None, config_hash: str | None = None) -> set[str]:
-    cd = _cache_dir_for(trade_date, param_hash, config_hash)
+def _completed_symbols(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> set[str]:
+    cd = _cache_dir_for(trade_date, param_hash, config_hash, data_fp)
     if not cd.exists():
         return set()
     symbols = set()
@@ -186,8 +208,8 @@ def _save_stock_signal(cache_dir: Path, symbol: str, rows: list[dict]) -> None:
     pd.DataFrame(rows).to_parquet(path, index=False, compression="zstd", compression_level=3)
 
 
-def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_hash: str | None = None) -> pd.DataFrame | None:
-    cd = _cache_dir_for(trade_date, param_hash, config_hash)
+def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> pd.DataFrame | None:
+    cd = _cache_dir_for(trade_date, param_hash, config_hash, data_fp)
     if not cd.exists():
         return None
     files = []
@@ -300,16 +322,17 @@ def prepare_backtest_data(
         params = base
 
     config_hash = _compute_config_hash()
-    cache_tag = f"cfg={config_hash},param={signal_param_hash}"
+    data_fp = _data_fingerprint(kline_df)
+    cache_tag = f"cfg={config_hash},param={signal_param_hash},data={data_fp}"
 
     random.seed(42)
     np.random.seed(42)
 
     trade_date = _trade_day_str()
-    cache_dir = _cache_dir_for(trade_date, signal_param_hash, config_hash)
+    cache_dir = _cache_dir_for(trade_date, signal_param_hash, config_hash, data_fp)
 
     symbols = sorted(kline_df["symbol"].unique())
-    done = _completed_symbols(trade_date, signal_param_hash, config_hash)
+    done = _completed_symbols(trade_date, signal_param_hash, config_hash, data_fp)
     missing = [s for s in symbols if s not in done]
 
     def _finalize(kline, signal) -> pd.DataFrame:
@@ -359,7 +382,7 @@ def prepare_backtest_data(
     if done:
         if not missing:
             logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
-            signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+            signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
             if signal_df is not None:
                 return _finalize(kline_df, signal_df)
         else:
@@ -367,7 +390,7 @@ def prepare_backtest_data(
 
     if not missing:
         logger.info("无需要计算的股票")
-        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
         if signal_df is not None:
             return _finalize(kline_df, signal_df)
         return kline_df
@@ -385,8 +408,10 @@ def prepare_backtest_data(
             )
 
         # Phase 0: 预计算所有股票的技术指标 + peak/trough（仅一次，后续评估复用）
+        # fingerprint=data_fp：跨数据批次（WFO 窗口/路径切片）切换时清空指标内存缓存，
+        # 防止 worker 复用旧切片的指标导致信号日期错位（2026-08-07 OOS 0 交易根因）。
         if vectorized:
-            precompute_all_indicators(stock_dir)
+            precompute_all_indicators(stock_dir, fingerprint=data_fp)
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES
@@ -457,11 +482,11 @@ def prepare_backtest_data(
     logger.info(f"加载信号缓存合并...")
     _t_load = time.time()
     try:
-        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
     except MemoryError:
         logger.error("读取信号缓存内存不足(MemoryError)，尝试强制 GC 后重试一次")
         gc.collect()
-        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash)
+        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
     logger.info(f"读取信号缓存耗时 {time.time()-_t_load:.1f}s")
     if signal_df is None or signal_df.empty:
         logger.warning(f"所有信号计算失败（signal_df={type(signal_df).__name__}），返回原始 K 线")
