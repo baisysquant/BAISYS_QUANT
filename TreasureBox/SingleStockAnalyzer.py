@@ -146,20 +146,8 @@ def fetch_kline_data(symbol: str, days: int = 300) -> pd.DataFrame | None:
     return None
 
 
-# ── 主流程 ────────────────────────────────────────────────────────────────
-def main() -> None:
-    print_header()
-
-    # 1. 用户输入 ──────────────────────────────────────────────────────
-    if len(sys.argv) > 1:
-        raw_code = sys.argv[1]
-    else:
-        raw_code = input("\n  请输入股票代码 (6位数字，如 000001): ").strip()
-
-    if not raw_code:
-        print("  [ERROR] 未输入股票代码")
-        return
-
+# ── 单只股票分析 ──────────────────────────────────────────────────────────
+def analyze_stock(raw_code: str) -> None:
     pure_code = CodeNormalizer.normalize(raw_code)
     symbol = CodeNormalizer.add_market_prefix(raw_code)
     print(f"\n  [-] 股票代码: {pure_code}  ({symbol})")
@@ -252,6 +240,37 @@ def main() -> None:
         print(f"  综合结论: {bull_result.get('conclusion', 'N/A')}")
     print("=" * WIDTH)
     print()
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────
+def main() -> None:
+    print_header()
+
+    if len(sys.argv) > 1:
+        first_code = sys.argv[1]
+        analyze_stock(first_code)
+        if first_code:
+            _ask_continue()
+        return
+
+    while True:
+        raw_code = input("\n  请输入股票代码 (6位数字，如 000001): ").strip()
+        if not raw_code:
+            print("  [ERROR] 未输入股票代码")
+            continue
+        analyze_stock(raw_code)
+        if not _ask_continue():
+            break
+
+
+def _ask_continue() -> bool:
+    """询问用户继续还是退出，输入 1 继续，其他输入退出"""
+    print("=" * WIDTH)
+    choice = input("  输入 1 继续分析，其他任意键退出: ").strip()
+    if choice == "1":
+        return True
+    print("  再见！")
+    return False
 
 
 if __name__ == "__main__":
