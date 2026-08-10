@@ -62,6 +62,29 @@ def _sobol_samples(n: int, d: int, seed: int = 42) -> np.ndarray:
     return sampler.random(n_pow2)[:n]
 
 
+# ── 去重与 GP 去退化 ──
+
+def _unique_x_agg(X: np.ndarray, Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """按坐标去重聚合：重复点取 y 均值，修复 GP 退化（同 x 异 y → 表面平坦）。
+
+    归一化坐标由同一管线生成（确定性），重复坐标必然对应同一参数组合；
+    去重后 GP 拟合的观测集才是真唯一的参数点集合。
+    """
+    Xa = np.asarray(X, dtype=float)
+    Ya = np.asarray(Y, dtype=float)
+    if len(Xa) == 0:
+        return Xa, Ya
+    Xr = np.round(Xa, 10)
+    _, idx, inv = np.unique(Xr, axis=0, return_index=True, return_inverse=True)
+    if len(idx) == len(Xa):
+        return Xa, Ya
+    Y_agg = np.zeros(len(idx))
+    np.add.at(Y_agg, inv, Ya)
+    counts = np.bincount(inv)
+    Y_agg /= np.maximum(counts, 1)
+    return Xa[idx], Y_agg
+
+
 # ── 局部精细化（L-BFGS-B on GP 代理） ──
 
 def _local_refine(
@@ -109,6 +132,7 @@ def optimize_window(
     eval_start_date: str | None = None,
     st_history: dict | None = None,
     exclude_st: bool = True,
+    data_version: str | None = None,
 ) -> tuple[dict[str, float], GPState | None, list[dict[str, float]], float]:
     """单窗口贝叶斯优化（4 阶段）。
 
@@ -139,7 +163,7 @@ def optimize_window(
     n_signal = len(signal_sp)
     n_total = len(spaces)
 
-    controller = FidelityController(kline_df, engine_cfg, compute_exit_strategy, vectorized=True, eval_start_date=eval_start_date, st_history=st_history, exclude_st=exclude_st)
+    controller = FidelityController(kline_df, engine_cfg, compute_exit_strategy, vectorized=True, eval_start_date=eval_start_date, st_history=st_history, exclude_st=exclude_st, data_version=data_version)
     _opt_t0 = time.time()
 
     best_sharpe_local = -1e10
@@ -148,6 +172,25 @@ def optimize_window(
     X_hist: list[np.ndarray] = []
     Y_hist: list[float] = []
     params_hist: list[dict[str, float]] = []
+
+    # ── 评估去重：同一参数组合只算一次 ──
+    # GP 在重复点（Phase1 信号坐标恒为默认值、Phase2 组合坐标冻结在 best）下
+    # 表面平坦，EI 会反复提议已评估点；这里全局兜底 + 连续重复转随机探索。
+    _seen: dict[tuple[tuple[str, float], ...], dict[str, Any]] = {}
+    _consecutive_skips = 0
+
+    def _params_key(p: dict[str, float]) -> tuple[tuple[str, float], ...]:
+        return tuple(sorted((k, round(float(v), 8)) for k, v in p.items()))
+
+    def _eval_once(params: dict[str, float], fidelity: int) -> dict[str, Any]:
+        key = _params_key(params)
+        hit = _seen.get(key)
+        if hit is not None:
+            logger.debug(f"  [去重] 参数已评估过，复用结果: sharpe={hit['sharpe']:.4f}")
+            return hit
+        result = controller.evaluate(params, fidelity=fidelity)
+        _seen[key] = result
+        return result
 
     def _track(sharpe: float, params: dict[str, float], x: np.ndarray, equity: Any = None) -> None:
         nonlocal best_sharpe_local, best_params_local, best_equity_local
@@ -173,11 +216,12 @@ def optimize_window(
     if n_portfolio > 0:
         logger.info(f"[Phase 1/4] Sobol init: {n_init} 组 (组合空间 Level2, 信号=默认)")
         sobol_x = _sobol_samples(n_init, n_portfolio, seed=seed)
+        _consecutive_skips = 0
         for i in range(n_init):
             port_params = _from_normalized(sobol_x[i], portfolio_sp)
             params = {**default_signal, **port_params}
             x_norm = _to_normalized(params, spaces)
-            result = controller.evaluate(params, fidelity=0)
+            result = _eval_once(params, fidelity=0)
             sharpe = result["sharpe"]
             _track(sharpe, params, x_norm, result.get("equity"))
             if progress_cb:
@@ -186,10 +230,11 @@ def optimize_window(
     else:
         logger.info(f"[Phase 1/4] Sobol init: {n_init} 组 (全空间 Level2)")
         sobol_x = _sobol_samples(n_init, n_total, seed=seed)
+        _consecutive_skips = 0
         for i in range(n_init):
             params = _from_normalized(sobol_x[i], spaces)
             x_norm = sobol_x[i].reshape(1, -1)
-            result = controller.evaluate(params, fidelity=0)
+            result = _eval_once(params, fidelity=0)
             sharpe = result["sharpe"]
             _track(sharpe, params, x_norm.ravel(), result.get("equity"))
             if progress_cb:
@@ -201,10 +246,10 @@ def optimize_window(
     # ═══════════════════════════════════════════════════════════
     if n_signal > 0 and n_iter_signal > 0:
         logger.info(f"[Phase 2/4] Bayes signal: {n_iter_signal} 轮 (全空间GP)")
-        X_all = np.array(X_hist)
-        Y_arr = np.array(Y_hist)
+        X_all, Y_arr = _unique_x_agg(np.array(X_hist), np.array(Y_hist))
         # 信号 + 组合参数边界
         signal_bounds = np.array([[0.0, 1.0]] * n_signal)
+        _consecutive_skips = 0
 
         for i in range(n_iter_signal):
             gp = build_gp(
@@ -245,13 +290,33 @@ def optimize_window(
                 for k, sp in portfolio_sp.items()
             }
             params = {**sig_params, **best_port_params}
-            result = controller.evaluate(params, fidelity=1)
+            # ── 去重：EI 在退化 GP 上会反复提议已评估点，命中即跳过 ──
+            if _params_key(params) in _seen:
+                _consecutive_skips += 1
+                if _consecutive_skips >= 3:
+                    logger.info(
+                        f"  Bayes-Sig[{i}] 连续 {_consecutive_skips} 次重复提议，转随机探索"
+                    )
+                    rng_fb = np.random.RandomState(seed + 9000 + i)
+                    for _attempt in range(200):
+                        sig_params = _from_normalized(rng_fb.uniform(0, 1, n_signal), signal_sp)
+                        params = {**sig_params, **best_port_params}
+                        if _params_key(params) not in _seen:
+                            break
+                    _consecutive_skips = 0
+                else:
+                    logger.info(f"  Bayes-Sig[{i}] 重复提议已评估参数，跳过评估（第 {_consecutive_skips} 次连续）")
+                    if progress_cb:
+                        progress_cb(2, i, n_iter_signal, _seen[_params_key(params)]["sharpe"])
+                    continue
+            else:
+                _consecutive_skips = 0
+            result = _eval_once(params, fidelity=1)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
             _track(sharpe, params, x_norm, result.get("equity"))
 
-            X_all = np.array(X_hist)
-            Y_arr = np.array(Y_hist)
+            X_all, Y_arr = _unique_x_agg(np.array(X_hist), np.array(Y_hist))
 
             if progress_cb:
                 progress_cb(2, i, n_iter_signal, sharpe)
@@ -278,21 +343,24 @@ def optimize_window(
 
     if n_init_portfolio > 0 and len(portfolio_sp) > 0:
         sobol_port = _sobol_samples(n_init_portfolio, len(portfolio_sp), seed=seed + 999)
+        _consecutive_skips = 0
         for i in range(n_init_portfolio):
             port_params = _from_normalized(sobol_port[i], portfolio_sp)
             params = {**best_signal_params, **port_params}
             x_norm = _to_normalized(params, spaces)
-            result = controller.evaluate(params, fidelity=0)
+            result = _eval_once(params, fidelity=0)
             sharpe = result["sharpe"]
             _track(sharpe, params, x_norm, result.get("equity"))
             if progress_cb:
                 progress_cb(3, i, n_init_portfolio + n_iter_portfolio, sharpe)
 
     if len(portfolio_sp) > 0:
+        _consecutive_skips = 0
         for i in range(n_iter_portfolio):
             # 构建 GP 只用于组合参数（信号参数已固定）
-            X_port = np.array([x[n_signal:] for x in X_hist])
-            Y_arr = np.array(Y_hist)
+            X_port, Y_arr = _unique_x_agg(
+                np.array([x[n_signal:] for x in X_hist]), np.array(Y_hist)
+            )
 
             if len(X_port) < 3:
                 logger.debug(f"  组合参数数据点 < 3，跳过 BO 迭代")
@@ -313,7 +381,30 @@ def optimize_window(
             )
             port_params = _from_normalized(x_cand, portfolio_sp)
             params = {**best_signal_params, **port_params}
-            result = controller.evaluate(params, fidelity=0)
+            # ── 去重：组合参数被冻结/退化时 EI 同样会反复提议同一点 ──
+            if _params_key(params) in _seen:
+                _consecutive_skips += 1
+                if _consecutive_skips >= 3:
+                    logger.info(
+                        f"  Bayes-Port[{i}] 连续 {_consecutive_skips} 次重复提议，转随机探索"
+                    )
+                    rng_fb = np.random.RandomState(seed + 9500 + i)
+                    for _attempt in range(200):
+                        port_params = _from_normalized(
+                            rng_fb.uniform(0, 1, len(portfolio_sp)), portfolio_sp
+                        )
+                        params = {**best_signal_params, **port_params}
+                        if _params_key(params) not in _seen:
+                            break
+                    _consecutive_skips = 0
+                else:
+                    logger.info(f"  Bayes-Port[{i}] 重复提议已评估参数，跳过评估（第 {_consecutive_skips} 次连续）")
+                    if progress_cb:
+                        progress_cb(3, n_init_portfolio + i, n_init_portfolio + n_iter_portfolio, _seen[_params_key(params)]["sharpe"])
+                    continue
+            else:
+                _consecutive_skips = 0
+            result = _eval_once(params, fidelity=0)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
             _track(sharpe, params, x_norm, result.get("equity"))
@@ -329,21 +420,22 @@ def optimize_window(
     # ═══════════════════════════════════════════════════════════
     if n_signal > 0 and len(X_hist) >= 3:
         logger.info(f"[Phase 4/4] Local refinement: top-{n_refine_top}")
-        X_all_arr = np.array([x[:n_signal] for x in X_hist])
-        Y_all_arr = np.array(Y_hist)
+        X_all_arr, Y_all_arr = _unique_x_agg(
+            np.array([x[:n_signal] for x in X_hist]), np.array(Y_hist)
+        )
 
         gp_refine = build_gp(X_all_arr, Y_all_arr, n_restarts=3)
         top_idx = np.argsort(Y_all_arr)[-n_refine_top:]
 
         # 取当前最优组合参数
-        best_full_x = np.array([x for x in X_hist])[Y_all_arr.argmax()]
+        best_full_x = np.array([x for x in X_hist])[Y_hist.index(max(Y_hist))]
         best_port_params = _from_normalized(best_full_x[n_signal:], portfolio_sp)
 
         for idx in top_idx:
             refined = _local_refine(X_all_arr[idx], gp_refine, np.array([[0.0, 1.0]] * n_signal))
             sig_params = _from_normalized(refined, signal_sp)
             params = {**sig_params, **best_port_params}
-            result = controller.evaluate(params, fidelity=1)
+            result = _eval_once(params, fidelity=1)
             sharpe = result["sharpe"]
             x_norm = _to_normalized(params, spaces)
             _track(sharpe, params, x_norm, result.get("equity"))
@@ -359,8 +451,9 @@ def optimize_window(
     gp_state = None
     if len(X_hist) > 0:
         try:
-            X_all_final = np.array([x for x in X_hist])
-            Y_all_final = np.array(Y_hist)
+            X_all_final, Y_all_final = _unique_x_agg(
+                np.array([x for x in X_hist]), np.array(Y_hist)
+            )
             sub_states: dict[int, GPState] = {}
             if n_signal > 0:
                 sub_states[n_signal] = save_gp_state(

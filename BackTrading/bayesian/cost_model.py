@@ -17,6 +17,7 @@ from BackTrading._engine_legacy import (
     _run_single_backtest,
 )
 from BackTrading.prepare import prepare_backtest_data, _compute_param_hash
+from BackTrading.prepare import _data_fingerprint as _prepare_data_fingerprint
 
 # 影响信号计算的参数名（必须与 prepare._compute_param_hash 一致）
 _SIGNAL_PARAM_KEYS = frozenset({
@@ -38,9 +39,11 @@ _TUNABLE_CFG_FIELDS = frozenset({
 # ── 全局信号缓存（跨路径跨窗口共享） ──
 # key: (config_hash, data_fingerprint, param_hash) → DataFrame
 # 注意：每个条目 ~0.7 GiB（1.8M 行 × 50 列），磁盘缓存已保底，
-# 内存仅保留最近 1 份，防止多窗口同时驻留多份大盘在 Windows 上触发 OOM 终止。
+# 内存保留最近 _GLOBAL_CACHE_MAX 份：Phase1/2/3 交替评估的信号组
+# （默认参数、best 信号、refine 候选）可同时驻留，避免来回踢缓存导致
+# 同一参数组反复全量重算。4 份 ≈ 2.8GiB，若内存紧张可调回 2。
 _GLOBAL_SIGNAL_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
-_GLOBAL_CACHE_MAX = 1
+_GLOBAL_CACHE_MAX = 4
 _GLOBAL_CACHE_LOCK = threading.Lock()
 
 
@@ -69,13 +72,8 @@ def _signal_hash(params: dict[str, Any]) -> str:
 
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
-    """给 kline_df 切片生成指纹，区分不同 CV 路径的日期区间与股票列表。"""
-    dates = df["trade_date"]
-    symbols = df["symbol"]
-    sym_list = sorted(symbols.dropna().unique())
-    sym_hash = hashlib.md5("|".join(sym_list).encode()).hexdigest()[:8]
-    raw = f"{len(df)}_{dates.min()}_{dates.max()}_{len(sym_list)}_{sym_hash}"
-    return hashlib.md5(raw.encode()).hexdigest()[:8]
+    """与 prepare._data_fingerprint 保持同一实现（含内容哈希），避免两处漂移。"""
+    return _prepare_data_fingerprint(df)
 
 
 def _make_eval_cfg(base: EngineConfig, params: dict[str, Any]) -> EngineConfig:
@@ -107,6 +105,7 @@ class FidelityController:
         eval_start_date: str | None = None,
         st_history: dict | None = None,
         exclude_st: bool = True,
+        data_version: str | None = None,
     ):
         self._kline = kline_df
         self._base_cfg = base_engine_cfg
@@ -118,6 +117,8 @@ class FidelityController:
         # ST/退市逐日动态剔除（与 runner 最终回测口径一致，注入引擎 params）
         self._st_history = st_history
         self._exclude_st = exclude_st
+        # P3.1 数据版本（入 ML 冻结缓存 key 与信号缓存指纹，增量同步后整库失效）
+        self._data_version = data_version
         # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
         #（跨参数组合的命中率本来就低，多窗口下每份 ~0.7GiB 是 OOM 主因）
         self._signal_cache: dict[str, pd.DataFrame] = {}
@@ -127,6 +128,8 @@ class FidelityController:
         self._has_signals = self._SIGNAL_COLS.issubset(set(kline_df.columns))
         # 数据指纹（用于全局缓存键）
         self._data_key = _data_fingerprint(kline_df) if not self._has_signals else ""
+        if data_version:
+            self._data_key = f"{self._data_key or 'pre'}:{data_version}"
 
     def _config_hash(self) -> str:
         """计算当前 BaseConfig 的哈希，用于全局缓存键。"""
@@ -164,6 +167,9 @@ class FidelityController:
                     # 查全局缓存（跨路径共享）
                     global_key = (self._config_hash(), self._data_key, sig_hash)
                     data = _GLOBAL_SIGNAL_CACHE.get(global_key)
+                    if data is not None:
+                        with _GLOBAL_CACHE_LOCK:
+                            _GLOBAL_SIGNAL_CACHE.move_to_end(global_key)
                     if data is None:
                         _t_p = time.perf_counter()
                         data = prepare_backtest_data(
@@ -171,6 +177,7 @@ class FidelityController:
                             compute_exit_strategy=self._compute_exit,
                             vectorized=self._vectorized,
                             backtest_start_date=self._eval_start_date,
+                            data_version=self._data_version,
                         )
                         logger.debug(f"  [evaluate] 信号准备耗时 {time.perf_counter()-_t_p:.1f}s（data={len(data)} 行, hash={sig_hash}）")
                         with _GLOBAL_CACHE_LOCK:
@@ -233,6 +240,9 @@ class FidelityController:
             # 检查全局缓存
             global_key = (self._config_hash(), self._data_key, sig_hash)
             data = _GLOBAL_SIGNAL_CACHE.get(global_key)
+            if data is not None:
+                with _GLOBAL_CACHE_LOCK:
+                    _GLOBAL_SIGNAL_CACHE.move_to_end(global_key)
             if data is None:
                 _t_p = time.perf_counter()
                 data = prepare_backtest_data(
@@ -240,6 +250,7 @@ class FidelityController:
                     compute_exit_strategy=self._compute_exit,
                     vectorized=self._vectorized,
                     backtest_start_date=self._eval_start_date,
+                    data_version=self._data_version,
                 )
                 logger.debug(f"  [warm_cache] 信号准备耗时 {time.perf_counter()-_t_p:.1f}s（data={len(data)} 行, hash={sig_hash}）")
                 with _GLOBAL_CACHE_LOCK:

@@ -68,11 +68,11 @@ def _detect_market_regime(df: pd.DataFrame, boll_col: str | None = None,
     if params is None:
         params = {}
     close = float(df['close'].iloc[-1])
-    ma5 = float(df['MA_5'].iloc[-1])
-    ma10 = float(df['MA_10'].iloc[-1])
-    ma20 = float(df['MA_20'].iloc[-1])
-    ma30 = float(df['MA_30'].iloc[-1])
-    ma60 = float(df['MA_60'].iloc[-1])
+    ma5 = float(df['MA_5'].iloc[-1]) if 'MA_5' in df.columns else 0
+    ma10 = float(df['MA_10'].iloc[-1]) if 'MA_10' in df.columns else 0
+    ma20 = float(df['MA_20'].iloc[-1]) if 'MA_20' in df.columns else 0
+    ma30 = float(df['MA_30'].iloc[-1]) if 'MA_30' in df.columns else 0
+    ma60 = float(df['MA_60'].iloc[-1]) if 'MA_60' in df.columns else 0
     ma_bullish = ma5 > ma10 > ma20 > ma30 > ma60
     ma_bearish = ma5 < ma10 < ma20 < ma30 < ma60
     dif = df['DIF'].iloc[-1] if 'DIF' in df.columns else 0
@@ -116,19 +116,20 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
     if params is None:
         params = {}
 
-    high = df['high']
-    low = df['low']
     close_series = df['close']
-
-    close = df.attrs.get('latest_price', None)
-    if close is None:
-        close = float(close_series.iloc[-1])
 
     atr_val = float(df['ATR'].iloc[-1]) if 'ATR' in df.columns else float('nan')
 
     if pd.isna(atr_val) or atr_val <= 0:
         return {'stop_loss': None, 't1_target': None, 't2_target': None,
                 'trailing_stop': None, 'exit_rrr': None}
+
+    high = df['high']
+    low = df['low']
+
+    close = df.attrs.get('latest_price', None)
+    if close is None:
+        close = float(close_series.iloc[-1])
 
     atr_stop = params.get('atr_stop_mult', 1.5)
     atr_t1 = params.get('atr_t1_mult', 3.0)

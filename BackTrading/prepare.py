@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import tempfile
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from concurrent.futures.process import BrokenProcessPool
@@ -23,6 +24,14 @@ from loguru import logger
 
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.ml.signal_model import apply_ml_signal
+
+# ── ML 预测列冻结缓存（P1 特征/参数解耦） ──
+# key: (config_hash, data_fp) → DataFrame[symbol, trade_date, 进场评分]
+# ML 只按数据版本重训一次（该版本的"首帧"，优化器路径下即默认参数帧），
+# 后续任意参数变体直接注入冻结预测，不再重训 XGBoost（~800s → 秒级）。
+# 未预测日期（预热期/模型不显著回退）保持原生评分，语义与 apply_ml_signal 一致。
+_ML_PRED_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+_ML_PRED_LOCK = threading.Lock()
 
 # 向量化信号引擎（延迟导入，在导入时解析以避免 Windows spawn 锁）
 try:
@@ -142,19 +151,32 @@ def _compute_param_hash(params: dict[str, Any]) -> str:
     return hashlib.md5(s.encode()).hexdigest()[:8]
 
 
-def _data_fingerprint(kline_df: pd.DataFrame) -> str:
-    """信号缓存隔离用数据指纹：区分不同日期范围/股票列表的输入数据。
+def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -> str:
+    """信号缓存隔离用数据指纹：区分不同日期范围/股票列表/内容的输入数据。
 
     修复 WFO 污染：信号缓存 key 原先只有 (trade_date, config, param)，
     窗口切片的 prepare（如 2023-01~2025-11）生成的缓存会被更大范围的
     调用命中（key 相同），导致 2025-11 之后的信号全部 fillna(0)。
+
+    内容哈希：增量同步 / 复权因子改写会改变 OHLC 内容而保持行数与日期范围
+    不变，旧指纹下会静默复用脏缓存；现对 OHLCV 采样行做 md5，
+    内容变化即整库失效（宁可全废，不可错用）。
+
+    data_version: P3.1 显式数据版本标识（如 kline 表 max(trade_date)+行数
+    摘要）。增量同步不改 OHLC 内容时也能让缓存失效，杜绝脏复用。
     """
     try:
         dates = kline_df["trade_date"]
         syms = sorted(kline_df["symbol"].astype(str).dropna().unique())
+        content = ""
+        cols = [c for c in ("open", "high", "low", "close", "volume") if c in kline_df.columns]
+        if cols:
+            step = max(1, len(kline_df) // 20000)
+            sampled = kline_df.iloc[::step]
+            content = hashlib.md5(sampled[cols].values.tobytes()).hexdigest()[:8]
         raw = (
-            f"{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
-            f"{hashlib.md5('|'.join(syms).encode()).hexdigest()[:8]}"
+            f"{data_version or ''}|{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
+            f"{hashlib.md5('|'.join(syms).encode()).hexdigest()[:8]}_{content}"
         )
         return hashlib.md5(raw.encode()).hexdigest()[:10]
     except Exception:
@@ -286,6 +308,7 @@ def prepare_backtest_data(
     compute_exit_strategy: bool = False,
     vectorized: bool = False,
     backtest_start_date: str | None = None,
+    data_version: str | None = None,
 ) -> pd.DataFrame:
     is_flat = params is not None and (
         "atr_stop_mult" in params
@@ -322,7 +345,7 @@ def prepare_backtest_data(
         params = base
 
     config_hash = _compute_config_hash()
-    data_fp = _data_fingerprint(kline_df)
+    data_fp = _data_fingerprint(kline_df, data_version=data_version)
     cache_tag = f"cfg={config_hash},param={signal_param_hash},data={data_fp}"
 
     random.seed(42)
@@ -340,9 +363,26 @@ def prepare_backtest_data(
         del kline, signal
         gc.collect()
         _t_ml = time.time()
-        logger.info(f"  ML 信号覆写开始（{len(merged)} 行, {merged['symbol'].nunique()} 只），XGBoost 重训可能较久...")
-        merged = apply_ml_signal(merged)
-        logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s")
+        # ── ML 解耦：预测列按数据版本冻结，参数变体不重训 ──
+        ml_key = (config_hash, data_fp)
+        with _ML_PRED_LOCK:
+            ml_pred = _ML_PRED_CACHE.get(ml_key)
+        if ml_pred is None:
+            logger.info(f"  ML 信号覆写开始（{len(merged)} 行, {merged['symbol'].nunique()} 只），XGBoost 重训一次...")
+            merged = apply_ml_signal(merged)
+            ml_pred = merged[["symbol", "trade_date", "进场评分"]].copy()
+            with _ML_PRED_LOCK:
+                _ML_PRED_CACHE[ml_key] = ml_pred
+            logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s（预测已冻结，后续参数变体不再重训）")
+        else:
+            merged = merged.merge(
+                ml_pred.rename(columns={"进场评分": "ML进场评分"}),
+                on=["symbol", "trade_date"], how="left",
+            )
+            _ml_fill = merged["ML进场评分"].notna()
+            merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML进场评分"]
+            merged = merged.drop(columns=["ML进场评分"])
+            logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
         if _saved_atr_stop is not None and "ATR" in merged.columns:
             stop_raw = merged["close"] - merged["ATR"] * _saved_atr_stop
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100

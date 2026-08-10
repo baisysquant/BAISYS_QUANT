@@ -209,6 +209,73 @@ def test_meta_optimizer(bayesian_test_df, basic_spaces) -> None:
     assert result.iloc[0]["sharpe_ratio"] is not None
 
 
+class TestWindowDatesCpcv:
+    def _dates(self, n: int):
+        import pandas as pd
+        return pd.bdate_range("2023-01-01", periods=n).strftime("%Y-%m-%d").tolist()
+
+    def test_baseline_no_purge_no_embargo(self) -> None:
+        from BackTrading.bayesian.meta_optimizer import _window_dates
+        dates = self._dates(100)
+        windows = _window_dates(dates, train_period=40, test_period=10, offset=0)
+        # 步长 = test_period，训练/测试首尾相接
+        tr_s, tr_e, te_s, te_e = windows[0]
+        assert tr_e == te_s
+        assert te_e - te_s == 10
+        assert len(windows) == 6  # (100-40)//10 = 6
+
+    def test_purge_shrinks_train_end(self) -> None:
+        from BackTrading.bayesian.meta_optimizer import _window_dates
+        dates = self._dates(100)
+        windows = _window_dates(dates, train_period=40, test_period=10, offset=0, purge_days=5)
+        tr_s, tr_e, te_s, te_e = windows[0]
+        # 训练尾部剔除 5 天：tr_e = start+40-5，测试起点仍 = start+40
+        assert tr_e == te_s - 5
+        assert te_s == 40
+
+    def test_embargo_gap_between_train_and_test(self) -> None:
+        from BackTrading.bayesian.meta_optimizer import _window_dates
+        dates = self._dates(120)
+        windows = _window_dates(dates, train_period=40, test_period=10, offset=0, embargo_days=3)
+        tr_s, tr_e, te_s, te_e = windows[0]
+        assert te_s - tr_e == 3  # 禁运间隔
+        assert len(windows) == 6  # 步长 = 10+3=13，start∈{0,13,26,39,52,65}
+
+    def test_purge_and_embargo_combined(self) -> None:
+        from BackTrading.bayesian.meta_optimizer import _window_dates
+        dates = self._dates(120)
+        windows = _window_dates(dates, train_period=40, test_period=10, offset=0,
+                                purge_days=5, embargo_days=3)
+        tr_s, tr_e, te_s, te_e = windows[0]
+        assert tr_e == 35          # 40 - 5
+        assert te_s - tr_e == 8    # purge(5) + embargo(3) 的总间隔
+        assert windows[0] != windows[1]
+
+    def test_purge_larger_than_train_skips_invalid(self) -> None:
+        from BackTrading.bayesian.meta_optimizer import _window_dates
+        dates = self._dates(100)
+        # purge 吃掉整个训练期 → 无有效窗口
+        windows = _window_dates(dates, train_period=10, test_period=5, offset=0, purge_days=10)
+        assert windows == []
+
+
+def test_fallback_frame_has_full_schema(bayesian_test_df, basic_spaces) -> None:
+    """无有效窗口时返回的兜底帧必须含 runner 依赖的全部绩效列。"""
+    from BackTrading.bayesian.meta_optimizer import bayesian_walk_forward_multi
+    # 数据量满足最低门槛，但 purge 吃掉全部训练期 → 所有窗口无效 → 兜底帧
+    result = bayesian_walk_forward_multi(
+        kline_df=bayesian_test_df, train_period=120, test_period=15,
+        num_paths=2, initial_cash=1_000_000, spaces=basic_spaces,
+        purge_days=200,
+    )
+    assert not result.empty
+    for col in ("window", "params", "sharpe_ratio", "total_return",
+                "max_drawdown", "num_combos", "num_paths"):
+        assert col in result.columns, f"兜底帧缺少列 {col}"
+    assert result.iloc[0]["total_return"] == 0.0
+    assert result.iloc[0]["max_drawdown"] == 0.0
+
+
 def test_fidelity_controller_with_signals(bayesian_test_df, basic_engine_cfg) -> None:
     from BackTrading.bayesian.cost_model import FidelityController
     ctrl = FidelityController(bayesian_test_df, basic_engine_cfg)

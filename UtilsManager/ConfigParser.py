@@ -401,6 +401,16 @@ class BacktestConfig(BaseModel):
     BAYESIAN_N_ITER_SIGNAL: int = Field(default=35, ge=10, le=200)
     BAYESIAN_N_INIT_PORTFOLIO: int = Field(default=50, ge=5, le=100)
     BAYESIAN_N_ITER_PORTFOLIO: int = Field(default=250, ge=20, le=500)
+    # ── P2.4 预算制：总时间上限 + 连续无改进早停 ──
+    BAYESIAN_TIME_BUDGET_SECONDS: int = Field(default=8 * 3600, ge=600, le=24 * 3600,
+                                              description="WFO 总时间预算（秒），超时提前终止")
+    BAYESIAN_MAX_NO_IMPROVE_WINDOWS: int = Field(default=3, ge=1, le=10,
+                                                 description="连续无 OOS 改进窗口数，达到即提前终止本路径")
+    # ── P2.1 CPCV：训练尾部净化（标签视界）+ 训练/OOS 禁运间隔 ──
+    BAYESIAN_CPCV_PURGE_DAYS: int = Field(default=5, ge=0, le=60,
+                                          description="CPCV 净化天数：训练窗口尾部剔除（前向收益标签视界）")
+    BAYESIAN_CPCV_EMBARGO_DAYS: int = Field(default=3, ge=0, le=30,
+                                            description="CPCV 禁运天数：训练结束与 OOS 开始之间的缓冲间隔")
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"

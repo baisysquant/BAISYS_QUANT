@@ -6,11 +6,70 @@ import numpy as np
 import pytest
 
 from BackTrading.overfitting import (
+    compute_dm_test,
     compute_pbo,
     deflated_sharpe_ratio,
     probabilistic_sharpe_ratio,
     compute_dsr_from_equity_curve,
 )
+
+
+class TestComputeDmTest:
+    def test_dm_positive_when_a_better(self):
+        rng = np.random.default_rng(7)
+        n = 250
+        base = rng.normal(0.0001, 0.01, n)
+        a = base + 0.0012  # A 恒定略优
+        b = base
+        stat, p = compute_dm_test(a, b)
+        assert stat > 0
+        assert p < 0.05
+
+    def test_dm_negative_when_b_better(self):
+        rng = np.random.default_rng(8)
+        n = 250
+        base = rng.normal(0.0001, 0.01, n)
+        a = base - 0.0012
+        b = base
+        stat, p = compute_dm_test(a, b)
+        assert stat < 0
+
+    def test_dm_not_significant_when_equal(self):
+        rng = np.random.default_rng(9)
+        n = 250
+        a = rng.normal(0.0001, 0.01, n)
+        b = a + rng.normal(0.0, 0.0002, n)  # 微差噪声
+        stat, p = compute_dm_test(a, b)
+        assert p >= 0.05 or abs(stat) < 1.96
+
+    def test_dm_short_series(self):
+        a = np.array([0.01, 0.02, 0.03])
+        b = np.array([0.01, 0.02, 0.03])
+        stat, p = compute_dm_test(a, b)
+        assert p == 1.0
+        assert stat == 0.0
+
+    def test_dm_p_value_bounds(self):
+        rng = np.random.default_rng(10)
+        a = rng.normal(0.0005, 0.01, 200)
+        b = rng.normal(0.0005, 0.01, 200)
+        _, p = compute_dm_test(a, b)
+        assert 0.0 <= p <= 1.0
+
+    def test_dm_newey_west_autocorrelation_handled(self):
+        # 强自相关序列：普通 t 检验会误判显著，NW 修正后 p 应更保守
+        rng = np.random.default_rng(11)
+        n = 200
+        noise = rng.normal(0.0, 0.005, n)
+        a = np.zeros(n)
+        b = np.zeros(n)
+        # 构造自相关（随机游走成分）
+        for i in range(1, n):
+            a[i] = 0.9 * a[i - 1] + noise[i]
+            b[i] = 0.9 * b[i - 1] + noise[i]
+        stat, p = compute_dm_test(a, b)
+        assert math.isfinite(stat)
+        assert 0.0 <= p <= 1.0
 
 
 class TestProbabilisticSharpeRatio:

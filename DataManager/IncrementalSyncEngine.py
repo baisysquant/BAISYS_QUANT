@@ -566,6 +566,20 @@ class IncrementalSyncEngine:
 
     def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
         from UtilsManager.CodeNormalizer import CodeNormalizer
+        from UtilsManager.IDataProvider import backtest_lock_held
+
+        # ── 回测数据隔离（P3.3 制度化）：回测进程持有会话级 advisory lock 时禁止写入 ──
+        # 运行中改写 stock_daily_kline 会导致回测窗口数据漂移、信号缓存静默失效，
+        # 且内容指纹可能在行数/日期不变时命中旧缓存。检测到锁即整体跳过本次同步。
+        try:
+            if backtest_lock_held(self._engine):
+                logger.warning(
+                    f"回测运行中（advisory lock {BACKTEST_ADVISORY_LOCK_KEY} 被占用），"
+                    "跳过本次 K 线同步以避免污染回测数据"
+                )
+                return set()
+        except Exception as e:
+            logger.warning(f"回测隔离锁探测失败，视为空闲继续同步: {e}")
 
         if target_date is None:
             target_date = TradingCalendarAnalyzer().get_last_trading_day()

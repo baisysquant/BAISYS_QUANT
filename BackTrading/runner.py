@@ -31,6 +31,9 @@ from sqlalchemy import text
 
 
 _BACKTEST_LOCK_KEY = 987654321
+# 会话级 advisory lock 专用连接：回测全程持有，外部增量同步（IncrementalSyncEngine）
+# 在写 K 线前探测同一 key，被占用即跳过，防止运行中数据被改写导致缓存内容漂移。
+_RUN_LOCK_CONN: Any = None
 
 
 def _acquire_lock(engine: Any) -> None:
@@ -46,6 +49,35 @@ def _acquire_lock(engine: Any) -> None:
         else:
             logger.warning("回测分布式锁被占用，跳过本次执行（可能有另一个进程正在运行）")
             sys.exit(0)
+
+    # 会话级锁：在专用连接上持有整个回测期间（session-level，跨事务存活）。
+    # 同一会话重复获取返回 True（回测自身的启动同步不受影响），
+    # 外部进程探测同一 key 返回 False → 同步引擎跳过本次执行。
+    global _RUN_LOCK_CONN
+    _RUN_LOCK_CONN = engine.connect()
+    try:
+        held = _RUN_LOCK_CONN.execute(
+            _t(f"SELECT pg_try_advisory_lock({_BACKTEST_LOCK_KEY})")
+        ).scalar()
+        if held:
+            logger.info("  获取会话级数据隔离锁成功（外部数据同步将让路）")
+        else:
+            logger.warning("  会话级数据隔离锁被占用，仍继续执行")
+    except Exception as exc:
+        logger.warning(f"  会话级数据隔离锁获取失败: {exc}")
+        _RUN_LOCK_CONN.close()
+        _RUN_LOCK_CONN = None
+
+
+def _release_run_lock() -> None:
+    """释放会话级 advisory lock（关闭专用连接即自动释放）。"""
+    global _RUN_LOCK_CONN
+    if _RUN_LOCK_CONN is not None:
+        try:
+            _RUN_LOCK_CONN.close()
+        except Exception:
+            pass
+        _RUN_LOCK_CONN = None
 
 
 def run_backtest_pipeline(
@@ -78,8 +110,17 @@ def run_backtest_pipeline(
     # ── 分布式锁（pg_advisory_xact_lock + NOWAIT 防止阻塞） ──
     _acquire_lock(engine)
 
+    # ── P3.1/P3.2 四方绑定：数据版本 + 配置哈希，变化即强制重跑 ──
+    from BackTrading.prepare import _compute_config_hash as _cfg_hash
+    _data_version = _compute_kline_data_version(engine)
+    _cur_config_hash = _cfg_hash()
+
     last = get_last_run(engine)
-    should_run, reason = should_rerun(last, bt.OPTIMIZE_FREQUENCY)
+    should_run, reason = should_rerun(
+        last, bt.OPTIMIZE_FREQUENCY,
+        data_version=_data_version,
+        config_hash=_cur_config_hash,
+    )
 
     if not should_run and not force:
         logger.info(reason)
@@ -114,6 +155,9 @@ def run_backtest_pipeline(
             return None
 
         logger.info(f"  K 线行数: {len(kline_df)}")
+
+        # P3.1: fetch 可能已增量同步新行，重算数据版本以匹配实际使用的数据
+        _data_version = _compute_kline_data_version(engine)
 
         # ── ST/退市历史早加载（供 WFO / 模拟验证 / 最终回测全链路使用） ──
         _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
@@ -185,6 +229,14 @@ def run_backtest_pipeline(
             backtest_start_date=_bt_cut,
             st_history=st_history,
             exclude_st=bool(bt.EXCLUDE_ST),
+            # P2.1 CPCV 净化+禁运
+            purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
+            embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
+            # P2.4 预算制
+            time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
+            max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
+            # P3.1 数据版本入缓存 key
+            data_version=_data_version,
         )
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
@@ -245,7 +297,7 @@ def run_backtest_pipeline(
             logger.warning(f"模拟验证不通过，参数不写入 config.ini: {_sim_verdict.reason}")
 
         _log_step("prepare_final_signals")
-        final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso)
+        final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso, data_version=_data_version)
         _log_step("full_backtest")
         # ST 历史已早加载并注入 best_params（见上方 _st_history 注入）
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
@@ -391,9 +443,10 @@ def run_backtest_pipeline(
             pass
 
         top = wf_result.dropna(subset=["sharpe_ratio"]).sort_values("sharpe_ratio", ascending=False).head(5)
-        sharpe_avg = float(top["sharpe_ratio"].mean())
-        total_return_avg = float(top["total_return"].mean())
-        max_dd_avg = float(top["max_drawdown"].mean())
+        sharpe_avg = float(top["sharpe_ratio"].mean()) if not top.empty else 0.0
+        # 兜底结果帧（无有效窗口时）可能缺少绩效列，逐列防御
+        total_return_avg = float(top["total_return"].mean()) if "total_return" in top.columns and not top.empty else 0.0
+        max_dd_avg = float(top["max_drawdown"].mean()) if "max_drawdown" in top.columns and not top.empty else 0.0
 
         from BackTrading.calibration import _get_git_commit
         from BackTrading.prepare import _compute_config_hash
@@ -596,6 +649,7 @@ def run_backtest_pipeline(
             extra_metrics=risk | trade | {"pbo": cal_result.pbo, "dsr": cal_result.dsr, "num_trials": cal_result.num_trials},
             git_commit=cal_result.git_commit,
             config_hash=cal_result.config_hash,
+            data_version=_data_version,
         )
 
         updated_sections = set()
@@ -620,11 +674,35 @@ def run_backtest_pipeline(
                 total_return=0,
                 max_drawdown=0,
                 status="failed",
+                data_version=_data_version,
             )
         except Exception as log_err:
             logger.warning(f"回测失败记录写入异常: {log_err}")
         alert.on_failure(exc)
         return None
+    finally:
+        _release_run_lock()
+
+
+def _compute_kline_data_version(engine: Any) -> str:
+    """P3.1 数据版本标识：kline 表 max(trade_date) + 行数摘要。
+
+    增量同步写入新行 → max 日期或行数变化 → 版本号变化，
+    信号缓存 key 与 calibration_log 随之失效/重新绑定。
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT COALESCE(MAX(trade_date)::text, ''), COUNT(*) FROM stock_daily_kline"
+            )).fetchone()
+        if row is None or not row[0]:
+            return ""
+        import hashlib as _hl
+        _raw = f"{row[0]}_{row[1]}"
+        return f"{row[0]}_{_hl.md5(_raw.encode()).hexdigest()[:6]}"
+    except Exception as exc:
+        logger.warning(f"计算 kline 数据版本失败: {exc}")
+        return ""
 
 
 def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
@@ -794,6 +872,12 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
     """
     从 Walk-Forward 结果中提取最佳参数。
 
+    主路径（P2.3 稳健中位数）：优先取 DM 检验显著通过（p<0.05）且
+    OOS Sharpe>0 的窗口参数中位数——单窗口 Sharpe 尖峰多为噪声，
+    中位数对离群窗口稳健；DM 显著过滤保证"寻优确实优于基准"。
+    兜底路径：DM 数据缺失时退化为"OOS 为正窗口的中位数"；
+    窗口不足时退回原 Sharpe 加权 Top-N 均值；仍失败则用配置中位数。
+
     如果提取失败（数据不足、Sharpe 全为 NaN/负值、params 列缺失等），
     返回配置中的默认参数中位数作为兜底，并记录警告。
     """
@@ -831,6 +915,44 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
         logger.warning("Walk-Forward 所有组合 Sharpe 均为 NaN，使用配置中位数作为兜底参数")
         return _fallback_params(config)
 
+    def _median_params(rows_: pd.DataFrame) -> dict[str, float]:
+        """对行内 params 取逐参数中位数（稳健主路径核心）。"""
+        all_params = [r["params"] for _, r in rows_.iterrows() if isinstance(r["params"], dict)]
+        if not all_params:
+            return {}
+        keys = all_params[0].keys()
+        median_params: dict[str, float] = {}
+        for k in keys:
+            vals = sorted(p[k] for p in all_params)
+            median_params[k] = vals[len(vals) // 2]
+        return median_params
+
+    # ── 主路径：DM 显著通过（p<0.05）且 OOS>0 的窗口 → 参数中位数 ──
+    if "dm_p_value" in rows.columns:
+        dm_rows = rows[
+            (rows["dm_p_value"] < 0.05) & (rows["sharpe_ratio"] > 0)
+        ]
+        if len(dm_rows) >= 2:
+            med = _median_params(dm_rows)
+            if med:
+                logger.info(
+                    f"[稳健中位数主路径] DM 显著窗口 {len(dm_rows)} 个 "
+                    f"(p<0.05 且 OOS>0)，取参数中位数: {med}"
+                )
+                return med
+        logger.warning(
+            f"DM 显著窗口仅 {len(dm_rows)} 个(<2)，退化到 OOS 正收益窗口中位数"
+        )
+
+    # ── 次级路径：OOS Sharpe>0 窗口的参数中位数（无 DM 列时直接走这里） ──
+    pos_rows = rows[rows["sharpe_ratio"] > 0]
+    if len(pos_rows) >= 2:
+        med = _median_params(pos_rows)
+        if med:
+            logger.info(f"[稳健中位数] OOS 正收益窗口 {len(pos_rows)} 个，取参数中位数: {med}")
+            return med
+
+    # ── 兜底：原 Sharpe 加权 Top-N 均值 ──
     rows = rows.sort_values("sharpe_ratio", ascending=False).head(top_n)
     weights = rows["sharpe_ratio"].values
     total_weight = weights.sum()

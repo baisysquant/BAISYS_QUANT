@@ -39,6 +39,55 @@ def probabilistic_sharpe_ratio(
     return float(stats.norm.cdf(num / den))
 
 
+def compute_dm_test(
+    returns_a: np.ndarray,
+    returns_b: np.ndarray,
+    lag: int | None = None,
+) -> tuple[float, float]:
+    """Diebold-Mariano 检验（Newey-West HAC 方差）。
+
+    损失函数取负收益（loss = -return，等价于 d_t = a_t - b_t），
+    H0: 两组日收益均值相等（E[d] = 0）。
+    用于判定"寻优最佳参数在 OOS 上是否显著优于基准（配置中位数参数）"，
+    防止调参只是噪声拟合：若 p ≥ 0.05，最佳参数的相对优势不显著，
+    最终参数提取应退回稳健中位数主路径，而不是采信 Sharpe 尖峰。
+
+    Args:
+        returns_a: 策略 A 日收益序列。
+        returns_b: 基准 B 日收益序列。
+        lag: Newey-West 滞后阶数，None 时取 floor(4*(n/100)^(2/9))。
+
+    Returns:
+        (dm_stat, p_value)；dm_stat > 0 表示 A 平均收益高于 B（A 更优）。
+    """
+    a = np.asarray(returns_a, dtype=float)
+    b = np.asarray(returns_b, dtype=float)
+    n = min(len(a), len(b))
+    if n < 10:
+        return 0.0, 1.0
+
+    d = a[:n] - b[:n]
+    mean_d = float(d.mean())
+    d_centered = d - mean_d
+
+    if lag is None:
+        lag = int(math.floor(4.0 * (n / 100.0) ** (2.0 / 9.0)))
+    lag = max(0, min(lag, n - 2))
+
+    gamma0 = float(np.mean(d_centered ** 2))
+    var_hac = gamma0
+    for j in range(1, lag + 1):
+        w = 1.0 - j / (lag + 1.0)
+        gamma_j = float(np.mean(d_centered[:-j] * d_centered[j:]))
+        var_hac += 2.0 * w * gamma_j
+
+    var_hac = max(var_hac, 1e-12)
+    se = math.sqrt(var_hac / n)
+    dm_stat = mean_d / se
+    p_value = float(2.0 * stats.norm.cdf(-abs(dm_stat)))
+    return dm_stat, p_value
+
+
 def deflated_sharpe_ratio(
     sharpe: float,
     n_obs: int,

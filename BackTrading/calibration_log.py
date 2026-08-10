@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     status          VARCHAR(16) NOT NULL DEFAULT 'success',
     git_commit      VARCHAR(12) DEFAULT '',
     config_hash     VARCHAR(8)  DEFAULT '',
+    data_version    VARCHAR(40) DEFAULT '',
     pbo             NUMERIC(6,4) DEFAULT 0.0,
     dsr             NUMERIC(6,4) DEFAULT 0.0,
     num_trials      INT DEFAULT 0
@@ -68,6 +69,7 @@ def ensure_table(engine: Any) -> None:
         ("total_trades", "INT DEFAULT 0"),
         ("git_commit", "VARCHAR(12) DEFAULT ''"),
         ("config_hash", "VARCHAR(8) DEFAULT ''"),
+        ("data_version", "VARCHAR(40) DEFAULT ''"),
         ("pbo", "NUMERIC(6,4) DEFAULT 0.0"),
         ("dsr", "NUMERIC(6,4) DEFAULT 0.0"),
         ("num_trials", "INT DEFAULT 0"),
@@ -89,7 +91,8 @@ def ensure_table(engine: Any) -> None:
 def get_last_run(engine: Any) -> dict[str, Any] | None:
     sql = text(f"""
         SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
-               initial_cash, params, sharpe, total_return, max_drawdown, status
+               initial_cash, params, sharpe, total_return, max_drawdown, status,
+               config_hash, data_version, git_commit
         FROM {TABLE}
         WHERE status = 'success'
         ORDER BY run_time DESC
@@ -105,8 +108,17 @@ def get_last_run(engine: Any) -> dict[str, Any] | None:
     return result
 
 
-def should_rerun(last_run: dict[str, Any] | None, frequency: str, today: date | None = None) -> tuple[bool, str]:
-    """判断是否需要重新执行回测。
+def should_rerun(
+    last_run: dict[str, Any] | None,
+    frequency: str,
+    today: date | None = None,
+    data_version: str | None = None,
+    config_hash: str | None = None,
+) -> tuple[bool, str]:
+    """判断是否需要重新执行回测（四方绑定：数据版本 + 配置哈希 + 频率 + 时间）。
+
+    data_version/config_hash 与上次成功记录不一致时，即使在同一周期内
+    也强制重跑——上次结果对应的数据/配置已过期，缓存复用会静默失真。
 
     Returns:
         (should_run, reason)
@@ -121,6 +133,16 @@ def should_rerun(last_run: dict[str, Any] | None, frequency: str, today: date | 
     if isinstance(last_time, str):
         last_time = datetime.fromisoformat(last_time)
     last_date = last_time.date()
+
+    # ── 四方绑定 1/2：数据版本 / 配置哈希 ──
+    if data_version is not None:
+        _last_dv = last_run.get("data_version") or ""
+        if _last_dv and _last_dv != data_version:
+            return True, f"数据版本变化（{_last_dv} → {data_version}），需重新回测"
+    if config_hash is not None:
+        _last_ch = last_run.get("config_hash") or ""
+        if _last_ch and _last_ch != config_hash:
+            return True, f"配置哈希变化（{_last_ch} → {config_hash}），需重新回测"
 
     if frequency == "initial":
         return False, f"频率=initial，上次执行于 {last_date}，不再自动重跑"
@@ -169,6 +191,7 @@ def record_run(
     extra_metrics: dict[str, Any] | None = None,
     git_commit: str = "",
     config_hash: str = "",
+    data_version: str = "",
 ) -> None:
     metrics = dict(extra_metrics or {})
     sortino = metrics.pop("sortino_ratio", None) or metrics.get("sortino", 0)
@@ -187,12 +210,12 @@ def record_run(
             (run_time, frequency, backtest_start_date, out_of_sample_days,
              initial_cash, params, sharpe, total_return, max_drawdown, status,
              sortino, calmar, var_95, cvar_95, win_rate, profit_factor, total_trades,
-             git_commit, config_hash, pbo, dsr, num_trials)
+             git_commit, config_hash, data_version, pbo, dsr, num_trials)
         VALUES
             (NOW(), :frequency, :backtest_start_date, :out_of_sample_days,
              :initial_cash, CAST(:params AS jsonb), :sharpe, :total_return, :max_drawdown, :status,
              :sortino, :calmar, :var_95, :cvar_95, :win_rate, :profit_factor, :total_trades,
-             :git_commit, :config_hash, :pbo, :dsr, :num_trials)
+             :git_commit, :config_hash, :data_version, :pbo, :dsr, :num_trials)
     """)
     with engine.begin() as conn:
         conn.execute(sql, _pyval({
@@ -214,6 +237,7 @@ def record_run(
             "total_trades": total_trades,
             "git_commit": git_commit,
             "config_hash": config_hash,
+            "data_version": data_version,
             "pbo": pbo,
             "dsr": dsr,
             "num_trials": num_trials,

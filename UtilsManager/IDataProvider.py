@@ -9,6 +9,29 @@ from sqlalchemy.engine import Engine
 
 TABLE = "stock_daily_kline"
 
+# 回测会话级 advisory lock 键：回测全程持有，外部数据同步检测到后必须让路，
+# 避免运行中改写 K 线导致信号缓存内容漂移（与 runner._BACKTEST_LOCK_KEY 共用）。
+BACKTEST_ADVISORY_LOCK_KEY = 987654321
+
+
+def backtest_lock_held(engine: Engine) -> bool:
+    """P3.3 制度化探测：回测进程是否持有会话级 advisory lock。
+
+    同步引擎在写 K 线前统一调用本函数；返回 True 表示回测运行中，
+    必须整体跳过本次同步（探测后立即释放锁，本进程无需持有）。
+    """
+    try:
+        with engine.connect() as conn:
+            acquired = conn.execute(
+                text(f"SELECT pg_try_advisory_lock({BACKTEST_ADVISORY_LOCK_KEY})")
+            ).scalar()
+            if not acquired:
+                return True
+            conn.execute(text(f"SELECT pg_advisory_unlock({BACKTEST_ADVISORY_LOCK_KEY})"))
+            return False
+    except Exception:
+        return False
+
 
 class IDataProvider(ABC):
     @abstractmethod

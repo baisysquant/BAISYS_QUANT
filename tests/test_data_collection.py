@@ -29,17 +29,15 @@ class TestFinancialQualityFetcher:
     @pytest.fixture
     def mock_akshare(self):
         with patch("akshare.stock_financial_abstract") as m:
-            # 模拟 stock_financial_abstract 返回格式：指标行 × 日期列
-            data = {
-                ("净资产收益率", "2024-12-31"): 15.5,
-                ("毛利率", "2024-12-31"): 45.2,
-                ("销售净利率", "2024-12-31"): 12.3,
-                ("营业总收入增长率", "2024-12-31"): 8.7,
-                ("归属母公司净利润增长率", "2024-12-31"): 10.1,
-            }
-            idx = ["净资产收益率", "毛利率", "销售净利率",
-                   "营业总收入增长率", "归属母公司净利润增长率"]
-            df = pd.DataFrame({"指标名称": idx, "2024-12-31": [15.5, 45.2, 12.3, 8.7, 10.1]})
+            # 模拟 stock_financial_abstract 返回格式：col[0]="选项"、col[1]="指标"、col[2:]=报告日期
+            rows = [
+                ("每股指标", "净资产收益率", 15.5),
+                ("每股指标", "毛利率", 45.2),
+                ("每股指标", "销售净利率", 12.3),
+                ("成长能力", "营业总收入增长率", 8.7),
+                ("成长能力", "归属母公司净利润增长率", 10.1),
+            ]
+            df = pd.DataFrame(rows, columns=["选项", "指标", "2024-12-31"])
             m.return_value = df
             yield m
 

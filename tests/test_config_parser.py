@@ -94,6 +94,34 @@ class TestConfigInit:
         cfg = Config(str(temp_config_ini))
         assert cfg.EXEMPT_LEVELS == ["完全主升", "趋势加速"]
 
+    @pytest.mark.unit
+    def test_bayesian_cpcv_defaults(self, temp_config_ini):
+        cfg = Config(str(temp_config_ini))
+        bt = cfg.app_config.backtest
+        assert bt.BAYESIAN_CPCV_PURGE_DAYS >= 0
+        assert bt.BAYESIAN_CPCV_EMBARGO_DAYS >= 0
+        assert bt.BAYESIAN_TIME_BUDGET_SECONDS >= 600
+        assert bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS >= 1
+
+    @pytest.mark.unit
+    def test_bayesian_cpcv_parsed_from_ini(self, tmp_path):
+        ini = tmp_path / "config.ini"
+        ini.write_text(
+            "[DATABASE]\nUSER=u\nPASSWORD=p\nHOST=h\nPORT=5432\nDB_NAME=d\n\n"
+            "[BACKTEST]\n"
+            "bayesian_cpcv_purge_days = 10\n"
+            "bayesian_cpcv_embargo_days = 7\n"
+            "bayesian_time_budget_seconds = 7200\n"
+            "bayesian_max_no_improve_windows = 2\n",
+            encoding="utf-8",
+        )
+        cfg = Config(str(ini))
+        bt = cfg.app_config.backtest
+        assert bt.BAYESIAN_CPCV_PURGE_DAYS == 10
+        assert bt.BAYESIAN_CPCV_EMBARGO_DAYS == 7
+        assert bt.BAYESIAN_TIME_BUDGET_SECONDS == 7200
+        assert bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS == 2
+
 
 class TestHotReload:
     @pytest.mark.unit
