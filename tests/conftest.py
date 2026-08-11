@@ -17,6 +17,29 @@ def pytest_configure(config: Any) -> None:
     config.addinivalue_line("markers", "e2e: 端到端测试，需要网络和金融数据 API")
 
 
+@pytest.fixture(autouse=True)
+def _snapshot_isolated(tmp_path, monkeypatch) -> None:
+    """所有测试默认把失败快照写入临时目录，杜绝污染真实缓存。"""
+    import BackTrading.snapshot as _snap
+
+    monkeypatch.setattr(_snap, "_snapshot_root", lambda: tmp_path / "failure_snapshots")
+    monkeypatch.setattr(_snap, "_SESSION_CAP", 5000)
+    _snap.begin_snapshot_session()
+
+
+@pytest.fixture
+def loguru_sink() -> list[str]:
+    """捕获 loguru 输出（{message} 格式），用于断言日志内容。"""
+    from loguru import logger
+
+    records: list[str] = []
+    sink_id = logger.add(records.append, format="{message}", level="INFO")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
+
+
 @pytest.fixture
 def temp_config_ini() -> Path:
     """创建最小配置文件和临时目录供测试使用。"""
@@ -66,6 +89,7 @@ def temp_config_ini() -> Path:
         "BACKTEST_START_DATE = 20200101\n"
         "OUT_OF_SAMPLE_DAYS = 20\n"
         "INITIAL_CASH = 1000000\n"
+        "CALENDAR_ALIGN_MODE = off\n"
         "\n"
         "[BACKTEST_CALIBRATED]\n"
         "atr_stop_mult = 1.5\n"

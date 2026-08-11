@@ -47,7 +47,7 @@ import pandas as pd
 
 from LogicAnalyzer.ml.split_integrity import SplitReport
 
-_EXEC_MODES = ("close", "next_open")
+_EXEC_MODES = ("close", "next_open", "vwap")
 # 价格比较容差（绝对/相对），用于吸收浮点舍入
 _RTOL = 1e-6
 _ATOL = 1e-3
@@ -68,6 +68,10 @@ def _norm_date(x: Any) -> str | None:
 def _price_frame(bars: pd.DataFrame) -> pd.DataFrame:
     """抽取价格列并统一 trade_date 为字符串；无 close_adj 时回落 close。
 
+    同时保留原始价列 open_adj/high_adj/low_adj（若存在）——引擎成交价在
+    next_open/vwap 模型下取原始价基准（与 close_adj 估值基准一致），
+    合规校验须用同一基准（未复权原始 OHLC）。
+
     注意：trade_date 批量转 Timestamp 后格式化，禁止逐元素 pd.to_datetime
     （20 万行量级下逐元素转换耗时数十秒，会拖垮 WFO 全量回测）。
     """
@@ -76,6 +80,7 @@ def _price_frame(bars: pd.DataFrame) -> pd.DataFrame:
         b["close_adj"] = b["close"]
     keep = ["trade_date", "symbol", "close_adj"]
     keep.extend(c for c in ("open", "high", "low", "close") if c in b.columns)
+    keep.extend(c for c in ("open_adj", "high_adj", "low_adj") if c in b.columns)
     b = b[keep]
     b["trade_date"] = pd.to_datetime(b["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
     return b.dropna(subset=["trade_date"])
@@ -91,7 +96,7 @@ def _bar_index(frame: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
             if not sym:
                 continue
             px: dict[str, float] = {}
-            for c in ("close_adj", "open", "high", "low", "close"):
+            for c in ("close_adj", "open", "high", "low", "close", "open_adj", "high_adj", "low_adj"):
                 v = r.get(c)
                 if v is None or pd.isna(v):
                     continue
@@ -112,9 +117,9 @@ def _same_price(a: float, b: float | None) -> bool:
 
 def _trade_rows(
     trade_log: Sequence[dict[str, Any]],
-) -> list[tuple[str, str, str, float]]:
-    """规范化成交记录 → (date, symbol, action, price)；无效记录剔除。"""
-    rows: list[tuple[str, str, str, float]] = []
+) -> list[tuple[str, str, str, float, bool]]:
+    """规范化成交记录 → (date, symbol, action, price, force_exit)；无效记录剔除。"""
+    rows: list[tuple[str, str, str, float, bool]] = []
     for t in trade_log:
         dt = _norm_date(t.get("time"))
         sym = str(t.get("symbol", ""))
@@ -123,20 +128,10 @@ def _trade_rows(
         if dt is None or not sym or not action or px is None or pd.isna(px):
             continue
         try:
-            rows.append((dt, sym, action, float(px)))
+            rows.append((dt, sym, action, float(px), bool(t.get("force_exit"))))
         except (TypeError, ValueError):
             continue
     return rows
-
-
-def _next_day(dates_sorted: Sequence[str], dt: str) -> str | None:
-    """返回 dt 之后的第一个交易日（用于 next_open 模式的次日开盘锚点）。"""
-    pos = np.searchsorted(np.asarray(dates_sorted, dtype=str), dt)
-    if pos < len(dates_sorted):
-        return str(dates_sorted[pos]) if str(dates_sorted[pos]) != dt else (
-            str(dates_sorted[pos + 1]) if pos + 1 < len(dates_sorted) else None
-        )
-    return None
 
 
 # ── 1. 成交价时点合规 ───────────────────────────────────────
@@ -149,10 +144,16 @@ def check_execution_price(
 ) -> SplitReport:
     """成交价时点合规（1.7 执行滞后）。
 
-    规则：
-      - exec_mode="close"（默认）：成交价必须 ≈ 信号日收盘价 close_adj。
-      - exec_mode="next_open"：成交价必须 ≈ 信号下一交易日开盘价 open。
-      - 成交价 == 信号日 open/high/low（当日盘中价）= 当天信号吃当天收益，违规。
+    成交记录 time = 实际成交日（fill-time 约定）：
+      - exec_mode="close"（默认）：成交价必须 ≈ 成交日收盘价 close_adj。
+      - exec_mode="next_open"：成交价必须落在「成交日（信号次日/T+1）OHLC 区间」内
+        —— 引擎在 next_open 下以成交日开盘价 open_adj 成交，等价于
+        price ∈ [low_adj, high_adj]（成交日为 T+1）。
+      - exec_mode="vwap"：成交价落在成交日 OHLC 区间内（VWAP 为盘中价，合法）。
+      - 成交价 == 信号日（T）盘中价 = 当天信号吃当天收益，违规；
+        次日/未来日（T+1 之后）价格在 fill-time 下无从出现（Time 即 T+1）。
+
+    force_exit（ST/退市强平，无视 T+1/跌停的终态清算）成交免于 next_open/vwap 校验。
 
     Returns:
         SplitReport: n_checked = 可比对的成交笔数，违规数 = 不满足的笔数。
@@ -174,41 +175,46 @@ def check_execution_price(
         return check
     idx = _bar_index(frame)
 
-    allowed_col = "close_adj" if exec_mode == "close" else "open"
-    intraday_cols = ("open", "high", "low") if exec_mode == "close" else ()
-    dates_sorted = sorted(frame["trade_date"].unique().tolist())
-
     checked = 0
     violations: list[str] = []
-    for dt, sym, action, trade_px in _trade_rows(trade_log):
-        bar_date = dt
-        if exec_mode == "next_open":
-            nxt = _next_day(dates_sorted, dt)
-            if nxt is None:
-                continue  # 信号日为最后一个交易日 → 无可比对的次日 bar
-            bar_date = nxt
-        sym_bar = idx.get(bar_date, {}).get(sym)
+    for dt, sym, action, trade_px, _is_force in _trade_rows(trade_log):
+        if exec_mode in ("next_open", "vwap") and _is_force:
+            continue  # ST/退市强平终态清算，免于 next_open/vwap 校验
+        sym_bar = idx.get(dt, {}).get(sym)
         if sym_bar is None:
             continue  # 当日停牌/数据缺失 → 不可比，不计违规
-        allowed_val = sym_bar.get(allowed_col)
-        if allowed_val is None:
-            continue
-        checked += 1
-        if _same_price(trade_px, allowed_val):
-            continue
-        if any(_same_price(trade_px, sym_bar.get(c)) for c in intraday_cols):
-            note = "（当日盘中价成交 = 当天信号吃当天收益）"
+        if exec_mode == "close":
+            allowed_val = sym_bar.get("close_adj")
+            if allowed_val is None:
+                continue
+            checked += 1
+            if _same_price(trade_px, allowed_val):
+                continue
+            if any(_same_price(trade_px, sym_bar.get(c)) for c in ("open", "high", "low")):
+                note = "（当日盘中价成交 = 当天信号吃当天收益）"
+            else:
+                note = ""
+            violations.append(f"{action} {sym} {dt}@{trade_px} != close_adj={allowed_val} {note}")
         else:
-            note = ""
-        violations.append(f"{action} {sym} {dt}@{trade_px} != {allowed_col}={allowed_val} {note}")
+            # next_open / vwap：成交价 ∈ 成交日（T+1）OHLC 区间（原始价基准）
+            lo = sym_bar.get("low_adj") if sym_bar.get("low_adj") is not None else sym_bar.get("low")
+            hi = sym_bar.get("high_adj") if sym_bar.get("high_adj") is not None else sym_bar.get("high")
+            if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi):
+                continue
+            checked += 1
+            lo_f = float(lo) - _ATOL - _RTOL * abs(float(lo))
+            hi_f = float(hi) + _ATOL + _RTOL * abs(float(hi))
+            if lo_f <= trade_px <= hi_f:
+                continue
+            violations.append(f"{action} {sym} {dt}@{trade_px} 不在 OHLC[{lo:.4f},{hi:.4f}] 内（疑似信号日/未来价成交）")
 
     check.n_checked = checked
     check.n_violations = len(violations)
     check.passed = check.n_violations == 0
     if violations:
         check.details.append(
-            f"{check.n_violations}/{check.n_checked} 笔成交价 ≠ {allowed_col}"
-            "（含当日盘中价＝当天信号×当天收益）"
+            f"{check.n_violations}/{check.n_checked} 笔成交价 ≠ 合规锚点"
+            "（close=成交日收盘；next_open/vwap=成交日 OHLC 区间）"
         )
         check.details.append("示例: " + "; ".join(violations[:5]))
     if _log:
@@ -220,43 +226,54 @@ def check_execution_price(
 
 def check_price_vs_close_adj(
     trade_log: Sequence[dict[str, Any]],
+    exec_mode: str = "close",
     _log: bool = True,
 ) -> SplitReport:
-    """基于成交记录自带 close_adj 字段的轻量校验（1.7）。
+    """基于成交记录自带锚点字段的轻量校验（1.7/0.1）。
 
-    引擎在记录每笔成交时已把「同一信号日的复权收盘价」写入 trade["close_adj"]。
+    引擎在记录每笔成交时已写入锚点字段：
+      - close 模型：trade["close_adj"] = 成交日（信号日）复权收盘价；
+      - next_open/vwap：trade["close_adj"] = 信号日复权收盘价（前一日），
+        trade["exec_open"] = 成交日参考价（开盘/典型价/收盘）。
     热路径（WFO 中每轮回测）用本函数 O(成交笔数) 完成乘数对齐校验，
-    无需对全量面板做 O(N) 扫描。任何 price != close_adj 的成交，意味着
-    成交价不是信号日收盘价（可能用了开盘/盘中价）→ 当天信号吃当天收益。
+    无需对全量面板做 O(N) 扫描。任何 price != 锚点的成交，意味着成交价与
+    成交时序模型不一致 → 收益乘数可能错配。
 
     Args:
-        trade_log: 引擎成交记录（必须含 close_adj 字段；缺失该字段的旧日志跳过）。
+        trade_log: 引擎成交记录（必须含锚点字段；缺失该字段的旧日志跳过）。
+        exec_mode: "close"（price≈close_adj）或 "next_open"/"vwap"（price≈exec_open）。
         _log: 是否输出日志。
 
     Returns:
         SplitReport。
     """
-    check = SplitReport(check_name="成交价=信号日收盘价(热路径)", passed=True)
+    check = SplitReport(check_name=f"成交价=成交时序锚点(热路径 {exec_mode})", passed=True)
+    anchor_key = "close_adj" if exec_mode == "close" else "exec_open"
     checked = 0
     violations: list[str] = []
     for t in trade_log:
+        if exec_mode != "close" and t.get("force_exit"):
+            continue  # ST/退市强平终态清算，免于 next_open/vwap 校验
         px = t.get("price")
-        close_adj = t.get("close_adj")
-        if px is None or close_adj is None or pd.isna(px) or pd.isna(close_adj):
+        anchor = t.get(anchor_key)
+        if px is None or anchor is None or pd.isna(px) or pd.isna(anchor):
             continue
         checked += 1
-        if not _same_price(float(px), float(close_adj)):
+        if not _same_price(float(px), float(anchor)):
             violations.append(
                 f"{t.get('action', 'trade')} {t.get('symbol')} {t.get('time')}: "
-                f"price={px} != close_adj={close_adj}"
+                f"price={px} != {anchor_key}={anchor}"
             )
     check.n_checked = checked
     check.n_violations = len(violations)
     check.passed = check.n_violations == 0
     if violations:
+        if exec_mode == "close":
+            _why = "成交价 ≠ 成交日收盘价(close_adj)"
+        else:
+            _why = "成交价 ≠ 成交参考价(exec_open)"
         check.details.append(
-            f"{check.n_violations}/{check.n_checked} 笔成交价 ≠ 信号日收盘价"
-            "（疑似开盘/盘中价成交，当天信号吃当天收益）"
+            f"{check.n_violations}/{check.n_checked} 笔 {_why}（疑似开盘/盘中价成交，当天信号吃当天收益）"
         )
         check.details.append("示例: " + "; ".join(violations[:5]))
     if _log:
@@ -274,9 +291,11 @@ def check_same_day_contribution(
 ) -> SplitReport:
     """信号日收益贡献归零（1.7 执行滞后）。
 
-    对每笔买入：成交当日该资产「当日收益乘数」的入账量必须为 0 ——
-      收盘模型：贡献 = close(t)/成交价 - 1（成交价=当日收盘 ⇒ 0）；
-      次日模型：贡献 = open(t+1)/成交价 - 1（成交价=次日开盘 ⇒ 0）。
+    对每笔买入：成交当日「当日收益乘数」的入账量必须为 0 ——
+      close 模型：贡献 = close(t)/成交价 - 1（成交价=当日收盘 ⇒ 0）；t=成交日
+      next_open 模型：贡献 = open_adj(t)/成交价 - 1（成交价=次日开盘 ⇒ 0）；
+            t=成交日（=信号次日=T+1），信号日收益未入账。
+      vwap 模型：成交价为盘中典型价，入账自成交价起计，无同日收益乘数错配 ⇒ 0。
     任何非零贡献说明该仓当天已被「当天收益」乘入（收益乘数错配）。
 
     Returns:
@@ -299,11 +318,10 @@ def check_same_day_contribution(
         return check
 
     idx = _bar_index(frame)
-    dates_sorted = sorted(frame["trade_date"].unique().tolist())
 
     checked = 0
     violations: list[str] = []
-    for dt, sym, action, trade_px in _trade_rows(trade_log):
+    for dt, sym, action, trade_px, _is_force in _trade_rows(trade_log):
         if action != "buy":
             continue
         sym_bar = idx.get(dt, {}).get(sym)
@@ -311,14 +329,15 @@ def check_same_day_contribution(
             continue
         if exec_mode == "close":
             anchor = sym_bar["close_adj"]
-        else:
-            nxt = _next_day(dates_sorted, dt)
-            if nxt is None:
+        elif exec_mode == "next_open":
+            anchor = sym_bar.get("open_adj")
+            if anchor is None:
+                anchor = sym_bar.get("open")
+            if anchor is None:
                 continue
-            nxt_bar = idx.get(nxt, {}).get(sym)
-            if nxt_bar is None or "open" not in nxt_bar:
-                continue
-            anchor = nxt_bar["open"]
+        else:  # vwap：成交日为盘中成交，成交价即入账基准，无同日错配
+            checked += 1
+            continue
         if anchor is None:
             continue
         checked += 1
@@ -332,7 +351,7 @@ def check_same_day_contribution(
     check.n_violations = len(violations)
     check.passed = check.n_violations == 0
     check.details.append(
-        f"校验 {checked} 笔买入当日收益贡献均为 0（锚点={('当日收盘' if exec_mode == 'close' else '次日开盘')}）"
+        f"校验 {checked} 笔买入当日收益贡献均为 0（锚点={('当日收盘' if exec_mode == 'close' else '成交日开盘/VWAP')}）"
     )
     if violations:
         check.details.append("示例: " + "; ".join(violations[:5]))
@@ -443,19 +462,8 @@ def run_execution_lag_check(
         if dates_needed:
             td = bars["trade_date"]
             sym_arr = bars["symbol"].astype(str).values
-            if exec_mode == "next_open":
-                # 次日模型还需成交日的下一交易日 bar
-                if pd.api.types.is_datetime64_any_dtype(td):
-                    all_dates = sorted(set(td.dt.strftime("%Y-%m-%d").tolist()))
-                else:
-                    all_dates = sorted(set(td.astype(str).tolist()))
-                arr_d = np.array(all_dates, dtype=str)
-                for d in list(dates_needed):
-                    pos = int(np.searchsorted(arr_d, d))
-                    if pos < len(arr_d) and arr_d[pos] != d:
-                        dates_needed.add(arr_d[pos])
-                    elif pos < len(arr_d) and arr_d[pos] == d and pos + 1 < len(arr_d):
-                        dates_needed.add(arr_d[pos + 1])
+            # fill-time 约定：成交记录 time=实际成交日，价格校验只用到成交日本身，
+            # 无需扩展下一交易日 bar。
             if pd.api.types.is_datetime64_any_dtype(td):
                 dt_arr = td.to_numpy().astype("datetime64[D]")
                 date_key = np.array(sorted(dates_needed), dtype="datetime64[D]")

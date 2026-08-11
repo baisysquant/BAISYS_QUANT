@@ -470,6 +470,9 @@ cd BAISYS_QUAN
 |------|------|--------|------|
 | `enabled` | 布尔 | `true` | 启用多因子 Alpha 评分 |
 | `financial_quality_cache_days` | 整数 | `90` | 质量因子缓存天数 |
+| `financial_quality_batch_size` | 整数 | `500` | 质量因子每批采集股票数 |
+| `financial_quality_batch_sleep` | 整数 | `20` | 质量因子批间休眠秒数 |
+| `financial_quality_file_cache_days` | 整数 | `30` | 质量因子离线文件缓存天数 |
 | 因子权重 | — | — | 权重定义已迁移至 `config/factor_registry.yaml` |
 
 
@@ -523,6 +526,7 @@ cd BAISYS_QUAN
 | `initial_cash` | `1000000` | 初始资金 |
 | `full_a_share_mode` | `false` | 是否全 A 股回测 |
 | `signal_pipelines` | `3` | 信号预计算并行管道数 |
+| `execution_model` | `next_open` | 成交时点模型：`close` 信号日收盘成交（老行为）/ `next_open` 信号次日开盘成交（默认，符合A股T+1）/ `vwap` 信号次日VWAP成交 |
 
 **网格搜索参数范围（逗号分隔 min,max,step）：**
 

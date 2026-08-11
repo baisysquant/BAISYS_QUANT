@@ -19,7 +19,6 @@ from DataCollection.CalendarManager import TradingCalendarAnalyzer
 
 import numpy as np
 import pandas as pd
-from UtilsManager import TACompatibility as ta
 from loguru import logger
 
 from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
@@ -48,6 +47,8 @@ except Exception:
     CACHE_DIR = Path(__file__).resolve().parent / "data" / "signal_cache"
 
 from BackTrading.indicator_cache import get_precomputed, get_divergence, precompute_all_indicators
+from BackTrading import output_store as _os
+from BackTrading import calendar_align as _ca
 
 
 def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
@@ -227,7 +228,13 @@ def _completed_symbols(trade_date: str, param_hash: str | None = None, config_ha
 
 def _save_stock_signal(cache_dir: Path, symbol: str, rows: list[dict]) -> None:
     path = _symbol_cache_path(cache_dir, symbol)
-    pd.DataFrame(rows).to_parquet(path, index=False, compression="zstd", compression_level=3)
+    if _os.write_mode() == _os.OUTPUT_WRITE_REPLACE:
+        # 回退：禁用 upsert，直接替换写（分片前原始行为）
+        pd.DataFrame(rows).to_parquet(path, index=False, compression="zstd", compression_level=3)
+        return
+    # upsert：原子写（tmp + os.replace），同 key 覆写 → 重复运行不产生重复记录，
+    # 且不会留下半成品文件被 _completed_symbols 误判为已完成
+    _os.atomic_write_parquet(path, pd.DataFrame(rows))
 
 
 def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> pd.DataFrame | None:
@@ -272,6 +279,38 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
     if rename_map:
         df.rename(columns=rename_map, inplace=True)
+    return _validate_signal_merge(df, cd)
+
+
+def _validate_signal_merge(df: pd.DataFrame, cache_dir: Path) -> pd.DataFrame:
+    """合并阶段校验唯一性（Task E）：主键 (symbol, trade_date) 重复行去重 + 清单覆盖率。
+
+    重复运行同一片只覆写同名工件，合并后主键唯一；若历史遗留/异常产生重复，
+    此处 keep=first 去重并告警，保证下游引擎消费无重复记录。
+    """
+    _pk = ("symbol", "trade_date")
+    if _pk[0] in df.columns and _pk[1] in df.columns:
+        _dup = int(df.duplicated(subset=list(_pk), keep="first").sum())
+        if _dup:
+            logger.warning(f"[output] 信号合并发现 {_dup} 行主键重复，keep=first 去重")
+            df = df.drop_duplicates(subset=list(_pk), keep="first").reset_index(drop=True)
+    if _os.write_mode() == _os.OUTPUT_WRITE_UPSERT:
+        try:
+            _manifest = _os.OutputManifest(cache_dir, _os.OutputSchema("signal_cache", _pk, "v1"))
+            _records = _manifest.records()
+            if _records:
+                _found = set(df["symbol"].unique()) if "symbol" in df.columns else set()
+                _expected = {r.key for r in _records}
+                _missing = sorted(_expected - _found)
+                _report = _os.MergeReport(
+                    expected=len(_expected),
+                    read_ok=len(_expected) - len(_missing),
+                    missing=_missing,
+                    primary_keys=_pk,
+                )
+                _os.log_merge(_report, "信号合并")
+        except Exception as _e:
+            logger.debug(f"[output] 信号清单校验失败: {_e}")
     return df
 
 
@@ -309,6 +348,7 @@ def prepare_backtest_data(
     vectorized: bool = False,
     backtest_start_date: str | None = None,
     data_version: str | None = None,
+    confirmed_suspension_days: set[str] | None = None,
 ) -> pd.DataFrame:
     is_flat = params is not None and (
         "atr_stop_mult" in params
@@ -350,6 +390,39 @@ def prepare_backtest_data(
 
     random.seed(42)
     np.random.seed(42)
+
+    # ── Task F 交易日历与停牌标志对齐（CALENDAR_ALIGN_MODE=off 回退老版合并逻辑） ──
+    # 真实成交行打标 is_trading/is_suspended（不物化 NaN 行），并按官方日历口径
+    # 计算每只股票停牌统计（供 Phase 0 / worker precheck 日历口径 SKIP）。
+    # confirmed_suspension_days（官方停牌公告/龙虎榜独立口径）存在时对缺失日做
+    # "漏采 vs 停牌"交叉验证，避免数据源漏采被误判为停牌而硬拒。
+    _susp_stats: dict[str, dict[str, Any]] = {}
+    if _ca.align_enabled():
+        _ca.maintain_calendar()
+        kline_df = _ca.add_alignment_flags(kline_df)
+        _susp_stats = _ca.compute_suspension_stats(
+            kline_df, confirmed_suspension_days=confirmed_suspension_days
+        )
+        try:
+            from BackTrading.precheck import suspension_suspects as _suspects
+
+            _susp_suspects = _suspects(_susp_stats)
+            if _susp_suspects:
+                logger.warning(f"[停牌-疑似漏采] {len(_susp_suspects)} 只高缺失日股票需人工复核"
+                               "（真实停牌 vs 数据源漏采，可对比官方停牌公告/龙虎榜）：")
+                for _r in _susp_suspects:
+                    _cv = (
+                        f" 确认停牌={len(_r['confirmed_days'])}天/漏采嫌疑={len(_r['under_collected_days'])}天"
+                        if _r["cross_validated"]
+                        else " 未交叉验证"
+                    )
+                    logger.warning(
+                        f"  - {_r['symbol']}: 缺失占比={_r['ratio']:.2%}({_r['days']}天) "
+                        f"tail={len(_r['tail_days'])}天 interior={len(_r['interior_days'])}天{_cv} "
+                        f"缺失日={_r['missing_days'][:8]}{'…' if len(_r['missing_days']) > 8 else ''}"
+                    )
+        except Exception as _susp_e:
+            logger.debug(f"[停牌-疑似漏采] 清单生成跳过: {_susp_e}")
 
     trade_date = _trade_day_str()
     cache_dir = _cache_dir_for(trade_date, signal_param_hash, config_hash, data_fp)
@@ -451,7 +524,7 @@ def prepare_backtest_data(
         # fingerprint=data_fp：跨数据批次（WFO 窗口/路径切片）切换时清空指标内存缓存，
         # 防止 worker 复用旧切片的指标导致信号日期错位（2026-08-07 OOS 0 交易根因）。
         if vectorized:
-            precompute_all_indicators(stock_dir, fingerprint=data_fp)
+            precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES
@@ -460,9 +533,11 @@ def prepare_backtest_data(
         )
 
         _worker_fn = _stock_worker_vectorized if vectorized else _stock_worker
+        _pipeline_records: list[_os.OutputRecord] = []
 
         def _pipeline(syms: list[str], idx: int) -> None:
-            """单管道：ThreadPoolExecutor 并发处理股票（Windows spawn 下 ProcessPoolExecutor 会死锁）。"""
+            """单管道：ThreadPoolExecutor 并发处理股票（Windows spawn 下 ProcessPoolExecutor 会死锁）。
+            D1 分片：失败片（=失败股票集合）在 SHARD_MAX_ATTEMPTS 内仅重跑失败片。"""
             if not syms:
                 return
             pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
@@ -471,31 +546,54 @@ def prepare_backtest_data(
             done = 0
             failures: set[str] = set()
             try:
-                fut_to_sym: dict[Any, str] = {}
-                for sym in syms:
-                    fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy)
-                    fut_to_sym[fut] = sym
+                def _run_batch(syms_batch: list[str], *, progress: bool = False) -> set[str]:
+                    """提交一批符号并收集失败集合（片级失败：仅这批重跑）。"""
+                    nonlocal done
+                    batch_failures: set[str] = set()
+                    fut_to_sym: dict[Any, str] = {}
+                    for sym in syms_batch:
+                        fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy, _susp_stats)
+                        fut_to_sym[fut] = sym
 
-                for future in as_completed(fut_to_sym):
-                    sym = fut_to_sym[future]
-                    try:
-                        rows = future.result(timeout=120)
-                        if rows:
-                            _save_stock_signal(cache_dir, sym, rows)
-                    except Exception as e:
-                        failures.add(sym)
-                        logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")
-                    done += 1
-                    if done % 500 == 0:
-                        logger.info(f"  管道{idx+1} 进度 {done}/{len(syms)} 只（耗时 {time.time()-_p0:.0f}s, 失败 {len(failures)}）")
-                    pbar.update(1)
+                    for future in as_completed(fut_to_sym):
+                        sym = fut_to_sym[future]
+                        try:
+                            rows = future.result(timeout=120)
+                            if rows:
+                                _save_stock_signal(cache_dir, sym, rows)
+                                _pipeline_records.append(_os.OutputRecord(
+                                    shard_id=f"p{idx}", key=sym,
+                                    path=str(_symbol_cache_path(cache_dir, sym)),
+                                    rows=len(rows),
+                                    written_at=time.time(),
+                                ))
+                        except Exception as e:
+                            batch_failures.add(sym)
+                            logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")
+                        if progress:
+                            done += 1
+                            if done % 500 == 0:
+                                logger.info(f"  管道{idx+1} 进度 {done}/{len(syms)} 只（耗时 {time.time()-_p0:.0f}s, 失败 {len(batch_failures)}）")
+                            pbar.update(1)
+                    return batch_failures
+
+                failures = _run_batch(syms, progress=True)
+                # 失败仅重跑失败片（shard=失败股票集合），不重跑成功片
+                if failures and Config().SHARD_MODE != "off":
+                    max_attempts = max(int(Config().SHARD_MAX_ATTEMPTS), 1)
+                    for _a in range(2, max_attempts + 1):
+                        if not failures:
+                            break
+                        time.sleep(0.5)
+                        logger.info(f"  管道{idx+1} 重跑失败片（仅失败 {len(failures)} 只，第 {_a}/{max_attempts} 次尝试）...")
+                        failures = _run_batch(sorted(failures))
             finally:
                 # wait=True：等所有 worker 真正结束再返回，防止残留线程在
                 # _load_signal_cache 阶段仍用 pyarrow 写 parquet，与主线程
                 # 并发读触发 Windows 原生崩溃（0xC0000005 静默终止）。
                 pool.shutdown(wait=True)
             pbar.close()
-            logger.info(f"  管道{idx+1} 完成: 成功 {done-len(failures)}/{len(syms)} 只, 失败 {len(failures)}（耗时 {time.time()-_p0:.0f}s）")
+            logger.info(f"  管道{idx+1} 完成: 成功 {len(syms)-len(failures)}/{len(syms)} 只, 失败 {len(failures)}（耗时 {time.time()-_p0:.0f}s）")
             if failures:
                 with open(os.path.join(cache_dir, "_pipeline_failures.txt"), "a", encoding="utf-8") as _f:
                     for _s in sorted(failures):
@@ -512,6 +610,17 @@ def prepare_backtest_data(
                     logger.warning(f" 管道 Future 异常，继续等待其他管道")
         finally:
             pool_t.shutdown(wait=True)
+
+        # Task E 幂等输出：信号片输出按 (shard_id, key) upsert 到表级清单（同键覆写）
+        if _os.write_mode() == _os.OUTPUT_WRITE_UPSERT and _pipeline_records:
+            try:
+                _schema = _os.OutputSchema("signal_cache", ("symbol", "trade_date"), "v1")
+                _manifest = _os.OutputManifest(cache_dir, _schema)
+                _manifest.upsert_many(_pipeline_records)
+                _merge = _os.validate_artifacts(_manifest.records())
+                _os.log_merge(_merge, "信号")
+            except Exception as _e:
+                logger.warning(f"[output] 信号清单写入失败（不影响计算）: {_e}")
         _t1 = time.time()
         logger.info(f"所有管道完成，耗时 {_t1-_t0:.1f}s")
     finally:
@@ -540,6 +649,7 @@ def _stock_worker(
     stock_dir: str,
     params: dict[str, Any],
     compute_exit_strategy: bool = False,
+    susp_stats: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     stock_df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"), engine="fastparquet")
     if len(stock_df) < 60:
@@ -548,9 +658,18 @@ def _stock_worker(
     # 数据质量检查
     _validate_stock_data(stock_df, symbol)
 
+    # ── 窗口预检（指标计算前）：SKIP → 返回空跳过；NEED_FILL → 限界填充 ──
+    # Task F: 日历口径停牌统计（超阈值 → SKIP），无统计回退启发式
+    from BackTrading.precheck import apply_precheck as _apply_precheck
+
+    stock_df, _pre_res = _apply_precheck(symbol, stock_df, context="_stock_worker",
+                                         suspension_stats=(susp_stats or {}).get(symbol))
+    if stock_df.empty:
+        return []
+
     # 所有滚动指标（MA, MACD, ATR, BBANDS 等）只向后看，不存在前瞻偏差。
     # 在全量数据上一次性计算，避免每根 bar 重复 800 次。
-    stock_df = _compute_indicators(stock_df)
+    stock_df = _compute_indicators_snapshotted(stock_df, symbol=symbol, context="_stock_worker")
 
     analyzer = MACDAnalyzer()
     rows: list[dict[str, Any]] = []
@@ -561,6 +680,12 @@ def _stock_worker(
             signal = _compute_signal(analyzer, bar, params, compute_exit_strategy)
         except Exception:
             continue
+        # ── 置信度消费（指标降级 RELAX/SKIP）：低置信度 bar 抑制进场信号 ──
+        from BackTrading.degradation import low_confidence_mask as _low_conf_mask
+
+        if _low_conf_mask(bar).any():
+            signal["进场评分"] = 0.0
+            signal["score"] = 0.0
         _details = signal.get("details") or {}
         rows.append({
             "symbol": symbol,
@@ -586,6 +711,7 @@ def _stock_worker_vectorized(
     stock_dir: str,
     params: dict[str, Any],
     compute_exit_strategy: bool = False,
+    susp_stats: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """全向量化版本的 _stock_worker — 无 per-bar Python 循环。
 
@@ -624,7 +750,7 @@ def _stock_worker_vectorized(
             import traceback
             logger.warning(f"  [{symbol}] 向量化信号计算失败({e})\n{traceback.format_exc()}")
             try:
-                return _stock_worker(symbol, stock_dir, params, compute_exit_strategy)
+                return _stock_worker(symbol, stock_dir, params, compute_exit_strategy, susp_stats)
             except Exception as f:
                 logger.warning(f"  [{symbol}] 原始引擎也失败: {f}")
                 return []
@@ -698,24 +824,98 @@ def _validate_stock_data(df: pd.DataFrame, symbol: str) -> None:
         logger.warning(f"[{symbol}] 缺失值比例 {nan_frac:.1%} > 1%")
 
 
-def _compute_indicators(df_raw: pd.DataFrame) -> pd.DataFrame:
+def _compute_indicators_snapshotted(
+    df_raw: pd.DataFrame,
+    symbol: str = "",
+    context: str = "",
+) -> pd.DataFrame:
+    """_compute_indicators 的失败快照包装（Task A2）。
+
+    指标计算抛异常时，把原始输入快照落盘并返回 snapshot_id 写入日志，
+    随后原样重抛，调用方行为不变。
+    """
+    import traceback as _tb
+
+    from BackTrading.snapshot import save_failure_snapshot
+
+    try:
+        return _compute_indicators(df_raw)
+    except Exception as exc:
+        _sid = save_failure_snapshot(
+            ohlcv=df_raw,
+            symbol=symbol or None,
+            metric_name="compute_indicators",
+            error_code="INDICATOR_COMPUTE_FAILED",
+            error_message=str(exc),
+            traceback_text=_tb.format_exc(),
+        )
+        _suffix = f" | snapshot_id={_sid}" if _sid else ""
+        logger.opt(exception=True).error(
+            f"[{symbol or 'unknown'}] 指标计算失败{_suffix}（{context or 'compute'}）: {exc}"
+        )
+        raise
+
+
+def _compute_indicators(
+    df_raw: pd.DataFrame,
+    min_periods: dict[str, int] | None = None,
+    confidence_flag: bool = True,
+) -> pd.DataFrame:
+    """计算全部技术指标（指标降级 + min_periods + 置信度标签）。
+
+    Args:
+        min_periods: 每指标最小周期下限（降级时使用），如 {"ma_200": 20, "atr": 5}。
+        confidence_flag: 是否生成 bar 级 _IND_CONF 置信度列（策略层消费）。
+
+    Returns:
+        df_raw + 指标列；RELAX/SKIP 降级时附加 _IND_CONF（high/low）列与
+        df.attrs["_confidence"] = {level, reasons, start_bar}。
+    """
+    from BackTrading.degradation import (
+        degrade_mode,
+        safe_adx,
+        safe_atr,
+        safe_bbands,
+        safe_cci,
+        safe_ma,
+        safe_macd,
+        safe_rsi,
+        safe_stoch,
+    )
+
     df = df_raw.copy()
     close = df["close"]
     high = df["high"]
     low = df["low"]
-    macd = ta.macd(close, fast=12, slow=26, signal=9)
-    if macd is not None:
-        df["DIF"] = macd.iloc[:, 0].values if macd.shape[1] >= 1 else 0
-        df["DEA"] = macd.iloc[:, 1].values if macd.shape[1] >= 2 else 0
-        hist = macd.iloc[:, 2].values if macd.shape[1] >= 3 else 0
+    n = len(df)
+    mode = degrade_mode()
+
+    def _mp(name: str) -> int | None:
+        return (min_periods or {}).get(name)
+
+    def _track(res, degraded_starts: list[int], reasons: list[str]) -> None:
+        if res.confidence.is_low:
+            degraded_starts.append(res.start_bar)
+            reasons.extend(res.confidence.reasons)
+
+    degraded_starts: list[int] = []
+    degraded_reasons: list[str] = []
+
+    macd = safe_macd(close, min_periods=_mp("macd"))
+    _track(macd, degraded_starts, degraded_reasons)
+    if macd.value is not None:
+        df["DIF"] = macd.value.iloc[:, 0].values if macd.value.shape[1] >= 1 else 0
+        df["DEA"] = macd.value.iloc[:, 1].values if macd.value.shape[1] >= 2 else 0
+        hist = macd.value.iloc[:, 2].values if macd.value.shape[1] >= 3 else 0
         df["MACD_HIST"] = 2 * hist if isinstance(hist, np.ndarray) else hist
     else:
         df["DIF"] = 0.0
         df["DEA"] = 0.0
         df["MACD_HIST"] = 0.0
 
-    atr_series = ta.atr(high, low, close, length=14)
-    df["ATR"] = atr_series if atr_series is not None else 0.0
+    atr = safe_atr(high, low, close, min_periods=_mp("atr"))
+    _track(atr, degraded_starts, degraded_reasons)
+    df["ATR"] = atr.value if atr.value is not None else 0.0
 
     if "DIF" in df.columns and "DEA" in df.columns:
         dif = df["DIF"]
@@ -738,39 +938,62 @@ def _compute_indicators(df_raw: pd.DataFrame) -> pd.DataFrame:
         df.loc[dead, "MACD_CROSS"] = -1
 
     for p in (5, 10, 20, 30, 60):
-        df[f"MA_{p}"] = close.rolling(p).mean()
+        res = safe_ma(close, p, mode=mode, min_periods=_mp(f"ma_{p}"))
+        _track(res, degraded_starts, degraded_reasons)
+        df[f"MA_{p}"] = res.value
 
-    bb = ta.bbands(close, length=20, std=2)  # type: ignore[arg-type]
-    if bb is not None and bb.shape[1] >= 3:
-        df["BBU_20_2.0"] = bb.iloc[:, 0].values
-        df["BBM_20_2.0"] = bb.iloc[:, 1].values
-        df["BBL_20_2.0"] = bb.iloc[:, 2].values
-        df["BOLL_BANDWIDTH"] = (bb.iloc[:, 0] - bb.iloc[:, 2]) / close
+    bb = safe_bbands(close, min_periods=_mp("bbands"))
+    _track(bb, degraded_starts, degraded_reasons)
+    if bb.value is not None and bb.value.shape[1] >= 3:
+        df["BBU_20_2.0"] = bb.value.iloc[:, 0].values
+        df["BBM_20_2.0"] = bb.value.iloc[:, 1].values
+        df["BBL_20_2.0"] = bb.value.iloc[:, 2].values
+        df["BOLL_BANDWIDTH"] = (bb.value.iloc[:, 0] - bb.value.iloc[:, 2]) / close
 
     # 以下指标供 pipeline_analysis._precompute_rule_indicators 使用，
     # 列名必须与 guards 的检查前缀完全匹配，避免每根 bar 重算。
-    adx_series = ta.adx(high, low, close, length=14)
-    if adx_series is not None:
-        df["ADX"] = adx_series.get("ADX_14", 0.0).values  # type: ignore[union-attr]
+    adx = safe_adx(high, low, close, min_periods=_mp("adx"))
+    _track(adx, degraded_starts, degraded_reasons)
+    if adx.value is not None:
+        df["ADX"] = adx.value.iloc[:, 0].values  # 降级后列名变化，必须按位置取
 
-    df["MA_200"] = close.rolling(200).mean()
+    res200 = safe_ma(close, 200, mode=mode, min_periods=_mp("ma_200"))
+    _track(res200, degraded_starts, degraded_reasons)
+    df["MA_200"] = res200.value
+    rsi = safe_rsi(close, min_periods=_mp("rsi"))
+    _track(rsi, degraded_starts, degraded_reasons)
+    if rsi.value is not None:
+        df["RSI_14"] = rsi.value.values if isinstance(rsi.value, pd.Series) else rsi.value
 
-    rsi_s = ta.rsi(close, length=14)
-    if rsi_s is not None:
-        df["RSI_14"] = rsi_s.values if isinstance(rsi_s, pd.Series) else rsi_s
-
-    stoch_df = ta.stoch(high, low, close, k=9, d=3)
-    if stoch_df is not None:
-        for c in stoch_df.columns:
-            df[c] = stoch_df[c].to_numpy()
+    stoch = safe_stoch(high, low, close, min_periods=_mp("stoch"))
+    _track(stoch, degraded_starts, degraded_reasons)
+    if stoch.value is not None:
+        for c in stoch.value.columns:
+            df[c] = stoch.value[c].to_numpy()
 
     df["AMOUNT"] = close * df["volume"]
     df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean()
     df["AMPLITUDE_PCT"] = (high - low) / close
 
-    cci_s = ta.cci(high, low, close, length=20)
-    if cci_s is not None:
-        df["CCI_20"] = cci_s.values if isinstance(cci_s, pd.Series) else cci_s
+    cci = safe_cci(high, low, close, min_periods=_mp("cci"))
+    _track(cci, degraded_starts, degraded_reasons)
+    if cci.value is not None:
+        df["CCI_20"] = cci.value.values if isinstance(cci.value, pd.Series) else cci.value
+
+    # ── 置信度标签：bar 级 _IND_CONF + attrs 汇总（策略层消费） ──
+    if confidence_flag:
+        df["_IND_CONF"] = "high"
+        if degraded_starts:
+            _start = min(degraded_starts)
+            conf_col = pd.Series("high", index=df.index)
+            conf_col.iloc[max(0, _start):] = "low"
+            df["_IND_CONF"] = conf_col
+            df.attrs["_confidence"] = {
+                "level": "low",
+                "reasons": degraded_reasons,
+                "start_bar": int(_start),
+                "mode": mode.value,
+            }
     return df
 
 

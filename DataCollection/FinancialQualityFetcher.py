@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -19,6 +20,7 @@ class FinancialQualityFetcher:
 
     通过 akShare ``stock_financial_abstract`` 接口逐只获取财务摘要。
     文件缓存以交易日后缀命名，交易日匹配时直接读缓存跳过 API。
+    采集按批进行（默认每批 500 只），批间休眠（默认 20 秒）以避免接口封禁。
     """
 
     TABLE_NAME = "ods_financial_quality"
@@ -26,6 +28,9 @@ class FinancialQualityFetcher:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._cache_days = config.FINANCIAL_QUALITY_CACHE_DAYS
+        self._batch_size = getattr(config, "FINANCIAL_QUALITY_BATCH_SIZE", 500)
+        self._batch_sleep = getattr(config, "FINANCIAL_QUALITY_BATCH_SLEEP", 20)
+        self._file_cache_days = getattr(config, "FINANCIAL_QUALITY_FILE_CACHE_DAYS", 30)
         self._engine = get_engine(config)
 
 
@@ -96,16 +101,34 @@ class FinancialQualityFetcher:
         key = today_str.replace("-", "")
         return os.path.join(self._cache_dir, f"financial_quality_{key}.parquet")
 
-    def _load_cache(self, today_str: str) -> pd.DataFrame | None:
-        path = self._cache_path(today_str)
-        if not os.path.isfile(path):
+    def _find_recent_cache(self) -> pd.DataFrame | None:
+        """查找最近 ``_file_cache_days`` 天内的缓存文件，命中则直接读取。
+
+        财报非日更，只要离线文件在一个月内即可直接复用，避免频繁请求被封禁。
+        """
+        if not os.path.isdir(self._cache_dir):
+            return None
+        cutoff = time.time() - self._file_cache_days * 86400
+        best_path: str | None = None
+        best_mtime = 0.0
+        for name in os.listdir(self._cache_dir):
+            if not name.startswith("financial_quality_") or not name.endswith(".parquet"):
+                continue
+            path = os.path.join(self._cache_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime >= cutoff and mtime > best_mtime:
+                best_path, best_mtime = path, mtime
+        if best_path is None:
             return None
         try:
-            df = pd.read_parquet(path)
-            logger.info(f"[FinancialQuality] 读取缓存 {path}，共 {len(df)} 只")
+            df = pd.read_parquet(best_path)
+            logger.info(f"[FinancialQuality] 命中离线缓存 {best_path}（{self._file_cache_days} 天内），共 {len(df)} 只")
             return df
         except Exception as e:
-            logger.warning(f"[FinancialQuality] 缓存读取失败: {e}")
+            logger.warning(f"[FinancialQuality] 缓存读取失败 {best_path}: {e}")
             return None
 
     def _save_cache(self, today_str: str, rows: list[dict[str, Any]]) -> None:
@@ -142,10 +165,11 @@ class FinancialQualityFetcher:
         """并发采集全股池，增量补全，返回此次采集数量。
 
         流程：
-        1. 合并已有数据：今日缓存（文件）∪ 数据库已有记录
+        1. 合并已有数据：离线缓存（一个月内文件）∪ 数据库已有记录
         2. 仅采集 stock_list 中缺失的股票
-        3. 新采集的追加到缓存文件（不覆盖）
-        4. 批量写入 DB
+        3. 按批采集（默认每批 500 只），批间休眠（默认 20 秒）避免接口封禁
+        4. 新采集的追加到缓存文件（不覆盖）
+        5. 批量写入 DB
         """
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
         from sqlalchemy import text
@@ -156,14 +180,12 @@ class FinancialQualityFetcher:
 
         already: set[str] = set()
 
-        # ── 1a. 加载今日缓存（增量 checkpoint） ──
-        cached_df: pd.DataFrame | None = None
-        if today_str:
-            cached_df = self._load_cache(today_str)
-            if cached_df is not None and not cached_df.empty:
-                cached_syms = set(cached_df["symbol"].unique())
-                already |= cached_syms
-                logger.info(f"[FinancialQuality] 缓存已有 {len(cached_syms)} 只")
+        # ── 1a. 加载一个月内离线缓存（财报非日更，直接复用） ──
+        cached_df: pd.DataFrame | None = self._find_recent_cache()
+        if cached_df is not None and not cached_df.empty:
+            cached_syms = set(cached_df["symbol"].unique())
+            already |= cached_syms
+            logger.info(f"[FinancialQuality] 离线缓存已有 {len(cached_syms)} 只")
 
         # ── 1b. 查询数据库最新 record_date，仅未过期的才跳过 ──
         cutoff = (datetime.now().date() - timedelta(days=self._cache_days))
@@ -195,40 +217,47 @@ class FinancialQualityFetcher:
             logger.info(f"[FinancialQuality] 全部 {len(target_set)} 只已采集，跳过")
             return 0
 
-        logger.info(f"[FinancialQuality] 需采集 {len(need)}/{len(target_set)} 只（{max_workers} 路并发）...")
+        logger.info(f"[FinancialQuality] 需采集 {len(need)}/{len(target_set)} 只（每批 {self._batch_size} 只，{max_workers} 路并发）...")
 
         all_rows: list[dict[str, Any]] = []
         total = len(need)
         done = 0
         failed = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            fut_to_sym = {pool.submit(self.fetch_one, sym): sym for sym in need}
-            while fut_to_sym:
-                done_set, not_done = wait(fut_to_sym, timeout=120, return_when=FIRST_COMPLETED)
-                if not done_set and not_done:
-                    for fut in not_done:
-                        sym = fut_to_sym.get(fut, "?")
-                        logger.warning(f"[FinancialQuality] {sym} 采集超时（120s），跳过")
-                        fut.cancel()
+        # ── 3. 按批采集，批间休眠避免接口封禁 ──
+        for batch_start in range(0, total, self._batch_size):
+            batch = need[batch_start:batch_start + self._batch_size]
+            if batch_start > 0:
+                logger.info(f"[FinancialQuality] 批间休眠 {self._batch_sleep} 秒，避免接口封禁...")
+                time.sleep(self._batch_sleep)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                fut_to_sym = {pool.submit(self.fetch_one, sym): sym for sym in batch}
+                while fut_to_sym:
+                    done_set, not_done = wait(fut_to_sym, timeout=120, return_when=FIRST_COMPLETED)
+                    if not done_set and not_done:
+                        for fut in not_done:
+                            sym = fut_to_sym.get(fut, "?")
+                            logger.warning(f"[FinancialQuality] {sym} 采集超时（120s），跳过")
+                            fut.cancel()
+                            done += 1
+                            failed += 1
+                        break
+                    for fut in done_set:
+                        sym = fut_to_sym.pop(fut, "?")
                         done += 1
-                        failed += 1
-                    break
-                for fut in done_set:
-                    sym = fut_to_sym.pop(fut, "?")
-                    done += 1
-                    try:
-                        row = fut.result(timeout=5)
-                    except Exception:
-                        logger.warning(f"[FinancialQuality] {sym} 采集失败，跳过")
-                        failed += 1
-                        continue
-                    if row is None:
-                        failed += 1
-                        continue
-                    all_rows.append(row)
-                    if done % 50 == 0 or done == total:
-                        logger.info(f"[FinancialQuality] 进度 {done}/{total}，已采集 {len(all_rows)} 只，失败 {failed} 只")
+                        try:
+                            row = fut.result(timeout=5)
+                        except Exception:
+                            logger.warning(f"[FinancialQuality] {sym} 采集失败，跳过")
+                            failed += 1
+                            continue
+                        if row is None:
+                            failed += 1
+                            continue
+                        all_rows.append(row)
+                        if done % 50 == 0 or done == total:
+                            logger.info(f"[FinancialQuality] 进度 {done}/{total}，已采集 {len(all_rows)} 只，失败 {failed} 只")
 
         # ── 追加到缓存文件（不覆盖已有） ──
         if today_str and all_rows:

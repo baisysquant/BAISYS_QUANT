@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import bisect
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
+from BackTrading.engine import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
+
+# 压力测试 warmup 天数（危机段前预留的交易日 buffer，
+# 让引擎建立 ADV 历史/仓位状态后再进入危机段，避免冷启动失真）
+_STRESS_WARMUP_DAYS = 30
 
 # 历史极端场景（基于已知 A 股危机时段）
 CRISIS_SCENARIOS = {
@@ -69,22 +74,43 @@ def run_stress_tests(
         prepared["止损价"] = 0.0
 
     date_range = prepared["trade_date"].astype(str)
+    # ── P3-1：交易日序列（用于 warmup buffer 回溯） ──
+    unique_dates = sorted(date_range.unique())
 
     results = {}
     for name, scenario in CRISIS_SCENARIOS.items():
-        mask = (date_range >= scenario["start"]) & (date_range <= scenario["end"])
-        scene_data = prepared[mask].copy()
-        if scene_data.empty:
+        crisis_start = scenario["start"]
+        crisis_end = scenario["end"]
+        # ── P3-1：30 天 warmup buffer 避免 ADV 冷启动 ──
+        # 回测从危机前 30 个交易日开始，让引擎建立仓位/ADV 历史后再进入危机段
+        _start_pos = bisect.bisect_left(unique_dates, crisis_start)
+        _warmup_pos = max(0, _start_pos - _STRESS_WARMUP_DAYS)
+        warmup_start = unique_dates[_warmup_pos]
+        mask_ext = (date_range >= warmup_start) & (date_range <= crisis_end)
+        scene_data_ext = prepared[mask_ext].copy()
+        if scene_data_ext.empty:
             logger.info(f"  压力测试 [{name}] 无数据，跳过")
             continue
 
         tl: list[dict[str, Any]] = []
         ec: list[dict[str, Any]] = []
-        _run_single_backtest(scene_data, params, engine_cfg, tl, ec)
+        _run_single_backtest(scene_data_ext, params, engine_cfg, tl, ec)
+
+        # 仅保留危机段权益曲线（warmup 段不入指标）
+        _cs_ts = pd.Timestamp(crisis_start)
+        _ce_ts = pd.Timestamp(crisis_end)
+        ec_crisis = [
+            row for row in ec
+            if _cs_ts <= pd.Timestamp(row.get("time", crisis_start)) <= _ce_ts
+        ]
+        if not ec_crisis:
+            logger.info(f"  压力测试 [{name}] 危机段无权益数据，跳过")
+            continue
 
         from LogicAnalyzer.backtest_metrics import compute_risk_metrics
-        risk = compute_risk_metrics(ec) or {}
+        risk = compute_risk_metrics(ec_crisis) or {}
 
+        _end_pos = bisect.bisect_right(unique_dates, crisis_end)
         results[name] = {
             "sharpe": risk.get("sharpe_ratio", 0),
             "total_return": risk.get("total_return", 0),
@@ -92,7 +118,7 @@ def run_stress_tests(
             "max_drawdown": risk.get("max_drawdown", 0),
             "max_drawdown_duration": risk.get("max_drawdown_duration", 0),
             "annual_vol": risk.get("annual_vol", 0),
-            "trading_days": len(scene_data["trade_date"].unique()),
+            "trading_days": _end_pos - _start_pos,
         }
         logger.info(
             f"  压力测试 [{name}]: "

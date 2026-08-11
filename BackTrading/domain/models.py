@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,16 @@ DEFAULT_TIER_CAP: tuple[float, ...] = (0.10, 0.05, 0.05, 0.03)
 # 固定滑点强制下限（1.8 交易摩擦合规）：A股隐性成本不低于单边 0.05%，
 # 配置值低于此下限时一律抬升，防止策略 Alpha 未被真实市场摩擦覆盖。
 MIN_SLIPPAGE_FLOOR: float = 0.0005
+# 印花税日期分段表（配置驱动，替代硬编码）：date:rate 升序，取最晚 ≤ 交易日的档。
+# 2023-08-28 财政部减半：0.1% → 0.05%（卖出单向）。默认含历史兜底段 2000-01-01。
+DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
+    ("2023-08-28", 0.0005),
+    ("2000-01-01", 0.001),
+)
+# 经手费（双边 0.00341%，沪/深交易所） + 证管费（双边 0.002%，证监会），
+# 行业惯例通常已并入佣金，此处单独建模（拆分报告可见），并入 CostModel 统一收取。
+DEFAULT_HANDLING_FEE_RATE: float = 0.0000341
+DEFAULT_CSRC_FEE_RATE: float = 0.00002
 
 
 @dataclass
@@ -45,6 +56,9 @@ class CostModel:
     short_cost_rate: float = 0.0
     min_commission_per_trade: float = 5.0
     transfer_fee_rate: float = 0.00001
+    handling_fee_rate: float = DEFAULT_HANDLING_FEE_RATE
+    csrc_fee_rate: float = DEFAULT_CSRC_FEE_RATE
+    stamp_tax_segments: tuple[tuple[str, float], ...] = DEFAULT_STAMP_TAX_SEGMENTS
     liquidity_tier_edges: tuple[float, ...] = DEFAULT_TIER_EDGES
     liquidity_tier_impact_base: tuple[float, ...] = DEFAULT_TIER_IMPACT_BASE
     liquidity_tier_threshold: tuple[float, ...] = DEFAULT_TIER_THRESHOLD
@@ -53,6 +67,10 @@ class CostModel:
     def __post_init__(self) -> None:
         """构造时校验分档配置，避免档位错位导致成本失真。"""
         self.validate_liquidity_tiers()
+        # 印花税分段表按日期升序，保证 stamp_tax_rate_for 取"最晚 ≤ 交易日"档
+        self.stamp_tax_segments = tuple(
+            sorted(self.stamp_tax_segments, key=lambda x: str(x[0]))
+        )
 
     # ── 流动性分档 ────────────────────────────────────────────
 
@@ -121,25 +139,38 @@ class CostModel:
 
     # ── 成本计算 ──────────────────────────────────────────────
 
-    def calc_slippage(
+    def stamp_tax_rate_for(self, dt: str | None) -> float:
+        """按配置日期表取印花税率（替代硬编码分段）。
+
+        Args:
+            dt: 交易日（YYYY-MM-DD）；None 返回单值 stamp_tax_rate。
+
+        Returns:
+            float: 最晚 ≤ dt 的档位税率；无命中时回落 stamp_tax_rate。
+        """
+        if dt is None:
+            return self.stamp_tax_rate
+        rate = self.stamp_tax_rate
+        for _date, _r in self.stamp_tax_segments:
+            if str(dt) >= str(_date):
+                rate = _r
+            else:
+                break  # 升序：后续日期更晚，不可能命中
+        return rate
+
+    def _slippage_components(
         self,
         volume: float,
         adv: float,
-        side: str = "buy",
         order_type: str = "market",
         amount_ma20: float | None = None,
         volatility_multiplier: float = 1.0,
-    ) -> float:
-        """计算总滑点 = 基础滑点×波动倍率 + 大单冲击成本。
+    ) -> tuple[float, float]:
+        """返回 (基础滑点率, 冲击成本率)。
 
         波动倍率（1.9 流动性拟真）：单日振幅>5% 的剧烈波动日，盘中价格跳动加剧，
-        基础滑点必须翻倍（×2）。振幅可观测性由调用方（引擎）计算，无高/低价时默认 1.0。
-
-        冲击参数按流动性分档独立取值：小票（低 AMOUNT_MA20）冲击大、阈值低，
-        大票反之，纠正统一冲击参数下小票收益虚高的问题。
-
-        参与率上限 1.0（单日成交量 100%），冲击成本上限为该档 impact_cap，
-        防止极端流动性场景下滑点 > 100% 导致现金为负。
+        基础滑点必须翻倍（×2）。冲击参数按流动性分档独立取值（小票冲击大、阈值低，
+        大票反之）。参与率上限 1.0，冲击上限为该档 impact_cap，防止极端场景滑点>100%。
         """
         base = self.market_slippage if order_type == "market" else self.limit_slippage
         base = max(base, MIN_SLIPPAGE_FLOOR)
@@ -155,7 +186,82 @@ class CostModel:
         else:
             impact = 0.0
         impact = min(impact, impact_cap)
+        return base, impact
+
+    def calc_slippage(
+        self,
+        volume: float,
+        adv: float,
+        side: str = "buy",
+        order_type: str = "market",
+        amount_ma20: float | None = None,
+        volatility_multiplier: float = 1.0,
+    ) -> float:
+        """计算总滑点 = 基础滑点×波动倍率 + 大单冲击成本。"""
+        base, impact = self._slippage_components(
+            volume, adv, order_type=order_type, amount_ma20=amount_ma20,
+            volatility_multiplier=volatility_multiplier,
+        )
         return base + impact
+
+    def buy_cost_breakdown(
+        self,
+        value: float,
+        volume: float,
+        adv: float,
+        order_type: str = "market",
+        amount_ma20: float | None = None,
+        volatility_multiplier: float = 1.0,
+    ) -> dict[str, float]:
+        """买入成本拆解 = 佣金(含最低5元) + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。
+
+        返回各分项金额（元）与 total，供成本拆解报告按占比汇总。
+        """
+        base, impact = self._slippage_components(
+            volume, adv, order_type=order_type, amount_ma20=amount_ma20,
+            volatility_multiplier=volatility_multiplier,
+        )
+        commission = max(value * self.commission_rate, self.min_commission_per_trade)
+        transfer = value * self.transfer_fee_rate
+        handling = value * self.handling_fee_rate
+        csrc = value * self.csrc_fee_rate
+        slippage = value * base
+        impact_v = value * impact
+        return {
+            "commission": commission,
+            "transfer": transfer,
+            "handling": handling,
+            "csrc": csrc,
+            "slippage": slippage,
+            "impact": impact_v,
+            "total": commission + transfer + handling + csrc + slippage + impact_v,
+        }
+
+    def sell_cost_breakdown(
+        self,
+        value: float,
+        volume: float,
+        adv: float,
+        order_type: str = "market",
+        stamp_tax_rate: float | None = None,
+        dt: str | None = None,
+        amount_ma20: float | None = None,
+        volatility_multiplier: float = 1.0,
+    ) -> dict[str, float]:
+        """卖出成本拆解 = 买入成本项 + 印花税（按日期表，仅卖出）。
+
+        stamp_tax_rate 显式传入优先；否则按 dt 查 stamp_tax_segments 日期表。
+        """
+        parts = self.buy_cost_breakdown(
+            value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
+            volatility_multiplier=volatility_multiplier,
+        )
+        if stamp_tax_rate is None:
+            stamp_tax_rate = self.stamp_tax_rate_for(dt)
+        stamp = value * stamp_tax_rate
+        parts["stamp"] = stamp
+        parts["total"] += stamp
+        return parts
 
     def buy_cost(
         self,
@@ -166,13 +272,11 @@ class CostModel:
         amount_ma20: float | None = None,
         volatility_multiplier: float = 1.0,
     ) -> float:
-        """买入成本 = 佣金（含最低5元） + 过户费 + 滑点。"""
-        slip = self.calc_slippage(
-            volume, adv, side="buy", order_type=order_type, amount_ma20=amount_ma20,
+        """买入成本 = 佣金（含最低5元） + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。"""
+        return self.buy_cost_breakdown(
+            value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             volatility_multiplier=volatility_multiplier,
-        )
-        commission = max(value * self.commission_rate, self.min_commission_per_trade)
-        return value * (slip + self.transfer_fee_rate) + commission
+        )["total"]
 
     def sell_cost(
         self,
@@ -181,26 +285,43 @@ class CostModel:
         adv: float,
         order_type: str = "market",
         stamp_tax_rate: float | None = None,
+        dt: str | None = None,
         amount_ma20: float | None = None,
         volatility_multiplier: float = 1.0,
     ) -> float:
-        """卖出成本 = 佣金（含最低5元） + 印花税 + 过户费 + 滑点。"""
-        slip = self.calc_slippage(
-            volume, adv, side="sell", order_type=order_type, amount_ma20=amount_ma20,
+        """卖出成本 = 佣金（含最低5元） + 印花税 + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。"""
+        return self.sell_cost_breakdown(
+            value, volume, adv, order_type=order_type,
+            stamp_tax_rate=stamp_tax_rate, dt=dt,
+            amount_ma20=amount_ma20,
             volatility_multiplier=volatility_multiplier,
-        )
-        commission = max(value * self.commission_rate, self.min_commission_per_trade)
-        stamp = self.stamp_tax_rate if stamp_tax_rate is None else stamp_tax_rate
-        return value * (slip + stamp + self.transfer_fee_rate) + commission
+        )["total"]
 
     # ── 配置构建 ──────────────────────────────────────────────
 
     @classmethod
-    def from_backtest_config(cls, bt: Any) -> CostModel:
+    def _parse_stamp_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
+        """解析 "date:rate;date:rate" 印花税日期表，按日期升序。"""
+        segs: list[tuple[str, float]] = []
+        for part in str(s).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            _date, _, _rate = part.partition(":")
+            if not _date or not _rate:
+                raise ValueError(f"STAMP_TAX_SEGMENTS 段格式应为 date:rate，收到 {part!r}")
+            segs.append((_date.strip(), float(_rate.strip())))
+        return tuple(sorted(segs, key=lambda x: x[0])) or DEFAULT_STAMP_TAX_SEGMENTS
+
+    @classmethod
+    def from_backtest_config(cls, bt: Any, trading_cost: Any | None = None) -> CostModel:
         """从 BacktestConfig 构建成本模型（含流动性分档冲击参数）。
 
         Args:
             bt: UtilsManager.ConfigParser.BacktestConfig 实例。
+            trading_cost: 可选 UtilsManager.ConfigParser.TradingCostConfig 实例；
+                提供时以其费率覆盖 [BACKTEST] 的佣金/印花税/过户费/经手费/证管费/分段表，
+                实现 [TRADING_COST] 节与回测引擎统一由 CostModel 单一来源驱动。
 
         Returns:
             CostModel: 配置校验失败时按默认值回落并告警，不中断回测。
@@ -210,17 +331,29 @@ class CostModel:
         def _parse_csv(s: str) -> tuple[float, ...]:
             return tuple(float(x.strip()) for x in str(s).split(",") if x.strip())
 
+        def _seg(s: str) -> tuple[tuple[str, float], ...]:
+            try:
+                return cls._parse_stamp_segments(s)
+            except ValueError:
+                return DEFAULT_STAMP_TAX_SEGMENTS
+
+        base_kw = dict(
+            commission_rate=float(bt.COMMISSION_RATE),
+            stamp_tax_rate=float(bt.STAMP_TAX_RATE),
+            market_slippage=float(bt.SLIPPAGE),
+            limit_slippage=float(bt.SLIPPAGE) * 0.5,
+            min_commission_per_trade=float(bt.MIN_COMMISSION_PER_TRADE),
+            transfer_fee_rate=float(bt.TRANSFER_FEE_RATE),
+            handling_fee_rate=float(getattr(bt, "HANDLING_FEE_RATE", DEFAULT_HANDLING_FEE_RATE)),
+            csrc_fee_rate=float(getattr(bt, "CSRC_FEE_RATE", DEFAULT_CSRC_FEE_RATE)),
+            stamp_tax_segments=_seg(getattr(bt, "STAMP_TAX_SEGMENTS", "")),
+            impact_base=getattr(bt, "IMPACT_BASE", 0.002),
+            impact_threshold=getattr(bt, "IMPACT_THRESHOLD", 0.01),
+            impact_cap=getattr(bt, "IMPACT_CAP", 0.05),
+        )
         try:
-            return cls(
-                commission_rate=float(bt.COMMISSION_RATE),
-                stamp_tax_rate=float(bt.STAMP_TAX_RATE),
-                market_slippage=float(bt.SLIPPAGE),
-                limit_slippage=float(bt.SLIPPAGE) * 0.5,
-                min_commission_per_trade=float(bt.MIN_COMMISSION_PER_TRADE),
-                transfer_fee_rate=float(bt.TRANSFER_FEE_RATE),
-                impact_base=getattr(bt, "IMPACT_BASE", 0.002),
-                impact_threshold=getattr(bt, "IMPACT_THRESHOLD", 0.01),
-                impact_cap=getattr(bt, "IMPACT_CAP", 0.05),
+            model = cls(
+                **base_kw,
                 liquidity_tier_edges=_parse_csv(
                     getattr(bt, "LIQUIDITY_TIER_EDGES", "5e6,2e7,1e8")
                 ),
@@ -236,14 +369,17 @@ class CostModel:
             )
         except ValueError as e:
             logger.warning(f"[CostModel] 流动性分档配置无效，回落默认分档: {e}")
-            return cls(
-                commission_rate=float(bt.COMMISSION_RATE),
-                stamp_tax_rate=float(bt.STAMP_TAX_RATE),
-                market_slippage=float(bt.SLIPPAGE),
-                limit_slippage=float(bt.SLIPPAGE) * 0.5,
-                min_commission_per_trade=float(bt.MIN_COMMISSION_PER_TRADE),
-                transfer_fee_rate=float(bt.TRANSFER_FEE_RATE),
-                impact_base=getattr(bt, "IMPACT_BASE", 0.002),
-                impact_threshold=getattr(bt, "IMPACT_THRESHOLD", 0.01),
-                impact_cap=getattr(bt, "IMPACT_CAP", 0.05),
+            model = cls(**base_kw)
+
+        if trading_cost is not None:
+            # [TRADING_COST] 节为统一成本来源：提供时覆盖 [BACKTEST] 对应费率
+            model = dataclasses.replace(
+                model,
+                commission_rate=float(getattr(trading_cost, "COMMISSION_RATE", model.commission_rate)),
+                stamp_tax_rate=float(getattr(trading_cost, "STAMP_TAX_RATE", model.stamp_tax_rate)),
+                transfer_fee_rate=float(getattr(trading_cost, "TRANSFER_FEE_RATE", model.transfer_fee_rate)),
+                handling_fee_rate=float(getattr(trading_cost, "HANDLING_FEE_RATE", model.handling_fee_rate)),
+                csrc_fee_rate=float(getattr(trading_cost, "CSRC_FEE_RATE", model.csrc_fee_rate)),
+                stamp_tax_segments=_seg(getattr(trading_cost, "STAMP_TAX_SEGMENTS", "")),
             )
+        return model

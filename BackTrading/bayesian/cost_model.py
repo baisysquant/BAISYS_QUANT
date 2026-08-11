@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import (
+from BackTrading.engine import (
     EngineConfig,
     _run_single_backtest,
 )

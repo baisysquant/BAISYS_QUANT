@@ -389,8 +389,11 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     prev2_open = shift_v(open_, 2)
     prev_body = shift_v(body, 1)
     prev2_bullish = shift_v(bullish, 2).astype(bool)
-    body_ma20 = pd.Series(body).rolling(20, min_periods=5).mean().values
-    mid_body_small = prev_body < (np.where(body_ma20 > 0, body_ma20, np.nanmean(body)) * 0.3)
+    _body_ma = pd.Series(body).rolling(20, min_periods=5).mean()
+    # 因果回退：早期不足 20 根的窗口用"截至当日"的滚动均值（expanding），
+    # 不使用全样本 mean（np.nanmean(body)）以免引入未来数据的前视泄漏。
+    body_ma20 = _body_ma.fillna(_body_ma.expanding().mean()).values
+    mid_body_small = prev_body < (body_ma20 * 0.3)
     # 晨星：长阴 → 小实体（跳空低开） → 长阳（收过第一根中点）
     cond_ms = (~prev2_bullish) & mid_body_small & bullish & (close > (prev2_open + prev2_close) / 2.0)
     engulfing[cond_ms] = 2.0
@@ -755,6 +758,10 @@ def compute_signals(
     })
     for c in ["entry_score", "exit_score", "score"]:
         result[c] = result[c].fillna(0.0)
+
+    # ── 12. 置信度消费（指标降级 RELAX/SKIP）：低置信度 bar 抑制信号或降权 ──
+    from BackTrading.degradation import apply_confidence_consumption
+    result["_low_confidence"] = apply_confidence_consumption(result, stock_df, params).astype(np.int8)
     return result
 
 

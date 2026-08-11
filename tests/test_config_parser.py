@@ -80,6 +80,14 @@ class TestConfigInit:
         assert cfg.app_config.backtest.INITIAL_CASH == 1_000_000.0
 
     @pytest.mark.unit
+    def test_resume_gap_defaults(self, temp_config_ini):
+        """0.6 复牌跳空阈值：默认 0.05，且 0=关闭 合法。"""
+        cfg = Config(str(temp_config_ini))
+        bt = cfg.app_config.backtest
+        assert bt.RESUME_GAP_UP == pytest.approx(0.05)
+        assert bt.RESUME_GAP_DOWN == pytest.approx(0.05)
+
+    @pytest.mark.unit
     def test_macd_params_parsed_as_tuple(self, temp_config_ini):
         cfg = Config(str(temp_config_ini))
         assert cfg.MACD_PARAMS == (12, 26, 9)

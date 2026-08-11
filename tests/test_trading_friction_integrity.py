@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from BackTrading._engine_legacy import _run_single_backtest
+from BackTrading.engine import _run_single_backtest
 from BackTrading.domain.models import CostModel
 from BackTrading.engine import EngineConfig
 from LogicAnalyzer.ml.trading_friction_integrity import (
@@ -267,9 +267,13 @@ def test_engine_friction_hot_path_passes_with_cost_model() -> None:
 # ── 政策常量一致性 ─────────────────────────────────────────
 
 def test_stamp_tax_policy_constants() -> None:
-    from BackTrading._engine_legacy import _STAMP_TAX_OLD, _STAMP_TAX_RECENT
-    assert _STAMP_TAX_RECENT == 0.0005  # 2023-08-28 减半后
-    assert _STAMP_TAX_OLD == 0.001
+    """印花税分段表驱动（单一来源 CostModel），2023-08-28 减半为 0.05%。"""
+    from BackTrading.domain.models import CostModel, DEFAULT_STAMP_TAX_SEGMENTS
+
+    assert DEFAULT_STAMP_TAX_SEGMENTS == (("2023-08-28", 0.0005), ("2000-01-01", 0.001))
+    cm = CostModel()
+    assert cm.stamp_tax_rate_for("2023-08-27") == 0.001  # 减半前
+    assert cm.stamp_tax_rate_for("2023-08-28") == 0.0005  # 减半后（现行）
 
 
 def test_engine_stamp_tax_historical_split() -> None:

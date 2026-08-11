@@ -13,13 +13,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from BackTrading._engine_legacy import (
+from BackTrading.engine import (
     _MIN_SLIPPAGE_FLOOR,
-    _STAMP_TAX_RECENT,
 )
 from LogicAnalyzer.ml.split_integrity import SplitReport
 
-# 政策常量（与 _engine_legacy 同源，避免两处漂移）
+# 政策常量（现行费率，引擎侧分段表以 stamp_tax_segments 驱动）
+_STAMP_TAX_CURRENT = 0.0005  # 2023-08-28 起现行印花税（万五）
 _STAMP_TAX_CUTOFF = "2023-08-28"
 _COMMISSION_FLOOR = 0.0003
 _MIN_COMMISSION_CNY = 5.0
@@ -84,10 +84,10 @@ def check_double_sided_explicit_costs(
             f"佣金 {cfg['commission_rate']:.6f} < 单边 0.03%（{_COMMISSION_FLOOR}），"
             "单回合显性成本被低估"
         )
-    if "stamp_tax_rate" in cfg and cfg["stamp_tax_rate"] < _STAMP_TAX_RECENT:
+    if "stamp_tax_rate" in cfg and cfg["stamp_tax_rate"] < _STAMP_TAX_CURRENT:
         check.passed = False
         check.details.append(
-            f"印花税 {cfg['stamp_tax_rate']:.6f} < 现行政策 0.05%（{_STAMP_TAX_RECENT}）"
+            f"印花税 {cfg['stamp_tax_rate']:.6f} < 现行政策 0.05%（{_STAMP_TAX_CURRENT}）"
         )
     if "transfer_fee_rate" in cfg and cfg["transfer_fee_rate"] < _TRANSFER_FEE_FLOOR:
         check.passed = False
@@ -195,7 +195,7 @@ def check_sell_side_completeness(
     check = SplitReport(check_name="卖出端显性成本完整性（热路径）", passed=True)
     cfg = _read_cfg(cm_or_cfg)
     commission = cfg.get("commission_rate", _COMMISSION_FLOOR)
-    stamp = cfg.get("stamp_tax_rate", _STAMP_TAX_RECENT)
+    stamp = cfg.get("stamp_tax_rate", _STAMP_TAX_CURRENT)
     transfer = cfg.get("transfer_fee_rate", _TRANSFER_FEE_FLOOR)
     min_comm = cfg.get("min_commission_per_trade", _MIN_COMMISSION_CNY)
     checked = 0

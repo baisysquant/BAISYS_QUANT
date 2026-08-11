@@ -109,20 +109,22 @@ def test_sell_cost_passes_tier_to_slippage() -> None:
 # ── 引擎透传（AMOUNT_MA20 → 分档冲击成本） ─────────────────
 
 
-def _make_engine_data() -> pd.DataFrame:
+def _make_engine_data(dates: list[str] | None = None) -> pd.DataFrame:
     """两只同市值股票：600001 微盘（AMOUNT_MA20=100万），600002 大盘（=10亿）。
 
     Day1 无信号（仅累计 ADV），Day2 双双买入，Day3 双双卖出（风险 HIGH）。
+    dates 可覆盖日期（默认为 2024-01-01..05，用于印花税分段跨日测试）。
     """
+    dates = dates or [f"2024-01-0{d}" for d in range(1, 6)]
     amounts = {"600001": 1_000_000.0, "600002": 1_000_000_000.0}
     rows = []
-    for day in range(1, 6):
+    for day, dt in enumerate(dates, start=1):
         for sym in ("600001", "600002"):
             buy = 100 if day == 2 else 0
             risk = "HIGH" if day == 3 else "LOW"
             rows.append(
                 {
-                    "trade_date": f"2024-01-0{day}",
+                    "trade_date": dt,
                     "symbol": sym,
                     "close": 10.0,
                     "close_adj": 10.0,
@@ -139,7 +141,7 @@ def _make_engine_data() -> pd.DataFrame:
 
 
 def test_engine_applies_tiered_impact_costs() -> None:
-    from BackTrading._engine_legacy import _run_single_backtest
+    from BackTrading.engine import _run_single_backtest
     from BackTrading.engine import EngineConfig
 
     data = _make_engine_data()
@@ -150,6 +152,7 @@ def test_engine_applies_tiered_impact_costs() -> None:
         max_holdings=2,
         point_in_time=False,
         initial_cash=100_000_000.0,
+        execution_model="close",
     )
     tl: list[dict] = []
     ec: list[dict] = []
@@ -173,12 +176,108 @@ def test_engine_applies_tiered_impact_costs() -> None:
     ) ** 1.5
     expected_large = (
         sells["600002"]["value"]
-        * (cm.market_slippage + impact_large + cm.stamp_tax_rate + cm.transfer_fee_rate)
+        * (cm.market_slippage + impact_large + cm.stamp_tax_rate
+           + cm.transfer_fee_rate + cm.handling_fee_rate + cm.csrc_fee_rate)
         + max(sells["600002"]["value"] * cm.commission_rate, cm.min_commission_per_trade)
     )
     assert sells["600002"]["cost"] == pytest.approx(expected_large, rel=0.05)
     assert sells["600001"]["cost"] / sells["600001"]["value"] > 0.09
     assert sells["600002"]["cost"] / sells["600002"]["value"] < 0.05
+
+
+# ── 印花税日期分段表（配置驱动，替代硬编码） ─────────────────
+
+
+def test_stamp_tax_segments_date_driven() -> None:
+    cm = CostModel()
+    # 2023-08-28 财政部减半：其后 0.05%，其前 0.1%
+    assert cm.stamp_tax_rate_for("2023-08-27") == pytest.approx(0.001)
+    assert cm.stamp_tax_rate_for("2023-08-28") == pytest.approx(0.0005)
+    assert cm.stamp_tax_rate_for("2024-01-03") == pytest.approx(0.0005)
+    assert cm.stamp_tax_rate_for(None) == pytest.approx(cm.stamp_tax_rate)
+
+
+def test_stamp_tax_custom_segments() -> None:
+    cm = CostModel(stamp_tax_segments=(("2024-01-01", 0.0004), ("2022-01-01", 0.0015)))
+    assert cm.stamp_tax_rate_for("2023-06-01") == pytest.approx(0.0015)
+    assert cm.stamp_tax_rate_for("2024-06-01") == pytest.approx(0.0004)
+    assert cm.stamp_tax_rate_for("2001-01-01") == pytest.approx(cm.stamp_tax_rate)  # 早于所有段 → 回落单值
+
+
+def test_sell_cost_uses_date_segments() -> None:
+    cm = CostModel()
+    before = cm.sell_cost(100_000.0, 1_000, 1_000_000, dt="2023-08-27")
+    after = cm.sell_cost(100_000.0, 1_000, 1_000_000, dt="2023-09-01")
+    assert before - after == pytest.approx(100_000.0 * (0.001 - 0.0005))
+
+
+# ── 成本拆解（各项占总成本百分比） ───────────────────────────
+
+
+def test_breakdown_components_sum_to_total() -> None:
+    cm = CostModel()
+    parts = cm.buy_cost_breakdown(100_000.0, 2_000, 1_000_000)
+    assert set(parts) == {"commission", "transfer", "handling", "csrc",
+                          "slippage", "impact", "total"}
+    # 经手费 + 证管费 确实收取（不再是"定义了但从未收取"）
+    assert parts["handling"] == pytest.approx(100_000.0 * cm.handling_fee_rate)
+    assert parts["csrc"] == pytest.approx(100_000.0 * cm.csrc_fee_rate)
+    # 各分项之和 == total（留 1e-9 浮点误差）
+    assert parts["total"] == pytest.approx(
+        sum(v for k, v in parts.items() if k != "total"), abs=1e-6
+    )
+    # 拆解 sum 与 buy_cost 单值一致
+    assert cm.buy_cost(100_000.0, 2_000, 1_000_000) == pytest.approx(parts["total"])
+
+    sp = cm.sell_cost_breakdown(100_000.0, 2_000, 1_000_000, dt="2024-01-03")
+    assert "stamp" in sp and sp["stamp"] == pytest.approx(100_000.0 * 0.0005)
+    assert sp["total"] == pytest.approx(
+        sum(v for k, v in sp.items() if k != "total"), abs=1e-6
+    )
+    assert cm.sell_cost(100_000.0, 2_000, 1_000_000, dt="2024-01-03") == pytest.approx(sp["total"])
+
+
+def test_buy_cost_breakdown_has_no_stamp() -> None:
+    cm = CostModel()
+    parts = cm.buy_cost_breakdown(100_000.0, 2_000, 1_000_000)
+    assert "stamp" not in parts  # 印花税仅卖出端
+
+
+def test_from_backtest_config_parses_stamp_segments_and_fees(temp_config_ini: object) -> None:
+    from UtilsManager.ConfigParser import Config
+
+    cfg = Config(str(temp_config_ini))
+    bt = cfg.app_config.backtest
+    cm = CostModel.from_backtest_config(bt)
+    assert cm.stamp_tax_rate_for("2023-08-27") == pytest.approx(0.001)
+    assert cm.stamp_tax_rate_for("2024-01-03") == pytest.approx(0.0005)
+    assert cm.handling_fee_rate == pytest.approx(0.0000341)
+    assert cm.csrc_fee_rate == pytest.approx(0.00002)
+
+
+def test_from_backtest_config_trading_cost_overrides(temp_config_ini: object) -> None:
+    """[TRADING_COST] 节提供时覆盖 [BACKTEST] 对应费率（统一成本来源）。"""
+    from UtilsManager.ConfigParser import Config
+
+    ini = str(temp_config_ini)
+    with open(ini, encoding="utf-8") as f:
+        content = f.read()
+    content += (
+        "\n[TRADING_COST]\n"
+        "commission_rate = 0.0005\n"
+        "handling_fee_rate = 0.00005\n"
+        "stamp_tax_segments = 2024-01-01:0.0004;2022-01-01:0.0015\n"
+    )
+    with open(ini, "w", encoding="utf-8") as f:
+        f.write(content)
+    cfg = Config(ini)
+    cm = CostModel.from_backtest_config(
+        cfg.app_config.backtest, trading_cost=cfg.app_config.trading_cost
+    )
+    assert cm.commission_rate == pytest.approx(0.0005)
+    assert cm.handling_fee_rate == pytest.approx(0.00005)
+    assert cm.stamp_tax_rate_for("2023-06-01") == pytest.approx(0.0015)
+    assert cm.stamp_tax_rate_for("2024-06-01") == pytest.approx(0.0004)
 
 
 # ── 配置构建 ────────────────────────────────────────────────
@@ -217,3 +316,71 @@ def test_from_backtest_config_invalid_tiers_falls_back(temp_config_ini: object) 
     # 无效分档配置回落默认分档，不中断回测
     assert cm.liquidity_tier_edges == DEFAULT_TIER_EDGES
     assert cm.liquidity_tier(1_000_000) == 0
+
+
+# ── 引擎级：印花税日期分段（卖出日驱动） ────────────────────
+
+
+def _run_engine_on(dates: list[str]) -> tuple[list[dict], list[dict]]:
+    from BackTrading.engine import _run_single_backtest
+    from BackTrading.engine import EngineConfig
+
+    data = _make_engine_data(dates=dates)
+    engine_cfg = EngineConfig(
+        cost_model=CostModel(),
+        max_position_pct=0.5,
+        max_holdings=2,
+        point_in_time=False,
+        initial_cash=100_000_000.0,
+        execution_model="close",
+    )
+    tl: list[dict] = []
+    ec: list[dict] = []
+    _run_single_backtest(data, {}, engine_cfg, tl, ec)
+    return tl, ec
+
+
+def test_engine_stamp_tax_date_driven() -> None:
+    """卖出日跨 2023-08-28 分界：卖出成本差 = 成交额 × (0.1% − 0.05%)。
+
+    两段 K 线除日期外完全一致（价格/量/ADV 相同），仅卖出日的印花税档不同。
+    买入 Day2 / 卖出 Day3 与旧测试一致。
+    """
+    before = ["2023-08-23", "2023-08-24", "2023-08-25", "2023-08-28", "2023-08-29"]
+    after = ["2023-08-25", "2023-08-28", "2023-08-29", "2023-08-30", "2023-08-31"]
+    tl_a, _ = _run_engine_on(before)
+    tl_b, _ = _run_engine_on(after)
+
+    def _sell_cost(tl: list[dict], sym: str) -> float:
+        return sum(t["cost"] for t in tl if t["symbol"] == sym and t["action"] in ("sell", "sell_partial"))
+
+    def _sell_gross(tl: list[dict], sym: str) -> float:
+        return sum(
+            t["value"] + t["cost"]
+            for t in tl
+            if t["symbol"] == sym and t["action"] in ("sell", "sell_partial")
+        )
+
+    for sym in ("600001", "600002"):
+        gross = _sell_gross(tl_a, sym)
+        # 成交额相同 → 仅印花税差 (0.001 − 0.0005)
+        assert _sell_gross(tl_b, sym) == pytest.approx(gross)
+        assert _sell_cost(tl_a, sym) - _sell_cost(tl_b, sym) == pytest.approx(gross * (0.001 - 0.0005))
+
+
+def test_engine_costs_accumulated_without_raise() -> None:
+    """引擎买卖成本进入累计且成本拆解报告在 INFO 级正常输出。"""
+    from loguru import logger
+
+    records: list[str] = []
+    sink_id = logger.add(records.append, format="{message}", level="INFO")
+    try:
+        tl, _ = _run_engine_on(["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"])
+    finally:
+        logger.remove(sink_id)
+    text = "\n".join(records)
+    assert "[成本拆解]" in text
+    assert "总成本=" in text
+    assert "%" in text
+    assert any(t["action"] == "buy" for t in tl)
+    assert any(t["action"] in ("sell", "sell_partial") for t in tl)

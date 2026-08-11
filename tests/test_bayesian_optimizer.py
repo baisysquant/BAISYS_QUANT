@@ -51,7 +51,7 @@ def spaces_with_signal() -> dict:
 
 @pytest.fixture
 def basic_engine_cfg() -> object:
-    from BackTrading._engine_legacy import EngineConfig
+    from BackTrading.engine import EngineConfig
     from BackTrading.domain.models import CostModel
     return EngineConfig(
         initial_cash=1_000_000,

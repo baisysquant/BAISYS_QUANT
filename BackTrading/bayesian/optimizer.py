@@ -8,7 +8,7 @@ from loguru import logger
 from scipy.optimize import minimize
 from scipy.stats.qmc import Sobol
 
-from BackTrading._engine_legacy import EngineConfig
+from BackTrading.engine import EngineConfig
 from BackTrading.bayesian.cost_model import FidelityController
 from BackTrading.bayesian.kernel import (
     GPState,

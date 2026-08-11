@@ -63,9 +63,9 @@ class DataQualityChecker:
 
     def _log(self, trade_date: str, step_name: str, check_name: str,
              status: str, metric: float = 0.0, threshold: float = 0.0,
-             detail: str = "") -> None:
+             detail: str = "") -> bool:
         if self._engine is None:
-            return
+            return False
         try:
             sql = sql_text(f"""
             INSERT INTO public.{self.TABLE_NAME}
@@ -78,8 +78,9 @@ class DataQualityChecker:
                     "st": status, "m": float(metric), "th": float(threshold),
                     "dt": detail[:500],
                 })
+            return True
         except Exception:
-            pass
+            return False
 
     # ── 检查项 ─────────────────────────────────────────────
 
@@ -154,6 +155,39 @@ class DataQualityChecker:
                 logger.warning(f"[数据质量] {detail}")
                 return False
         return True
+
+    def log_suspension_suspects(self, suspects: list[dict[str, Any]],
+                                trade_date: str) -> int:
+        """把"停牌-疑似漏采"清单写入质量日志（check_name=停牌-疑似漏采）。
+
+        缺失日可能来自数据源漏采而非真实停牌，逐一落库便于 /pipeline/quality-log
+        查询与人工复核。
+
+        Args:
+            suspects: BackTrading.precheck.suspension_suspects() 输出。
+            trade_date: 数据/回测日期。
+
+        Returns:
+            写入条数（无引擎时 0）。
+        """
+        n = 0
+        for r in suspects:
+            detail = (
+                f"{r['symbol']} 缺失占比 {r['ratio']:.2%}（{r['days']}天）"
+                f"tail={len(r.get('tail_days') or [])}天 "
+                f"interior={len(r.get('interior_days') or [])}天"
+            )
+            if r.get("cross_validated"):
+                detail += (
+                    f" 确认停牌={len(r.get('confirmed_days') or [])}天 "
+                    f"漏采嫌疑={len(r.get('under_collected_days') or [])}天"
+                )
+            md = r.get("missing_days") or []
+            detail += f" 缺失日={','.join(md[:10])}{'…' if len(md) > 10 else ''}"
+            if self._log(trade_date, "数据质量", "停牌-疑似漏采", "warn",
+                         float(r.get("ratio", 0.0)), 0.0, detail):
+                n += 1
+        return n
 
     # ── 批量运行 ───────────────────────────────────────────
 

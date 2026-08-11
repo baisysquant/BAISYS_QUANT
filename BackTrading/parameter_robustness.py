@@ -32,7 +32,7 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
+from BackTrading.engine import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
 from LogicAnalyzer.backtest_metrics import compute_risk_metrics
 
@@ -50,7 +50,7 @@ MAX_ALLOWED_LOSS = -0.10
 # 扰动后收益 < 基线收益 × 此比例视为断崖式下跌
 RETURN_CLIFF_FRACTION = 0.50
 
-# 参数消费路径分派（与 prepare.py flat 分派 / _engine_legacy.py / vectorized_signal.py 保持一致）
+# 参数消费路径分派（与 prepare.py flat 分派 / engine/core.py / vectorized_signal.py 保持一致）
 # 经 prepare_backtest_data 消费：scoring / regime / thresholds
 PREPARE_CONSUMED = {
     "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",

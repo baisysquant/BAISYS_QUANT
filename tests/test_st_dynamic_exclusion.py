@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
+from BackTrading.engine import EngineConfig, _run_single_backtest
 
 SYM_A = "600001.SH"   # 被标记 ST / 退市的股票
 SYM_B = "600002.SH"   # 正常对照股票
@@ -37,6 +37,7 @@ def _run(data: pd.DataFrame, st_history: dict | None, exclude_st: bool = True) -
         portfolio_method="score_weighted",
         max_position_pct=0.5,
         atr_stop_mult=0.0,
+        execution_model="close",
     )
     params = {}
     if st_history is not None:

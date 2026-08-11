@@ -30,9 +30,17 @@ class BacktestAlert:
         self._check_drift(result.params)
         self._check_overoptimize(result)
 
-    def on_failure(self, exc: Exception) -> None:
+    def on_failure(self, exc: Exception, snapshot_id: str | None = None) -> None:
         logger.error(f"回测失败: {exc}")
-        self._write_alert("failure", {"error": str(exc), "time": datetime.now().isoformat()})
+        data: dict[str, Any] = {"error": str(exc), "time": datetime.now().isoformat()}
+        if snapshot_id:
+            data["snapshot_id"] = snapshot_id
+            data["error_code"] = "PIPELINE_FAILED"
+            logger.error(
+                f"失败快照已落盘，可用 load_snapshot('{snapshot_id}') 本地复现"
+                f"（目录: <CACHE_DIRECTORY>/failure_snapshots）"
+            )
+        self._write_alert("failure", data)
 
     def _check_drift(self, new_params: dict[str, float]) -> None:
         old = load_calibration()

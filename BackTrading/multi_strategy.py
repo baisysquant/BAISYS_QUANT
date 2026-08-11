@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
+from BackTrading.engine import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
 
 # 3 个子策略的因子权重配置（设计为低相关）

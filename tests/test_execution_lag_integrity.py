@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from BackTrading._engine_legacy import _run_single_backtest
+from BackTrading.engine import _run_single_backtest
 from LogicAnalyzer.ml.execution_lag_integrity import (
     check_execution_price,
     check_price_vs_close_adj,
@@ -98,16 +98,38 @@ def test_same_day_high_edge_execution_fails() -> None:
 
 
 def test_next_open_mode_accepts_next_open_price() -> None:
+    """fill-time 约定：time=成交日（=信号次日 T+1），next_open 下成交价=当日开盘 → 合规。"""
     bars = _make_bars()
-    # 信号日 2024-01-04 buy，次日(2024-01-05)开盘价成交 → next_open 模式合规
-    next_open = float(bars[(bars["trade_date"] == "2024-01-05")
-                           & (bars["symbol"] == "600000.SH")]["open"].iloc[0])
-    trades = [_trade("2024-01-04", "600000.SH", "buy", next_open)]
+    row = bars[(bars["trade_date"] == "2024-01-05")
+               & (bars["symbol"] == "600000.SH")].iloc[0]
+    trades = [_trade("2024-01-05", "600000.SH", "buy", float(row["open"]))]
     report = check_execution_price(trades, bars, exec_mode="next_open")
     assert report.passed is True
-    # 同一成交在 close 模式下反而 FAIL（当日收盘价 != 次日开盘价）
+    # 同一成交在 close 模式下反而 FAIL（当日收盘价 != 开盘价）
     report_close = check_execution_price(trades, bars, exec_mode="close")
     assert report_close.passed is False
+
+
+def test_next_open_price_within_ohlc_passes() -> None:
+    """next_open：成交价 ∈ 成交日 OHLC 区间即合规（收盘模型不允许盘中价）。"""
+    bars = _make_bars()
+    row = bars.iloc[2]
+    trades = [_trade(row["trade_date"], row["symbol"], "buy", float(row["open"]))]
+    report = check_execution_price(trades, bars, exec_mode="next_open")
+    assert report.passed is True
+    assert report.n_checked == 1
+
+
+def test_next_open_price_outside_ohlc_fails() -> None:
+    """next_open：成交价须落在成交日 OHLC 区间内；区间外（信号日/未来价）违规。"""
+    bars = _make_bars()
+    row = bars.iloc[2]
+    bad = float(row["high"]) * 1.5
+    trades = [_trade(row["trade_date"], row["symbol"], "buy", bad)]
+    report = check_execution_price(trades, bars, exec_mode="next_open")
+    assert report.passed is False
+    assert report.n_violations == 1
+    assert "OHLC" in "；".join(report.details)
 
 
 def test_missing_bar_skipped_not_failed() -> None:
@@ -148,21 +170,26 @@ def test_contribution_nonzero_when_open_executed() -> None:
 
 
 def test_contribution_next_open_mode() -> None:
+    """fill-time 约定：next_open 成交价=成交日开盘 ⇒ 当日收益贡献 0。"""
     bars = _make_bars()
-    next_open = float(bars[(bars["trade_date"] == "2024-01-05")
-                           & (bars["symbol"] == "600001.SH")]["open"].iloc[0])
-    trades = [_trade("2024-01-04", "600001.SH", "buy", next_open)]
+    row = bars[(bars["trade_date"] == "2024-01-05")
+               & (bars["symbol"] == "600001.SH")].iloc[0]
+    trades = [_trade(row["trade_date"], row["symbol"], "buy", float(row["open"]))]
     report = check_same_day_contribution(trades, bars, exec_mode="next_open")
     assert report.passed is True
 
 
-def test_buy_within_day_open_fails_next_open_mode() -> None:
-    """次日模型下仍以当日 open 成交 → 当日记收益，FAIL。"""
+def test_next_open_fill_at_prev_close_fails_contribution() -> None:
+    """next_open：成交价 ≠ 成交日开盘价（如盘中价）→ 贡献非零，FAIL。"""
     bars = _make_bars()
-    row = bars.iloc[0]
-    trades = [_trade(row["trade_date"], row["symbol"], "buy", float(row["open"]))]
+    row = bars[(bars["trade_date"] == "2024-01-05")
+               & (bars["symbol"] == "600001.SH")].iloc[0]
+    # high 恒 > open → 成交价 ≠ 开盘价 ⇒ 贡献非零
+    trades = [_trade(row["trade_date"], row["symbol"], "buy", float(row["high"]))]
     report = check_same_day_contribution(trades, bars, exec_mode="next_open")
+    assert report.n_checked == 1
     assert report.passed is False
+    assert report.n_violations == 1
 
 
 # ── check_return_multiplier_alignment ──────────────────────
@@ -305,7 +332,7 @@ def test_hot_path_catches_high_price_execution() -> None:
 # ── 引擎集成 ───────────────────────────────────────────────
 
 def _engine_bars(n_days: int = 60, n_syms: int = 6, seed: int = 11) -> pd.DataFrame:
-    """构造引擎可直接消费的面板（close_adj + 进场/退出评分 + 风险等级）。"""
+    """构造引擎可直接消费的面板（close_adj + 进场/退出评分 + 风险等级 + OHLC）。"""
     rng = np.random.default_rng(seed)
     dates = _dates(n_days, start="2024-01-01")
     rows = []
@@ -314,8 +341,12 @@ def _engine_bars(n_days: int = 60, n_syms: int = 6, seed: int = 11) -> pd.DataFr
         close_prev = 10.0 + i
         for d in dates:
             close = max(close_prev * (1 + rng.normal(0.0, 0.01)), 1.0)
+            open_ = float(close_prev)
+            high_ = max(open_, close) * 1.01
+            low_ = min(open_, close) * 0.99
             rows.append({
                 "trade_date": d, "symbol": sym,
+                "open": open_, "high": high_, "low": low_,
                 "close": float(close), "close_adj": float(close),
                 "volume": 1_000_000,
                 "进场评分": float(rng.integers(0, 100)),
@@ -341,6 +372,7 @@ def test_engine_trades_pass_execution_lag_check() -> None:
         transfer_fee_rate=0.0,
         slippage=0.0,
         atr_stop_mult=0.0,
+        execution_model="close",
     )
     tl, ec = [], []
     _run_single_backtest(data, {}, cfg, tl, ec)
@@ -351,13 +383,14 @@ def test_engine_trades_pass_execution_lag_check() -> None:
 
 
 def test_engine_trade_prices_recorded_at_close() -> None:
-    """回归：引擎成交价必须逐笔等于信号日收盘价（复权价语义）。"""
+    """回归（收盘成交模型）：引擎成交价必须逐笔等于信号日收盘价（复权价语义）。"""
     data = _engine_bars()
     from BackTrading.engine import EngineConfig
     cfg = EngineConfig(initial_cash=1_000_000.0, buy_threshold=30,
                        portfolio_method="score_weighted", max_position_pct=0.5,
                        commission_rate=0.0, transfer_fee_rate=0.0,
-                       stamp_tax_rate=0.0, slippage=0.0)
+                       stamp_tax_rate=0.0, slippage=0.0,
+                       execution_model="close")
     tl, ec = [], []
     _run_single_backtest(data, {}, cfg, tl, ec)
     rows = []
@@ -370,7 +403,27 @@ def test_engine_trade_prices_recorded_at_close() -> None:
 
 
 def test_engine_trades_carry_close_adj_field() -> None:
-    """回归：引擎每笔成交必须携带同日 close_adj 字段（热路径自检锚点）。"""
+    """回归（收盘成交模型）：引擎每笔成交必须携带同日 close_adj 字段（热路径自检锚点）。"""
+    data = _engine_bars()
+    from BackTrading.engine import EngineConfig
+    cfg = EngineConfig(initial_cash=1_000_000.0, buy_threshold=30,
+                       portfolio_method="score_weighted", max_position_pct=0.5,
+                       commission_rate=0.0, transfer_fee_rate=0.0,
+                       stamp_tax_rate=0.0, slippage=0.0,
+                       execution_model="close")
+    tl, ec = [], []
+    _run_single_backtest(data, {}, cfg, tl, ec)
+    assert tl
+    for t in tl:
+        assert t.get("close_adj") is not None, f"缺少 close_adj: {t}"
+        assert abs(float(t["price"]) - float(t["close_adj"])) < 1e-6
+    report = check_price_vs_close_adj(tl, exec_mode="close")
+    assert report.passed is True
+    assert report.n_checked == len(tl)
+
+
+def test_engine_default_next_open_fills_at_next_open() -> None:
+    """0.1 回归：默认 execution_model=next_open，成交价=成交日开盘价且落在 OHLC 区间。"""
     data = _engine_bars()
     from BackTrading.engine import EngineConfig
     cfg = EngineConfig(initial_cash=1_000_000.0, buy_threshold=30,
@@ -379,10 +432,14 @@ def test_engine_trades_carry_close_adj_field() -> None:
                        stamp_tax_rate=0.0, slippage=0.0)
     tl, ec = [], []
     _run_single_backtest(data, {}, cfg, tl, ec)
-    assert tl
+    assert tl, "引擎应产生成交记录"
+    # 热路径：price ≈ exec_open（成交参考价）
+    report = check_price_vs_close_adj(tl, exec_mode="next_open")
+    assert report.passed is True, report.details
+    # bar 级校验：成交价 ∈ 成交日 OHLC 区间 + 当日贡献归零
+    result = run_execution_lag_check(tl, data, exec_mode="next_open")
+    assert result["passed"] is True, result["summary"].to_dict()
+    # 逐笔：price == 成交日 open（数据无 open_adj 时回落 open）
     for t in tl:
-        assert t.get("close_adj") is not None, f"缺少 close_adj: {t}"
-        assert abs(float(t["price"]) - float(t["close_adj"])) < 1e-6
-    report = check_price_vs_close_adj(tl)
-    assert report.passed is True
-    assert report.n_checked == len(tl)
+        row = data[(data["trade_date"] == t["time"]) & (data["symbol"] == t["symbol"])]
+        assert row.iloc[0]["open"] == float(t["price"]), t

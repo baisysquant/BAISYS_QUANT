@@ -137,6 +137,16 @@ def run_backtest_pipeline(
     logger.info(f"  样本外天数: {bt.OUT_OF_SAMPLE_DAYS}")
     logger.info(f"  初始资金: {bt.INITIAL_CASH:,.0f}")
 
+    # ── A2 失败快照：进程级 run_id/task_id 上下文（随日志/告警/快照透出） ──
+    import uuid as _uuid
+
+    _run_id = _uuid.uuid4().hex[:12]
+    from BackTrading.snapshot import begin_snapshot_session, save_failure_snapshot, set_run_context
+    set_run_context(run_id=_run_id, task_id="backtest_pipeline")
+    begin_snapshot_session()
+
+    kline_df: pd.DataFrame | None = None
+
     _step_times: dict[str, float] = {"start": time.time()}
     def _log_step(name: str) -> None:
         _step_times[name] = time.time()
@@ -202,15 +212,39 @@ def run_backtest_pipeline(
         _bt_cut = f"{bt.BACKTEST_START_DATE[:4]}-{bt.BACKTEST_START_DATE[4:6]}-{bt.BACKTEST_START_DATE[6:8]}"
         total_trading_days = sum(1 for d in kline_df["trade_date"].unique() if _ds(d) >= _bt_cut)
         _oos = bt.OUT_OF_SAMPLE_DAYS
+        # ── 末段独立 holdout：终验只在该段进行，WFO 全程禁触 ──
+        # holdout_days = round(total * ratio)；钳制 ≥OOS 且 WFO 寻参域须留足 120+OOS，
+        # 否则禁用 holdout 回退旧逻辑（自引用，但保证 WFO 至少可跑）。
+        _holdout_ratio = float(getattr(bt, "HOLDOUT_RATIO", 0.0))
+        _holdout_days = 0
+        _holdout_active = False
+        if _holdout_ratio > 0:
+            _holdout_days = round(total_trading_days * _holdout_ratio)
+            _wfo_total = total_trading_days - _holdout_days
+            if _holdout_days >= _oos and _wfo_total >= 120 + _oos:
+                _holdout_active = True
+            else:
+                logger.warning(
+                    f"  末段 holdout={_holdout_days} 天但条件不满足"
+                    f"（holdout≥OOS? {_holdout_days >= _oos} | WFO域={_wfo_total}≥{120 + _oos}? "
+                    f"{_wfo_total >= 120 + _oos}），禁用 holdout 回退旧逻辑"
+                )
+                _holdout_days = 0
+        _wfo_total = total_trading_days - _holdout_days
         # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS <= n，
         # 否则路径 2/3 必然越界跳过（如 IS=805+OOS=60 在 865 天数据上只有 1 条路径有效）。
         _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
-        _max_np = max(1, (total_trading_days - 120) // _oos) if total_trading_days > _oos + 120 else 1
+        _max_np = max(1, (_wfo_total - 120) // _oos) if _wfo_total > _oos + 120 else 1
         _num_paths = min(_np_cfg, _max_np)
-        train_period = max(120, min(total_trading_days - _oos, total_trading_days - _oos * _num_paths))
+        train_period = max(120, min(_wfo_total - _oos, _wfo_total - _oos * _num_paths))
+        _holdout_label = (
+            f" | Holdout: {_holdout_days}天(占比{_holdout_days/total_trading_days:.0%},独立终验)"
+            if _holdout_active else " | Holdout: 禁用(自引用回退)"
+        )
         logger.info(
             f"  交易日数: {total_trading_days} | IS训练窗口: {train_period}天 | OOS: {_oos}天"
             f" | WFO路径数: {_num_paths}（配置 {_np_cfg}，数据上限 {_max_np}）"
+            f"{_holdout_label}"
         )
         _log_step("fetch_kline")
         wf_result = run_walk_forward(
@@ -235,8 +269,13 @@ def run_backtest_pipeline(
             # P2.4 预算制
             time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
             max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
+            # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
+            holdout_days=_holdout_days,
             # P3.1 数据版本入缓存 key
             data_version=_data_version,
+            # A2 失败快照上下文
+            run_id=_run_id,
+            task_id="backtest_pipeline",
         )
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
@@ -251,7 +290,7 @@ def run_backtest_pipeline(
         best_params["_st_history"] = st_history
         best_params["_exclude_st"] = bool(bt.EXCLUDE_ST)
 
-        from BackTrading._engine_legacy import EngineConfig, run_full_backtest
+        from BackTrading.engine import EngineConfig, run_full_backtest
         from BackTrading.domain.models import CostModel
 
         from UtilsManager.ConfigParser import PositionSizingConfig as _PsCfg
@@ -271,7 +310,16 @@ def run_backtest_pipeline(
             atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
             buy_threshold=int(best_params.get("buy_threshold", _bt_mid)),
             max_holdings=int(best_params.get("max_holdings", _mh_mid)),
-            cost_model=CostModel.from_backtest_config(bt),
+            cost_model=CostModel.from_backtest_config(
+                bt, trading_cost=config.app_config.trading_cost
+            ),
+            execution_model=bt.EXECUTION_MODEL,
+            simulate_limit_up_down=bool(bt.SIMULATE_LIMIT_UP_DOWN),
+            limit_seal_ratio=float(bt.LIMIT_SEAL_RATIO),
+            limit_tradable_ratio=float(bt.LIMIT_TRADABLE_RATIO),
+            limit_seal_decay=float(bt.LIMIT_SEAL_DECAY),
+            resume_gap_up=float(bt.RESUME_GAP_UP),
+            resume_gap_down=float(bt.RESUME_GAP_DOWN),
         )
         final_params = _build_params(config)
         final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
@@ -523,24 +571,30 @@ def run_backtest_pipeline(
 
         _oos_decay_pass = True
         try:
-            # 按 OOS 天数从净值曲线尾部拆分 IS / OOS
-            _oos_n = max(bt.OUT_OF_SAMPLE_DAYS, 20)
+            # 终验 OOS 段：holdout 启用时用末段独立 holdout（WFO 全程禁触），
+            # 否则回退旧逻辑从全周期净值尾部切 OOS（自引用）
+            if _holdout_active and _holdout_days > 0:
+                _oos_n = _holdout_days
+                _decay_tag = "独立Holdout"
+            else:
+                _oos_n = max(bt.OUT_OF_SAMPLE_DAYS, 20)
+                _decay_tag = "自引用回退"
             _eq = pd.DataFrame(equity_curve) if isinstance(equity_curve, list) else equity_curve
-            if not _eq.empty and "trade_date" in _eq.columns:
+            if not _eq.empty and "time" in _eq.columns:
                 # 确保日期为字符串统一比较
-                if pd.api.types.is_datetime64_any_dtype(_eq["trade_date"]):
+                if pd.api.types.is_datetime64_any_dtype(_eq["time"]):
                     _eq = _eq.copy()
-                    _eq["trade_date"] = _eq["trade_date"].dt.strftime("%Y-%m-%d")
+                    _eq["time"] = _eq["time"].dt.strftime("%Y-%m-%d")
 
-                _all_dates = sorted(_eq["trade_date"].unique())
+                _all_dates = sorted(_eq["time"].unique())
                 _total_td = len(_all_dates)
                 _is_end = max(_total_td - _oos_n, 1)
                 _is_dates = set(_all_dates[:_is_end])
                 _oos_dates = set(_all_dates[_is_end:])
 
                 if len(_oos_dates) >= 2:
-                    _is_curve = _eq[_eq["trade_date"].isin(_is_dates)]
-                    _oos_curve = _eq[_eq["trade_date"].isin(_oos_dates)]
+                    _is_curve = _eq[_eq["time"].isin(_is_dates)]
+                    _oos_curve = _eq[_eq["time"].isin(_oos_dates)]
 
                     _report = _validate_oos_decay(
                         _is_curve, _oos_curve,
@@ -550,12 +604,19 @@ def run_backtest_pipeline(
                     if not _report.passed:
                         _oos_decay_pass = False
                         logger.warning(
-                            f"[OOS衰减校验] FAIL | IS_Sharpe={_report.is_sharpe:.2f} → "
+                            f"[OOS衰减校验][{_decay_tag}] FAIL | IS_Sharpe={_report.is_sharpe:.2f} → "
                             f"OOS_Sharpe={_report.oos_sharpe:.2f} (衰减 {_report.sharpe_decay:.1%}) | "
                             f"IS_Sortino={_report.is_sortino:.2f} → OOS_Sortino={_report.oos_sortino:.2f} "
                             f"(衰减 {_report.sortino_decay:.1%})"
                         )
-                        logger.warning(f"[OOS衰减校验] {_report.reason}")
+                        logger.warning(f"[OOS衰减校验][{_decay_tag}] {_report.reason}")
+                    else:
+                        logger.info(
+                            f"[OOS衰减校验][{_decay_tag}] PASS | IS_Sharpe={_report.is_sharpe:.2f} → "
+                            f"OOS_Sharpe={_report.oos_sharpe:.2f} (衰减 {_report.sharpe_decay:.1%}) | "
+                            f"IS_Sortino={_report.is_sortino:.2f} → OOS_Sortino={_report.oos_sortino:.2f} "
+                            f"(衰减 {_report.sortino_decay:.1%})"
+                        )
                 else:
                     logger.info(f"[OOS衰减校验] OOS 交易日仅 {len(_oos_dates)} 天 < 2 天，跳过")
             else:
@@ -662,6 +723,18 @@ def run_backtest_pipeline(
 
     except Exception as exc:
         logger.opt(exception=True).error(f"回测管线失败: {exc}")
+        # A2：管线级兜底快照（窗口级快照由 meta_optimizer 内部落盘）
+        import traceback as _tb
+
+        _snap_id = save_failure_snapshot(
+            ohlcv=kline_df if kline_df is not None and not kline_df.empty else None,
+            metric_name="pipeline",
+            error_code="PIPELINE_FAILED",
+            error_message=str(exc),
+            traceback_text=_tb.format_exc(),
+        )
+        if _snap_id:
+            logger.error(f"回测管线失败快照已保存 | snapshot_id={_snap_id} | run_id={_run_id}")
         try:
             record_run(
                 engine=engine,
@@ -678,7 +751,7 @@ def run_backtest_pipeline(
             )
         except Exception as log_err:
             logger.warning(f"回测失败记录写入异常: {log_err}")
-        alert.on_failure(exc)
+        alert.on_failure(exc, snapshot_id=_snap_id)
         return None
     finally:
         _release_run_lock()
@@ -729,7 +802,7 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
         if len(raw) < before:
             logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
     # 注意：不再做静态 ST 剔除，逐日动态剔除由引擎根据 stock_st_history 完成
-    # EXCLUDE_ST 控制 ST/*ST 日是否剔除（退市日无条件剔除，见 _engine_legacy）
+    # EXCLUDE_ST 控制 ST/*ST 日是否剔除（退市日无条件剔除，见 engine/core.py）
     if config is not None and config.app_config.backtest.EXCLUDE_ST:
         logger.info("EXCLUDE_ST=True：引擎按 stock_st_history 逐日剔除 ST/*ST 日的买入与持仓（退市日无条件剔除）")
     elif config is not None:

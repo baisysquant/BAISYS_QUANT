@@ -188,6 +188,9 @@ def config_fixture():
     cfg.MONEYFLOW_RETRY = 1
     cfg.MONEYFLOW_PAGE_DELAY = 0.1
     cfg.FINANCIAL_QUALITY_CACHE_DAYS = 90
+    cfg.FINANCIAL_QUALITY_BATCH_SIZE = 500
+    cfg.FINANCIAL_QUALITY_BATCH_SLEEP = 20
+    cfg.FINANCIAL_QUALITY_FILE_CACHE_DAYS = 30
     cfg.TEMP_DATA_DIRECTORY = "/tmp/test_cache"
     cfg.DB_USER = "test"
     cfg.DB_PASSWORD = "test"

@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import random
 import time
+import traceback
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from loguru import logger
 
-from BackTrading._engine_legacy import EngineConfig, _run_single_backtest
+from BackTrading.engine import EngineConfig, _run_single_backtest
 from BackTrading.bayesian.kernel import GPState
 from BackTrading.bayesian.optimizer import optimize_window
 from BackTrading.bayesian.space import ParamSpace, build_spaces, split_by_cost
 from BackTrading.domain.models import CostModel
 from BackTrading.prepare import prepare_backtest_data
+from BackTrading.snapshot import begin_snapshot_session, save_failure_snapshot, set_run_context
+
+
+def _snap_log(snapshot_id: str | None) -> str:
+    return f" | snapshot_id={snapshot_id}" if snapshot_id else ""
 
 
 def _datetime64_to_string_guard(df: pd.DataFrame) -> pd.DataFrame:
@@ -55,19 +61,22 @@ def _window_dates(
     offset: int = 0,
     purge_days: int = 0,
     embargo_days: int = 0,
+    max_idx: int | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """生成 WFO 窗口切分（CPCV：净化 + 禁运）。
 
     purge_days:  训练窗口尾部剔除天数（标签视界），防止训练期最后的持仓
                  （标签 = 前向收益）跨入 OOS 窗口起点，造成 IS/OOS 泄露。
     embargo_days: 训练结束与测试开始之间的禁运间隔，切断自相关污染。
+    max_idx:     WFO 寻参上界（exclusive）。末段 holdout 对 WFO 全程禁触时传入，
+                 使 test_end 与循环终止均不越过此界；None 时回退用全部交易日。
 
     Returns:
         [(train_start, train_end, test_start, test_end), ...] 索引元组。
     """
     windows = []
     start = offset
-    n = len(unique_dates)
+    n = len(unique_dates) if max_idx is None else min(max_idx, len(unique_dates))
     step = test_period + embargo_days
     while start + train_period + step <= n:
         train_end = start + train_period - purge_days
@@ -187,12 +196,37 @@ def bayesian_walk_forward_multi(
         cfg = _Config().app_config.backtest
         spaces = build_spaces(cfg)
 
+    # ── A2 失败快照：开启会话（重置计数 + 过期清理），注入 run/task 上下文 ──
+    begin_snapshot_session()
+    set_run_context(run_id=kwargs.get("run_id"), task_id=kwargs.get("task_id"))
+
     signal_sp, portfolio_sp = split_by_cost(spaces)
 
     # ── 构建基座 EngineConfig（挂载 CostModel：ADV 动态冲击成本 + 流动性分档） ──
-    # 与 runner.py 最终回测路径同源（同 kwargs 费率），保证寻优期间摩擦口径一致；
-    # 否则引擎回退固定费率，大单冲击成本被系统性低估（1.8 交易摩擦合规 FAIL）。
+    # 与 runner.py 最终回测路径同源：优先从 BacktestConfig 构建完整 CostModel
+    # （含印花税日期分段 / 经手费 / 证管费 / 过户费 / 流动性分档冲击），
+    # 保证寻优期间摩擦口径与终验完全一致；否则引擎回退固定费率，大单冲击成本
+    # 被系统性低估（1.8 交易摩擦合规 FAIL）。
+    # fallback：config 不可用时退回 kwargs 手动构造（单元测试路径）。
     _slip = kwargs.get("slippage", 0.001)
+    _app_cfg = None
+    try:
+        _app_cfg = _Config().app_config
+    except Exception:
+        pass
+    if _app_cfg is not None:
+        _wfo_cost = CostModel.from_backtest_config(
+            _app_cfg.backtest,
+            trading_cost=_app_cfg.trading_cost,
+        )
+    else:
+        _wfo_cost = CostModel(
+            commission_rate=kwargs.get("commission", 0.0003),
+            stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
+            market_slippage=_slip,
+            limit_slippage=_slip * 0.5,
+            min_commission_per_trade=kwargs.get("min_commission", 5.0),
+        )
     base_cfg = EngineConfig(
         initial_cash=initial_cash,
         commission_rate=kwargs.get("commission", 0.0003),
@@ -201,13 +235,8 @@ def bayesian_walk_forward_multi(
         max_position_pct=kwargs.get("max_position_pct", 0.1),
         portfolio_method=kwargs.get("portfolio_method", "score_weighted"),
         point_in_time=kwargs.get("point_in_time", True),
-        cost_model=CostModel(
-            commission_rate=kwargs.get("commission", 0.0003),
-            stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
-            market_slippage=_slip,
-            limit_slippage=_slip * 0.5,
-            min_commission_per_trade=kwargs.get("min_commission", 5.0),
-        ),
+        execution_model=kwargs.get("execution_model", "next_open"),
+        cost_model=_wfo_cost,
     )
 
     # 从 config 读取 BO 预算
@@ -235,6 +264,7 @@ def bayesian_walk_forward_multi(
     embargo_days = int(kwargs.get("embargo_days", _def_embargo))
     time_budget_seconds = float(kwargs.get("time_budget_seconds", _def_time_budget))
     max_no_improve_windows = int(kwargs.get("max_no_improve_windows", _def_no_improve))
+    holdout_days = int(kwargs.get("holdout_days", 0))
     data_version = kwargs.get("data_version")
     if purge_days or embargo_days:
         logger.info(
@@ -259,9 +289,37 @@ def bayesian_walk_forward_multi(
         unique_dates = all_dates_str
     _trim_offset = len(all_dates_str) - len(unique_dates)
     n_dates = len(unique_dates)
+    # 末段独立 holdout：WFO 寻参上界（holdout_days>0 时末段对 WFO 全程禁触，供终验独立使用）
+    if holdout_days > 0:
+        wfo_max_idx = max(0, n_dates - holdout_days)
+        logger.info(
+            f"  末段 holdout: {holdout_days} 天（占比 {holdout_days / n_dates:.0%}），"
+            f"WFO 寻参上界 wfo_max_idx={wfo_max_idx}（末 {holdout_days} 天禁触）"
+        )
+    else:
+        wfo_max_idx = None
     logger.info(f"  n_dates={n_dates}, train_period={train_period}, test_period={test_period}, required={train_period + test_period}")
     if n_dates < train_period + test_period:
-        raise ValueError(f"数据不足: {n_dates} 个交易日（正式回测起点后），需要至少 {train_period + test_period}")
+        _msg = f"数据不足: {n_dates} 个交易日（正式回测起点后），需要至少 {train_period + test_period}"
+        _sid = save_failure_snapshot(
+            ohlcv=kline_df,
+            window_name="entry",
+            metric_name="window_setup",
+            error_code="DATA_INSUFFICIENT",
+            error_message=_msg,
+        )
+        logger.warning(f"WFO 入口失败快照已保存{_snap_log(_sid)}: {_msg}")
+        raise ValueError(_msg)
+
+    # ── 窗口预检：股票池级摘要（执行级拦截在 prepare/indicator_cache 内部） ──
+    try:
+        from BackTrading.precheck import precheck_summary as _pc_summary
+        _pc_counts = _pc_summary(kline_df, {"mode": kwargs.get("precheck_mode")})
+        if _pc_counts:
+            logger.info(f"  Precheck 股票池摘要: {_pc_counts}（mode={kwargs.get('precheck_mode') or '配置'}，"
+                        f"SKIP/NEED_FILL 由 prepare 阶段执行拦截或填充）")
+    except Exception as _pce:
+        logger.warning(f"  Precheck 摘要计算失败（不影响主流程）: {_pce}")
     show_progress = kwargs.get("show_progress", False)
     # ST/退市逐日动态剔除（runner 注入，寻优与最终回测口径一致）
     st_history = kwargs.get("st_history")
@@ -275,17 +333,29 @@ def bayesian_walk_forward_multi(
         # 确定性偏移：各路径互不重叠，避免 IS/OOS 数据泄露
         offset = path_idx * test_period
         _span = train_period + test_period + embargo_days  # purge 仅缩训练尾部，不占额外天数
-        max_offset = max(0, n_dates - _span)
+        # WFO 寻参上界受 holdout 限制（末段禁触）；无 holdout 时回退 n_dates
+        _wfo_cap = wfo_max_idx if wfo_max_idx is not None else n_dates
+        max_offset = max(0, _wfo_cap - _span)
         if offset > max_offset:
             logger.warning(f"路径 {path_idx + 1} offset={offset} 超出数据范围 (max={max_offset})，跳过")
             continue
 
         windows = _window_dates(unique_dates, train_period, test_period, offset,
-                                purge_days=purge_days, embargo_days=embargo_days)
+                                purge_days=purge_days, embargo_days=embargo_days,
+                                max_idx=wfo_max_idx)
         logger.info(f"路径 {path_idx + 1}/{num_paths}: offset={offset}, 窗口数={len(windows)}")
 
         if not windows:
             logger.warning(f"路径 {path_idx + 1} 无有效窗口，检查 n_dates({n_dates}) >= train({train_period})+test({test_period})?")
+            _sid = save_failure_snapshot(
+                ohlcv=kline_df,
+                window_name=f"path-{path_idx + 1}",
+                metric_name="window_setup",
+                error_code="WINDOW_SLICE_EMPTY",
+                error_message=f"路径 {path_idx + 1} 无有效窗口: n_dates={n_dates}, "
+                              f"train={train_period}, test={test_period}, offset={offset}",
+            )
+            logger.warning(f"路径 {path_idx + 1} 窗口切片为空，失败快照已保存{_snap_log(_sid)}")
             continue
 
         previous_gp_state: GPState | None = None
@@ -321,6 +391,17 @@ def bayesian_walk_forward_multi(
 
             if train_data.empty:
                 logger.warning(f"  [{path_idx + 1}-{win_idx}] 训练数据为空(train_dates={train_dates[0]}~{train_dates[-1]}), 跳过")
+                _sid = save_failure_snapshot(
+                    ohlcv=kline_df,
+                    window_name=f"{path_idx + 1}-{win_idx}",
+                    window_start=_to_date_str(train_dates[0]),
+                    window_end=_to_date_str(train_dates[-1]),
+                    window_size=0,
+                    metric_name="window_train",
+                    error_code="WINDOW_TRAIN_EMPTY",
+                    error_message=f"训练数据为空: 窗口 {_to_date_str(train_dates[0])}~{_to_date_str(train_dates[-1])}",
+                )
+                logger.warning(f"  [{path_idx + 1}-{win_idx}] 训练数据为空，失败快照已保存{_snap_log(_sid)}")
                 continue
 
             if show_progress:
@@ -346,7 +427,20 @@ def bayesian_walk_forward_multi(
                     data_version=data_version,
                 )
             except Exception as opt_err:
-                logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] 窗口优化失败: {opt_err}")
+                _sid = save_failure_snapshot(
+                    ohlcv=train_data,
+                    window_name=f"{path_idx + 1}-{win_idx}",
+                    window_start=_to_date_str(train_dates[0]),
+                    window_end=_to_date_str(train_dates[-1]),
+                    window_size=len(train_data),
+                    metric_name="window_optimize",
+                    error_code="WINDOW_OPTIMIZE_FAILED",
+                    error_message=str(opt_err),
+                    traceback_text=traceback.format_exc(),
+                )
+                logger.opt(exception=True).warning(
+                    f"  [{path_idx + 1}-{win_idx}] 窗口优化失败: {opt_err}{_snap_log(_sid)}"
+                )
                 continue
 
             # ── 跨窗口迁移 ──
@@ -373,7 +467,20 @@ def bayesian_walk_forward_multi(
                     data_version=data_version,
                 )
             except Exception as oos_err:
-                logger.opt(exception=True).warning(f"  [{path_idx + 1}-{win_idx}] OOS 验证失败: {oos_err}")
+                _sid = save_failure_snapshot(
+                    ohlcv=test_data,
+                    window_name=f"{path_idx + 1}-{win_idx}",
+                    window_start=_to_date_str(test_dates[0]),
+                    window_end=_to_date_str(test_dates[-1]),
+                    window_size=len(test_data),
+                    metric_name="window_oos",
+                    error_code="WINDOW_OOS_FAILED",
+                    error_message=str(oos_err),
+                    traceback_text=traceback.format_exc(),
+                )
+                logger.opt(exception=True).warning(
+                    f"  [{path_idx + 1}-{win_idx}] OOS 验证失败: {oos_err}{_snap_log(_sid)}"
+                )
                 continue
 
             # ── 计算 OOS 指标 ──

@@ -61,6 +61,36 @@ class SystemConfig(BaseModel):
     STOCK_BASIC_INFO_EXPIRE_DAYS: int = Field(default=30, ge=1, le=365,
                                                 description="股票基本信息缓存过期天数")
     SIGNAL_PROCESSING_PROCESSES: int = Field(default_factory=_default_signal_workers, ge=1)
+    # ── D1 分片执行（shard）：大盘任务按 symbol 分批并行 + 失败片重跑 ──
+    SHARD_MODE: str = Field(default="hybrid",
+                            description="分片模式: off 单任务串行(回退) / symbol 按股票分片 / hybrid 全部已实现维度(v1=symbol, date 维度为 WFO path 扩展点)")
+    SHARD_SYMBOL_BATCH_SIZE: int = Field(default=50, ge=1, le=10000,
+                                         description="symbol 分片每批股票数（片粒度）")
+    SHARD_MAX_ATTEMPTS: int = Field(default=2, ge=1, le=10,
+                                    description="失败片最大尝试次数（含首跑；仅重跑失败片）")
+    SHARD_MAX_WORKERS: int = Field(default=0, ge=0, le=64,
+                                   description="分片并发 worker 数（0=自动=CPU 核数）")
+    # ── Task E 幂等输出：分片输出按 (shard_id, key) upsert + 原子写 ──
+    OUTPUT_WRITE_MODE: str = Field(default="upsert",
+                                   description="输出写入模式: upsert 原子写+清单去重（重复运行不重复累加） / replace 直接替换写（禁用 upsert 回退）")
+
+    @field_validator("SHARD_MODE")
+    @classmethod
+    def validate_shard_mode(cls, v: str) -> str:
+        v_lower = v.strip().lower()
+        if v_lower not in ("off", "symbol", "hybrid"):
+            msg = f"SHARD_MODE 必须为 off/symbol/hybrid，收到 {v}"
+            raise ValueError(msg)
+        return v_lower
+
+    @field_validator("OUTPUT_WRITE_MODE")
+    @classmethod
+    def validate_output_write_mode(cls, v: str) -> str:
+        v_lower = v.strip().lower()
+        if v_lower not in ("upsert", "replace"):
+            msg = f"OUTPUT_WRITE_MODE 必须为 upsert/replace，收到 {v}"
+            raise ValueError(msg)
+        return v_lower
 
     @field_validator("HOME_DIRECTORY")
     @classmethod
@@ -244,6 +274,12 @@ class MultiFactorAlphaConfig(BaseModel):
     ENABLED: bool = Field(default=True, description="是否启用多因子 Alpha 评分")
     FINANCIAL_QUALITY_CACHE_DAYS: int = Field(default=90, ge=1, le=365,
                                                description="质量因子缓存天数")
+    FINANCIAL_QUALITY_BATCH_SIZE: int = Field(default=500, ge=1, le=5000,
+                                              description="质量因子每批采集股票数")
+    FINANCIAL_QUALITY_BATCH_SLEEP: int = Field(default=20, ge=0, le=600,
+                                               description="质量因子批间休眠秒数")
+    FINANCIAL_QUALITY_FILE_CACHE_DAYS: int = Field(default=30, ge=1, le=365,
+                                                   description="质量因子离线文件缓存天数")
     FUNDAMENTALS_RETRY: int = Field(default=3, ge=0, le=10,
                                      description="估值因子 API 重试次数")
     # 因子权重已迁移至 config/factor_registry.yaml
@@ -362,6 +398,8 @@ class BacktestConfig(BaseModel):
     OPTIMIZE_FREQUENCY: str = "monthly"
     BACKTEST_START_DATE: str = Field(default="20200101", pattern=r"^\d{8}$")
     OUT_OF_SAMPLE_DAYS: int = Field(default=120, ge=20, le=504)
+    HOLDOUT_RATIO: float = Field(default=0.20, ge=0.0, le=0.50,
+                                  description="末段独立 holdout 占正式回测交易日比例（0.20=末段20%对WFO全程禁触，终验只在此段进行；0.0=禁用回退旧逻辑）")
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
     FULL_A_SHARE_MODE: bool = Field(default=False)
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01)
@@ -393,6 +431,9 @@ class BacktestConfig(BaseModel):
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
+    # 0.1 成交时点模型（执行时序合规）：close 信号日收盘成交 / next_open 信号次日开盘（默认，A股T+1）/ vwap 信号次日VWAP
+    EXECUTION_MODEL: str = Field(default="next_open",
+                                 description="成交时点模型: close 信号日收盘成交 / next_open 信号次日开盘成交（默认，符合A股T+1）/ vwap 信号次日VWAP成交")
     SIGNAL_PIPELINES: int = Field(default=3, ge=1, le=8)
     WFO_NUM_PATHS: int = Field(default=3, ge=1, le=10)
 
@@ -432,6 +473,71 @@ class BacktestConfig(BaseModel):
             raise ValueError(msg)
         return v_lower
 
+    @field_validator("CALENDAR_ALIGN_MODE")
+    @classmethod
+    def validate_calendar_align_mode(cls, v: str) -> str:
+        v_lower = v.strip().lower()
+        if v_lower not in ("on", "off"):
+            msg = f"CALENDAR_ALIGN_MODE 必须为 on/off，收到 {v}"
+            raise ValueError(msg)
+        return v_lower
+
+    @field_validator("EXECUTION_MODEL")
+    @classmethod
+    def validate_execution_model(cls, v: str) -> str:
+        v_lower = v.strip().lower()
+        if v_lower not in ("close", "next_open", "vwap"):
+            msg = f"EXECUTION_MODEL 必须为 close/next_open/vwap，收到 {v}"
+            raise ValueError(msg)
+        return v_lower
+
+    # ── A2 失败快照持久化 ──
+    SNAPSHOT_ENABLED: bool = Field(default=True,
+                                   description="窗口计算无效/异常时持久化失败快照（Task A2）")
+    SNAPSHOT_MAX_ROWS: int = Field(default=200, ge=50, le=5000,
+                                   description="快照 OHLCV 截断行数（最近 N 行）")
+    SNAPSHOT_RETENTION_DAYS: int = Field(default=14, ge=1, le=365,
+                                         description="失败快照保留天数，过期自动清理并告警")
+    # ── 窗口预检与容错（指标计算前判断序列可计算性） ──
+    PRECHECK_MODE: str = Field(default="RELAX",
+                               description="窗口预检模式: STRICT 任何可疑一律SKIP / RELAX 硬失败SKIP+可修复填充+软问题放行 / OFF 关闭")
+    # ── Task F 交易日历与停牌标志对齐 ──
+    CALENDAR_ALIGN_MODE: str = Field(default="on",
+                                     description="交易日历对齐: on 合并时按官方日历对齐（is_trading/is_suspended 标志 + 停牌比例日历口径 SKIP + 引擎日轴=交易所日历） / off 回退老版合并逻辑（无标志、启发式停牌检测、数据日轴）")
+    CALENDAR_TTL_HOURS: float = Field(default=24.0, ge=1.0, le=24 * 30,
+                                      description="官方交易日历本地缓存有效期（小时），过期后维护时重新拉取")
+
+    # ── 指标计算降级（min_periods / 置信度标签） ──
+    INDICATOR_DEGRADATION: str = Field(default="RELAX",
+                                       description="指标降级模式: STRICT 原周期全窗计算(头部NaN,原行为) / RELAX 缩窗计算并标low_confidence / SKIP 标低置信由策略层跳过")
+    INDICATOR_DEGRADATION_LOW_ACTION: str = Field(default="skip",
+                                                  description="低置信度信号处理: skip 不下单 / low_weight 按系数降权")
+    INDICATOR_DEGRADATION_LOW_WEIGHT: float = Field(default=0.5, ge=0.01, le=1.0,
+                                                    description="低置信度信号降权系数")
+    # ── 涨跌停撮合约束（可成交量规则，提升成交模拟真实度） ──
+    SIMULATE_LIMIT_UP_DOWN: bool = Field(default=True,
+                                         description="涨跌停撮合约束: true 触板日按可成交量比例部分成交/未成交 / false 回退简化撮合（触板一律禁止买卖）")
+    LIMIT_SEAL_RATIO: float = Field(default=0.05, ge=0.0, le=1.0,
+                                    description="一字板（开=收=限价）可成交量比例")
+    LIMIT_TRADABLE_RATIO: float = Field(default=0.30, ge=0.0, le=1.0,
+                                        description="盘中触板可成交量比例")
+    LIMIT_SEAL_DECAY: float = Field(default=0.5, ge=0.0, le=1.0,
+                                    description="连续板每板可成交量衰减系数")
+    # ── 复牌跳空（0.6）：停牌后复牌日开盘大幅跳空（补涨兑现卖出 / 补跌标记 / 追高禁买） ──
+    RESUME_GAP_UP: float = Field(default=0.05, ge=0.0, le=1.0,
+                                 description="复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买（追高）；0=关闭")
+    RESUME_GAP_DOWN: float = Field(default=0.05, ge=0.0, le=1.0,
+                                   description="复牌低开≤-该比例 → 日志标记（风控卖出照常）；0=关闭")
+    # ── 统一成本（单一来源 CostModel，覆盖原硬编码印花税分段） ──
+    HANDLING_FEE_RATE: float = Field(default=0.0000341, ge=0.0, le=0.01,
+                                     description="经手费（双边，0.00341%）")
+    CSRC_FEE_RATE: float = Field(default=0.00002, ge=0.0, le=0.01,
+                                 description="证管费（双边，0.002%）")
+    STAMP_TAX_SEGMENTS: str = Field(
+        default="2023-08-28:0.0005;2000-01-01:0.001",
+        description="印花税日期分段表（date:rate;...，卖出单向；最晚≤交易日档生效）",
+    )
+
     def parse_range(self, key: str) -> tuple[float, float, float]:
         raw = getattr(self, key.upper(), "")
         if not raw or not raw.strip():
@@ -450,7 +556,7 @@ class DistributionConfig(BaseModel):
 
 
 class TradingCostConfig(BaseModel):
-    """A股交易成本配置模型"""
+    """A股交易成本配置模型（统一成本来源，供回测引擎 CostModel 与跟仓回测共用）"""
 
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01,
                                     description="佣金费率（默认万三）")
@@ -458,6 +564,14 @@ class TradingCostConfig(BaseModel):
                                     description="印花税费率（卖出收取，2023.8 起万五）")
     TRANSFER_FEE_RATE: float = Field(default=0.00001, ge=0, le=0.001,
                                       description="过户费率（双向，默认万0.1）")
+    HANDLING_FEE_RATE: float = Field(default=0.0000341, ge=0, le=0.01,
+                                     description="经手费（双边，0.00341%）")
+    CSRC_FEE_RATE: float = Field(default=0.00002, ge=0, le=0.01,
+                                 description="证管费（双边，0.002%）")
+    STAMP_TAX_SEGMENTS: str = Field(
+        default="2023-08-28:0.0005;2000-01-01:0.001",
+        description="印花税日期分段表（date:rate;...，卖出单向）",
+    )
 
 
 class PositionBacktestConfig(BaseModel):
@@ -729,6 +843,23 @@ class Config:
     @property
     def MAX_WORKERS(self) -> int: return self.app_config.system.MAX_WORKERS
 
+    # D1 分片执行（shard）
+    @property
+    def SHARD_MODE(self) -> str: return self.app_config.system.SHARD_MODE
+
+    @property
+    def SHARD_SYMBOL_BATCH_SIZE(self) -> int: return self.app_config.system.SHARD_SYMBOL_BATCH_SIZE
+
+    @property
+    def SHARD_MAX_ATTEMPTS(self) -> int: return self.app_config.system.SHARD_MAX_ATTEMPTS
+
+    @property
+    def SHARD_MAX_WORKERS(self) -> int: return self.app_config.system.SHARD_MAX_WORKERS
+
+    # Task E 幂等输出
+    @property
+    def OUTPUT_WRITE_MODE(self) -> str: return self.app_config.system.OUTPUT_WRITE_MODE
+
     @property
     def DATA_FETCH_RETRIES(self) -> int: return self.app_config.system.DATA_FETCH_RETRIES
 
@@ -833,7 +964,21 @@ class Config:
     def OUT_OF_SAMPLE_DAYS(self) -> int: return self.app_config.backtest.OUT_OF_SAMPLE_DAYS
 
     @property
+    def HOLDOUT_RATIO(self) -> float: return self.app_config.backtest.HOLDOUT_RATIO
+
+    @property
     def SIGNAL_PIPELINES(self) -> int: return self.app_config.backtest.SIGNAL_PIPELINES
+
+    # Task F 交易日历与停牌标志对齐
+    @property
+    def CALENDAR_ALIGN_MODE(self) -> str: return self.app_config.backtest.CALENDAR_ALIGN_MODE
+
+    @property
+    def CALENDAR_TTL_HOURS(self) -> float: return self.app_config.backtest.CALENDAR_TTL_HOURS
+
+    # 0.1 成交时点模型（执行时序合规）
+    @property
+    def EXECUTION_MODEL(self) -> str: return self.app_config.backtest.EXECUTION_MODEL
 
     # 跟仓回测
     @property
@@ -851,6 +996,9 @@ class Config:
             "commission_rate": t.COMMISSION_RATE,
             "stamp_tax_rate": t.STAMP_TAX_RATE,
             "transfer_fee_rate": t.TRANSFER_FEE_RATE,
+            "handling_fee_rate": t.HANDLING_FEE_RATE,
+            "csrc_fee_rate": t.CSRC_FEE_RATE,
+            "stamp_tax_segments": t.STAMP_TAX_SEGMENTS,
         }
 
     # 多因子 Alpha
@@ -861,6 +1009,18 @@ class Config:
     @property
     def FINANCIAL_QUALITY_CACHE_DAYS(self) -> int:
         return self.app_config.multi_factor_alpha.FINANCIAL_QUALITY_CACHE_DAYS
+
+    @property
+    def FINANCIAL_QUALITY_BATCH_SIZE(self) -> int:
+        return self.app_config.multi_factor_alpha.FINANCIAL_QUALITY_BATCH_SIZE
+
+    @property
+    def FINANCIAL_QUALITY_BATCH_SLEEP(self) -> int:
+        return self.app_config.multi_factor_alpha.FINANCIAL_QUALITY_BATCH_SLEEP
+
+    @property
+    def FINANCIAL_QUALITY_FILE_CACHE_DAYS(self) -> int:
+        return self.app_config.multi_factor_alpha.FINANCIAL_QUALITY_FILE_CACHE_DAYS
 
     @property
     def FUNDAMENTALS_RETRY(self) -> int:
