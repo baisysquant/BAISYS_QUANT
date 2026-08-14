@@ -28,7 +28,6 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
         "host = localhost",
         "port = 5432",
         "db_name = postgres",
-        "main_board_only = true",
     ],
     "SYSTEM": [
         "[SYSTEM]",
@@ -280,7 +279,6 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="DATABASE", description="数据库连接配置", fields=[
         FieldRule("user", "str"), FieldRule("password", "str"),
         FieldRule("host", "str"), FieldRule("port", "str"), FieldRule("db_name", "str"),
-        FieldRule("main_board_only", "bool", required=False, default="true"),
     ]),
     SectionRule(name="SYSTEM", description="系统运行参数", fields=[
         FieldRule("HOME_DIRECTORY", "str", required=False, default="~/Downloads/CoreNews_Reports"),
@@ -423,11 +421,17 @@ SECTION_RULES: list[SectionRule] = [
                    allowed_values=["score_weighted", "risk_parity", "min_variance", "mean_variance"]),
         FieldRule("point_in_time", "bool", required=False, default="true"),
         FieldRule("execution_model", "str", required=False, default="next_open",
-                   allowed_values=["close", "next_open", "vwap"]),
+                   allowed_values=["next_open", "vwap"]),
         FieldRule("simulate_limit_up_down", "bool", required=False, default="true"),
         FieldRule("limit_seal_ratio", "float", required=False, default="0.05", min_value=0, max_value=1),
         FieldRule("limit_tradable_ratio", "float", required=False, default="0.30", min_value=0, max_value=1),
         FieldRule("limit_seal_decay", "float", required=False, default="0.5", min_value=0, max_value=1),
+        # P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理）
+        FieldRule("auction_fill_ratio", "float", required=False, default="0.12", min_value=0, max_value=1),
+        # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
+        FieldRule("regime_ret20_full", "float", required=False, default="0.02", min_value=-1, max_value=1),
+        FieldRule("regime_ret20_half", "float", required=False, default="-0.02", min_value=-1, max_value=1),
+        FieldRule("regime_vol_pct_max", "float", required=False, default="0.8", min_value=0, max_value=1),
         FieldRule("resume_gap_up", "float", required=False, default="0.05", min_value=0, max_value=1),
         FieldRule("resume_gap_down", "float", required=False, default="0.05", min_value=0, max_value=1),
         FieldRule("handling_fee_rate", "float", required=False, default="0.0000341", min_value=0, max_value=0.01),
@@ -435,7 +439,11 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("stamp_tax_segments", "str", required=False,
                    default="2023-08-28:0.0005;2000-01-01:0.001"),
     ]),
-    SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True),
+    SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True, fields=[
+        # P0-7 ②：整数参数必须整值落盘（float "17.0" 会在加载端 int() 解析崩溃）
+        FieldRule("buy_threshold", "int", required=False, default="17", min_value=1, max_value=100),
+        FieldRule("max_holdings", "int", required=False, default="11", min_value=0, max_value=100),
+    ]),
     SectionRule(name="MULTI_FACTOR_ALPHA", description="多因子Alpha评分配置", optional=True, fields=[
         FieldRule("enabled", "bool", required=False, default="true"),
         FieldRule("financial_quality_cache_days", "int", required=False, default="90", min_value=1, max_value=365),

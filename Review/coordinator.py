@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
 import pandas as pd
+from loguru import logger
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, OperationalError
 
@@ -151,6 +152,8 @@ class StockAnalysisCoordinator:
         self.quality_checker = DataQualityChecker(db_engine=db_engine)
         self.force_rerun = False
         self.start_time = time.time()
+        # P0-7 ①：申万一级行业映射缓存（None=未加载；{} = 加载失败/为空）
+        self._sw_l1_map: dict[str, str] | None = None
 
     # ──────────────────────────────────────────────
     # Pipeline 定义
@@ -298,6 +301,18 @@ class StockAnalysisCoordinator:
                 self.logger.info(f"[因子数据] 质量因子同步完成，采集 {count} 只")
         except Exception as e:
             self.logger.warning(f"[因子数据] 质量因子同步失败: {e}")
+
+        # P0-7 ①：申万一级行业映射表（行业一级中性化 / 宏观 tilt 依赖，独立于
+        # stock_basic_info_sw 的二级语义；失败时响亮报错，不吞异常）
+        try:
+            from DataManager.SwIndustrySync import sync_sw_l1_industries
+            written = sync_sw_l1_industries(self.db_engine)
+            if written:
+                self.logger.info(f"[申万一级] 映射表同步完成，写入 {written} 条")
+        except Exception as e:
+            self.logger.error(
+                f"[申万一级] 映射表同步失败: {type(e).__name__}: {e} —— 行业一级中性化将降级"
+            )
 
     def _step_2_format_codes(self, ctx: PipelineContext) -> bool:
         filtered_pure_codes: set = ctx.get("filtered_pure_codes")
@@ -558,36 +573,47 @@ class StockAnalysisCoordinator:
 
         return df
 
-    def _load_north_flow(self, symbols: list[str]) -> pd.DataFrame | None:
-        """加载北向资金因子数据。"""
+    def _load_sw_l1_map(self) -> dict[str, str] | None:
+        """加载 申万一级行业映射（stock_code → l1_name）。
+
+        P0-7 ①：使用独立映射表 stock_basic_info_sw_l1 —— stock_basic_info_sw
+        无 sw_l1_name 列，旧查询必然 ProgrammingError 且被 except: pass 吞掉，
+        导致行业一级中性化从未执行。此处失败记录 error 日志（不静默），
+        返回 None 时调用方将 行业 置为 "未知"，监控可感知降级。
+        """
+        if self._sw_l1_map is not None:
+            return self._sw_l1_map or None
         try:
-            from DataCollection.NorthFlowFetcher import NorthFlowFetcher
-            fetcher = NorthFlowFetcher(self.config)
-            df = fetcher.fetch_multi_day(days=20)
-            if df.empty:
+            from sqlalchemy import text
+            with self.db_engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT stock_code, l1_name FROM stock_basic_info_sw_l1 "
+                    "WHERE record_date = (SELECT MAX(record_date) FROM stock_basic_info_sw_l1)"
+                )).fetchall()
+            m: dict[str, str] = {}
+            for code, name in rows:
+                c = str(code).strip()
+                for pfx in ("sh", "sz", "bj"):
+                    if c.lower().startswith(pfx):
+                        c = c[len(pfx):]
+                        break
+                c = c.zfill(6)
+                if c.isdigit() and name is not None:
+                    m[c] = str(name).strip()
+            if not m:
+                self.logger.error(
+                    "[申万一级] stock_basic_info_sw_l1 无数据 —— 行业一级中性化与宏观 tilt 未生效"
+                    "（请先运行 DataManager/SwIndustrySync.py 同步）"
+                )
+                self._sw_l1_map = {}
                 return None
-            symbols_set = set(symbols)
-            df = df[df["symbol"].isin(symbols_set)].copy()
-            if df.empty:
-                return None
-            df["行业"] = "未知"
-            try:
-                from DataManager.DbEngine import get_engine
-                from sqlalchemy import text
-                engine = get_engine(self.config)
-                with engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
-                    )).fetchall()
-                    name_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
-                    df["行业"] = df["symbol"].apply(
-                        lambda s: name_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
-                    )
-            except Exception:
-                pass
-            return df
+            self._sw_l1_map = m
+            return m
         except Exception as e:
-            self.logger.warning(f"[北向资金] 加载失败: {e}")
+            self.logger.error(
+                f"[申万一级] 行业映射表查询失败: {type(e).__name__}: {e} —— 行业一级中性化未生效"
+            )
+            self._sw_l1_map = {}
             return None
 
     def _load_top_trader(self, symbols: list[str]) -> pd.DataFrame | None:
@@ -603,20 +629,11 @@ class StockAnalysisCoordinator:
             if df.empty:
                 return None
             df["行业"] = "未知"
-            try:
-                from DataManager.DbEngine import get_engine
-                from sqlalchemy import text
-                engine = get_engine(self.config)
-                with engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
-                    )).fetchall()
-                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
-                    df["行业"] = df["symbol"].apply(
-                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
-                    )
-            except Exception:
-                pass
+            ind_map = self._load_sw_l1_map()
+            if ind_map:
+                df["行业"] = df["symbol"].apply(
+                    lambda s: ind_map.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                )
             return df
         except Exception as e:
             self.logger.warning(f"[龙虎榜] 加载失败: {e}")
@@ -652,20 +669,11 @@ class StockAnalysisCoordinator:
             if result.empty:
                 return None
             result["行业"] = "未知"
-            try:
-                from DataManager.DbEngine import get_engine
-                from sqlalchemy import text
-                engine = get_engine(self.config)
-                with engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
-                    )).fetchall()
-                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
-                    result["行业"] = result["symbol"].apply(
-                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
-                    )
-            except Exception:
-                pass
+            ind_map = self._load_sw_l1_map()
+            if ind_map:
+                result["行业"] = result["symbol"].apply(
+                    lambda s: ind_map.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                )
             result["业绩超预期分"] = result.get("业绩超预期分", 0.0)
             result["分析师共识分"] = result.get("分析师共识分", 0.0)
             return result
@@ -686,20 +694,11 @@ class StockAnalysisCoordinator:
             if df.empty:
                 return None
             df["行业"] = "未知"
-            try:
-                from DataManager.DbEngine import get_engine
-                from sqlalchemy import text
-                engine = get_engine(self.config)
-                with engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
-                    )).fetchall()
-                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
-                    df["行业"] = df["symbol"].apply(
-                        lambda s: code_to_ind.get(s.replace("sh","").replace("sz","").zfill(6), "未知")
-                    )
-            except Exception:
-                pass
+            ind_map = self._load_sw_l1_map()
+            if ind_map:
+                df["行业"] = df["symbol"].apply(
+                    lambda s: ind_map.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                )
             return df
         except Exception as e:
             self.logger.warning(f"[舆情因子] 加载失败: {e}")
@@ -718,20 +717,11 @@ class StockAnalysisCoordinator:
             if df.empty:
                 return None
             df["行业"] = "未知"
-            try:
-                from DataManager.DbEngine import get_engine
-                from sqlalchemy import text
-                engine = get_engine(self.config)
-                with engine.connect() as conn:
-                    rows = conn.execute(text(
-                        "SELECT stock_code, sw_l1_name FROM stock_basic_info_sw"
-                    )).fetchall()
-                    code_to_ind = {str(r[0]).strip().zfill(6): str(r[1]) for r in rows}
-                    df["行业"] = df["symbol"].apply(
-                        lambda s: code_to_ind.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
-                    )
-            except Exception:
-                pass
+            ind_map = self._load_sw_l1_map()
+            if ind_map:
+                df["行业"] = df["symbol"].apply(
+                    lambda s: ind_map.get(s.replace("sh", "").replace("sz", "").zfill(6), "未知")
+                )
             return df
         except Exception as e:
             self.logger.warning(f"[事件驱动] 加载失败: {e}")
@@ -751,11 +741,10 @@ class StockAnalysisCoordinator:
 
         symbols = list(consolidated_report["股票代码"].unique())
 
-        quality_df = self.factor_calculator.load_quality_from_db(symbols)
-        valuation_df = self.factor_calculator.load_valuation_from_db(symbols)
+        # P0-8① PIT：质量/估值按本交易日 as-of 加载（历史复盘时 today_str 为回放日）
+        quality_df = self.factor_calculator.load_quality_from_db(symbols, as_of=self.today_str)
+        valuation_df = self.factor_calculator.load_valuation_from_db(symbols, trade_date=self.today_str)
 
-        # 北向资金因子
-        north_df = self._load_north_flow(symbols)
         # 龙虎榜因子
         trader_df = self._load_top_trader(symbols)
         # 宏观因子
@@ -768,7 +757,6 @@ class StockAnalysisCoordinator:
         sentiment_df = self._load_news_sentiment(symbols)
 
         if (quality_df.empty and valuation_df.empty
-                and (north_df is None or north_df.empty)
                 and (trader_df is None or trader_df.empty)
                 and not macro_tilts
                 and (forward_df is None or forward_df.empty)
@@ -785,7 +773,6 @@ class StockAnalysisCoordinator:
                 hist_df=hist_df,
                 quality_df=quality_df,
                 valuation_df=valuation_df,
-                north_df=north_df,
                 trader_df=trader_df,
                 macro_tilts=macro_tilts,
                 forward_df=forward_df,
@@ -1194,7 +1181,6 @@ class StockAnalysisCoordinatorFactory:
         force_rerun: bool = False,
     ) -> StockAnalysisCoordinator:
         from LogicAnalyzer.FundMomentumAnalyzer import FundMomentumAnalyzer
-        from UtilsManager.LoggerManager import get_logger
         from UtilsManager.UnifiedCacheManager import CacheStrategy
 
         config = Config(config_file=config_file)
@@ -1208,10 +1194,12 @@ class StockAnalysisCoordinatorFactory:
         calendar_mgr = TradingCalendarAnalyzer()
         today_str = calendar_mgr.get_last_trading_day()
 
-        logger = get_logger(
-            log_dir=config.LOG_DIR,
-            log_filename=f"Corenews_Main_{today_str}.log",
-            level=config.LOG_LEVEL,
+        # P0-10 ⑤：LoggerManager 已删除，改用 loguru 文件 sink（原 get_logger 语义）
+        _log_path = os.path.join(config.LOG_DIR, f"Corenews_Main_{today_str}.log")
+        os.makedirs(config.LOG_DIR, exist_ok=True)
+        logger.add(
+            _log_path, level=config.LOG_LEVEL,
+            encoding="utf-8", enqueue=True, rotation="1 day",
         )
 
         cache_dir = os.path.join(config.CACHE_DIRECTORY, "unified_cache")
@@ -1228,16 +1216,15 @@ class StockAnalysisCoordinatorFactory:
             incremental_sync_engine = IncrementalSyncEngine(
                 db_engine,
                 default_start=config.BACKTEST_START_DATE,
-                main_board_only=config.MAIN_BOARD_ONLY,
                 enable_research_report_filter=config.ENABLE_RESEARCH_REPORT_FILTER,
                 research_report_min_count=config.RESEARCH_REPORT_MIN_COUNT,
             )
 
-            from DataCollection.GetStockBasicinfo import StockBasicInfoService
-            basic_info_service = StockBasicInfoService(config)
-            basic_info_service.sync_all_stock_basic_info()
+            # P0-10 ⑤：GetStockBasicinfo.py 已删除（申万行业同步由
+            # DataManager.SwIndustrySync 承担），此处不再调用；异常捕获面
+            # 扩大到 ImportError，防止残留引用导致日频管线启动即崩。
 
-        except (DBAPIError, OperationalError) as e:
+        except (DBAPIError, OperationalError, ImportError) as e:
             raise DatabaseConnectionError(f"初始化数据库引擎失败: {e}") from e
 
         from UtilsManager.IDataProvider import LiveDataProvider

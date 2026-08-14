@@ -217,8 +217,13 @@ def test_wfo_empty_slice_snapshot(monkeypatch) -> None:
 def test_indicator_cache_failure_snapshot(snap_df, tmp_path, monkeypatch) -> None:
     """指标计算异常：precompute_all_indicators 落盘符号级快照后原样重抛。"""
     import BackTrading.prepare as _prepare
-    from BackTrading.indicator_cache import precompute_all_indicators
+    from BackTrading.indicator_cache import (
+        _reset_memory_caches,
+        precompute_all_indicators,
+    )
     from BackTrading.snapshot import find_snapshots
+
+    _reset_memory_caches()
 
     def _boom(_df):
         raise ValueError("macd boom")
@@ -229,7 +234,7 @@ def test_indicator_cache_failure_snapshot(snap_df, tmp_path, monkeypatch) -> Non
     snap_df.to_parquet(stock_dir / "sh600000.parquet", index=False)
 
     with pytest.raises(ValueError, match="macd boom"):
-        precompute_all_indicators(str(stock_dir))
+        precompute_all_indicators(str(stock_dir), shard_mode="off")
 
     snaps = find_snapshots()
     assert len(snaps) == 1

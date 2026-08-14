@@ -21,10 +21,28 @@ DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2023-08-28", 0.0005),
     ("2000-01-01", 0.001),
 )
-# 经手费（双边 0.00341%，沪/深交易所） + 证管费（双边 0.002%，证监会），
+# 过户费日期分段表（双边收取，date:rate 升序，取最晚 ≤ 交易日的档）。
+# 2022-04-28 前 0.02‰（万分之零点零二），2022-04-29 起减半为 0.01‰。
+DEFAULT_TRANSFER_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
+    ("2022-04-29", 0.00001),
+    ("2000-01-01", 0.00002),
+)
+# 经手费（双边，沪/深交易所）+ 证管费（双边，证监会），
 # 行业惯例通常已并入佣金，此处单独建模（拆分报告可见），并入 CostModel 统一收取。
 DEFAULT_HANDLING_FEE_RATE: float = 0.0000341
 DEFAULT_CSRC_FEE_RATE: float = 0.00002
+# 经手费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
+# 2023-08-28 起 0.00341%（万分之零点三四一），此前 0.00487%。
+DEFAULT_HANDLING_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
+    ("2023-08-28", 0.0000341),
+    ("2000-01-01", 0.0000487),
+)
+# 证管费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
+# 2015-08-01 起 0.002%（万分之零点二），此前 0.004%。
+DEFAULT_CSRC_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
+    ("2015-08-01", 0.00002),
+    ("2000-01-01", 0.00004),
+)
 
 
 @dataclass
@@ -58,11 +76,21 @@ class CostModel:
     transfer_fee_rate: float = 0.00001
     handling_fee_rate: float = DEFAULT_HANDLING_FEE_RATE
     csrc_fee_rate: float = DEFAULT_CSRC_FEE_RATE
+    # ── 佣金是否已含经手费+证管费（#1 审计修复：行业惯例佣金为全包价）──
+    # True（默认）：佣金已含经手费(3.41bp)+证管费(2bp)，不再单独收取
+    # False：佣金为净佣金，需额外叠加经手费+证管费
+    commission_includes_fees: bool = True
     stamp_tax_segments: tuple[tuple[str, float], ...] = DEFAULT_STAMP_TAX_SEGMENTS
+    transfer_fee_segments: tuple[tuple[str, float], ...] = DEFAULT_TRANSFER_FEE_SEGMENTS
+    handling_fee_segments: tuple[tuple[str, float], ...] = DEFAULT_HANDLING_FEE_SEGMENTS
+    csrc_fee_segments: tuple[tuple[str, float], ...] = DEFAULT_CSRC_FEE_SEGMENTS
     liquidity_tier_edges: tuple[float, ...] = DEFAULT_TIER_EDGES
     liquidity_tier_impact_base: tuple[float, ...] = DEFAULT_TIER_IMPACT_BASE
     liquidity_tier_threshold: tuple[float, ...] = DEFAULT_TIER_THRESHOLD
     liquidity_tier_cap: tuple[float, ...] = DEFAULT_TIER_CAP
+    # ── 分档基础滑点下限（修复"小盘股静态滑点偏低"问题）──
+    # 大盘股0.05%，中盘0.08%，小盘0.12%，微盘0.18%；基础滑点=max(配置值, 档下限)
+    liquidity_tier_slippage_floor: tuple[float, ...] = (0.0018, 0.0012, 0.0008, 0.0005)
 
     def __post_init__(self) -> None:
         """构造时校验分档配置，避免档位错位导致成本失真。"""
@@ -71,6 +99,45 @@ class CostModel:
         self.stamp_tax_segments = tuple(
             sorted(self.stamp_tax_segments, key=lambda x: str(x[0]))
         )
+        # 过户费分段表同理，保证 transfer_fee_rate_for 取"最晚 ≤ 交易日"档
+        self.transfer_fee_segments = tuple(
+            sorted(self.transfer_fee_segments, key=lambda x: str(x[0]))
+        )
+        # 经手费/证管费分段表同理（2023-08-28 / 2015-08-01 前后费率不同）
+        self.handling_fee_segments = tuple(
+            sorted(self.handling_fee_segments, key=lambda x: str(x[0]))
+        )
+        self.csrc_fee_segments = tuple(
+            sorted(self.csrc_fee_segments, key=lambda x: str(x[0]))
+        )
+        # P0-10 审计修复：与印花税一致，经手费/证管费单值回退必须与分段表兜底段一致，
+        # 否则 commission_includes_fees=False 时历史成本被低估 ~30%（0.00487%→0.00341%）
+        for _name, _rate, _segs in (
+            ("handling_fee_rate", self.handling_fee_rate, self.handling_fee_segments),
+            ("csrc_fee_rate", self.csrc_fee_rate, self.csrc_fee_segments),
+        ):
+            if _segs:
+                _fallback_date, _fallback_rate = _segs[0]  # 最早日期 = 兜底
+                if abs(_rate - _fallback_rate) > 1e-9:
+                    import warnings
+                    warnings.warn(
+                        f"CostModel.{_name}={_rate} 与分段表兜底段 "
+                        f"({_fallback_date}: {_fallback_rate}) 不一致！"
+                        f"回退路径（无命中时）将使用 {_rate}，"
+                        f"可能导致历史经手费/证管费被低估。建议将 {_name} 设置为 {_fallback_rate}。"
+                    )
+        # P1 审计修复：stamp_tax_rate 回退值必须与分段表兜底段（最早日期档）一致
+        # 否则 2023-08-28 前交易按错误税率收取，历史成本被低估
+        if self.stamp_tax_segments:
+            _fallback_date, _fallback_rate = self.stamp_tax_segments[0]  # 最早日期 = 兜底
+            if abs(self.stamp_tax_rate - _fallback_rate) > 1e-9:
+                import warnings
+                warnings.warn(
+                    f"CostModel.stamp_tax_rate={self.stamp_tax_rate} 与分段表兜底段 "
+                    f"({_fallback_date}: {_fallback_rate}) 不一致！"
+                    f"回退路径（无命中时）将使用 stamp_tax_rate={self.stamp_tax_rate}，"
+                    f"可能导致 2023-08-28 前印花税被低估。建议将 stamp_tax_rate 设置为 {_fallback_rate}。"
+                )
 
     # ── 流动性分档 ────────────────────────────────────────────
 
@@ -87,6 +154,7 @@ class CostModel:
             ("liquidity_tier_impact_base", self.liquidity_tier_impact_base),
             ("liquidity_tier_threshold", self.liquidity_tier_threshold),
             ("liquidity_tier_cap", self.liquidity_tier_cap),
+            ("liquidity_tier_slippage_floor", self.liquidity_tier_slippage_floor),
         ):
             if len(seq) != n:
                 raise ValueError(
@@ -158,6 +226,57 @@ class CostModel:
                 break  # 升序：后续日期更晚，不可能命中
         return rate
 
+    def transfer_fee_rate_for(self, dt: str | None) -> float:
+        """按配置日期表取过户费率（双边收取，替代固定费率）。
+
+        2022-04-28 前为 0.02‰（万分之零点零二），2022-04-29 起减半为 0.01‰。
+
+        Args:
+            dt: 交易日（YYYY-MM-DD）；None 返回单值 transfer_fee_rate。
+
+        Returns:
+            float: 最晚 ≤ dt 的档位费率；无命中时回落 transfer_fee_rate。
+        """
+        if dt is None:
+            return self.transfer_fee_rate
+        rate = self.transfer_fee_rate
+        for _date, _r in self.transfer_fee_segments:
+            if str(dt) >= str(_date):
+                rate = _r
+            else:
+                break
+        return rate
+
+    def handling_fee_rate_for(self, dt: str | None) -> float:
+        """按配置日期表取经手费率（双边收取，替代固定费率）。
+
+        2023-08-28 起 0.00341%，此前 0.00487%（沪/深交易所）。
+        """
+        if dt is None:
+            return self.handling_fee_rate
+        rate = self.handling_fee_rate
+        for _date, _r in self.handling_fee_segments:
+            if str(dt) >= str(_date):
+                rate = _r
+            else:
+                break
+        return rate
+
+    def csrc_fee_rate_for(self, dt: str | None) -> float:
+        """按配置日期表取证管费率（双边收取，替代固定费率）。
+
+        2015-08-01 起 0.002%，此前 0.004%（证监会）。
+        """
+        if dt is None:
+            return self.csrc_fee_rate
+        rate = self.csrc_fee_rate
+        for _date, _r in self.csrc_fee_segments:
+            if str(dt) >= str(_date):
+                rate = _r
+            else:
+                break
+        return rate
+
     def _slippage_components(
         self,
         volume: float,
@@ -173,8 +292,15 @@ class CostModel:
         大票反之）。参与率上限 1.0，冲击上限为该档 impact_cap，防止极端场景滑点>100%。
         """
         base = self.market_slippage if order_type == "market" else self.limit_slippage
-        base = max(base, MIN_SLIPPAGE_FLOOR)
+        # 分档基础滑点下限：小票天然流动性不足，滑点下限随档位抬升
+        tier = self.liquidity_tier(amount_ma20)
+        if tier >= 0 and len(self.liquidity_tier_slippage_floor) > tier:
+            _tier_floor = self.liquidity_tier_slippage_floor[tier]
+            base = max(base, _tier_floor, MIN_SLIPPAGE_FLOOR)
+        else:
+            base = max(base, MIN_SLIPPAGE_FLOOR)
         base *= max(volatility_multiplier, 1.0)
+        # 参与率 = 委托量 / ADV（股数口径，测单日成交占比；AMOUNT_MA20 仅用于分档参数选择）
         participation = volume / adv if adv > 0 else 0.0
         participation = min(max(participation, 0.0), 1.0)
         impact_base, impact_threshold, impact_cap = self._impact_params(amount_ma20)
@@ -211,20 +337,27 @@ class CostModel:
         adv: float,
         order_type: str = "market",
         amount_ma20: float | None = None,
+        dt: str | None = None,
         volatility_multiplier: float = 1.0,
     ) -> dict[str, float]:
         """买入成本拆解 = 佣金(含最低5元) + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。
 
+        过户费按 dt 查 transfer_fee_segments 日期分段表（2022-04-29 前后费率不同）。
         返回各分项金额（元）与 total，供成本拆解报告按占比汇总。
+
+        #1 审计修复：当 commission_includes_fees=True（默认）时，经手费/证管费已含在佣金中，
+        不再单独收取；仅记录拆分值供报告展示（金额为 0）。
         """
         base, impact = self._slippage_components(
             volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             volatility_multiplier=volatility_multiplier,
         )
         commission = max(value * self.commission_rate, self.min_commission_per_trade)
-        transfer = value * self.transfer_fee_rate
-        handling = value * self.handling_fee_rate
-        csrc = value * self.csrc_fee_rate
+        transfer = value * self.transfer_fee_rate_for(dt)
+        # #1 修复：佣金为全包价时，经手费/证管费不单独收取
+        # P0-10：经手费/证管费按日期分段表取历史费率（2023-08-28 / 2015-08-01 分界）
+        handling = 0.0 if self.commission_includes_fees else value * self.handling_fee_rate_for(dt)
+        csrc = 0.0 if self.commission_includes_fees else value * self.csrc_fee_rate_for(dt)
         slippage = value * base
         impact_v = value * impact
         return {
@@ -251,9 +384,11 @@ class CostModel:
         """卖出成本拆解 = 买入成本项 + 印花税（按日期表，仅卖出）。
 
         stamp_tax_rate 显式传入优先；否则按 dt 查 stamp_tax_segments 日期表。
+        过户费同样按 dt 查 transfer_fee_segments 日期分段表（2022-04-29 前后费率不同）。
         """
         parts = self.buy_cost_breakdown(
             value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
+            dt=dt,
             volatility_multiplier=volatility_multiplier,
         )
         if stamp_tax_rate is None:
@@ -270,11 +405,13 @@ class CostModel:
         adv: float,
         order_type: str = "market",
         amount_ma20: float | None = None,
+        dt: str | None = None,
         volatility_multiplier: float = 1.0,
     ) -> float:
         """买入成本 = 佣金（含最低5元） + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。"""
         return self.buy_cost_breakdown(
             value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
+            dt=dt,
             volatility_multiplier=volatility_multiplier,
         )["total"]
 
@@ -301,7 +438,12 @@ class CostModel:
 
     @classmethod
     def _parse_stamp_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
-        """解析 "date:rate;date:rate" 印花税日期表，按日期升序。"""
+        """解析 "date:rate;date:rate" 印花税日期表，按日期升序。
+
+        #2 审计修复：强制注入兜底段（date <= 2005-01-01），确保自定义配置
+        不丢失早期历史数据的税率。若用户未提供兜底段，从 DEFAULT_STAMP_TAX_SEGMENTS
+        取最早段注入。
+        """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):
             part = part.strip()
@@ -311,7 +453,84 @@ class CostModel:
             if not _date or not _rate:
                 raise ValueError(f"STAMP_TAX_SEGMENTS 段格式应为 date:rate，收到 {part!r}")
             segs.append((_date.strip(), float(_rate.strip())))
-        return tuple(sorted(segs, key=lambda x: x[0])) or DEFAULT_STAMP_TAX_SEGMENTS
+        if not segs:
+            return DEFAULT_STAMP_TAX_SEGMENTS
+        segs = sorted(segs, key=lambda x: x[0])
+        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底
+        if segs[0][0] > "2005-01-01":
+            _fallback = DEFAULT_STAMP_TAX_SEGMENTS[0] if DEFAULT_STAMP_TAX_SEGMENTS else ("2000-01-01", 0.001)
+            segs.insert(0, _fallback)
+        return tuple(segs)
+
+    @classmethod
+    def _parse_transfer_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
+        """解析 "date:rate;date:rate" 过户费日期表，按日期升序。
+
+        #2 审计修复：同上，强制注入兜底段。
+        """
+        segs: list[tuple[str, float]] = []
+        for part in str(s).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            _date, _, _rate = part.partition(":")
+            if not _date or not _rate:
+                raise ValueError(f"TRANSFER_FEE_SEGMENTS 段格式应为 date:rate，收到 {part!r}")
+            segs.append((_date.strip(), float(_rate.strip())))
+        if not segs:
+            return DEFAULT_TRANSFER_FEE_SEGMENTS
+        segs = sorted(segs, key=lambda x: x[0])
+        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底
+        if segs[0][0] > "2005-01-01":
+            _fallback = DEFAULT_TRANSFER_FEE_SEGMENTS[0] if DEFAULT_TRANSFER_FEE_SEGMENTS else ("2000-01-01", 0.00002)
+            segs.insert(0, _fallback)
+        return tuple(segs)
+
+    @classmethod
+    def _parse_handling_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
+        """解析 "date:rate;date:rate" 经手费日期表，按日期升序（P0-10）。
+
+        2023-08-28 起 0.00341%，此前 0.00487%；强制注入兜底段。
+        """
+        segs: list[tuple[str, float]] = []
+        for part in str(s).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            _date, _, _rate = part.partition(":")
+            if not _date or not _rate:
+                raise ValueError(f"HANDLING_FEE_SEGMENTS 段格式应为 date:rate，收到 {part!r}")
+            segs.append((_date.strip(), float(_rate.strip())))
+        if not segs:
+            return DEFAULT_HANDLING_FEE_SEGMENTS
+        segs = sorted(segs, key=lambda x: x[0])
+        if segs[0][0] > "2005-01-01":
+            _fallback = DEFAULT_HANDLING_FEE_SEGMENTS[-1] if DEFAULT_HANDLING_FEE_SEGMENTS else ("2000-01-01", 0.0000487)
+            segs.insert(0, _fallback)
+        return tuple(segs)
+
+    @classmethod
+    def _parse_csrc_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
+        """解析 "date:rate;date:rate" 证管费日期表，按日期升序（P0-10）。
+
+        2015-08-01 起 0.002%，此前 0.004%；强制注入兜底段。
+        """
+        segs: list[tuple[str, float]] = []
+        for part in str(s).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            _date, _, _rate = part.partition(":")
+            if not _date or not _rate:
+                raise ValueError(f"CSRC_FEE_SEGMENTS 段格式应为 date:rate，收到 {part!r}")
+            segs.append((_date.strip(), float(_rate.strip())))
+        if not segs:
+            return DEFAULT_CSRC_FEE_SEGMENTS
+        segs = sorted(segs, key=lambda x: x[0])
+        if segs[0][0] > "2005-01-01":
+            _fallback = DEFAULT_CSRC_FEE_SEGMENTS[-1] if DEFAULT_CSRC_FEE_SEGMENTS else ("2000-01-01", 0.00004)
+            segs.insert(0, _fallback)
+        return tuple(segs)
 
     @classmethod
     def from_backtest_config(cls, bt: Any, trading_cost: Any | None = None) -> CostModel:
@@ -337,6 +556,24 @@ class CostModel:
             except ValueError:
                 return DEFAULT_STAMP_TAX_SEGMENTS
 
+        def _tseg(s: str) -> tuple[tuple[str, float], ...]:
+            try:
+                return cls._parse_transfer_segments(s)
+            except ValueError:
+                return DEFAULT_TRANSFER_FEE_SEGMENTS
+
+        def _hseg(s: str) -> tuple[tuple[str, float], ...]:
+            try:
+                return cls._parse_handling_segments(s)
+            except ValueError:
+                return DEFAULT_HANDLING_FEE_SEGMENTS
+
+        def _cseg(s: str) -> tuple[tuple[str, float], ...]:
+            try:
+                return cls._parse_csrc_segments(s)
+            except ValueError:
+                return DEFAULT_CSRC_FEE_SEGMENTS
+
         base_kw = dict(
             commission_rate=float(bt.COMMISSION_RATE),
             stamp_tax_rate=float(bt.STAMP_TAX_RATE),
@@ -347,6 +584,9 @@ class CostModel:
             handling_fee_rate=float(getattr(bt, "HANDLING_FEE_RATE", DEFAULT_HANDLING_FEE_RATE)),
             csrc_fee_rate=float(getattr(bt, "CSRC_FEE_RATE", DEFAULT_CSRC_FEE_RATE)),
             stamp_tax_segments=_seg(getattr(bt, "STAMP_TAX_SEGMENTS", "")),
+            transfer_fee_segments=_tseg(getattr(bt, "TRANSFER_FEE_SEGMENTS", "")),
+            handling_fee_segments=_hseg(getattr(bt, "HANDLING_FEE_SEGMENTS", "")),
+            csrc_fee_segments=_cseg(getattr(bt, "CSRC_FEE_SEGMENTS", "")),
             impact_base=getattr(bt, "IMPACT_BASE", 0.002),
             impact_threshold=getattr(bt, "IMPACT_THRESHOLD", 0.01),
             impact_cap=getattr(bt, "IMPACT_CAP", 0.05),
@@ -381,5 +621,8 @@ class CostModel:
                 handling_fee_rate=float(getattr(trading_cost, "HANDLING_FEE_RATE", model.handling_fee_rate)),
                 csrc_fee_rate=float(getattr(trading_cost, "CSRC_FEE_RATE", model.csrc_fee_rate)),
                 stamp_tax_segments=_seg(getattr(trading_cost, "STAMP_TAX_SEGMENTS", "")),
+                transfer_fee_segments=_tseg(getattr(trading_cost, "TRANSFER_FEE_SEGMENTS", "")),
+                handling_fee_segments=_hseg(getattr(trading_cost, "HANDLING_FEE_SEGMENTS", "")),
+                csrc_fee_segments=_cseg(getattr(trading_cost, "CSRC_FEE_SEGMENTS", "")),
             )
         return model

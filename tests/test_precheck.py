@@ -351,13 +351,19 @@ def test_precompute_need_fill_records_reasons(tmp_path) -> None:
 
 
 def test_stock_worker_skip_returns_empty(tmp_path, monkeypatch) -> None:
-    """_stock_worker: SKIP 股票返回 []（不进入信号计算）。"""
-    from BackTrading.prepare import _stock_worker
+    """_stock_worker_vectorized: SKIP 股票返回 []（不进入信号计算）。
+
+    P0-10 ②：循环路径 _stock_worker 已删除，SKIP 拦截在 Phase 0 预计算阶段。
+    """
+    import BackTrading.indicator_cache as ic
+    monkeypatch.setattr(ic, "_cache_root", lambda: tmp_path / "icache")
+    from BackTrading.prepare import _stock_worker_vectorized, precompute_all_indicators
 
     stock_dir = tmp_path / "stocks"
     stock_dir.mkdir()
     _valid_df(n=300).assign(volume=0.0).to_parquet(stock_dir / "sh600000.parquet", index=False)
-    rows = _stock_worker("sh600000", str(stock_dir), {})
+    precompute_all_indicators(str(stock_dir), shard_mode="off")
+    rows = _stock_worker_vectorized("sh600000", str(stock_dir), {})
     assert rows == []
 
 

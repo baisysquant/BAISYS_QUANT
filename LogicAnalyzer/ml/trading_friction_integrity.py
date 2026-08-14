@@ -3,7 +3,8 @@
 业务定义：策略 Alpha 必须能够覆盖真实的微观市场成本。
 审计口径：
   1. 双边显性成本：单回合完整交易必须强制扣除 A 股真实佣金（单边 0.03%）、
-     卖出端国家印花税（2023-08-28 减半后 0.05%，此前 0.1%）以及各交易所过户费（0.001% 双边）。
+     卖出端国家印花税（2023-08-28 减半后 0.05%，此前 0.1%）以及各交易所过户费
+     （2022-04-29 前双边 0.02‰，之后减半为 0.01‰）。
   2. 隐性滑点硬编码：固定滑点不得低于单边 0.05%（0.0005）；
      大资金调仓占个股日成交量（ADV）比例超过阈值时，必须引入平方根模型
      等非线性动态冲击成本调增滑点。
@@ -18,12 +19,12 @@ from BackTrading.engine import (
 )
 from LogicAnalyzer.ml.split_integrity import SplitReport
 
-# 政策常量（现行费率，引擎侧分段表以 stamp_tax_segments 驱动）
+# 政策常量（现行费率，引擎侧分段表以 stamp_tax_segments / transfer_fee_segments 驱动）
 _STAMP_TAX_CURRENT = 0.0005  # 2023-08-28 起现行印花税（万五）
 _STAMP_TAX_CUTOFF = "2023-08-28"
 _COMMISSION_FLOOR = 0.0003
 _MIN_COMMISSION_CNY = 5.0
-_TRANSFER_FEE_FLOOR = 0.00001
+_TRANSFER_FEE_FLOOR = 0.00001  # 2022-04-29 起现行过户费（万0.1，双边）；此前为万0.2
 
 _ATTRS = (
     "commission_rate",
@@ -67,7 +68,7 @@ def check_double_sided_explicit_costs(
     cm_or_cfg: Any,
     _log: bool = True,
 ) -> SplitReport:
-    """双边显性成本校验：佣金≥0.03%（且最低 5 元）、印花税≥0.05%、过户费≥0.001%。
+    """双边显性成本校验：佣金≥0.03%（且最低 5 元）、印花税≥0.05%、过户费≥0.001%（2022-04-29 起现行费率）。
 
     Args:
         cm_or_cfg: CostModel 或 EngineConfig。

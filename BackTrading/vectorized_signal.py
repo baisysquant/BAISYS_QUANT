@@ -68,11 +68,25 @@ def _regime_series(
     ma_bearish = (ma5 < ma10) & (ma10 < ma20) & (ma20 < ma30) & (ma30 < ma60)
     momentum_positive = hist > 0
 
-    # DIF 斜率
-    slope = dif.diff().rolling(slope_window, min_periods=3).apply(
-        lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) >= 3 else 0,
-        raw=True,
-    )
+    # DIF 斜率 — P1 审计修复：纯 numpy 卷积替代 rolling().apply(np.polyfit)
+    # 原实现每窗口调用一次 np.polyfit（Python 级循环），3000 只 × 数百年数据 = 瓶颈
+    # 线性回归斜率 = W*Σ((x-μx)(y-μy)) / Σ((x-μx)²)，可拆解为两个卷积（numerator/denominator）
+    n = len(df)
+    diff = dif.diff().values.astype(float)  # NaN at index 0
+    slope = np.zeros(n, dtype=float)
+    if n >= slope_window:
+        x = np.arange(slope_window, dtype=float)
+        x_mean = x.mean()
+        w_xx = x - x_mean
+        denom_val = float(np.sum(w_xx ** 2))
+        # 卷积核：slope = Σ w_xx * y / denom_val，翻转 w_xx 供 convolve
+        kernel = w_xx[::-1]
+        num_full = np.convolve(diff, kernel, mode="full")
+        # 对齐卷积输出到原始索引（full mode → len = n + slope_window - 1）
+        offset = slope_window - 1
+        # P3 审计修复：num 形状对齐 — 只取 valid 段再除以 denom_val
+        valid_end = min(n, len(num_full) - offset)
+        slope[offset:valid_end] = num_full[offset:valid_end] / denom_val
     slope_positive = slope > 0
 
     # Bollinger 带宽
@@ -131,6 +145,48 @@ def _regime_series(
 # 3. Divergence（使用预计算的 peak/trough）
 # ═══════════════════════════════════════════════════════════════════
 
+def _bfill_ffill_np(x: np.ndarray) -> np.ndarray:
+    """等价 pd.Series(x).bfill().ffill()（NaN 前后向填充，无 pandas 开销）。"""
+    out = x.copy()
+    n = len(out)
+    nz = np.where(~np.isnan(out))[0]
+    if len(nz) == 0 or len(nz) == n:
+        return out
+    i = np.arange(n)
+    jb = np.searchsorted(nz, i, side="left")
+    has_b = jb < len(nz)
+    bval = np.where(has_b, out[nz[np.minimum(jb, len(nz) - 1)]], np.nan)
+    jf = np.searchsorted(nz, i, side="right") - 1
+    has_f = jf >= 0
+    fval = np.where(has_f, out[nz[np.maximum(jf, 0)]], np.nan)
+    filled = np.where(has_b, bval, fval)
+    return np.where(np.isnan(out), filled, out)
+
+
+def _adaptive_distance_np(x: np.ndarray, base_distance: int = 10) -> int:
+    """等价 LogicAnalyzer.signals.divergence.adaptive_distance（numpy 版）。"""
+    n = len(x)
+    if n < 20:
+        return max(3, n // 4)
+    price_range = float(np.nanmax(x) - np.nanmin(x))
+    if np.isnan(price_range) or price_range == 0:
+        return base_distance
+    volatility = float(np.nanmean(np.abs(np.diff(x)))) / price_range
+    if np.isnan(volatility) or volatility < 0:
+        return base_distance
+    dynamic = max(3, int(base_distance * (1 + volatility * 10)))
+    return min(dynamic, max(10, n // 5))
+
+
+def _find_peaks_troughs_np(x: np.ndarray, distance: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """等价 find_peaks_troughs（scipy.signal.find_peaks，ndarray 直调）。"""
+    from scipy.signal import find_peaks
+
+    peaks, _ = find_peaks(x, distance=distance)
+    troughs, _ = find_peaks(-x, distance=distance)
+    return peaks, troughs
+
+
 def _divergence_scores(
     df: pd.DataFrame,
     base_distance: int = 10,
@@ -140,9 +196,13 @@ def _divergence_scores(
     对每个 bar，仅用截至该 bar 的数据计算 peaks/troughs，
     确保信号在实盘中可复现，消除全量预计算引入的前瞻偏差。
     每 distance//2 bar 批量重算一次 find_peaks 以平衡精度与性能。
-    """
-    from LogicAnalyzer.signals.divergence import adaptive_distance, find_peaks_troughs
 
+    P0-10 ③：原实现为"逐 bar × 逐峰"内层扫描 + 每批全前缀 pandas 重算
+    （O(n²/batch)）。现改为**峰事件表传播**：峰按位置降序处理，每个匹配峰
+    占据 (p, p+max_lookahead] 内尚未被更近匹配峰占据的 bar（owner 数组），
+    与"从最近峰向远峰扫描、命中即 break"的逐 bar 语义完全等价，复杂度 O(n)。
+    批次重算同步 numpy 化（去掉 pd.Series 构造 / bfill·ffill / 统计开销）。
+    """
     n = len(df)
     div_type = np.full(n, None, dtype=object)
     div_idx = np.full(n, -1, dtype=np.int32)
@@ -154,45 +214,76 @@ def _divergence_scores(
 
     last_peaks: np.ndarray = np.array([], dtype=int)
     last_troughs: np.ndarray = np.array([], dtype=int)
+    # 事件表 owner：owner[i] = 已占据 bar i 的最近匹配峰（-1 = 空闲）
+    _owner_top = np.full(n, -1, dtype=np.int32)
+    _owner_bot = np.full(n, -1, dtype=np.int32)
+
+    def _propagate_peaks(batch_i: int) -> None:
+        _owner_top[:] = -1
+        # 关键等价性：参考（逐 bar 循环）中 bar ≥ batch_i 尚未被处理，div_* 均为
+        # 初始值；事件表传播是"提前投影"，必须重置投影区间，否则更早 batch 的
+        # 记录会残留（参考中匹配即 break，且每次处理从初始值开始）。
+        div_type[batch_i:] = None
+        div_idx[batch_i:] = -1
+        div_strength[batch_i:] = 0.0
+        for p in last_peaks[::-1]:
+            # 参考语义：bar 只能使用"重算时已知"的峰（最近一次 ≤ bar 的 batch 重算）。
+            # 传播起点 = max(p+1, 本次 batch 点)，防止峰覆盖其发现之前的 bar。
+            lo = max(p + 1, batch_i)
+            # 参考条件 i - p > max_lookahead 才 break → p + max_lookahead 仍可匹配
+            hi = min(p + max_lookahead + 1, n)
+            if lo >= hi:
+                continue
+            seg_close = close_arr[lo:hi]
+            seg_ind = indicator_arr[lo:hi]
+            match = (close_arr[p] > seg_close * 0.98) & (indicator_arr[p] > seg_ind)
+            take = np.where(match & (_owner_top[lo:hi] == -1))[0]
+            for k in take:
+                i_pos = lo + k
+                _owner_top[i_pos] = p
+                price_ratio = close_arr[i_pos] / close_arr[p] - 1
+                ind_ratio = 1 - indicator_arr[i_pos] / indicator_arr[p]
+                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
+                if s > 0.15 and s > div_strength[i_pos]:
+                    div_type[i_pos] = Divergence.TOP_DIVERGENCE
+                    div_idx[i_pos] = p
+                    div_strength[i_pos] = s
+
+    def _propagate_troughs(batch_i: int) -> None:
+        _owner_bot[:] = -1
+        # 注意：不重置 div_*——参考中 trough 循环在 peak 循环之后运行，
+        # 覆写条件 s > div_strength[i] 基于 peak 已写入的强度；保留峰值
+        # 保证"trough 需更强才覆写"语义（匹配即 break，不达标则残留 peak 结果）。
+        for t in last_troughs[::-1]:
+            lo = max(t + 1, batch_i)
+            hi = min(t + max_lookahead + 1, n)
+            if lo >= hi:
+                continue
+            seg_close = close_arr[lo:hi]
+            seg_ind = indicator_arr[lo:hi]
+            match = (close_arr[t] < seg_close * 1.02) & (indicator_arr[t] < seg_ind)
+            take = np.where(match & (_owner_bot[lo:hi] == -1))[0]
+            for k in take:
+                i_pos = lo + k
+                _owner_bot[i_pos] = t
+                price_ratio = 1 - close_arr[i_pos] / close_arr[t]
+                ind_ratio = indicator_arr[i_pos] / indicator_arr[t] - 1
+                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
+                if s > 0.15 and s > div_strength[i_pos]:
+                    div_type[i_pos] = Divergence.BOTTOM_DIVERGENCE
+                    div_idx[i_pos] = t
+                    div_strength[i_pos] = s
 
     for i in range(1, n):
         if i % batch_size == 0:
-            sub = pd.Series(indicator_arr[: i + 1]).bfill().ffill()
-            if len(sub) < 5 or sub.isna().all():
+            sub = _bfill_ffill_np(indicator_arr[: i + 1])
+            if len(sub) < 5 or np.isnan(sub).all():
                 last_peaks, last_troughs = np.array([], dtype=int), np.array([], dtype=int)
             else:
-                adj = adaptive_distance(sub, base_distance=base_distance)
-                last_peaks, last_troughs = find_peaks_troughs(sub, distance=adj)
-
-        for p in reversed(last_peaks):
-            if p >= i:
-                continue
-            if i - p > max_lookahead:
-                break
-            if (close_arr[p] > close_arr[i] * 0.98) and (indicator_arr[p] > indicator_arr[i]):
-                price_ratio = close_arr[i] / close_arr[p] - 1
-                ind_ratio = 1 - indicator_arr[i] / indicator_arr[p]
-                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
-                if s > 0.15 and s > div_strength[i]:
-                    div_type[i] = Divergence.TOP_DIVERGENCE
-                    div_idx[i] = p
-                    div_strength[i] = s
-                break
-
-        for t in reversed(last_troughs):
-            if t >= i:
-                continue
-            if i - t > max_lookahead:
-                break
-            if (close_arr[t] < close_arr[i] * 1.02) and (indicator_arr[t] < indicator_arr[i]):
-                price_ratio = 1 - close_arr[i] / close_arr[t]
-                ind_ratio = indicator_arr[i] / indicator_arr[t] - 1
-                s = min(1.0, max(0.0, (price_ratio + ind_ratio) / 2))
-                if s > 0.15 and s > div_strength[i]:
-                    div_type[i] = Divergence.BOTTOM_DIVERGENCE
-                    div_idx[i] = t
-                    div_strength[i] = s
-                break
+                adj = _adaptive_distance_np(sub, base_distance=base_distance)
+                last_peaks, last_troughs = _find_peaks_troughs_np(sub, distance=adj)
+            _propagate_peaks(i)
+            _propagate_troughs(i)
 
     return div_type, div_idx, div_strength
 
@@ -454,25 +545,26 @@ def golden_cross_score(
     mask_bull = is_bull.values & ~mask_za & ~mask_zb
     score[mask_bull] = (w_cross * 0.75 * vol_factor[mask_bull]).astype(int)
 
-    # 衰减向量化: 对每个 cross 位置，线性衰减向后传播 cross_decay_days 根 bar
+    # 衰减向量化: 覆盖 cross 区间 c ∈ (i - cross_decay_days, i]（含 cross 当日）。
+    # 衰减随距离单调递减 → 每 bar 取区间内**最远**（最早）cross 的衰减 = 最严格值，
+    # 与逐 cross 循环"新衰减更小才覆盖"的语义等价。P0-10 ③：searchsorted 一次完成。
     cross_positions = np.where(macd_cross.values == 1)[0]
     if len(cross_positions) == 0:
         return score
 
-    # 为每根 bar 计算最近 cross 的距离，取最近 cross 的衰减
-    # 反向扫描：从最近到最远 cross
-    decay_mult = np.ones(n, dtype=np.float64)
-    for idx in cross_positions:
-        end = min(idx + cross_decay_days, n)
-        length = end - idx
-        # 线性衰减: 1.0 → cross_decay_min, 跨度 length 根 bar
-        decay_curve = np.maximum(
+    idx_arr = np.arange(n)
+    lo_idx = np.searchsorted(cross_positions, idx_arr - cross_decay_days + 1, side="left")
+    _lo = np.minimum(lo_idx, len(cross_positions) - 1)
+    valid = (lo_idx < len(cross_positions)) & (cross_positions[_lo] <= idx_arr)
+    dist = np.where(valid, idx_arr - cross_positions[_lo], 0)
+    decay_mult = np.where(
+        valid,
+        np.maximum(
             cross_decay_min,
-            1.0 - np.arange(length, dtype=np.float64) / cross_decay_days,
-        )
-        # 仅当新衰减更小（更严格）时才覆盖
-        mask_update = decay_curve < decay_mult[idx:end]
-        decay_mult[idx:end][mask_update] = decay_curve[mask_update]
+            1.0 - dist.astype(np.float64) / cross_decay_days,
+        ),
+        1.0,
+    )
 
     score = (score.astype(np.float64) * decay_mult).astype(np.int32)
     return score
@@ -638,6 +730,16 @@ def compute_signals(
     _ws = sum(weights.values())
     if _ws > 0 and _ws != 100:
         weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
+
+    # P0-2：信号引擎输入统一为单一空间（后复权）——指标（DIF/DEA/ATR/MA/BOLL）按
+    # close_adj 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
+    # 否则 close_ma20_ratio、_exit_score/stop_loss 出现"不复权价 − 后复权指标"混用。
+    # close_normal 仅供涨跌停/真实价格展示，不进入信号计算。
+    if "close_adj" in stock_df.columns:
+        for _c in ("open", "high", "low", "close"):
+            _adj_c = f"{_c}_adj"
+            if _adj_c in stock_df.columns:
+                stock_df[_c] = stock_df[_adj_c]
 
     close = stock_df["close"]
     dif = stock_df["DIF"]

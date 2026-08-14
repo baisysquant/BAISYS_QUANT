@@ -16,6 +16,10 @@ from UtilsManager.ConfigParser import Config
 class NorthFlowFetcher:
     """北向资金（沪深港通）个股持仓变动获取器。
 
+    【已停用 · P0-8②】本模块自 2024-08-16 起不再被评分链路引用：
+    港交所停止披露北向个股每日持仓/净买入后因子恒为 0，已从因子注册表与
+    coordinator 加载链路移除。保留本文件仅作历史记录，勿再接入。
+
     通过 akshare stock_hsgt_north_flow_em 获取每日北向资金个股净买入。
     缓存策略：当日结果缓存到 CSV；再次运行直接读缓存。
 

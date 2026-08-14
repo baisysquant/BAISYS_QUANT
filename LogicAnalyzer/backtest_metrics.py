@@ -8,7 +8,19 @@ import pandas as pd
 from loguru import logger
 
 
-def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]:
+def compute_risk_metrics(
+    equity_curve: list[dict[str, Any]],
+    risk_free_rate: float = 0.03,
+) -> dict[str, float]:
+    """计算风险指标。
+
+    #3 审计修复：新增 risk_free_rate 参数，Sharpe/Sortino 均扣除无风险利率。
+    默认 3%（年化），可动态传入当期国债收益率。
+
+    Args:
+        equity_curve: 权益曲线 [{time, portfolio_value, turnover, ...}, ...]
+        risk_free_rate: 年化无风险利率（默认 3%，中国 10 年期国债年化约 2.5-3.5%）
+    """
     df = pd.DataFrame(equity_curve)
     if df.empty or "portfolio_value" not in df.columns or len(df) < 2:
         return {}
@@ -34,15 +46,20 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
     mu = returns.mean() * ann_factor
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
 
-    sharpe = mu / sigma if sigma > 0 else 0.0
+    # #3 修复：超额收益 Sharpe = (R_p - R_f) / σ
+    excess_mu = mu - risk_free_rate
+    sharpe = excess_mu / sigma if sigma > 0 else 0.0
 
     downside = returns[returns < 0]
-    # 无亏损日时 Sortino 应为无穷大（风险为零），而不是伪分母导致的 10^12 量级失真
+    # P1 审计修复：无亏损日时 Sortino 截断为有限大值（100.0），避免优化器崩溃 / 数值不稳定
+    # 原逻辑：float("inf") → DSR/PBO 污染 / scipy 优化器 NaN
+    _SORTINO_CEILING = 100.0
     if len(downside) == 0:
-        sortino = float("inf") if mu > 0 else 0.0
+        sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
     else:
         downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
-        sortino = mu / downside_std if downside_std > 0 else (float("inf") if mu > 0 else 0.0)
+        raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)
+        sortino = min(raw_sortino, _SORTINO_CEILING)
 
     peak = np.maximum.accumulate(vals)  # type: ignore[arg-type]
     dd = (vals - peak) / peak
@@ -86,6 +103,8 @@ def compute_risk_metrics(equity_curve: list[dict[str, Any]]) -> dict[str, float]
         "cvar_95": round(cvar_95, 6),
         "avg_turnover": round(avg_turnover, 6),
         "max_turnover": round(max_turnover, 6),
+        # #3 修复：输出 risk_free_rate 用于审计可追溯
+        "risk_free_rate": risk_free_rate,
     }
 
 

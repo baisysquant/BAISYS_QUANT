@@ -109,6 +109,26 @@ class DataMergeService:
             pool = sync.get_stock_pool_from_db()
             industry = pool[["ts_code", "name", "industry"]].copy()
             industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
+            # P0-7 ①：附加申万一级行业列（独立映射表 stock_basic_info_sw_l1；
+            # 宏观 tilt 按一级行业 key 映射，二级语义 行业 列保持不变供行业信号使用）。
+            # 失败记录 error 日志（不静默吞异常），一级列缺失时宏观 tilt 降级为 0。
+            try:
+                from sqlalchemy import text
+                with _get_engine(self.config).connect() as conn:
+                    rows = conn.execute(text(
+                        "SELECT stock_code, l1_name FROM stock_basic_info_sw_l1 "
+                        "WHERE record_date = (SELECT MAX(record_date) FROM stock_basic_info_sw_l1)"
+                    )).fetchall()
+                l1_map = {str(c).strip().zfill(6): str(n).strip() for c, n in rows if n}
+                industry[ColumnNames.INDUSTRY_L1] = (
+                    industry[ColumnNames.STOCK_CODE].astype(str).str.zfill(6)
+                    .map(l1_map).fillna("未知")
+                )
+            except Exception as e:
+                self.logger.error(
+                    f"[申万一级] 一级行业映射加载失败: {type(e).__name__}: {e} —— 宏观 tilt 降级为 0"
+                )
+                industry[ColumnNames.INDUSTRY_L1] = "未知"
             self._industry_cache = industry
         formatted = {CodeNormalizer.normalize(c) for c in stock_codes}
         cache = self._industry_cache.copy()
@@ -185,8 +205,13 @@ class DataMergeService:
                 final_df.loc[is_missing, ColumnNames.STOCK_NAME] = (
                     final_df.loc[is_missing, ColumnNames.STOCK_CODE].map(ind_name_map).fillna("N/A")
                 )
-            final_df = pd.merge(final_df, industry_df[[ColumnNames.STOCK_CODE, ColumnNames.INDUSTRY]], on=ColumnNames.STOCK_CODE, how="left")
+            merge_cols = [ColumnNames.STOCK_CODE, ColumnNames.INDUSTRY]
+            if ColumnNames.INDUSTRY_L1 in industry_df.columns:
+                merge_cols.append(ColumnNames.INDUSTRY_L1)
+            final_df = pd.merge(final_df, industry_df[merge_cols], on=ColumnNames.STOCK_CODE, how="left")
             final_df[ColumnNames.INDUSTRY] = final_df[ColumnNames.INDUSTRY].fillna("N/A")
+            if ColumnNames.INDUSTRY_L1 in final_df.columns:
+                final_df[ColumnNames.INDUSTRY_L1] = final_df[ColumnNames.INDUSTRY_L1].fillna("未知")
         else:
             final_df[ColumnNames.INDUSTRY] = "N/A"
 

@@ -243,7 +243,7 @@ class UnifiedCacheManager:
         if params:
             # 将参数字典转换为排序后的JSON字符串，然后哈希
             params_str = json.dumps(params, sort_keys=True)
-            params_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
+            params_hash = hashlib.sha256(params_str.encode()).hexdigest()[:8]
             return f"{name}_{params_hash}"
         return name
 

@@ -135,9 +135,13 @@ CREATE TABLE IF NOT EXISTS public.ods_index_daily (
 );
 
 -- 质量/成长因子（季度）
+-- P0-8①：新增 disclosure_date（披露日/公告日）——record_date 是报告期末，披露日才是数据可得性时点，
+-- as-of 查询须按 披露日 <= 查询日 过滤，否则历史复盘会用到尚未披露的财报（前视偏差）。
+-- 披露日默认按监管披露截止日（公告日最晚可能值，保守无前视）回填，可被真实公告日覆盖。
 CREATE TABLE IF NOT EXISTS public.ods_financial_quality (
     symbol VARCHAR(20) NOT NULL,
     record_date DATE NOT NULL,
+    disclosure_date DATE,
     roe FLOAT,
     gross_profit_margin FLOAT,
     net_profit_margin FLOAT,
@@ -145,6 +149,10 @@ CREATE TABLE IF NOT EXISTS public.ods_financial_quality (
     net_profit_growth_rate FLOAT,
     PRIMARY KEY (symbol, record_date)
 );
+
+-- v2.1 migration: 已有部署补 disclosure_date 列
+ALTER TABLE public.ods_financial_quality ADD COLUMN IF NOT EXISTS disclosure_date DATE;
+CREATE INDEX IF NOT EXISTS idx_fq_disclosure ON public.ods_financial_quality (disclosure_date, record_date);
 
 -- ── v2.0 migration: 数据质量日志 ────────────────────────────────
 CREATE TABLE IF NOT EXISTS public.dash_quality_log (
@@ -227,3 +235,22 @@ CREATE TABLE IF NOT EXISTS public.ods_financial_valuation (
     PRIMARY KEY (symbol, trade_date)
 );
 CREATE INDEX IF NOT EXISTS idx_fv_date ON public.ods_financial_valuation (trade_date);
+
+-- ── v2.1 migration: 申万一级行业映射表（P0-7 ① 行业一级中性化） ────────
+-- 独立映射表（不修改 stock_basic_info_sw 的申万二级行业语义）：
+-- 每只股票 → 申万一级行业（l1_name 与 MacroFactorFetcher._SW1_MACRO_CLASS
+-- 的键一致，供宏观 tilt 映射与行业一级中性化使用）。
+-- 由 DataManager/SwIndustrySync.py 同步填充（AkShare 申万一级成分股）。
+CREATE TABLE IF NOT EXISTS public.stock_basic_info_sw_l1 (
+    id serial4 NOT NULL,
+    l1_code varchar(20) NOT NULL,
+    l1_name varchar(50) NOT NULL,
+    stock_code varchar(20) NOT NULL,
+    stock_name varchar(50) NULL,
+    record_date date NOT NULL,
+    CONSTRAINT stock_basic_info_sw_l1_pkey PRIMARY KEY (id),
+    CONSTRAINT uk_l1_ind_stock_date UNIQUE (l1_code, stock_code, record_date)
+);
+CREATE INDEX IF NOT EXISTS idx_sbi_l1_name ON public.stock_basic_info_sw_l1 USING btree (l1_name);
+CREATE INDEX IF NOT EXISTS idx_sbi_l1_stock_code ON public.stock_basic_info_sw_l1 USING btree (stock_code);
+CREATE INDEX IF NOT EXISTS idx_sbi_l1_record_date ON public.stock_basic_info_sw_l1 USING btree (record_date);

@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from DataManager.DbEngine import get_engine
 from DataManager.ColumnNames import ColumnNames
 from UtilsManager.CodeNormalizer import CodeNormalizer
-from UtilsManager.LoggerManager import get_logger
+from loguru import logger
 
-logger = get_logger(__name__)
+# P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:

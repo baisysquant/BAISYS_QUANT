@@ -201,31 +201,6 @@ class FactorCalculator:
             composite, df.get(industry_col, pd.Series(dtype=str))
         )
 
-    # ── 北向资金因子 ────────────────────────────────────────────
-
-    @staticmethod
-    def calc_north_flow_scores(north_df: pd.DataFrame, industry_col: str = "行业") -> pd.Series:
-        """计算北向资金因子 Z-Score（行业内中性化）。
-
-        使用 20 日净买入总额 + 持仓市值综合评分。
-        """
-        if north_df.empty:
-            return pd.Series(dtype=float)
-        if "北向净买入总额" not in north_df.columns and "北向净买入_万元" in north_df.columns:
-            val = north_df["北向净买入_万元"].fillna(0)
-        elif "北向净买入总额" in north_df.columns:
-            val = north_df["北向净买入总额"].fillna(0)
-        else:
-            val = pd.Series(0.0, index=north_df.index)
-        hold_val = north_df.get("北向持仓市值均值", north_df.get("北向持股市值_万元", pd.Series(0.0))).fillna(0)
-        composite = val + hold_val * 0.01  # 持仓市值权重降低
-        if industry_col in north_df.columns:
-            return FactorCalculator._industry_zscore(
-                composite, north_df[industry_col]
-            ).fillna(0)
-        std = composite.std()
-        return ((composite - composite.mean()) / (std if std != 0 else 1)).clip(-3, 3).fillna(0)
-
     # ── 宏观因子（行业 tilt） ──────────────────────────────────
 
     @staticmethod
@@ -381,7 +356,6 @@ class FactorCalculator:
         hist_df: pd.DataFrame | None = None,
         quality_df: pd.DataFrame | None = None,
         valuation_df: pd.DataFrame | None = None,
-        north_df: pd.DataFrame | None = None,
         trader_df: pd.DataFrame | None = None,
         macro_tilts: dict[str, float] | None = None,
         forward_df: pd.DataFrame | None = None,
@@ -438,15 +412,6 @@ class FactorCalculator:
         liquidity_score = self.calc_liquidity_scores(symbols, hist_df if not hist_df.empty else pd.DataFrame(), industry_map)
         volatility_score = self.calc_volatility_scores(symbols, hist_df if not hist_df.empty else pd.DataFrame(), industry_map)
 
-        # 北向资金
-        north_score = pd.Series(dtype=float)
-        if north_df is not None and not north_df.empty:
-            nf = north_df.copy()
-            if industry_col in result.columns:
-                nf["行业"] = nf["symbol"].map(result.set_index("股票代码")[industry_col].to_dict()).fillna("未知")
-            north_score = self.calc_north_flow_scores(nf, industry_col)
-        result["北向资金评分"] = north_score.reindex(result.index).fillna(0)
-
         # 龙虎榜
         trader_score = pd.Series(dtype=float)
         if trader_df is not None and not trader_df.empty:
@@ -457,7 +422,10 @@ class FactorCalculator:
         result["龙虎榜评分"] = trader_score.reindex(result.index).fillna(0)
 
         # 宏观因子（行业 tilt，不是截面 Z-Score）
-        macro_score = self.calc_macro_scores(result, macro_tilts, industry_col)
+        # P0-7 ①：tilt 按申万一级 key 映射 —— 报告含 行业一级（stock_basic_info_sw_l1）
+        # 时优先使用，否则回退二级 行业（可能多数为 0，调用方已记录降级日志）
+        _macro_ind_col = "行业一级" if "行业一级" in result.columns else industry_col
+        macro_score = self.calc_macro_scores(result, macro_tilts, _macro_ind_col)
         result["宏观评分"] = macro_score.reindex(result.index).fillna(0)
 
         # 财务前瞻
@@ -514,7 +482,7 @@ class FactorCalculator:
         _COL_TO_KEY = {
             "MACD评分": "macd", "动量评分": "momentum", "资金流评分": "moneyflow",
             "基本面评分": "quality", "估值评分": "valuation",
-            "北向资金评分": "north_flow", "龙虎榜评分": "top_trader",
+            "龙虎榜评分": "top_trader",
             "流动性评分": "liquidity", "波动率评分": "volatility",
             "宏观评分": "macro", "财务前瞻评分": "financial_forward",
             "事件驱动评分": "event_driven", "舆情评分": "news_sentiment",
@@ -538,7 +506,7 @@ class FactorCalculator:
             "[FactorCalculator] 多因子评分融合完成，因子权重: "
             f"MACD={ic_w.get('macd',0):.2f} 动量={ic_w.get('momentum',0):.2f} "
             f"资金流={ic_w.get('moneyflow',0):.2f} 质量={ic_w.get('quality',0):.2f} "
-            f"估值={ic_w.get('valuation',0):.2f} 北向={ic_w.get('north_flow',0):.2f} "
+            f"估值={ic_w.get('valuation',0):.2f} "
             f"龙虎榜={ic_w.get('top_trader',0):.2f} 流动性={ic_w.get('liquidity',0):.2f} "
             f"波动率={ic_w.get('volatility',0):.2f} 宏观={ic_w.get('macro',0):.2f} "
             f"财务前瞻={ic_w.get('financial_forward',0):.2f} 事件驱动={ic_w.get('event_driven',0):.2f}"
@@ -564,7 +532,6 @@ class FactorCalculator:
             ("动量评分", CN.MOMENTUM_PCT_INDUSTRY),
             ("基本面评分", CN.QUALITY_PCT_INDUSTRY),
             ("估值评分", CN.VALUATION_PCT_INDUSTRY),
-            ("北向资金评分", CN.NORTH_FLOW_PCT_INDUSTRY),
             ("龙虎榜评分", CN.TOP_TRADER_PCT_INDUSTRY),
             ("流动性评分", CN.LIQUIDITY_PCT_INDUSTRY),
             ("波动率评分", CN.VOLATILITY_PCT_INDUSTRY),
@@ -585,7 +552,7 @@ class FactorCalculator:
 
         FACTOR_KEYS = [
             "momentum", "quality", "valuation", "moneyflow", "macd",
-            "north_flow", "top_trader", "liquidity", "volatility",
+            "top_trader", "liquidity", "volatility",
             "macro", "financial_forward", "event_driven",
         ]
         COL_MAP = {
@@ -594,7 +561,6 @@ class FactorCalculator:
             "valuation": "估值评分",
             "moneyflow": "资金流评分",
             "macd": "MACD评分",
-            "north_flow": "北向资金评分",
             "top_trader": "龙虎榜评分",
             "liquidity": "流动性评分",
             "volatility": "波动率评分",
@@ -714,12 +680,17 @@ class FactorCalculator:
         self._weights = dict(self._registry.weights)
         logger.info(f"[FactorCalculator] 因子权重调整: {factor_key} → {new_weight:.3f}，归一化后权重: {self._weights}")
 
-    def load_quality_from_db(self, symbols: list[str] | None = None) -> pd.DataFrame:
-        """从数据库加载质量因子数据。"""
+    def load_quality_from_db(self, symbols: list[str] | None = None,
+                             as_of: str | None = None) -> pd.DataFrame:
+        """从数据库加载质量因子数据（PIT as-of 语义）。
+
+        Args:
+            as_of: 查询日，仅取该日前已披露（disclosure_date <= as_of）的财报。
+        """
         try:
             from DataCollection.FinancialQualityFetcher import FinancialQualityFetcher
             fetcher = FinancialQualityFetcher(self.config)
-            return fetcher.load_quality(symbols)
+            return fetcher.load_quality(symbols, as_of)
         except Exception as e:
             logger.warning(f"[FactorCalculator] 质量因子加载失败: {e}")
             return pd.DataFrame()

@@ -47,7 +47,6 @@ class DatabaseConfig(BaseModel):
     host: str
     port: str
     db_name: str
-    main_board_only: bool = Field(default=False)
 
 
 class SystemConfig(BaseModel):
@@ -401,7 +400,6 @@ class BacktestConfig(BaseModel):
     HOLDOUT_RATIO: float = Field(default=0.20, ge=0.0, le=0.50,
                                   description="末段独立 holdout 占正式回测交易日比例（0.20=末段20%对WFO全程禁触，终验只在此段进行；0.0=禁用回退旧逻辑）")
     INITIAL_CASH: float = Field(default=1_000_000, gt=0)
-    FULL_A_SHARE_MODE: bool = Field(default=False)
     COMMISSION_RATE: float = Field(default=0.0003, ge=0, le=0.01)
     STAMP_TAX_RATE: float = Field(default=0.0005, ge=0, le=0.01,
                                      description="印花税费率（卖出收取，2023.8 起万五）")
@@ -431,9 +429,10 @@ class BacktestConfig(BaseModel):
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
-    # 0.1 成交时点模型（执行时序合规）：close 信号日收盘成交 / next_open 信号次日开盘（默认，A股T+1）/ vwap 信号次日VWAP
+    # 0.1 成交时点模型（执行时序合规）：next_open 信号次日开盘（默认，A股T+1）/ vwap 信号次日VWAP
+    # close 模式已移除（固有前视偏差：信号依赖当日收盘数据计算，以同日收盘价成交=先知交易）
     EXECUTION_MODEL: str = Field(default="next_open",
-                                 description="成交时点模型: close 信号日收盘成交 / next_open 信号次日开盘成交（默认，符合A股T+1）/ vwap 信号次日VWAP成交")
+                                 description="成交时点模型: next_open 信号次日开盘成交（默认，符合A股T+1）/ vwap 信号次日VWAP成交")
     SIGNAL_PIPELINES: int = Field(default=3, ge=1, le=8)
     WFO_NUM_PATHS: int = Field(default=3, ge=1, le=10)
 
@@ -463,6 +462,13 @@ class BacktestConfig(BaseModel):
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
     BUY_THRESHOLD_RANGE: str = "5,30,5"
     MAX_HOLDINGS_RANGE: str = "3,20,1"
+    # P0-7 ②：校准闭环 —— [BACKTEST_CALIBRATED] 覆写目标（默认取区间中位，
+    # 与旧日频回退口径 int(17.5)=17 / int(11.5)=11 保持一致；校准后由
+    # write_calibration_to_ini 写回、此处读取，供日频路径 EngineConfig 兜底使用）
+    BUY_THRESHOLD: int = Field(default=17, ge=1, le=100,
+                               description="买入评分阈值（校准覆写目标，WFO 未寻优时兜底）")
+    MAX_HOLDINGS: int = Field(default=11, ge=0, le=100,
+                              description="最大同时持仓数，0=不限制（校准覆写目标，WFO 未寻优时兜底）")
 
     @field_validator("OPTIMIZE_FREQUENCY")
     @classmethod
@@ -486,8 +492,11 @@ class BacktestConfig(BaseModel):
     @classmethod
     def validate_execution_model(cls, v: str) -> str:
         v_lower = v.strip().lower()
-        if v_lower not in ("close", "next_open", "vwap"):
-            msg = f"EXECUTION_MODEL 必须为 close/next_open/vwap，收到 {v}"
+        if v_lower == "close":
+            msg = f"EXECUTION_MODEL=close 已移除（固有前视偏差），请使用 next_open/vwap，收到 {v}"
+            raise ValueError(msg)
+        if v_lower not in ("next_open", "vwap"):
+            msg = f"EXECUTION_MODEL 必须为 next_open/vwap，收到 {v}"
             raise ValueError(msg)
         return v_lower
 
@@ -520,9 +529,21 @@ class BacktestConfig(BaseModel):
     LIMIT_SEAL_RATIO: float = Field(default=0.05, ge=0.0, le=1.0,
                                     description="一字板（开=收=限价）可成交量比例")
     LIMIT_TRADABLE_RATIO: float = Field(default=0.30, ge=0.0, le=1.0,
-                                        description="盘中触板可成交量比例")
+                                        description="开盘触板后炸板（open≥限价, close<限价）可成交量比例")
+    LIMIT_INTRADAY_RATIO: float = Field(default=0.10, ge=0.0, le=1.0,
+                                        description="盘中冲板（open<限价, high≥限价）可成交量比例")
     LIMIT_SEAL_DECAY: float = Field(default=0.5, ge=0.0, le=1.0,
                                     description="连续板每板可成交量衰减系数")
+    # ── P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理） ──
+    AUCTION_FILL_RATIO: float = Field(default=0.12, ge=0.0, le=1.0,
+                                      description="开盘价触板日集合竞价可成交量比例上限（= 当日量 × min(触板档, 该值)）")
+    # ── P0-6 ⑤：市场状态仓位调节（客观状态变量，替代旧评分中位数口径） ──
+    REGIME_RET20_FULL: float = Field(default=0.02, ge=-1.0, le=1.0,
+                                     description="指数20日收益（全市场 ret_20d 中位数代理）≥ 此值 → 全仓倍率")
+    REGIME_RET20_HALF: float = Field(default=-0.02, ge=-1.0, le=1.0,
+                                     description="指数20日收益 ≥ 此值（且非高波动）→ 半仓倍率")
+    REGIME_VOL_PCT_MAX: float = Field(default=0.8, ge=0.0, le=1.0,
+                                      description="市场波动率分位（过去250交易日）> 此值 → 高波动，仓位压制到最低倍率")
     # ── 复牌跳空（0.6）：停牌后复牌日开盘大幅跳空（补涨兑现卖出 / 补跌标记 / 追高禁买） ──
     RESUME_GAP_UP: float = Field(default=0.05, ge=0.0, le=1.0,
                                  description="复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买（追高）；0=关闭")
@@ -536,6 +557,10 @@ class BacktestConfig(BaseModel):
     STAMP_TAX_SEGMENTS: str = Field(
         default="2023-08-28:0.0005;2000-01-01:0.001",
         description="印花税日期分段表（date:rate;...，卖出单向；最晚≤交易日档生效）",
+    )
+    TRANSFER_FEE_SEGMENTS: str = Field(
+        default="2022-04-29:0.00001;2000-01-01:0.00002",
+        description="过户费日期分段表（date:rate;...，双边收取；2022-04-29 起万0.1，此前万0.2；最晚≤交易日档生效）",
     )
 
     def parse_range(self, key: str) -> tuple[float, float, float]:
@@ -571,6 +596,10 @@ class TradingCostConfig(BaseModel):
     STAMP_TAX_SEGMENTS: str = Field(
         default="2023-08-28:0.0005;2000-01-01:0.001",
         description="印花税日期分段表（date:rate;...，卖出单向）",
+    )
+    TRANSFER_FEE_SEGMENTS: str = Field(
+        default="2022-04-29:0.00001;2000-01-01:0.00002",
+        description="过户费日期分段表（date:rate;...，双边收取；2022-04-29 起万0.1，此前万0.2）",
     )
 
 
@@ -746,7 +775,9 @@ class Config:
         )
 
         # ── 回测自动校准参数覆写 ──
-        # [BACKTEST_CALIBRATED] 将 8 个参数覆写到各自子模型，实现 INI 统一分组
+        # [BACKTEST_CALIBRATED] 将校准参数（含 P0-7 ② 补齐的 buy_threshold/
+        # max_holdings）覆写到各自子模型，与 BackTrading/calibration.py 的
+        # CALIB_PARAM_MAP 保持一一对应，实现 INI 统一分组、写读闭环。
         bt_cal = self._section_upper("BACKTEST_CALIBRATED")
         if bt_cal:
             sc = self.app_config.scoring_params
@@ -773,6 +804,14 @@ class Config:
                 sc.DIVERGENCE_PENALTY = int(bt_cal["DIVERGENCE_PENALTY"])
             if "RISK_NONE_MULTIPLIER" in bt_cal:
                 ps.RISK_NONE_MULTIPLIER = float(bt_cal["RISK_NONE_MULTIPLIER"])
+            # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
+            # 日频路径不生效；现覆写到 backtest 配置供 EngineConfig 兜底读取。
+            # 注：历史版本可能以 "17.0" 浮点落盘，此处 int(float()) 容错兼容，
+            # 新写入已由 calibration.py 类型断言保证整值。
+            if "BUY_THRESHOLD" in bt_cal:
+                self.app_config.backtest.BUY_THRESHOLD = int(float(bt_cal["BUY_THRESHOLD"]))
+            if "MAX_HOLDINGS" in bt_cal:
+                self.app_config.backtest.MAX_HOLDINGS = int(float(bt_cal["MAX_HOLDINGS"]))
 
     def reload(self) -> None:
         """热重载配置文件，保留 config_file 路径。"""
@@ -824,9 +863,6 @@ class Config:
 
     @property
     def DB_NAME(self) -> str: return self.app_config.database.db_name
-
-    @property
-    def MAIN_BOARD_ONLY(self) -> bool: return self.app_config.database.main_board_only
 
     # 系统
     @property
@@ -999,6 +1035,7 @@ class Config:
             "handling_fee_rate": t.HANDLING_FEE_RATE,
             "csrc_fee_rate": t.CSRC_FEE_RATE,
             "stamp_tax_segments": t.STAMP_TAX_SEGMENTS,
+            "transfer_fee_segments": t.TRANSFER_FEE_SEGMENTS,
         }
 
     # 多因子 Alpha

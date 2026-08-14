@@ -37,8 +37,14 @@ def main() -> None:
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
     # ── 初始化文件日志（必须先于所有业务代码） ──
-    from UtilsManager.LoggerManager import get_logger as _init_logger
-    _ = _init_logger()  # 首次调用初始化主日志 CoreNews_Reports/Logs/Corenews_Main_<trade_day>.log
+    # P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru 文件 sink
+    import os as _os
+    _log_dir = _os.path.join(_os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
+    _os.makedirs(_log_dir, exist_ok=True)
+    logger.add(
+        _os.path.join(_log_dir, "Corenews_Main.log"),
+        level="INFO", encoding="utf-8", enqueue=True, rotation="1 day",
+    )
 
     # ── 企业代理 SSL 兼容：AShareHub httpx 绕过自签名证书 ──
     import asharehub.client as _ahc

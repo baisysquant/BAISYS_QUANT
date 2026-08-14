@@ -27,6 +27,7 @@ from LogicAnalyzer.ml.signal_model import (
     _FEATURE_WINDOW_DAYS,
     _ISOLATION_DAYS,
     _LABEL_HORIZON,
+    _PURGE_DAYS,
     _RETRAIN_EVERY,
     _RETRAIN_FREQ,
     _TRAIN_WINDOW,
@@ -122,11 +123,11 @@ def test_combined_fails_when_only_embargo_satisfied() -> None:
 
 
 def _loop_folds(dates: list[str]) -> list[tuple[list[str], list[str]]]:
-    """复刻 apply_ml_signal 重训循环的折叠生成逻辑。"""
+    """复刻 apply_ml_signal 重训循环的折叠生成逻辑（含 P0-4 尾部 purge）。"""
     folds: list[tuple[list[str], list[str]]] = []
     for i in range(_RETRAIN_FREQ, len(dates), _RETRAIN_EVERY):
         cut_idx = max(0, i - _TRAIN_WINDOW)
-        window_dates = dates[cut_idx:i]
+        window_dates = dates[cut_idx : max(cut_idx, i - _PURGE_DAYS)]
         train_dates, val_dates = _split_train_val(window_dates)
         if train_dates and val_dates:
             folds.append((train_dates, val_dates))

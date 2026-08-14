@@ -76,16 +76,19 @@ CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
 CONFIG_INI = PROJECT_ROOT / "config.ini"
 
 # 写入 config.ini 时需取整的整数参数
+# P0-7 ②：补齐 buy_threshold/max_holdings —— 此前缺失导致以 "17.0" 浮点落盘，
+# 一旦加载端 int() 解析即崩溃；现强制整值落盘（写入前另有类型断言）。
 _INT_KEYS = frozenset({
     "cross_decay_days", "conclusion_full_bull",
     "golden_cross_bonus", "divergence_penalty",
+    "buy_threshold", "max_holdings",
 })
 
 
 def run_bayesian_walk_forward(
     kline_df: pd.DataFrame,
     train_period: int = 120,
-    test_period: int = 20,
+    test_period: int = 60,
     num_paths: int = 3,
     initial_cash: float = 1_000_000.0,
     spaces: dict | None = None,
@@ -96,8 +99,8 @@ def run_bayesian_walk_forward(
     Args:
         kline_df: K 线数据
         train_period: IS 训练窗口（交易日）
-        test_period: OOS 验证窗口
-        num_paths: 多路径数
+        test_period: OOS 验证窗口（审计强制 ≥ 60 天，低于此值拒绝执行）
+        num_paths: 多路径数（≥ 5，路径间偏移 ≥ 40 天以降低相关性）
         initial_cash: 初始资金
         spaces: 预构建的 ParamSpace dict（None 时从 config 自动构建）
         **kwargs: 透传给引擎的额外参数
@@ -105,6 +108,18 @@ def run_bayesian_walk_forward(
     Returns:
         DataFrame, 每行一个 WFO 窗口，与旧 walk_forward 返回格式兼容。
     """
+    # P0 审计修复：OOS 窗口硬约束 ≥ 60 天
+    if test_period < 60:
+        raise ValueError(
+            f"OOS 验证窗口 {test_period} 天 < 60 天最小要求，统计效力不足（Sharpe 标准误 ≈ 1.96/√{test_period-1}）"
+            " — 请缩短 IS 窗口或增加数据跨度以提供至少 60 天 OOS。"
+        )
+    # P1 审计修复：路径数 ≥ 5 以降低路径间相关性
+    if num_paths < 5:
+        logger.warning(
+            f"路径数 {num_paths} < 5，WFO 中位数聚合统计效力不足，建议 ≥ 5 且路径起始偏移 ≥ 40 天"
+        )
+
     from UtilsManager.ConfigParser import Config as _Config
 
     if spaces is None:
@@ -117,9 +132,6 @@ def run_bayesian_walk_forward(
 
     n_dates = len(kline_df["trade_date"].unique())
     logger.info(f"  交易日数: {n_dates} | IS={train_period} | OOS={test_period}")
-    if test_period < 60:
-        se = 1.96 / max(test_period - 1, 1) ** 0.5
-        logger.warning(f"OOS 窗口仅 {test_period} 天，Sharpe 估计标准误约 {se:.2f}，建议 ≥60 天")
 
     # ── 正式调用贝叶斯 WFO 引擎 ─────────────────────────
     from BackTrading.bayesian.meta_optimizer import bayesian_walk_forward_multi
@@ -187,6 +199,12 @@ def apply_calibration_to_config(config: object) -> None:
             sc.GOLDEN_CROSS_BONUS = int(val)
         elif key == "divergence_penalty":
             sc.DIVERGENCE_PENALTY = int(val)
+        # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
+        # 现覆写到 backtest 配置（与 ConfigParser [BACKTEST_CALIBRATED] 覆写同目标）
+        elif key == "buy_threshold":
+            cfg.app_config.backtest.BUY_THRESHOLD = int(val)
+        elif key == "max_holdings":
+            cfg.app_config.backtest.MAX_HOLDINGS = int(val)
 
 
 def _get_git_commit() -> str:
@@ -221,6 +239,18 @@ def write_calibration_to_ini(params: dict) -> None:
     if not params:
         logger.info("无校准参数，跳过写入")
         return
+    # P0-7 ②：落盘前类型断言 —— 整数参数必须为整数值，否则以 "17.0" 落盘
+    # 会在加载端 int() 解析崩溃；此处 fail-fast，拒绝污染 config.ini。
+    for k in sorted(_INT_KEYS & set(params)):
+        v = params[k]
+        try:
+            is_integral = isinstance(v, (int, float, str)) and float(v).is_integer()
+        except (TypeError, ValueError):
+            is_integral = False
+        if not is_integral:
+            raise ValueError(
+                f"[校准写回] 整数参数 {k} = {v!r} 必须为整数值，拒绝写入 config.ini（防 int() 解析崩溃）"
+            )
     ini_path = CONFIG_INI
     if not ini_path.exists():
         logger.warning(f"config.ini 不存在: {ini_path}")

@@ -43,7 +43,6 @@ class FactorDecayMonitor:
         "moneyflow": "资金流评分",
         "quality": "基本面评分",
         "valuation": "估值评分",
-        "north_flow": "北向资金评分",
         "top_trader": "龙虎榜评分",
         "liquidity": "流动性评分",
         "volatility": "波动率评分",

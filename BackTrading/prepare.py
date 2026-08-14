@@ -21,7 +21,6 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from LogicAnalyzer.MACDAnalyzer import MACDAnalyzer
 from LogicAnalyzer.ml.signal_model import apply_ml_signal
 
 # ── ML 预测列冻结缓存（P1 特征/参数解耦） ──
@@ -29,7 +28,9 @@ from LogicAnalyzer.ml.signal_model import apply_ml_signal
 # ML 只按数据版本重训一次（该版本的"首帧"，优化器路径下即默认参数帧），
 # 后续任意参数变体直接注入冻结预测，不再重训 XGBoost（~800s → 秒级）。
 # 未预测日期（预热期/模型不显著回退）保持原生评分，语义与 apply_ml_signal 一致。
+# P2 审计修复：使用 OrderedDict 实现 LRU 上限，防止内存泄漏
 _ML_PRED_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+_ML_PRED_CACHE_MAX = 10  # 最多缓存 10 个 (config_hash, data_fp) 组合
 _ML_PRED_LOCK = threading.Lock()
 
 # 向量化信号引擎（延迟导入，在导入时解析以避免 Windows spawn 锁）
@@ -89,20 +90,38 @@ def _trade_day_str() -> str:
 
 # ── 增量缓存（日期后缀 + 每只股票独立写入，支持中断续算） ──
 
-_SIGNAL_PIPELINE_VERSION = "v2"  # 信号管线版本号；管线逻辑变更时手动 +1，自动使旧缓存失效
+# P3 审计修复：自动管线版本管理 — 基于关键 Python 文件 mtime 生成哈希
+# 替代手动 _SIGNAL_PIPELINE_VERSION，代码变更即自动失效旧缓存
+def _pipeline_version_hash() -> str:
+    """对信号管线涉及的源文件计算 mtime 哈希，代码变更时自动使旧缓存失效。"""
+    import time as _time
+    _files = [
+        str(Path(__file__).resolve()),  # prepare.py
+        str(Path(__file__).resolve().parent / "vectorized_signal.py"),
+        str(Path(__file__).resolve().parent / "indicator_cache.py"),
+        str(Path(__file__).resolve().parent / "limit_pricing.py"),
+        str(Path(__file__).resolve().parent / "ml_signal.py"),
+    ]
+    _mts = []
+    for _fp in _files:
+        try:
+            _mts.append(str(Path(_fp).stat().st_mtime))
+        except OSError:
+            _mts.append("missing")
+    return hashlib.sha256("|".join(_mts).encode()).hexdigest()[:8]
 
 
 def _compute_config_hash() -> str:
-    """全量 config 哈希 + 管线版本号（用于缓存隔离）。
+    """全量 config 哈希 + 管线版本自动哈希（用于缓存隔离）。
 
     计算所有非校准信号参数的全量哈希，不再手动排除字段。
-    每次 `_SIGNAL_PIPELINE_VERSION` 变更时旧缓存自动失效。
+    管线代码变更时旧缓存自动失效（通过 _pipeline_version_hash）。
     """
     try:
         cfg = Config()
         ac = cfg.app_config
         payload = {
-            "_version": _SIGNAL_PIPELINE_VERSION,
+            "_version": _pipeline_version_hash(),
             "regime": ac.regime_detection.model_dump(),
             "divergence": ac.divergence.model_dump(),
             "scoring": ac.scoring_params.model_dump(),
@@ -112,7 +131,7 @@ def _compute_config_hash() -> str:
             "position_sizing": ac.position_sizing.model_dump(),
         }
         s = json.dumps(payload, sort_keys=True, default=str)
-        return hashlib.md5(s.encode()).hexdigest()[:8]
+        return hashlib.sha256(s.encode()).hexdigest()[:8]
     except Exception:
         return "unknown"
 
@@ -149,7 +168,7 @@ def _compute_param_hash(params: dict[str, Any]) -> str:
         "conclusion_full_bull": _get("conclusion_full_bull", 80),
     }
     s = json.dumps(key_params, sort_keys=True)
-    return hashlib.md5(s.encode()).hexdigest()[:8]
+    return hashlib.sha256(s.encode()).hexdigest()[:8]
 
 
 def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -> str:
@@ -160,7 +179,7 @@ def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -
     调用命中（key 相同），导致 2025-11 之后的信号全部 fillna(0)。
 
     内容哈希：增量同步 / 复权因子改写会改变 OHLC 内容而保持行数与日期范围
-    不变，旧指纹下会静默复用脏缓存；现对 OHLCV 采样行做 md5，
+    不变，旧指纹下会静默复用脏缓存；现对 OHLCV 采样行做 sha256，
     内容变化即整库失效（宁可全废，不可错用）。
 
     data_version: P3.1 显式数据版本标识（如 kline 表 max(trade_date)+行数
@@ -174,12 +193,12 @@ def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -
         if cols:
             step = max(1, len(kline_df) // 20000)
             sampled = kline_df.iloc[::step]
-            content = hashlib.md5(sampled[cols].values.tobytes()).hexdigest()[:8]
+            content = hashlib.sha256(sampled[cols].values.tobytes()).hexdigest()[:8]
         raw = (
             f"{data_version or ''}|{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
-            f"{hashlib.md5('|'.join(syms).encode()).hexdigest()[:8]}_{content}"
+            f"{hashlib.sha256('|'.join(syms).encode()).hexdigest()[:8]}_{content}"
         )
-        return hashlib.md5(raw.encode()).hexdigest()[:10]
+        return hashlib.sha256(raw.encode()).hexdigest()[:10]
     except Exception:
         return "unknown"
 
@@ -319,7 +338,7 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     # 只保留信号计算产生的列，避免加载不需要的中间指标
     _signal_cols = [c for c in signal_df.columns if c in (
         "进场评分", "退出评分", "综合评分", "止损价", "风险等级",
-        "entry_score", "exit_score", "score", "atr", "macd_trend",
+        "entry_score", "exit_score", "score", "atr", "ATR", "macd_trend",
         "golden_cross", "hist_momentum", "dif_slope", "divergence",
         "vol_price", "kline", "exit_strategy",
     ) or c.startswith("MACD_") or c.startswith("MA_") or c.startswith("ATR_")]
@@ -445,6 +464,11 @@ def prepare_backtest_data(
             merged = apply_ml_signal(merged)
             ml_pred = merged[["symbol", "trade_date", "进场评分"]].copy()
             with _ML_PRED_LOCK:
+                # P2 审计修复：LRU 淘汰 — 缓存超限则删除最久未使用的条目
+                if len(_ML_PRED_CACHE) >= _ML_PRED_CACHE_MAX:
+                    _evict_key = next(iter(_ML_PRED_CACHE))
+                    del _ML_PRED_CACHE[_evict_key]
+                    logger.info(f"  ML 缓存 LRU 淘汰: {_evict_key[0][:8]}...")
                 _ML_PRED_CACHE[ml_key] = ml_pred
             logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s（预测已冻结，后续参数变体不再重训）")
         else:
@@ -457,8 +481,50 @@ def prepare_backtest_data(
             merged = merged.drop(columns=["ML进场评分"])
             logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
         if _saved_atr_stop is not None and "ATR" in merged.columns:
-            stop_raw = merged["close"] - merged["ATR"] * _saved_atr_stop
+            # P2-3：止损价统一使用后复权口径，避免除权日 close 跳跌而 ATR 连续导致量纲不一致
+            close_for_stop = merged["close_adj"] if "close_adj" in merged.columns else merged["close"]
+            stop_raw = close_for_stop - merged["ATR"] * _saved_atr_stop
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
+
+        # ── P0-1：止损价复权空间断言（任何口径混用直接报错，禁止静默降级） ──
+        # 止损价必须与引擎比较基准 close_adj 同空间：
+        #  1) ATR 偏差核验（merged 含 ATR 时，生产路径）：|(close_adj−止损价)−ATR×mult|
+        #     在正确空间仅为取整误差（<0.2%）；混用不复权空间时偏差 ≈ close×(adj_factor−1)。
+        #  2) 无 ATR 列（合成数据/旧缓存）：邻域软检 — 止损价明显更靠近不复权 close 时告警
+        #     并拒绝静默（旧版缓存重建后即转为硬报错）。
+        if "止损价" in merged.columns and "close_adj" in merged.columns and "close" in merged.columns:
+            _stop_v = pd.to_numeric(merged["止损价"], errors="coerce").to_numpy(dtype=np.float64)
+            _ca_v = pd.to_numeric(merged["close_adj"], errors="coerce").to_numpy(dtype=np.float64)
+            _cl_v = pd.to_numeric(merged["close"], errors="coerce").to_numpy(dtype=np.float64)
+            _ok = np.isfinite(_stop_v) & np.isfinite(_ca_v) & np.isfinite(_cl_v)
+            _ok &= (_stop_v > 0) & (_ca_v > 0) & (_cl_v > 0)
+            if _ok.any():
+                _bad = np.zeros(len(_ok), dtype=bool)
+                if "ATR" in merged.columns:
+                    _atr_v = pd.to_numeric(merged["ATR"], errors="coerce").to_numpy(dtype=np.float64)
+                    _atr_ok = _ok & np.isfinite(_atr_v) & (_atr_v > 0)
+                    if _atr_ok.any():
+                        _mult_ref = _saved_atr_stop if _saved_atr_stop not in (None, 0) else 1.5
+                        _dev = np.abs((_ca_v[_atr_ok] - _stop_v[_atr_ok]) - _atr_v[_atr_ok] * _mult_ref) / _ca_v[_atr_ok]
+                        _dev_bad = _dev > 0.05 + 0.05 / _ca_v[_atr_ok]
+                        _bad[np.where(_atr_ok)[0][_dev_bad]] = True
+                else:
+                    _near_raw = _ok & (np.abs(_stop_v - _cl_v) < np.abs(_stop_v - _ca_v) * 0.5)
+                    if _near_raw.any():
+                        _n_near = int(_near_raw.sum())
+                        logger.warning(
+                            f"[P0-1] 检测到 {_n_near} 行止损价更接近不复权 close（疑似空间混用），"
+                            "merged 无 ATR 列无法硬校验；请清除信号缓存重建（旧版缓存为不复权止损价）。"
+                        )
+                if _bad.any():
+                    _rows = merged.iloc[np.where(_bad)[0][:5]][
+                        ["symbol", "trade_date", "close", "close_adj", "ATR", "止损价"]
+                    ]
+                    raise RuntimeError(
+                        f"[P0-1] 止损价复权空间断言失败：{int(_bad.sum())} 行止损价与 close_adj/ATR 不同空间"
+                        f"（止损价必须按 后复权 close_adj − ATR×mult 计算，旧版信号缓存需清除重建）。"
+                        f"样例：\n{_rows.to_string(index=False)}"
+                    )
 
         # 截断指标预热缓冲期：仅保留 backtest_start_date 之后的数据
         # 先过滤再返回，避免 .copy() 触发 _consolidate_inplace OOM（~846 MiB）
@@ -494,19 +560,39 @@ def prepare_backtest_data(
 
     if done:
         if not missing:
-            logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
             signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
-            if signal_df is not None:
-                return _finalize(kline_df, signal_df)
+            if signal_df is not None and not signal_df.empty:
+                _loaded_syms = set(signal_df["symbol"]) if "symbol" in signal_df.columns else set()
+                _missing_loaded = [s for s in symbols if s not in _loaded_syms]
+                if _missing_loaded:
+                    # 部分缓存损坏：文件存在但内容不可读/为空（如截断的 parquet）→ 仅重算缺失股票
+                    logger.warning(
+                        f"[信号缓存] {len(_missing_loaded)}/{len(symbols)} 只缓存文件存在但内容不可读"
+                        f"（缓存损坏/不完整）→ 重算: {sorted(_missing_loaded)[:5]}"
+                        f"{'…' if len(_missing_loaded) > 5 else ''} [{cache_tag}]"
+                    )
+                    missing = _missing_loaded
+                else:
+                    logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
+                    return _finalize(kline_df, signal_df)
+            else:
+                # P0-1 补充修复：缓存文件存在但整体不可读/为空（损坏缓存）时，之前会静默
+                # 返回原始 K 线（无止损价/信号列）→ 引擎在无止损保护下运行。改为降级重算。
+                logger.warning(
+                    f"[信号缓存] {len(done)} 只股票的缓存文件存在但无法读取或为空"
+                    f"（缓存损坏/不完整）→ 重新计算全部 {len(symbols)} 只 [{cache_tag}]"
+                )
+                missing = list(symbols)
         else:
             logger.info(f"信号缓存部分命中（{len(done)}/{len(symbols)}），续算 {len(missing)} 只 [{cache_tag}]")
 
     if not missing:
-        logger.info("无需要计算的股票")
-        signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
-        if signal_df is not None:
-            return _finalize(kline_df, signal_df)
-        return kline_df
+        # 防御保护：正常流程中不可达（命中且可读时已返回；损坏时已降级重算），
+        # 绝不静默返回无信号列的原始 K 线。
+        raise RuntimeError(
+            f"[信号缓存] 全部 {len(symbols)} 只股票缓存命中但加载结果为空（缓存损坏），"
+            f"且重算未执行——请清除缓存目录后重试 [{cache_tag}]"
+        )
 
     # ── 需要计算的股票 ──
     _t0 = time.time()
@@ -523,8 +609,10 @@ def prepare_backtest_data(
         # Phase 0: 预计算所有股票的技术指标 + peak/trough（仅一次，后续评估复用）
         # fingerprint=data_fp：跨数据批次（WFO 窗口/路径切片）切换时清空指标内存缓存，
         # 防止 worker 复用旧切片的指标导致信号日期错位（2026-08-07 OOS 0 交易根因）。
-        if vectorized:
-            precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
+        # P0-10 ②：循环兜底路径已删除，统一向量化路径（vectorized 参数仅保留兼容性）
+        if not vectorized:
+            logger.warning("vectorized=False 已弃用：循环兜底路径已删除，统一走向量化路径")
+        precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES
@@ -532,7 +620,7 @@ def prepare_backtest_data(
             min((os.cpu_count() or 4) // signal_pipelines, 3), 1
         )
 
-        _worker_fn = _stock_worker_vectorized if vectorized else _stock_worker
+        _worker_fn = _stock_worker_vectorized
         _pipeline_records: list[_os.OutputRecord] = []
 
         def _pipeline(syms: list[str], idx: int) -> None:
@@ -638,72 +726,14 @@ def prepare_backtest_data(
         signal_df = _load_signal_cache(trade_date, signal_param_hash, config_hash, data_fp)
     logger.info(f"读取信号缓存耗时 {time.time()-_t_load:.1f}s")
     if signal_df is None or signal_df.empty:
-        logger.warning(f"所有信号计算失败（signal_df={type(signal_df).__name__}），返回原始 K 线")
+        logger.warning(
+            f"信号计算完成但信号缓存加载为空（signal_df={type(signal_df).__name__}），"
+            f"缓存目录: {cache_dir}——返回原始 K 线（无信号/止损保护，回测结果不可用）；"
+            f"若为缓存文件损坏请清除该目录后重试"
+        )
         return kline_df
     logger.info(f"信号合并完成: {len(signal_df)} 行 ({time.time()-_t0:.1f}s)")
     return _finalize(kline_df, signal_df)
-
-
-def _stock_worker(
-    symbol: str,
-    stock_dir: str,
-    params: dict[str, Any],
-    compute_exit_strategy: bool = False,
-    susp_stats: dict[str, dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    stock_df = pd.read_parquet(os.path.join(stock_dir, f"{symbol}.parquet"), engine="fastparquet")
-    if len(stock_df) < 60:
-        return []
-
-    # 数据质量检查
-    _validate_stock_data(stock_df, symbol)
-
-    # ── 窗口预检（指标计算前）：SKIP → 返回空跳过；NEED_FILL → 限界填充 ──
-    # Task F: 日历口径停牌统计（超阈值 → SKIP），无统计回退启发式
-    from BackTrading.precheck import apply_precheck as _apply_precheck
-
-    stock_df, _pre_res = _apply_precheck(symbol, stock_df, context="_stock_worker",
-                                         suspension_stats=(susp_stats or {}).get(symbol))
-    if stock_df.empty:
-        return []
-
-    # 所有滚动指标（MA, MACD, ATR, BBANDS 等）只向后看，不存在前瞻偏差。
-    # 在全量数据上一次性计算，避免每根 bar 重复 800 次。
-    stock_df = _compute_indicators_snapshotted(stock_df, symbol=symbol, context="_stock_worker")
-
-    analyzer = MACDAnalyzer()
-    rows: list[dict[str, Any]] = []
-
-    for i in range(len(stock_df)):
-        bar = stock_df.iloc[: i + 1]
-        try:
-            signal = _compute_signal(analyzer, bar, params, compute_exit_strategy)
-        except Exception:
-            continue
-        # ── 置信度消费（指标降级 RELAX/SKIP）：低置信度 bar 抑制进场信号 ──
-        from BackTrading.degradation import low_confidence_mask as _low_conf_mask
-
-        if _low_conf_mask(bar).any():
-            signal["进场评分"] = 0.0
-            signal["score"] = 0.0
-        _details = signal.get("details") or {}
-        rows.append({
-            "symbol": symbol,
-            "trade_date": bar["trade_date"].iloc[-1],
-            "entry_score": float(signal.get("进场评分", 0)),
-            "exit_score": float(signal.get("退出评分", 0)),
-            "risk_level": str(signal.get("风险等级", "LOW")),
-            "score": float(signal.get("score", 0)),
-            "atr": float(bar["ATR"].iloc[-1]) if "ATR" in bar.columns else 0.0,
-            "macd_trend": float(_details.get("MACD趋势", {}).get("score", 0)),
-            "golden_cross": float(_details.get("金叉信号", {}).get("score", 0)),
-            "hist_momentum": float(_details.get("柱状动能", {}).get("score", 0)),
-            "dif_slope": float(_details.get("DIF斜率", {}).get("score", 0)),
-            "divergence": float(_details.get("背离信号", {}).get("score", 0)),
-            "vol_price": float(_details.get("量价配合", {}).get("score", 0)),
-            "kline": float(_details.get("K线形态", {}).get("score", 0)),
-        })
-    return rows
 
 
 def _stock_worker_vectorized(
@@ -747,13 +777,11 @@ def _stock_worker_vectorized(
                 precomputed_divergence=_div,
             )
         except Exception as e:
+            # P0-10 ②：循环兜底路径已删除。向量化失败即整票失败（不降级到
+            # O(n²) 逐 bar 重算的另一套实现），由外层 D1 分片重跑机制处理。
             import traceback
-            logger.warning(f"  [{symbol}] 向量化信号计算失败({e})\n{traceback.format_exc()}")
-            try:
-                return _stock_worker(symbol, stock_dir, params, compute_exit_strategy, susp_stats)
-            except Exception as f:
-                logger.warning(f"  [{symbol}] 原始引擎也失败: {f}")
-                return []
+            logger.error(f"  [{symbol}] 向量化信号计算失败，整票失败: {e}\n{traceback.format_exc()}")
+            raise
         # 将向量化结果格式化为 _stock_worker 相同的 list[dict]
         signal_df["symbol"] = symbol
         rows: list[dict[str, Any]] = []
@@ -884,9 +912,23 @@ def _compute_indicators(
     )
 
     df = df_raw.copy()
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+    # P2-3/P0-2：技术指标统一使用后复权口径，除权日连续无跳跌。
+    # 上游（DB）提供 open_adj/high_adj/low_adj/close_adj 全量后复权列；
+    # 合成/测试帧缺失 *_adj 时按 adj_factor 精确还原（adj = raw × adj_factor），
+    # 再回退原始列。旧版"close 用后复权、high/low 用不复权"的近似已删除。
+    close = df["close_adj"] if "close_adj" in df.columns else df["close"]
+    if "high_adj" in df.columns:
+        high = df["high_adj"]
+    elif "adj_factor" in df.columns:
+        high = df["high"] * df["adj_factor"]
+    else:
+        high = df["high"]
+    if "low_adj" in df.columns:
+        low = df["low_adj"]
+    elif "adj_factor" in df.columns:
+        low = df["low"] * df["adj_factor"]
+    else:
+        low = df["low"]
     n = len(df)
     mode = degrade_mode()
 
@@ -971,8 +1013,22 @@ def _compute_indicators(
         for c in stoch.value.columns:
             df[c] = stoch.value[c].to_numpy()
 
-    df["AMOUNT"] = close * df["volume"]
-    df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean()
+    # 成交额：优先用数据源真实成交额 amount（元，不复权），缺失/异常时回退 close*volume 估值。
+    # 真实成交额用于 AMOUNT_MA20 流动性分档，亦为 vwap 执行模型（成交额/成交量）的数据基础；
+    # 旧实现一律用 close*volume 合成（=收盘价估值），会扭曲流动性档位且使日频 VWAP 退化为收盘价。
+    if "amount" in df.columns:
+        _amt = pd.to_numeric(df["amount"], errors="coerce")
+        if _amt.notna().any() and (_amt.fillna(0) > 0).any():
+            df["AMOUNT"] = _amt
+        else:
+            df["AMOUNT"] = close * df["volume"]
+    else:
+        df["AMOUNT"] = close * df["volume"]
+    df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean().shift(1)
+    # P0-11：AMOUNT_MA20 用于次日开盘成交时点的流动性分档（冲击成本/滑点档位）。
+    # 原实现 rolling(20).mean() 含当日全天成交额——开盘撮合时当日成交额不可知，
+    # 属确定性前视（利好回测）。shift(1) 使其仅用 T 日及之前数据，与引擎
+    # _update_adv（收盘后更新、不含当日）口径一致（PIT 合规）。
     df["AMPLITUDE_PCT"] = (high - low) / close
 
     cci = safe_cci(high, low, close, min_periods=_mp("cci"))
@@ -997,40 +1053,8 @@ def _compute_indicators(
     return df
 
 
-def _compute_signal(
-    analyzer: MACDAnalyzer,
-    bar: pd.DataFrame,
-    params: dict[str, Any],
-    compute_exit_strategy: bool = False,
-) -> dict[str, Any]:
-    result = analyzer.pipeline_analysis(bar, params=params, compute_exit_strategy=compute_exit_strategy)
-    exit_strategy = result.get("exit_strategy", {})
-    risk_level = result.get("risk_level", "LOW")
-    entry_score = float(result.get("score", 0))
-    exit_score = _calc_exit_score(bar, exit_strategy, risk_level)
-    return {
-        "进场评分": entry_score,
-        "退出评分": exit_score,
-        "风险等级": risk_level,
-        "止损价": exit_strategy.get("stop_loss", 0),
-        "score": entry_score,
-    }
-
-
-def _calc_exit_score(
-    df: pd.DataFrame,
-    exit_strategy: dict[str, Any],
-    risk_level: str,
-) -> float:
-    if risk_level in ("HIGH", "D"):
-        return 100.0
-    stop_loss = exit_strategy.get("stop_loss")
-    if stop_loss and len(df) > 0:
-        close = df["close"].iloc[-1]
-        if close < stop_loss:
-            return 90.0
-    return 0.0
-
+# ── 预计算指标（Phase 0 使用，保留；循环路径 _compute_signal/_calc_exit_score
+#    已于 P0-10 ② 删除，两套信号实现合一为向量化路径） ──
 
 def _build_params(cfg: Config) -> dict[str, Any]:
     ac = cfg.app_config

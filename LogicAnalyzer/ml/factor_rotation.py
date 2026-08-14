@@ -23,7 +23,7 @@ class FactorRotationPlatform:
 
     _FACTOR_KEYS = [
         "macd", "momentum", "moneyflow", "quality", "valuation",
-        "north_flow", "top_trader", "liquidity", "volatility",
+        "top_trader", "liquidity", "volatility",
         "macro", "financial_forward", "event_driven",
     ]
 
@@ -31,7 +31,7 @@ class FactorRotationPlatform:
     _COL_TO_KEY = {
         "MACD评分": "macd", "动量评分": "momentum", "资金流评分": "moneyflow",
         "基本面评分": "quality", "估值评分": "valuation",
-        "北向资金评分": "north_flow", "龙虎榜评分": "top_trader",
+        "龙虎榜评分": "top_trader",
         "流动性评分": "liquidity", "波动率评分": "volatility",
         "宏观评分": "macro", "财务前瞻评分": "financial_forward",
         "事件驱动评分": "event_driven",

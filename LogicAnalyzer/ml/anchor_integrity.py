@@ -15,18 +15,27 @@
      强制推出重训，因训练耗时，该模型的首次信号只能落在 T 之后的下一个有效
      交易窗口（不得 = T 日）；T 日信号只能由 ≥ 上一代、训练时点在 T 之前的
      旧模型产出。
+  3. 标签价格窗口锚定（check_label_window_within_anchor）：窗口（训练+验证）
+     内任意样本的标签 fwd_5d = C_{t+5}/C_{t+1}−1 最远引用价格 C_{t+5} 必须
+     ≤ 锚点 T。窗口尾部样本若引用 T 及以后的价格，将驱动 XGBoost 早停、
+     验证集 Rank-IC 与显著性门控（决定 ML 是否覆写评分）——模型选择被未来
+     价格影响（前视泄漏）。训练窗口必须尾部 purge 标签持有期（截止 anchor−6，
+     全部标签价格窗口 ≤ anchor−1）。
 
 模块功能：
   - check_train_cutoff            —— 训练集截止线（max ≤ 锚点 T）
+  - check_label_window_within_anchor —— 标签价格窗口 ≤ 锚点（P0-4 前视泄漏断言）
   - check_first_signal_after_train —— 首个信号必须位于重训锚点之后
   - run_anchor_time_check         —— 一站式入口
 
 用法：
     from LogicAnalyzer.ml.anchor_integrity import (
-        check_train_cutoff, check_first_signal_after_train, run_anchor_time_check,
+        check_train_cutoff, check_label_window_within_anchor,
+        check_first_signal_after_train, run_anchor_time_check,
     )
     c1 = check_train_cutoff(train_dates, anchor_date=T)
-    c2 = check_first_signal_after_train(anchor_date=T, first_signal_date=T1)
+    c2 = check_label_window_within_anchor(window_dates, anchor_date=T)
+    c3 = check_first_signal_after_train(anchor_date=T, first_signal_date=T1)
 """
 
 from __future__ import annotations
@@ -94,6 +103,68 @@ def check_train_cutoff(
     return check
 
 
+def check_label_window_within_anchor(
+    window_dates: Sequence[str | pd.Timestamp],
+    anchor_date: str | pd.Timestamp,
+    *,
+    horizon: int = 5,
+    _log: bool = True,
+) -> SplitReport:
+    """标签价格窗口锚定：窗口内样本标签所引用的最远价格必须 ≤ 锚点 T。
+
+    P0-4 前视泄漏断言：标签 fwd_5d = C_{t+5} / C_{t+1} - 1 的行 t 最远引用
+    价格 C_{t+5}。窗口内最晚样本 t_max 若满足 t_max + horizon > T，则该行
+    标签引用锚点当日及以后的价格——这些尾部行落入验证集，驱动 XGBoost 早停、
+    验证集 Rank-IC 与显著性门控（决定 ML 是否覆写评分），模型选择被未来价格
+    影响。修复要求：训练窗口尾部 purge 标签持有期（窗口截止 anchor−6 时
+    标签最远引用 anchor−1 < anchor）。
+
+    Args:
+        window_dates: 参与本次 Fit 的窗口（训练+验证）样本日期序列。
+        anchor_date: 锚点 T（重训触发时间）。
+        horizon: 标签持有期（fwd_5d 的 h，默认 5）。
+        _log: 是否输出日志。
+
+    Returns:
+        SplitReport: passed = max(窗口) + horizon ≤ T（标签价格窗口不越过锚点）。
+    """
+    t = _norm_dates(window_dates)
+    a = pd.Timestamp(anchor_date)
+    check = SplitReport(
+        check_name=f"标签价格窗口锚定(≤{a.date()})", passed=True
+    )
+    if not t:
+        check.passed = False
+        check.details.append("窗口日期为空")
+        if _log:
+            check.log()
+        return check
+
+    t_max = t[-1]
+    gap = int(np.busday_count(t_max.date(), a.date()))  # [t_max, T) 内交易日数
+    check.n_checked = 1
+    check.passed = gap >= horizon  # t_max + horizon ≤ T ⟺ 标签最远引用价格不越过锚点
+    check.n_violations = 0 if check.passed else 1
+    check.details.append(
+        f"窗口最晚样本 {t_max.date()}（标签最远引用价格 = t+{horizon}），"
+        f"距锚点 {a.date()} 相隔 {gap} 交易日"
+    )
+    if check.passed:
+        check.details.append(
+            f"标签价格窗口（≤ {t_max.date()} + {horizon}）不越过锚点 {a.date()}，"
+            "无前视泄漏"
+        )
+    else:
+        check.details.append(
+            f"标签价格窗口越过锚点：窗口尾部 {horizon - gap} 行标签引用锚点当日及"
+            "以后价格，将驱动早停/IC/显著性门控——必须将训练窗口尾部 purge "
+            "标签持有期（截止 anchor−6，使标签价格窗口 ≤ anchor−1）"
+        )
+    if _log:
+        check.log()
+    return check
+
+
 def check_first_signal_after_train(
     anchor_date: str | pd.Timestamp,
     first_signal_date: str | pd.Timestamp,
@@ -141,6 +212,7 @@ def run_anchor_time_check(
     train_dates: Sequence[str | pd.Timestamp],
     anchor_date: str | pd.Timestamp,
     first_signal_date: str | pd.Timestamp | None = None,
+    horizon: int = 5,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """一站式动态重训时间戳锚定自检（1.6）.
@@ -149,12 +221,16 @@ def run_anchor_time_check(
         train_dates: 参与本次 Fit 的训练样本日期。
         anchor_date: 重训锚点 T.
         first_signal_date: 该模型的首个信号日期（可选；提供后执行当天废弃检查）。
+        horizon: 标签持有期（标签价格窗口锚定检查用）。
         **kwargs: 透传各检查项参数。
 
     Returns:
         dict: {"passed", "reports", "summary"}
     """
     reports = [check_train_cutoff(train_dates, anchor_date)]
+    reports.append(
+        check_label_window_within_anchor(train_dates, anchor_date, horizon=horizon)
+    )
     if first_signal_date is not None:
         reports.append(
             check_first_signal_after_train(anchor_date, first_signal_date)

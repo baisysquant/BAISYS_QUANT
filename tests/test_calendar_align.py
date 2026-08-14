@@ -308,7 +308,12 @@ class TestPrecheckCalendarSuspension:
 class TestWorkerThreading:
     @pytest.mark.unit
     def test_stock_worker_calendar_skip(self, tmp_path, monkeypatch):
-        from BackTrading.prepare import _stock_worker
+        """P0-10 ②：循环路径已删除。日历口径 SKIP 在 Phase 0 预计算阶段拦截，
+        _stock_worker_vectorized 对 SKIP 股票返回 []（不进入信号计算）。"""
+        import BackTrading.indicator_cache as ic
+        ic._reset_memory_caches()
+        monkeypatch.setattr(ic, "_cache_root", lambda: tmp_path / "icache")
+        from BackTrading.prepare import _stock_worker_vectorized, precompute_all_indicators
         stock_dir = tmp_path / "stocks"
         stock_dir.mkdir()
         df = _ohlcv(60)
@@ -317,20 +322,25 @@ class TestWorkerThreading:
         stats = {"sh600000": {
             "span_trading_days": 10, "suspended_days": ["2024-01-03", "2024-01-04", "2024-01-05"],
         }}
-        rows = _stock_worker("sh600000", str(stock_dir), {}, False, stats)
+        precompute_all_indicators(str(stock_dir), suspension_stats=stats, shard_mode="off")
+        rows = _stock_worker_vectorized("sh600000", str(stock_dir), {}, False, stats)
         assert rows == []
 
     @pytest.mark.unit
-    def test_stock_worker_without_stats_still_runs_legacy_path(self, tmp_path):
+    def test_stock_worker_without_stats_still_runs_legacy_path(self, tmp_path, monkeypatch):
         # 无统计时回退启发式：正常数据不应被误杀（此处仅验证不因新参数崩溃，
         # 信号计算失败返回空属预期；stats 缺省分支应走旧逻辑）
-        from BackTrading.prepare import _stock_worker
+        import BackTrading.indicator_cache as ic
+        ic._reset_memory_caches()
+        monkeypatch.setattr(ic, "_cache_root", lambda: tmp_path / "icache")
+        from BackTrading.prepare import _stock_worker_vectorized, precompute_all_indicators
         stock_dir = tmp_path / "stocks"
         stock_dir.mkdir()
         df = _ohlcv(60)
         df["symbol"] = "sh600000"
         df.to_parquet(stock_dir / "sh600000.parquet", index=False, engine="fastparquet")
-        _stock_worker("sh600000", str(stock_dir), {})  # 不抛异常即可
+        precompute_all_indicators(str(stock_dir), shard_mode="off")
+        _stock_worker_vectorized("sh600000", str(stock_dir), {})  # 不抛异常即可
 
     @pytest.mark.unit
     def test_phase0_calendar_skip(self, tmp_path, monkeypatch):
@@ -374,7 +384,7 @@ class TestPrepareIntegration:
                 "止损价": 0.0, "风险等级": "LOW",
             }]
 
-        monkeypatch.setattr(_prep, "_stock_worker", _fake_worker)
+        monkeypatch.setattr(_prep, "_stock_worker_vectorized", _fake_worker)
         monkeypatch.setattr(_prep, "apply_ml_signal", lambda df: df)
         monkeypatch.setattr(_prep, "_trade_day_str", lambda: "2024-03-31")
         monkeypatch.setattr(_prep, "CACHE_DIR", tmp_path / "signal_cache")
@@ -388,7 +398,7 @@ class TestPrepareIntegration:
         monkeypatch.setattr(_ca, "maintain_calendar", lambda force=False: len(cal))
         _prep, captured = self._run_prepare(monkeypatch, tmp_path)
         kline = self._kline()
-        out = _prep.prepare_backtest_data(kline, params={"atr_stop_mult": 1.5}, vectorized=False)
+        out = _prep.prepare_backtest_data(kline, params={"atr_stop_mult": 1.5}, vectorized=True)
         assert "is_trading" in out.columns and "is_suspended" in out.columns
         assert bool(out["is_trading"].all())
         assert not bool(out["is_suspended"].any())
@@ -402,7 +412,7 @@ class TestPrepareIntegration:
         _ca.set_official_calendar({d for d in pd.date_range("2024-01-01", periods=70).strftime("%Y-%m-%d")})
         monkeypatch.setattr(_ca, "align_enabled", lambda: False)
         _prep, captured = self._run_prepare(monkeypatch, tmp_path)
-        out = _prep.prepare_backtest_data(self._kline(), params={"atr_stop_mult": 1.5}, vectorized=False)
+        out = _prep.prepare_backtest_data(self._kline(), params={"atr_stop_mult": 1.5}, vectorized=True)
         assert "is_trading" not in out.columns
         assert "is_suspended" not in out.columns
 

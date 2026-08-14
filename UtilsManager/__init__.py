@@ -8,14 +8,11 @@ from . import Exceptions
 from .CodeNormalizer import CodeNormalizer
 from . import TACompatibility
 from .ConfigCipher import ConfigCipher
-from .LoggerManager import get_log_path, get_logger
 from .UnifiedCacheManager import UnifiedCacheManager
 
 __all__ = [
     "CodeNormalizer",
     "ConfigCipher",
     "Exceptions",
-    "get_logger",
-    "get_log_path",
     "UnifiedCacheManager",
 ]

@@ -22,6 +22,9 @@ class ColumnNames:
     STOCK_CODE = "股票代码"
     STOCK_NAME = "股票简称"
     INDUSTRY = "行业"
+    # P0-7 ①：申万一级行业（独立映射表 stock_basic_info_sw_l1；行业保持二级
+    # 语义供行业信号映射，一级列供宏观 tilt 与行业一级中性化使用）
+    INDUSTRY_L1 = "行业一级"
     INDUSTRY_SIGNAL = "所属行业信号"
     LATEST_PRICE = "最新价"
     STOCK_LINK = "股票链接"

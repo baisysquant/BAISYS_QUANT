@@ -267,7 +267,22 @@ def _check_suspension(df: pd.DataFrame, p: PrecheckParams,
     zero_mask = vol <= 0
     flat_mask = np.zeros(len(df), dtype=bool)
     flat_mask[1:] = np.isclose(close[1:], close[:-1], rtol=0, atol=1e-9)
-    susp = zero_mask & flat_mask
+    # #6c 审计修复：停牌 = 连续 N 日零成交+价格横盘，而非单天。
+    # 低流动性微盘股正常交易日可能零成交，单天误判率偏高。
+    _min_consecutive_susp = 3  # 至少连续 3 日零成交+横盘才视为停牌
+    susp = np.zeros(len(df), dtype=bool)
+    if _min_consecutive_susp > 0:
+        _candidate = zero_mask & flat_mask
+        # 统计连续段
+        _diff = np.diff(np.concatenate([[0], _candidate.astype(np.int8), [0]]))
+        _starts = np.where(_diff == 1)[0]
+        _ends = np.where(_diff == -1)[0]
+        if len(_starts) == len(_ends):
+            for s, e in zip(_starts, _ends):
+                if e - s >= _min_consecutive_susp:
+                    susp[s:e] = True
+    else:
+        susp = zero_mask & flat_mask
     ratio = float(susp.mean())
     metrics["suspension"] = {"ratio": round(ratio, 4), "days": int(susp.sum()), "total": len(df)}
     if ratio > p.max_suspension_ratio:

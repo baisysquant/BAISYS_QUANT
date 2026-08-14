@@ -64,7 +64,7 @@ def _data_fingerprint(df: pd.DataFrame) -> str:
         df[present].iloc[min(len(df) // 2, len(df) - 1)].values.tolist(),
         df["close"].sum(),
     )
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+    return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
 def _cache_root() -> Path:
@@ -193,25 +193,40 @@ def get_divergence(
     return div
 
 
+def _pipeline_version() -> str:
+    """管线代码版本（lazy import 避免循环导入）。
+
+    指标计算逻辑变更（prepare/vectorized_signal/indicator_cache 等文件 mtime
+    变化）时自动失效磁盘指标缓存，防止旧口径指标被复用（P0-2 空间统一）。
+    """
+    try:
+        from BackTrading.prepare import _pipeline_version_hash
+        return _pipeline_version_hash()
+    except Exception:
+        return "unknown"
+
+
 def _load_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
     """从磁盘加载到内存缓存。
 
     expected_fp: 当前输入数据的指纹，与 meta 中保存的指纹不一致时
     判定缓存失效（数据日期范围/内容已变化），强制重算，防止窗口切片
     缓存污染全量调用（WFO 场景 2025-11 后信号全 0 的根因）。
+    管线版本（meta["version"]）与当前代码不一致时同样判定失效。
     """
     ipath = _indicators_path(symbol)
     ppath = _peaks_path(symbol)
     tpath = _troughs_path(symbol)
     if not (ipath.exists() and ppath.exists() and tpath.exists()):
         return False
-    if expected_fp:
-        try:
-            meta = json.loads(_meta_path(symbol).read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
-        if meta.get("fingerprint") != expected_fp:
-            return False
+    try:
+        meta = json.loads(_meta_path(symbol).read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    if expected_fp and meta.get("fingerprint") != expected_fp:
+        return False
+    if meta.get("version") != _pipeline_version():
+        return False
     try:
         _IN_MEMORY[symbol] = pd.read_parquet(ipath)
         _PEAKS[symbol] = np.load(ppath)
@@ -223,7 +238,11 @@ def _load_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
 
 def _save_to_disk(symbol: str, df: pd.DataFrame, peaks: np.ndarray, troughs: np.ndarray,
                   precheck_reasons: list[str] | None = None) -> None:
-    meta = {"fingerprint": _data_fingerprint(df), "n_rows": len(df)}
+    meta = {
+        "fingerprint": _data_fingerprint(df),
+        "n_rows": len(df),
+        "version": _pipeline_version(),
+    }
     if precheck_reasons:
         meta["precheck"] = precheck_reasons
     if _os.write_mode() == _os.OUTPUT_WRITE_REPLACE:

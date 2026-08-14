@@ -13,15 +13,15 @@ from BackTrading.prepare import _build_params, prepare_backtest_data
 STRATEGY_WEIGHTS = {
     "momentum": {  # 动量策略
         "macd": 0.35, "momentum": 0.35, "moneyflow": 0.20,
-        "quality": 0.05, "valuation": 0.05, "north_flow": 0.0, "top_trader": 0.0,
+        "quality": 0.05, "valuation": 0.05, "top_trader": 0.0,
     },
     "fundamental_reversal": {  # 基本面反转
         "macd": 0.05, "momentum": 0.05, "moneyflow": 0.10,
-        "quality": 0.35, "valuation": 0.35, "north_flow": 0.10, "top_trader": 0.0,
+        "quality": 0.35, "valuation": 0.35, "top_trader": 0.0,
     },
     "defensive": {  # 低波防御
         "macd": 0.20, "momentum": 0.05, "moneyflow": 0.25,
-        "quality": 0.25, "valuation": 0.10, "north_flow": 0.10, "top_trader": 0.05,
+        "quality": 0.25, "valuation": 0.10, "top_trader": 0.05,
     },
 }
 
@@ -52,7 +52,9 @@ def run_multi_strategy_backtest(
     # 止损价
     stop_mult = params.get("atr_stop_mult", 2.0)
     if "ATR" in prepared.columns:
-        prepared["止损价"] = prepared["close"] - prepared["ATR"] * stop_mult
+        # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
+        _stop_close = prepared["close_adj"] if "close_adj" in prepared.columns else prepared["close"]
+        prepared["止损价"] = _stop_close - prepared["ATR"] * stop_mult
     else:
         prepared["止损价"] = 0.0
 
@@ -99,7 +101,7 @@ def _rerank_scores(df: pd.DataFrame, factor_weights: dict[str, float]) -> None:
     col_map = {
         "macd": "MACD评分", "momentum": "动量评分", "moneyflow": "资金流评分",
         "quality": "基本面评分", "valuation": "估值评分",
-        "north_flow": "北向资金评分", "top_trader": "龙虎榜评分",
+        "top_trader": "龙虎榜评分",
     }
 
     total_w = sum(factor_weights.values()) or 1.0

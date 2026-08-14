@@ -233,8 +233,12 @@ class OOSDecayReport:
 
 def _compute_risk_from_curve(
     equity_curve: list[dict[str, Any]] | pd.DataFrame,
+    risk_free_rate: float = 0.03,
 ) -> tuple[float, float]:
     """从净值曲线计算年化 Sharpe 和 Sortino。
+
+    P3 审计修复：新增 risk_free_rate 参数，与 backtest_metrics.compute_risk_metrics
+    保持一致（超额收益口径），默认 3% 年化。
 
     Returns:
         (sharpe, sortino)
@@ -259,19 +263,19 @@ def _compute_risk_from_curve(
 
     ann_factor = _ann_factor()
     mu = returns.mean() * ann_factor
+    excess_mu = mu - risk_free_rate  # P3 超额收益
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
-    sharpe = mu / sigma if sigma > 0 else 0.0
+    sharpe = excess_mu / sigma if sigma > 0 else 0.0
 
     downside = returns[returns < 0]
+    # P1/P3 对齐：无穷大 Sortino 截断为 100.0，使用超额收益
+    _SORTINO_CEILING = 100.0
     if len(downside) == 0:
-        sortino = float("inf") if mu > 0 else 0.0
+        sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
     else:
         downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
-        sortino = mu / downside_std if downside_std > 0 else (float("inf") if mu > 0 else 0.0)
-
-    # 将无穷大的 Sortino 转为一个可比较的大数（避免除法异常）
-    if not math.isfinite(sortino):
-        sortino = 999.0
+        raw_sortino = excess_mu / downside_std if downside_std > 0 else (_SORTINO_CEILING if excess_mu > 0 else 0.0)
+        sortino = min(raw_sortino, _SORTINO_CEILING)
 
     return float(sharpe), float(sortino)
 

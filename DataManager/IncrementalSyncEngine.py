@@ -33,13 +33,11 @@ class IncrementalSyncEngine:
         db_engine: Any,
         default_start: str | None = None,
         cache_dir: str | None = None,
-        main_board_only: bool = False,
         enable_research_report_filter: bool = False,
         research_report_min_count: int = 1,
     ) -> None:
         self._engine = db_engine
         self._default_start = self.align_to_trading_day(default_start) if default_start else None
-        self._main_board_only = main_board_only
         self._enable_research_report_filter = enable_research_report_filter
         self._research_report_min_count = research_report_min_count
         self._cache_dir = cache_dir
@@ -240,7 +238,8 @@ class IncrementalSyncEngine:
                 key = "hfqday" if adjust == "hfq" else "day"
                 param = f"{symbol},day,{year}-01-01,{year+1}-12-31,640,{adjust}"
                 var = f"kline_day{adjust}{year}"
-                for attempt in range(3):
+                # P2 审计修复：指数退避重试 — 所有异常统一退避，重试次数 5，per-symbol 速率限制
+                for attempt in range(5):
                     try:
                         r = self._session.get(
                             self.TX_URL,
@@ -248,17 +247,32 @@ class IncrementalSyncEngine:
                             timeout=15,
                         )
                         if r.status_code == 429:
-                            time.sleep(2 ** attempt)
+                            # 速率限制：指数退避 + 抖动
+                            _backoff = min(2 ** attempt + random.uniform(0, 1), 30)
+                            logger.warning(
+                                f"腾讯API 429: {symbol} {adjust} {year}，等待 {_backoff:.1f}s 后重试"
+                            )
+                            time.sleep(_backoff)
                             continue
                         r.raise_for_status()
                         data = json.loads(r.text[r.text.find("={") + 1:])
                         rows.extend(data["data"][symbol].get(key, []))
+                        # P2 速率限制：每只股票请求间隔 ≥ 0.5s
+                        time.sleep(0.5)
                         break
                     except Exception as e:
-                        if attempt < 2:
-                            time.sleep(2 ** attempt)
+                        if attempt < 4:
+                            # P2 指数退避：base_delay=2s, max=30s, 加 0~1s 抖动防雷群效应
+                            _backoff = min(2 ** attempt + random.uniform(0, 1), 30)
+                            logger.warning(
+                                f"腾讯API {symbol} {adjust} {year} 异常: {type(e).__name__}，"
+                                f"等待 {_backoff:.1f}s 后第 {attempt+2} 次重试"
+                            )
+                            time.sleep(_backoff)
                         else:
-                            logger.error(f"腾讯API {symbol} {adjust} 第{year}年 3次重试均失败: {type(e).__name__}: {e}")
+                            logger.error(
+                                f"腾讯API {symbol} {adjust} 第{year}年 5次重试均失败: {type(e).__name__}: {e}"
+                            )
                             return None
             return rows
 
@@ -524,8 +538,10 @@ class IncrementalSyncEngine:
         return df[~df["name"].astype(str).str.contains(pattern, na=False)].copy()
 
     def filter_main_board(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not self._main_board_only:
-            return df
+        """仅保留沪深主板股票（60x/00x 开头）。
+
+        系统仅覆盖沪深主板，创业板/科创板/北交所已从业务中剔除。
+        """
         codes = df["股票代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
         return df[codes.str.match(r"^(60|00)", na=False)].copy()
 

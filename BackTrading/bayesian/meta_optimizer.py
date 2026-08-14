@@ -97,6 +97,7 @@ def _oos_validate(
     st_history: dict | None = None,
     exclude_st: bool = True,
     data_version: str | None = None,
+    listing_days: dict | None = None,
 ) -> list[dict[str, Any]]:
     """对 top-M 参数组合做 OOS 验证。
 
@@ -139,6 +140,9 @@ def _oos_validate(
         if st_history:
             engine_params["_st_history"] = st_history
             engine_params["_exclude_st"] = exclude_st
+        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
+        if listing_days:
+            engine_params["_listing_days"] = listing_days
         _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
@@ -324,6 +328,8 @@ def bayesian_walk_forward_multi(
     # ST/退市逐日动态剔除（runner 注入，寻优与最终回测口径一致）
     st_history = kwargs.get("st_history")
     exclude_st = bool(kwargs.get("exclude_st", True))
+    # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
+    listing_days = kwargs.get("listing_days")
 
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
@@ -425,6 +431,7 @@ def bayesian_walk_forward_multi(
                     st_history=st_history,
                     exclude_st=exclude_st,
                     data_version=data_version,
+                    listing_days=listing_days,
                 )
             except Exception as opt_err:
                 _sid = save_failure_snapshot(
@@ -465,6 +472,7 @@ def bayesian_walk_forward_multi(
                     st_history=st_history,
                     exclude_st=exclude_st,
                     data_version=data_version,
+                    listing_days=listing_days,
                 )
             except Exception as oos_err:
                 _sid = save_failure_snapshot(
@@ -502,6 +510,7 @@ def bayesian_walk_forward_multi(
                     eval_start_date=test_eval_start,
                     st_history=st_history, exclude_st=exclude_st,
                     data_version=data_version,
+                    listing_days=listing_days,
                 )
                 _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
                 _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []

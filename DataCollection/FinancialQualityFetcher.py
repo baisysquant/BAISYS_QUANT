@@ -25,6 +25,24 @@ class FinancialQualityFetcher:
 
     TABLE_NAME = "ods_financial_quality"
 
+    # 各报告期监管披露截止日（公告日最晚可能值，用于保守 as-of 回填，无前视）
+    _DISCLOSURE_DEADLINES = {
+        "03": "04-30", "06": "08-31", "09": "10-31", "12": "04-30",
+    }
+
+    @classmethod
+    def _disclosure_deadline(cls, record_date: str) -> str:
+        """按监管披露截止日推导披露日：公告日 <= 截止日恒成立，用截止日近似最保守（无前视）。
+
+        年报（12-31）截止次年 4-30；一季报 4-30；中报 8-31；三季报 10-31。
+        """
+        y, m, _ = (int(x) for x in str(record_date).split("-"))
+        md = cls._DISCLOSURE_DEADLINES.get(f"{m:02d}")
+        if md is None:
+            return str(record_date)
+        year = y + 1 if m == 12 else y
+        return f"{year}-{md}"
+
     def __init__(self, config: Config) -> None:
         self.config = config
         self._cache_days = config.FINANCIAL_QUALITY_CACHE_DAYS
@@ -72,6 +90,7 @@ class FinancialQualityFetcher:
         result = {
             "symbol": symbol,
             "record_date": latest_date,
+            "disclosure_date": self._disclosure_deadline(latest_date),
             "roe": self._safe_float(df.at[_find("净资产收益率"), latest_date]) if _find("净资产收益率") is not None else None,
             "gross_profit_margin": self._safe_float(df.at[_find("毛利率"), latest_date]) if _find("毛利率") is not None else None,
             "net_profit_margin": self._safe_float(df.at[_find("销售净利率"), latest_date]) if _find("销售净利率") is not None else None,
@@ -144,11 +163,12 @@ class FinancialQualityFetcher:
 
         sql = text(
             f"INSERT INTO {self.TABLE_NAME} "
-            "(symbol, record_date, roe, gross_profit_margin, net_profit_margin, "
+            "(symbol, record_date, disclosure_date, roe, gross_profit_margin, net_profit_margin, "
             "revenue_growth_rate, net_profit_growth_rate) "
-            "VALUES (:symbol, :record_date, :roe, :gross_profit_margin, :net_profit_margin, "
+            "VALUES (:symbol, :record_date, :disclosure_date, :roe, :gross_profit_margin, :net_profit_margin, "
             ":revenue_growth_rate, :net_profit_growth_rate) "
             "ON CONFLICT (symbol, record_date) DO UPDATE SET "
+            "disclosure_date = EXCLUDED.disclosure_date, "
             "roe = EXCLUDED.roe, "
             "gross_profit_margin = EXCLUDED.gross_profit_margin, "
             "net_profit_margin = EXCLUDED.net_profit_margin, "
@@ -275,30 +295,53 @@ class FinancialQualityFetcher:
         logger.info(f"[FinancialQuality] 完成，此次采集 {len(all_rows)}/{total} 只，累计 {len(already | {r['symbol'] for r in all_rows})} 只")
         return len(all_rows)
 
-    def load_quality(self, symbols: list[str] | None = None) -> pd.DataFrame:
-        """从数据库加载最近一期的质量因子数据。"""
+    def load_quality(self, symbols: list[str] | None = None,
+                     as_of: str | None = None) -> pd.DataFrame:
+        """从数据库加载质量因子数据（PIT as-of 语义）。
+
+        只取查询日 as_of 之前已披露的财报（disclosure_date <= as_of），
+        每只股票取最新一个报告期 —— 避免历史复盘用到尚未披露的财报（前视）。
+        旧数据无 disclosure_date 时回退为 record_date <= as_of 过滤。
+
+        Args:
+            symbols: 股票代码列表，None 表示全市场。
+            as_of: 查询日 "YYYYMMDD" 或 "YYYY-MM-DD"，默认今天（当日数据可得性）。
+        """
         from sqlalchemy import text
+
+        if as_of:
+            as_of_norm = str(as_of).replace("-", "")
+            as_of_date = (f"{as_of_norm[:4]}-{as_of_norm[4:6]}-{as_of_norm[6:8]}")
+        else:
+            as_of_date = datetime.now().date().strftime("%Y-%m-%d")
+
+        as_of_clause = (
+            "((disclosure_date IS NOT NULL AND disclosure_date <= :as_of) "
+            "OR (disclosure_date IS NULL AND record_date <= :as_of))"
+        )
 
         if symbols:
             placeholders = ", ".join(f":s{i}" for i in range(len(symbols)))
-            params = {f"s{i}": s for i, s in enumerate(symbols)}
+            params: dict[str, Any] = {f"s{i}": s for i, s in enumerate(symbols)}
+            params["as_of"] = as_of_date
             sql = text(
-                f"SELECT DISTINCT ON (symbol) symbol, record_date, "
+                f"SELECT DISTINCT ON (symbol) symbol, record_date, disclosure_date, "
                 "roe, gross_profit_margin, net_profit_margin, "
                 "revenue_growth_rate, net_profit_growth_rate "
                 f"FROM {self.TABLE_NAME} "
-                f"WHERE symbol IN ({placeholders}) "
+                f"WHERE symbol IN ({placeholders}) AND {as_of_clause} "
                 "ORDER BY symbol, record_date DESC"
             )
         else:
             sql = text(
-                f"SELECT DISTINCT ON (symbol) symbol, record_date, "
+                f"SELECT DISTINCT ON (symbol) symbol, record_date, disclosure_date, "
                 "roe, gross_profit_margin, net_profit_margin, "
                 "revenue_growth_rate, net_profit_growth_rate "
                 f"FROM {self.TABLE_NAME} "
+                f"WHERE {as_of_clause} "
                 "ORDER BY symbol, record_date DESC"
             )
-            params = {}
+            params = {"as_of": as_of_date}
 
         with self._engine.connect() as conn:
             return pd.read_sql(sql, conn, params=params)

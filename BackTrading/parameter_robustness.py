@@ -45,6 +45,8 @@ PERTURBATION_FRAC = 0.10  # ±10%
 ROBUSTNESS_SHARPE_DROP = 0.50  # 50%
 # 同窗口评估：基线与扰动在同一评估窗口上对比（交易日）
 ROBUSTNESS_EVAL_WINDOW = 250
+# warmup 天数（评估段前预留交易日 buffer，让引擎建立 ADV/仓位后再进入评估段）
+_ROBUSTNESS_WARMUP_DAYS = 30
 # 扰动后收益低于此值视为大额亏损
 MAX_ALLOWED_LOSS = -0.10
 # 扰动后收益 < 基线收益 × 此比例视为断崖式下跌
@@ -257,37 +259,53 @@ def _run_perturbation_backtest(
     if len(dates) < sim_days + 20:
         return 0.0, 0.0, 0.0  # 数据不足，跳过
 
-    sim_start_idx = len(dates) - sim_days
-    sim_dates_set = set(dates[sim_start_idx:])
-
     # 准备信号
     prepared = _prepare_for_params(kline_df, perturbed_params, config)
 
-    # 切片
+    # ── P2-4：warmup buffer 避免 ADV 冷启动 ──
+    # 与 simulated_trading.py P1-1 同类修复：评估窗口前 ~20 天 ADV 未满载，
+    # 加 30 天 warmup 让引擎建立 ADV/仓位后再进入评估段，指标仅在评估段计算。
     if pd.api.types.is_datetime64_any_dtype(prepared["trade_date"]):
         _prep = prepared.copy()
         _prep["trade_date"] = _prep["trade_date"].dt.strftime("%Y-%m-%d")
     else:
         _prep = prepared
 
-    sim_dates_str = {d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d) for d in sim_dates_set}
-    sim_data = _prep[_prep["trade_date"].isin(sim_dates_str)].copy()
-    if sim_data.empty:
+    _date_range = _prep["trade_date"].astype(str)
+    _unique_dates = sorted(_date_range.unique())
+    _sim_n = min(sim_days, len(_unique_dates))
+    _sim_start_pos = len(_unique_dates) - _sim_n
+    sim_dates_str = set(_unique_dates[_sim_start_pos:])
+    # 扩展段 [warmup_start, sim_end]
+    _warmup_pos = max(0, _sim_start_pos - _ROBUSTNESS_WARMUP_DAYS)
+    _warmup_start = _unique_dates[_warmup_pos]
+    _sim_end = _unique_dates[-1]
+    mask_ext = (_date_range >= _warmup_start) & (_date_range <= _sim_end)
+    ext_data = _prep[mask_ext].copy()
+    if ext_data.empty:
         return 0.0, 0.0, 0.0
 
     # 止损价
     stop_mult = perturbed_params.get("atr_stop_mult")
-    if stop_mult is not None and "ATR" in sim_data.columns:
-        sim_data["止损价"] = sim_data["close"] - sim_data["ATR"] * stop_mult
-    elif "止损价" not in sim_data.columns:
-        sim_data["止损价"] = 0.0
+    if stop_mult is not None and "ATR" in ext_data.columns:
+        # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
+        _stop_close = ext_data["close_adj"] if "close_adj" in ext_data.columns else ext_data["close"]
+        ext_data["止损价"] = _stop_close - ext_data["ATR"] * stop_mult
+    elif "止损价" not in ext_data.columns:
+        ext_data["止损价"] = 0.0
 
     ecfg = _build_engine_cfg(perturbed_params, engine_cfg)
 
     tl: list[dict[str, Any]] = []
     ec: list[dict[str, Any]] = []
-    _run_single_backtest(sim_data, perturbed_params, ecfg, tl, ec)
-    risk = compute_risk_metrics(ec) or {}
+    _run_single_backtest(ext_data, perturbed_params, ecfg, tl, ec)
+
+    # 仅保留评估段权益曲线（warmup 段不入指标）
+    ec_sim = [row for row in ec if str(row.get("time", ""))[:10] in sim_dates_str]
+    if not ec_sim:
+        return 0.0, 0.0, 0.0
+
+    risk = compute_risk_metrics(ec_sim) or {}
     return (
         float(risk.get("sharpe_ratio", 0.0) or 0.0),
         float(risk.get("sortino_ratio", 0.0) or 0.0),

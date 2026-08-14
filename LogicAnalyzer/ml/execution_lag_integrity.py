@@ -66,21 +66,20 @@ def _norm_date(x: Any) -> str | None:
 
 
 def _price_frame(bars: pd.DataFrame) -> pd.DataFrame:
-    """抽取价格列并统一 trade_date 为字符串；无 close_adj 时回落 close。
+    """抽取价格列并统一 trade_date 为字符串。
 
-    同时保留原始价列 open_adj/high_adj/low_adj（若存在）——引擎成交价在
-    next_open/vwap 模型下取原始价基准（与 close_adj 估值基准一致），
-    合规校验须用同一基准（未复权原始 OHLC）。
+    P0-11 审计修复：引擎成交价/估值/费用已统一为**真实价（不复权原始价）**，
+    合规校验须用同一真实价基准（open/high/low/close）。close_adj 仅作 close
+    模型兜底（无 close 列时的旧数据兼容），不再作为成交价锚点。
 
     注意：trade_date 批量转 Timestamp 后格式化，禁止逐元素 pd.to_datetime
     （20 万行量级下逐元素转换耗时数十秒，会拖垮 WFO 全量回测）。
     """
     b = bars.copy()
-    if "close_adj" not in b.columns and "close" in b.columns:
-        b["close_adj"] = b["close"]
-    keep = ["trade_date", "symbol", "close_adj"]
+    keep = ["trade_date", "symbol"]
     keep.extend(c for c in ("open", "high", "low", "close") if c in b.columns)
-    keep.extend(c for c in ("open_adj", "high_adj", "low_adj") if c in b.columns)
+    if "close" not in b.columns and "close_adj" in b.columns:
+        keep.append("close_adj")
     b = b[keep]
     b["trade_date"] = pd.to_datetime(b["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
     return b.dropna(subset=["trade_date"])
@@ -96,7 +95,7 @@ def _bar_index(frame: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
             if not sym:
                 continue
             px: dict[str, float] = {}
-            for c in ("close_adj", "open", "high", "low", "close", "open_adj", "high_adj", "low_adj"):
+            for c in ("close", "open", "high", "low", "close_adj"):
                 v = r.get(c)
                 if v is None or pd.isna(v):
                     continue
@@ -145,13 +144,16 @@ def check_execution_price(
     """成交价时点合规（1.7 执行滞后）。
 
     成交记录 time = 实际成交日（fill-time 约定）：
-      - exec_mode="close"（默认）：成交价必须 ≈ 成交日收盘价 close_adj。
+      - exec_mode="close"（默认）：成交价必须 ≈ 成交日收盘价 close（真实价）。
       - exec_mode="next_open"：成交价必须落在「成交日（信号次日/T+1）OHLC 区间」内
-        —— 引擎在 next_open 下以成交日开盘价 open_adj 成交，等价于
-        price ∈ [low_adj, high_adj]（成交日为 T+1）。
+        —— 引擎在 next_open 下以成交日开盘价 open（真实价）成交，等价于
+        price ∈ [low, high]（成交日为 T+1）。
       - exec_mode="vwap"：成交价落在成交日 OHLC 区间内（VWAP 为盘中价，合法）。
       - 成交价 == 信号日（T）盘中价 = 当天信号吃当天收益，违规；
         次日/未来日（T+1 之后）价格在 fill-time 下无从出现（Time 即 T+1）。
+
+    P0-11 注：引擎成交价已统一为真实价（不复权原始价），此处基准为 open/high/
+    low/close（非 *_adj）。
 
     force_exit（ST/退市强平，无视 T+1/跌停的终态清算）成交免于 next_open/vwap 校验。
 
@@ -184,7 +186,7 @@ def check_execution_price(
         if sym_bar is None:
             continue  # 当日停牌/数据缺失 → 不可比，不计违规
         if exec_mode == "close":
-            allowed_val = sym_bar.get("close_adj")
+            allowed_val = sym_bar.get("close", sym_bar.get("close_adj"))
             if allowed_val is None:
                 continue
             checked += 1
@@ -194,11 +196,11 @@ def check_execution_price(
                 note = "（当日盘中价成交 = 当天信号吃当天收益）"
             else:
                 note = ""
-            violations.append(f"{action} {sym} {dt}@{trade_px} != close_adj={allowed_val} {note}")
+            violations.append(f"{action} {sym} {dt}@{trade_px} != close={allowed_val} {note}")
         else:
-            # next_open / vwap：成交价 ∈ 成交日（T+1）OHLC 区间（原始价基准）
-            lo = sym_bar.get("low_adj") if sym_bar.get("low_adj") is not None else sym_bar.get("low")
-            hi = sym_bar.get("high_adj") if sym_bar.get("high_adj") is not None else sym_bar.get("high")
+            # next_open / vwap：成交价 ∈ 成交日（T+1）OHLC 区间（真实价基准）
+            lo = sym_bar.get("low")
+            hi = sym_bar.get("high")
             if lo is None or hi is None or not np.isfinite(lo) or not np.isfinite(hi):
                 continue
             checked += 1
@@ -232,9 +234,9 @@ def check_price_vs_close_adj(
     """基于成交记录自带锚点字段的轻量校验（1.7/0.1）。
 
     引擎在记录每笔成交时已写入锚点字段：
-      - close 模型：trade["close_adj"] = 成交日（信号日）复权收盘价；
-      - next_open/vwap：trade["close_adj"] = 信号日复权收盘价（前一日），
-        trade["exec_open"] = 成交日参考价（开盘/典型价/收盘）。
+      - close 模型：trade["close_adj"] = 成交日（信号日）真实收盘价（=price，真实价体系）；
+      - next_open/vwap：trade["exec_open"] = 成交日参考价（真实开盘/VWAP/收盘），
+        trade["close_adj"] = 信号日复权收盘价（仅日志锚点，非成交价基准）。
     热路径（WFO 中每轮回测）用本函数 O(成交笔数) 完成乘数对齐校验，
     无需对全量面板做 O(N) 扫描。任何 price != 锚点的成交，意味着成交价与
     成交时序模型不一致 → 收益乘数可能错配。
@@ -293,9 +295,10 @@ def check_same_day_contribution(
 
     对每笔买入：成交当日「当日收益乘数」的入账量必须为 0 ——
       close 模型：贡献 = close(t)/成交价 - 1（成交价=当日收盘 ⇒ 0）；t=成交日
-      next_open 模型：贡献 = open_adj(t)/成交价 - 1（成交价=次日开盘 ⇒ 0）；
+      next_open 模型：贡献 = open(t)/成交价 - 1（成交价=次日开盘 ⇒ 0）；
             t=成交日（=信号次日=T+1），信号日收益未入账。
-      vwap 模型：成交价为盘中典型价，入账自成交价起计，无同日收益乘数错配 ⇒ 0。
+      vwap 模型：成交价为盘中量价加权均价（成交额/成交量），入账自成交价起计，无同日收益乘数错配 ⇒ 0。
+      （P0-11：全部为真实价基准，与引擎成交价口径一致。）
     任何非零贡献说明该仓当天已被「当天收益」乘入（收益乘数错配）。
 
     Returns:
@@ -325,14 +328,12 @@ def check_same_day_contribution(
         if action != "buy":
             continue
         sym_bar = idx.get(dt, {}).get(sym)
-        if sym_bar is None or "close_adj" not in sym_bar:
+        if sym_bar is None or ("close" not in sym_bar and "close_adj" not in sym_bar):
             continue
         if exec_mode == "close":
-            anchor = sym_bar["close_adj"]
+            anchor = sym_bar.get("close", sym_bar.get("close_adj"))
         elif exec_mode == "next_open":
-            anchor = sym_bar.get("open_adj")
-            if anchor is None:
-                anchor = sym_bar.get("open")
+            anchor = sym_bar.get("open")
             if anchor is None:
                 continue
         else:  # vwap：成交日为盘中成交，成交价即入账基准，无同日错配

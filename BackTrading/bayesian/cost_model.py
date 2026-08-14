@@ -42,6 +42,7 @@ _TUNABLE_CFG_FIELDS = frozenset({
 # 内存保留最近 _GLOBAL_CACHE_MAX 份：Phase1/2/3 交替评估的信号组
 # （默认参数、best 信号、refine 候选）可同时驻留，避免来回踢缓存导致
 # 同一参数组反复全量重算。4 份 ≈ 2.8GiB，若内存紧张可调回 2。
+# #6b 审计修复：存入时 deep copy，防止外部线程修改缓存中的 DataFrame
 _GLOBAL_SIGNAL_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
 _GLOBAL_CACHE_MAX = 4
 _GLOBAL_CACHE_LOCK = threading.Lock()
@@ -68,7 +69,7 @@ def _signal_hash(params: dict[str, Any]) -> str:
         for k in _SIGNAL_PARAM_KEYS
         if k in params or _get(k, None) is not None
     }
-    return hashlib.md5(json.dumps(sub, sort_keys=True).encode()).hexdigest()[:8]
+    return hashlib.sha256(json.dumps(sub, sort_keys=True).encode()).hexdigest()[:8]
 
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
@@ -106,6 +107,7 @@ class FidelityController:
         st_history: dict | None = None,
         exclude_st: bool = True,
         data_version: str | None = None,
+        listing_days: dict | None = None,
     ):
         self._kline = kline_df
         self._base_cfg = base_engine_cfg
@@ -117,6 +119,8 @@ class FidelityController:
         # ST/退市逐日动态剔除（与 runner 最终回测口径一致，注入引擎 params）
         self._st_history = st_history
         self._exclude_st = exclude_st
+        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
+        self._listing_days = listing_days
         # P3.1 数据版本（入 ML 冻结缓存 key 与信号缓存指纹，增量同步后整库失效）
         self._data_version = data_version
         # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
@@ -183,7 +187,8 @@ class FidelityController:
                         with _GLOBAL_CACHE_LOCK:
                             if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
                                 _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))
-                            _GLOBAL_SIGNAL_CACHE[global_key] = data
+                            # #6b 审计修复：deep copy 防止外部修改缓存
+                            _GLOBAL_SIGNAL_CACHE[global_key] = data.copy(deep=True)
                     self._signal_cache[sig_hash] = data
                     while len(self._signal_cache) > self._INSTANCE_CACHE_MAX:
                         self._signal_cache.pop(next(iter(self._signal_cache)))
@@ -204,6 +209,9 @@ class FidelityController:
         if self._st_history:
             engine_params["_st_history"] = self._st_history
             engine_params["_exclude_st"] = self._exclude_st
+        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
+        if self._listing_days:
+            engine_params["_listing_days"] = self._listing_days
         _t_b = time.perf_counter()
         total_return = _run_single_backtest(
             data, engine_params, eval_cfg, trade_log, equity_curve
@@ -256,7 +264,8 @@ class FidelityController:
                 with _GLOBAL_CACHE_LOCK:
                     if len(_GLOBAL_SIGNAL_CACHE) >= _GLOBAL_CACHE_MAX:
                         _GLOBAL_SIGNAL_CACHE.pop(next(iter(_GLOBAL_SIGNAL_CACHE)))
-                    _GLOBAL_SIGNAL_CACHE[global_key] = data
+                    # #6b 审计修复：deep copy 防止外部修改缓存
+                    _GLOBAL_SIGNAL_CACHE[global_key] = data.copy(deep=True)
             self._signal_cache[sig_hash] = data
             while len(self._signal_cache) > self._INSTANCE_CACHE_MAX:
                 self._signal_cache.pop(next(iter(self._signal_cache)))
