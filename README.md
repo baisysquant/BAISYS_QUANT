@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="https://github.com/paiyuyen/Multi-factor-Quantitative-Stock-Selection-Analysis-System/raw/main/Images/logo.png" alt="LOGO" width="50%">
   <br/><br/>
@@ -186,7 +188,7 @@ max_single_position = 0.2
 
 ### 环境要求
 
-- **Python 3.12+**（推荐 3.12~3.13）
+- **Python 3.10+**（推荐 3.10~3.13）
 - **PostgreSQL 14+** — 数据持久化存储
 - **AkShare** — 免费使用，内置频率限制和 30s 全局超时
 
@@ -215,9 +217,9 @@ chip_limit = 1
 
 **克隆项目仓库：**
 
-git clone https://github.com/chowkuanyen/BAISYS_QUAN.git
+git clone https://github.com/baisysquant/BAISYS_QUANT.git
 
-cd BAISYS_QUAN
+cd BAISYS_QUANT
 
 **安装依赖包:**
 
