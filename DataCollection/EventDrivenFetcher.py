@@ -103,8 +103,8 @@ class EventDrivenFetcher:
             return pd.DataFrame()
 
         try:
-            from asharehub import AShareHub
-            client = AShareHub(api_key=self._asharehub_key)
+            from UtilsManager.AShareHubClient import make_asharehub_client
+            client = make_asharehub_client(api_key=self._asharehub_key)
             df = client.holder_trade()
         except Exception as e:
             logger.warning(f"[事件驱动] asharehub 增减持获取失败: {e}")

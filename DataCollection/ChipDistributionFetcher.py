@@ -75,8 +75,8 @@ class ChipDistributionFetcher:
     @property
     def client(self) -> Any:  # noqa: ANN401
         if self._client is None and self.api_key:
-            from asharehub import AShareHub
-            self._client = AShareHub(api_key=self.api_key)
+            from UtilsManager.AShareHubClient import make_asharehub_client
+            self._client = make_asharehub_client(api_key=self.api_key)
         return self._client
 
     def fetch_chip_data(self, symbols: list[str] | None = None, date: str | None = None) -> pd.DataFrame:

@@ -78,8 +78,11 @@ def _price_frame(bars: pd.DataFrame) -> pd.DataFrame:
     b = bars.copy()
     keep = ["trade_date", "symbol"]
     keep.extend(c for c in ("open", "high", "low", "close") if c in b.columns)
-    if "close" not in b.columns and "close_adj" in b.columns:
-        keep.append("close_adj")
+    if "close" not in b.columns:
+        for _fallback in ("close_normal", "close_adj"):
+            if _fallback in b.columns:
+                keep.append(_fallback)
+                break
     b = b[keep]
     b["trade_date"] = pd.to_datetime(b["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
     return b.dropna(subset=["trade_date"])
@@ -95,7 +98,7 @@ def _bar_index(frame: pd.DataFrame) -> dict[str, dict[str, dict[str, float]]]:
             if not sym:
                 continue
             px: dict[str, float] = {}
-            for c in ("close", "open", "high", "low", "close_adj"):
+            for c in ("close", "open", "high", "low", "close_normal", "close_adj"):
                 v = r.get(c)
                 if v is None or pd.isna(v):
                     continue
@@ -186,7 +189,7 @@ def check_execution_price(
         if sym_bar is None:
             continue  # 当日停牌/数据缺失 → 不可比，不计违规
         if exec_mode == "close":
-            allowed_val = sym_bar.get("close", sym_bar.get("close_adj"))
+            allowed_val = sym_bar.get("close", sym_bar.get("close_normal"))
             if allowed_val is None:
                 continue
             checked += 1
@@ -328,10 +331,10 @@ def check_same_day_contribution(
         if action != "buy":
             continue
         sym_bar = idx.get(dt, {}).get(sym)
-        if sym_bar is None or ("close" not in sym_bar and "close_adj" not in sym_bar):
+        if sym_bar is None or ("close" not in sym_bar and "close_normal" not in sym_bar):
             continue
         if exec_mode == "close":
-            anchor = sym_bar.get("close", sym_bar.get("close_adj"))
+            anchor = sym_bar.get("close", sym_bar.get("close_normal"))
         elif exec_mode == "next_open":
             anchor = sym_bar.get("open")
             if anchor is None:

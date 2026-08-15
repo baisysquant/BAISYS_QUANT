@@ -45,7 +45,12 @@ class IDataProvider(ABC):
 
 
 class LiveDataProvider(IDataProvider):
-    """实时/日更模式 — 从 stock_daily_kline 读取，返回不复权价和复权价。"""
+    """实时/日更模式 — 从 stock_daily_kline 读取，返回不复权价和后复权价。
+
+    列名规范（P0-12 价格空间审计修复）：
+    - close/open/high/low       → 不复权原始价（交易所真实成交价，用于涨跌停模型/撮合）
+    - close_adj/open_adj/…      → 后复权价（close_normal 等，跨除权日连续，用于信号/止损/估值）
+    """
 
     def __init__(self, db_engine: Engine) -> None:
         self._db_engine = db_engine
@@ -64,15 +69,13 @@ class LiveDataProvider(IDataProvider):
 
         sql = text(f"""
             SELECT symbol, trade_date,
-                   open / adj_factor AS open,
-                   high / adj_factor AS high,
-                   low / adj_factor AS low,
-                   close / adj_factor AS close,
-                   open AS open_adj,
-                   high AS high_adj,
-                   low AS low_adj,
-                   close AS close_adj,
-                   volume, amount, close_normal, adj_factor
+                   open, high, low, close,
+                   open AS open_raw,
+                   high AS high_raw,
+                   low AS low_raw,
+                   close AS close_raw,
+                   open_normal, high_normal, low_normal, close_normal,
+                   volume, amount, adj_factor
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date
@@ -115,15 +118,13 @@ class BacktestDataProvider(IDataProvider):
 
         sql = text(f"""
             SELECT symbol, trade_date,
-                   open / adj_factor AS open,
-                   high / adj_factor AS high,
-                   low / adj_factor AS low,
-                   close / adj_factor AS close,
-                   open AS open_adj,
-                   high AS high_adj,
-                   low AS low_adj,
-                   close AS close_adj,
-                   volume, amount, close_normal, adj_factor
+                   open, high, low, close,
+                   open AS open_raw,
+                   high AS high_raw,
+                   low AS low_raw,
+                   close AS close_raw,
+                   open_normal, high_normal, low_normal, close_normal,
+                   volume, amount, adj_factor
             FROM {TABLE}
             WHERE {' AND '.join(where)}
             ORDER BY symbol, trade_date

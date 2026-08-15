@@ -6,6 +6,7 @@ from pathlib import Path
 from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from BackTrading.alert import BacktestAlert
@@ -15,60 +16,89 @@ from UtilsManager.ConfigParser import Config
 
 
 class TestKlineDataVersion:
-    def test_returns_version_with_max_date_and_hash(self) -> None:
+    def test_returns_version_from_dataframe(self) -> None:
+        """主路径：从内存 DataFrame 计算版本，消除 fetch→version 竞态窗口。"""
+        from BackTrading.runner import _compute_kline_data_version
+
+        df = pd.DataFrame({"trade_date": ["2025-06-30", "2025-06-29"]})
+        version = _compute_kline_data_version(engine=None, kline_df=df)  # type: ignore[arg-type]
+        assert version == "2025-06-30"
+
+    def test_returns_version_from_dataframe_datetime(self) -> None:
+        """DataFrame trade_date 为 datetime64 时也能正确归一化。"""
+        from BackTrading.runner import _compute_kline_data_version
+
+        df = pd.DataFrame({"trade_date": pd.to_datetime(["2025-06-30", "2025-06-29"])})
+        version = _compute_kline_data_version(engine=None, kline_df=df)  # type: ignore[arg-type]
+        assert version == "2025-06-30"
+
+    def test_falls_back_to_db_when_no_dataframe(self) -> None:
+        """should_rerun 无 DataFrame 时回退到 DB 查询。"""
         from BackTrading.runner import _compute_kline_data_version
 
         conn = MagicMock()
-        conn.execute.return_value.fetchone.return_value = ("2025-06-30", 1234)
+        conn.execute.return_value.fetchone.return_value = ("2025-06-30",)
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value = conn
 
         version = _compute_kline_data_version(engine)
-        assert version.startswith("2025-06-30_")
-        assert len(version) > len("2025-06-30_")
+        assert version == "2025-06-30"
 
-    def test_changes_when_row_count_changes(self) -> None:
+    def test_dataframe_takes_precedence_over_db(self) -> None:
+        """DataFrame 优先：即使 DB 版本不同也不受影响（消除竞态窗口）。"""
         from BackTrading.runner import _compute_kline_data_version
 
         conn = MagicMock()
-        conn.execute.return_value.fetchone.return_value = ("2025-06-30", 1234)
+        conn.execute.return_value.fetchone.return_value = ("2025-07-15",)
         engine = MagicMock()
         engine.connect.return_value.__enter__.return_value = conn
-        v1 = _compute_kline_data_version(engine)
 
-        conn2 = MagicMock()
-        conn2.execute.return_value.fetchone.return_value = ("2025-06-30", 5678)
-        engine2 = MagicMock()
-        engine2.connect.return_value.__enter__.return_value = conn2
-        v2 = _compute_kline_data_version(engine2)
-        assert v1 != v2
+        df = pd.DataFrame({"trade_date": ["2025-06-30"]})
+        version = _compute_kline_data_version(engine, kline_df=df)
+        # 应使用 DataFrame 的版本，而非 DB 的
+        assert version == "2025-06-30"
+
+    def test_unaffected_by_count_changes(self) -> None:
+        """COUNT 变动不再影响版本 — 新增股票全量历史不触发不必要重跑。"""
+        from BackTrading.runner import _compute_kline_data_version
+
+        df1 = pd.DataFrame({"trade_date": ["2025-06-30"] * 1000})
+        df2 = pd.DataFrame({"trade_date": ["2025-06-30"] * 50000})
+        v1 = _compute_kline_data_version(engine=None, kline_df=df1)  # type: ignore[arg-type]
+        v2 = _compute_kline_data_version(engine=None, kline_df=df2)  # type: ignore[arg-type]
+        assert v1 == v2  # 行数剧烈变动，版本一致
 
     def test_changes_when_max_date_changes(self) -> None:
+        """max(trade_date) 变化 → 新版本（新交易日到达触发重跑）。"""
         from BackTrading.runner import _compute_kline_data_version
 
         def _mk(max_date: str):
-            conn = MagicMock()
-            conn.execute.return_value.fetchone.return_value = (max_date, 1234)
-            engine = MagicMock()
-            engine.connect.return_value.__enter__.return_value = conn
-            return _compute_kline_data_version(engine)
+            df = pd.DataFrame({"trade_date": [max_date]})
+            return _compute_kline_data_version(engine=None, kline_df=df)  # type: ignore[arg-type]
 
         assert _mk("2025-06-30") != _mk("2025-07-01")
 
-    def test_empty_table_returns_empty_string(self) -> None:
+    def test_empty_dataframe_returns_empty_string(self) -> None:
         from BackTrading.runner import _compute_kline_data_version
 
-        conn = MagicMock()
-        conn.execute.return_value.fetchone.return_value = (None, 0)
-        engine = MagicMock()
-        engine.connect.return_value.__enter__.return_value = conn
-        assert _compute_kline_data_version(engine) == ""
+        df = pd.DataFrame({"trade_date": pd.Series([], dtype=str)})
+        version = _compute_kline_data_version(engine=None, kline_df=df)  # type: ignore[arg-type]
+        assert version == ""
 
     def test_db_error_returns_empty_string(self) -> None:
         from BackTrading.runner import _compute_kline_data_version
 
         engine = MagicMock()
         engine.connect.side_effect = RuntimeError("db down")
+        assert _compute_kline_data_version(engine) == ""
+
+    def test_db_empty_returns_empty_string(self) -> None:
+        from BackTrading.runner import _compute_kline_data_version
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = ("",)
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value = conn
         assert _compute_kline_data_version(engine) == ""
 
 
@@ -138,17 +168,17 @@ class TestShouldRun:
         assert should
 
     def test_data_version_change_forces_rerun(self) -> None:
-        last = {"run_time": "2025-01-15T00:00:00", "data_version": "2025-01-14_abc123"}
+        last = {"run_time": "2025-01-15T00:00:00", "data_version": "2025-01-14"}
         should, reason = should_rerun(
-            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-15_def456"
+            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-15"
         )
         assert should
         assert "数据版本变化" in reason
 
     def test_data_version_same_no_rerun(self) -> None:
-        last = {"run_time": "2025-01-15T00:00:00", "data_version": "2025-01-14_abc123"}
+        last = {"run_time": "2025-01-15T00:00:00", "data_version": "2025-01-14"}
         should, _ = should_rerun(
-            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-14_abc123"
+            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-14"
         )
         assert not should
 
@@ -164,7 +194,7 @@ class TestShouldRun:
         # 历史记录无 data_version 列 → 不因版本比较强制重跑（向前兼容）
         last = {"run_time": "2025-01-15T00:00:00"}
         should, _ = should_rerun(
-            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-15_def456"
+            last, "monthly", today=date(2025, 1, 25), data_version="2025-01-15"
         )
         assert not should
 
@@ -305,6 +335,71 @@ class TestBacktestAlert:
         assert len(drifts) == 0
         if alert.DRIFT_LOG.exists():
             alert.DRIFT_LOG.unlink()
+
+
+class TestPipelineReachesWalkForward:
+    """P0 冒烟测试：管线可达 run_walk_forward 且 backtest_start_date 传值正确。
+
+    防回归：runner.py:407 曾引用未定义的 _bt_cut（NameError，管线必然 FAILED）。
+    通过桩替换全部 DB/网络依赖，Sentinel 异常穿透 except 后断言
+    run_walk_forward 收到的 backtest_start_date == _bt_start_iso。
+    """
+
+    class _ReachedWfo(Exception):
+        pass
+
+    def test_pipeline_reaches_wfo_with_bt_start(self, monkeypatch) -> None:
+        import BackTrading.runner as runner_mod
+        import DataManager.StPitSync as stpit
+        import DataManager.ListingDaysSync as lds
+        import BackTrading.snapshot as snap
+
+        captured: dict = {}
+
+        def _fake_wf(**kwargs):
+            captured.update(kwargs)
+            raise TestPipelineReachesWalkForward._ReachedWfo()
+
+        engine = MagicMock()
+        monkeypatch.setattr(runner_mod, "get_engine", lambda config: engine)
+        monkeypatch.setattr(runner_mod, "ensure_table", lambda e: None)
+        monkeypatch.setattr(runner_mod, "_acquire_lock", lambda e: None)
+        monkeypatch.setattr(runner_mod, "_release_run_lock", lambda: None)
+        monkeypatch.setattr(
+            runner_mod, "_compute_kline_data_version",
+            lambda e, kline_df=None: "2026-08-14",
+        )
+        monkeypatch.setattr(runner_mod, "get_last_run", lambda e: None)
+        monkeypatch.setattr(
+            runner_mod, "should_rerun", lambda *a, **k: (True, "test force"),
+        )
+        monkeypatch.setattr(
+            runner_mod, "_resolve_symbols", lambda e, c: ["sh600000", "sz000001"],
+        )
+        kline_df = pd.DataFrame({
+            "symbol": ["sh600000", "sh600000", "sz000001"],
+            "trade_date": ["2018-01-02", "2018-01-03", "2018-01-04"],
+        })
+        monkeypatch.setattr(runner_mod, "_fetch_kline", lambda e, s, d: kline_df)
+        monkeypatch.setattr(runner_mod, "_load_st_history", lambda e, s, a, b: {})
+        monkeypatch.setattr(runner_mod, "_load_listing_days", lambda e, s, a: {})
+        monkeypatch.setattr(runner_mod, "run_walk_forward", _fake_wf)
+        monkeypatch.setattr(runner_mod, "record_run", lambda **k: None)
+        monkeypatch.setattr(stpit, "ensure_st_history_table", lambda e: None)
+        monkeypatch.setattr(stpit, "sync_st_pit", lambda *a, **k: None)
+        monkeypatch.setattr(stpit, "fetch_delisted_symbols", lambda: set())
+        monkeypatch.setattr(lds, "ensure_listing_days_table", lambda e: None)
+        monkeypatch.setattr(lds, "sync_listing_days", lambda *a, **k: None)
+        monkeypatch.setattr(snap, "begin_snapshot_session", lambda: None)
+        monkeypatch.setattr(snap, "set_run_context", lambda **k: None)
+        monkeypatch.setattr(snap, "save_failure_snapshot", lambda **k: None)
+
+        result = runner_mod.run_backtest_pipeline(force=True)
+
+        # 管线必须走到 run_walk_forward（Sentinel 被外层 except 吞掉后返回 None）
+        assert captured, "管线未执行到 run_walk_forward（此前可能已崩溃）"
+        assert captured["backtest_start_date"] == "2018-01-01"
+        assert result is None
 
 
 class TestWriteCalibrationToIni:

@@ -350,8 +350,11 @@ class ReportService:
         """
         将所有 sheet 中的 后复权 止损/目标价/移动止损 转换为 不复权 价格输出。
 
-        后复权价 = 不复权价 × max_adj_factor / adj_factor
-        → 不复权价 = 后复权价 × adj_factor / max_adj_factor
+        P1-6 修复：后复权价 = 不复权价 × adj_factor(交易日当日因子)
+        → 不复权价 = 后复权价 / adj_factor(trade_date)。
+        此前用 MAX(adj_factor) OVER (PARTITION BY symbol)（全历史最大因子）
+        折算，引用了截至报告日的未来信息（除权会推高后续因子），属前视偏差；
+        且 P0-12 复权语义统一后，后复权↔不复权只需当日因子，无需历史窗口。
 
         Args:
             sheets_data: sheet名称 -> DataFrame 映射
@@ -378,18 +381,17 @@ class ReportService:
         if not stock_codes:
             return sheets_data
 
-        # 查询每只股票的 adj_factor 和 max_adj_factor
+        # 查询每只股票当日的 adj_factor
         engine = get_engine(self.config)
         trade_date_iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
-        # 查询当日 adj_factor 及每只股票的历史最大 adj_factor
+        # P1-6：仅取交易日当日的复权因子（无历史窗口，无未来信息）
         placeholders = ",".join([f":code{i}" for i in range(len(stock_codes))])
         params = {f"code{i}": code for i, code in enumerate(stock_codes)}
         params["trade_date"] = trade_date_iso
 
         sql = f"""
-            SELECT symbol, adj_factor,
-                   MAX(adj_factor) OVER (PARTITION BY symbol) as max_adj_factor
+            SELECT symbol, adj_factor
             FROM stock_daily_kline
             WHERE symbol IN ({placeholders})
               AND trade_date = :trade_date
@@ -399,12 +401,12 @@ class ReportService:
             with engine.connect() as conn:
                 result = conn.execute(text(sql), params).fetchall()
 
-            # 构建映射: symbol -> (adj_factor, max_adj_factor)
+            # 构建映射: symbol -> adj_factor（当日）
             adj_map = {}
             for row in result:
-                symbol, adj, max_adj = row
-                if max_adj and max_adj > 0:
-                    adj_map[symbol] = (float(adj), float(max_adj))
+                symbol, adj = row
+                if adj and adj > 0:
+                    adj_map[symbol] = float(adj)
         except Exception as e:
             self.logger.warning(f"获取 adj_factor 失败，将保留原价格: {e}")
             return sheets_data
@@ -432,14 +434,14 @@ class ReportService:
                 if col not in df_copy.columns:
                     continue
 
-                # 转换: 不复权价 = 后复权价 × adj_factor / max_adj_factor
+                # P1-6：不复权价 = 后复权价 / 当日 adj_factor（无前视）
                 def _convert_price(row):
                     code = str(row[ColumnNames.STOCK_CODE]) if ColumnNames.STOCK_CODE in row else None
                     if code in adj_map:
-                        adj, max_adj = adj_map[code]
+                        adj = adj_map[code]
                         val = row[col]
-                        if pd.notna(val) and val > 0 and max_adj > 0:
-                            return round(float(val) * adj / max_adj, 2)
+                        if pd.notna(val) and val > 0 and adj > 0:
+                            return round(float(val) / adj, 2)
                     return row[col]
 
                 df_copy[col] = df_copy.apply(_convert_price, axis=1)

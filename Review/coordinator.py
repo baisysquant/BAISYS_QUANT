@@ -358,19 +358,20 @@ class StockAnalysisCoordinator:
         if hist_df_all.empty:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
-        # 从 hist_df_all 获取每只股票最新的 close_normal 作为 spot_data
+        # 从 hist_df_all 获取每只股票最新的 close（不复权原始价）作为 spot_data
+        # P0-12 修复：close_normal 为后复权价，界面展示/报告用原始价
         try:
-            cn = hist_df_all[hist_df_all["close_normal"].notna()]
+            cn = hist_df_all[hist_df_all["close"].notna()]
             if not cn.empty:
                 last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
                 last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
-                latest_prices_df = last_cn[["股票代码", "close_normal"]].rename(
-                    columns={"close_normal": "最新价"}
+                latest_prices_df = last_cn[["股票代码", "close"]].rename(
+                    columns={"close": "最新价"}
                 )
                 self.logger.info(f"[INFO] 从 DB 获取 {len(latest_prices_df)} 只股票的最新收盘价")
             else:
                 latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
-                self.logger.warning("[WARN] 数据库 close_normal 为空，最新价留空")
+                self.logger.warning("[WARN] 数据库 close 为空，最新价留空")
         except Exception as e:
             self.logger.warning(f"[WARN] 构建最新价失败: {e}")
             latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
@@ -419,12 +420,12 @@ class StockAnalysisCoordinator:
             hist = ctx.get("hist_df", pd.DataFrame())
             if not hist.empty:
                 try:
-                    cn = hist[hist["close_normal"].notna()]
+                    cn = hist[hist["close"].notna()]
                     if not cn.empty:
                         last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
                         last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
-                        spot_data = last_cn[["股票代码", "close_normal"]].rename(
-                            columns={"close_normal": "最新价"}
+                        spot_data = last_cn[["股票代码", "close"]].rename(
+                            columns={"close": "最新价"}
                         )
                         ctx.set("spot_data", spot_data)
                         self.logger.info(f"[spot_data] 从 hist_df 重建，{len(spot_data)} 条")

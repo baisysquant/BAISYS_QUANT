@@ -55,7 +55,7 @@
 
 | 数据 | 来源 | 方式 |
 |------|------|------|
-| 日 K 线（前复权） | AkShare `stock_zh_a_daily` | 增量同步到 PostgreSQL，除权自动检测全量重写 |
+| 日 K 线（后复权 + 不复权收盘 + 复权因子） | 腾讯行情 + AShareHub 复权因子 | 增量同步到 PostgreSQL，除权自动检测全量重写 |
 | 基础信息 / 行业分类 | AkShare 申万二级分类 | 并行抓取，按日缓存 |
 | 资金流向 | AkShare / AShareHub API | 多周期（3/5/10/20 日）|
 | 筹码分布 | AShareHub API | 获利比例 + 成本分位 + 集中度 |
@@ -74,7 +74,7 @@
 - **全向量化信号引擎** — 信号计算已从 per-bar 逐行 Python 循环重构为纯 numpy 向量化运算。`compute_signals()` 使用 `np.where`、`np.correlate`、`np.select`、前缀和、rolling window broadcast 等技术，消除所有逐行 Python 回调。次核心指标（MACD/BOLL/KDJ/RSI/CCI/ADX）及其峰值/谷值检测在 Phase 0 预计算阶段一次性完成，后续所有参数评估直接复用。
 - **机器学习信号增强** — 引入 XGBoost 模型（`BackTrading/model.py` `BacktestXGBScorer`）作为信号修偏层。`BacktestXGBScorer` 以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度，在 `compute_signals` 中叠加到综合评分，提升回测信号质量。
 - **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标 + 峰值/谷值检测，结果写磁盘（`.indicators.parquet` + `.peaks.npy` + `.troughs.npy`）。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
-- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。默认 IS=120 天、OOS=20 天，多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
+- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。默认 IS=120 天、OOS=120 天（`out_of_sample_days` 可配置，半年窗口保证 2 个 WFO 周期的统计量），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
 - **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化（~15 组）→ GP+qEI Level 1 搜索（~35 次）→ GP+qEI Level 2 搜索（~150 次，信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 12 个参数：boll_narrow_ratio, cross_decay_days, golden_cross_bonus, divergence_penalty（信号参数），atr_stop_mult, atr_t1_mult, atr_t2_mult, kelly_fraction, position_a, liq_veto_ratio, conclusion_full_bull, risk_none_multiplier（组合参数）
 - **两级成本分层** — 信号参数（4 个）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（8 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
 - **高斯过程代理模型** — `ConstantKernel × Matern(ARD) + WhiteKernel` 组合核，自动相关性长度尺度学习。`save_gp_state` / `restore_gp_state` 序列化核参数实现跨窗口迁移学习
@@ -83,6 +83,19 @@
 - **仓位优化** — 支持风险平价、最小方差、均值-方差（含换手率惩罚 + 行业约束）、评分加权四种组合权重分配
 - **校准持久化** — 最优参数自动写入 `config.ini [BACKTEST_CALIBRATED]` 分区，回测日志记录到 `backtest_calibration_log` 表
 - **信号预计算缓存** — `prepare_backtest_data()` 按 `signal_cache_{trade_date}_{config_hash}_{param_hash}/{bucket}/{symbol}.parquet` 增量写入，分桶减小单目录文件数，zstd 压缩，断点自动续算。Phase 0 缓存位于 `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet`，子进程通过磁盘共享。
+- **独立验证集模拟验证** — WFO 选参后优先使用与选参区间**无交集**的 holdout 独立验证集（P0-10 ④）做 Sharpe/Sortino 衰减校验（衰减 >30% 拒绝上线），替代旧的自引用"最近 N 日"验证；独立验证集未提供时回退并告警
+
+### 真实价格体系（P0-11 审计重构）
+
+回测引擎的成交、现金、净值、费用一律使用**不复权真实价**，复权价仅用于信号/止损/市场状态判定：
+
+- **成交价格** — 开盘/收盘/VWAP 均按不复权真实价（VWAP = 成交额/成交量，不复权），买入成交价 = 当日真实开盘价，与 A 股实际成交口径一致
+- **净值与费用** — 市值按真实价估值，佣金/印花税/过户费按真实成交额计费（旧体系按复权额计费，被复权因子放大）
+- **除权处理** — 除权日按复权因子跳变比率（af_now/af_prev）自动调整持仓股数，净值跨除权日零跳变（如 10 送 10 → 股数翻倍）
+- **涨跌停取整** — 涨跌停价按交易所口径 ROUND_HALF_UP 四舍五入（前收 9.55 涨停价 10.51，而非银行家舍入的 10.50）
+- **可成交量** — 涨跌停开盘撮合的可成交量取**前日成交量**（PIT 合规，避免当日量前视）；数据首日（无前收）标的禁买
+- **前视合规** — 当日指标一律 shift(1) 后使用（如 AMOUNT_MA20），信号日收盘决策 → 次日开盘执行（A 股 T+1）
+- **效果** — 修复三类失真：①净值收益被持仓加权复权因子放大；②真实仓位低于目标仓位（目标 10% 实际仅 3.3%）；③费用按复权成交额高估
 
 ### 数据同步（IncrementalSyncEngine）
 

@@ -270,10 +270,25 @@ def test_stamp_tax_policy_constants() -> None:
     """印花税分段表驱动（单一来源 CostModel），2023-08-28 减半为 0.05%。"""
     from BackTrading.domain.models import CostModel, DEFAULT_STAMP_TAX_SEGMENTS
 
-    assert DEFAULT_STAMP_TAX_SEGMENTS == (("2023-08-28", 0.0005), ("2000-01-01", 0.001))
+    # P2-3（审计）：补全 2008-09-19 前历史分段——2007-05-30 起双边 0.3%、
+    # 2008-04-24 起双边 0.1%、2008-09-19 起卖出单边 0.1%、2023-08-28 起 0.05%
+    assert DEFAULT_STAMP_TAX_SEGMENTS == (
+        ("2023-08-28", 0.0005),
+        ("2008-09-19", 0.001),
+        ("2008-04-24", 0.001),
+        ("2007-05-30", 0.003),
+        ("2000-01-01", 0.001),
+    )
     cm = CostModel()
     assert cm.stamp_tax_rate_for("2023-08-27") == 0.001  # 减半前
     assert cm.stamp_tax_rate_for("2023-08-28") == 0.0005  # 减半后（现行）
+    # P2-3：2008 分段边界（卖出侧费率）
+    assert cm.stamp_tax_rate_for("2008-09-19") == 0.001   # 单边 0.1%
+    assert cm.stamp_tax_rate_for("2008-09-18") == 0.001   # 双边 0.1% 的卖出侧
+    assert cm.stamp_tax_rate_for("2008-04-24") == 0.001   # 双边 0.1% 的卖出侧
+    assert cm.stamp_tax_rate_for("2008-04-23") == 0.003   # 双边 0.3% 的卖出侧
+    assert cm.stamp_tax_rate_for("2007-05-30") == 0.003
+    assert cm.stamp_tax_rate_for("2007-05-29") == 0.001   # 兜底段（2005-01-24 起 0.1% 双边）
 
 
 def test_engine_stamp_tax_historical_split() -> None:

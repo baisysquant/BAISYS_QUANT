@@ -289,7 +289,7 @@ def _run_perturbation_backtest(
     stop_mult = perturbed_params.get("atr_stop_mult")
     if stop_mult is not None and "ATR" in ext_data.columns:
         # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
-        _stop_close = ext_data["close_adj"] if "close_adj" in ext_data.columns else ext_data["close"]
+        _stop_close = ext_data["close_normal"] if "close_normal" in ext_data.columns else ext_data["close"]
         ext_data["止损价"] = _stop_close - ext_data["ATR"] * stop_mult
     elif "止损价" not in ext_data.columns:
         ext_data["止损价"] = 0.0

@@ -338,7 +338,8 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     # 只保留信号计算产生的列，避免加载不需要的中间指标
     _signal_cols = [c for c in signal_df.columns if c in (
         "进场评分", "退出评分", "综合评分", "止损价", "风险等级",
-        "entry_score", "exit_score", "score", "atr", "ATR", "macd_trend",
+        "entry_score", "exit_score", "score", "atr", "ATR",
+        "macd_trend", "macd_trend_value",
         "golden_cross", "hist_momentum", "dif_slope", "divergence",
         "vol_price", "kline", "exit_strategy",
     ) or c.startswith("MACD_") or c.startswith("MA_") or c.startswith("ATR_")]
@@ -375,9 +376,10 @@ def prepare_backtest_data(
         or "conclusion_full_bull" in params or "golden_cross_bonus" in params
     )
 
-    # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO/RISK 单值
+    # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO 单值
     _saved_atr_stop = params.get("atr_stop_mult") if isinstance(params, dict) else None
-    _saved_risk_none = params.get("risk_none_multiplier") if isinstance(params, dict) else None
+    # ⚠️ _saved_risk_none 已移除：risk_none_multiplier 属于 DEAD_KEYS（不扰动），
+    # 在 prepare 管线中从未消费；仓位倍率由 EngineConfig.risk_none_multiplier 注入。
 
     if signal_param_hash is None:
         signal_param_hash = _compute_param_hash(params)
@@ -388,7 +390,11 @@ def prepare_backtest_data(
     elif is_flat:
         cfg = Config()
         base = _build_params(cfg)
+        # 白名单对齐 CALIB_PARAM_MAP，确保所有校准参数都能正确落入 structured 分区。
+        # atr_stop_mult 属于 scoring 段（_build_params 默认也放在 scoring_params 中），
+        # 但已通过 _saved_atr_stop 单独提取；此处一并纳入白名单以保证 params 一致性。
         base["scoring"].update({k: v for k, v in params.items() if k in (
+            "atr_stop_mult",
             "cross_decay_days", "cross_decay_min",
             "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
             "expected_return_lookback",
@@ -398,8 +404,8 @@ def prepare_backtest_data(
             base["regime"]["boll_narrow_ratio"] = float(params["boll_narrow_ratio"])
         base["thresholds"] = {
             "fully_bull": int(params.get("conclusion_full_bull", base["thresholds"]["fully_bull"])),
-            "bullish": base["thresholds"]["bullish"],
-            "oscillate": base["thresholds"]["oscillate"],
+            "bullish": int(params.get("conclusion_bullish", base["thresholds"]["bullish"])),
+            "oscillate": int(params.get("conclusion_oscillate", base["thresholds"]["oscillate"])),
         }
         params = base
 
@@ -482,22 +488,22 @@ def prepare_backtest_data(
             logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
         if _saved_atr_stop is not None and "ATR" in merged.columns:
             # P2-3：止损价统一使用后复权口径，避免除权日 close 跳跌而 ATR 连续导致量纲不一致
-            close_for_stop = merged["close_adj"] if "close_adj" in merged.columns else merged["close"]
+            close_for_stop = merged["close_normal"] if "close_normal" in merged.columns else merged["close"]
             stop_raw = close_for_stop - merged["ATR"] * _saved_atr_stop
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
 
         # ── P0-1：止损价复权空间断言（任何口径混用直接报错，禁止静默降级） ──
-        # 止损价必须与引擎比较基准 close_adj 同空间：
-        #  1) ATR 偏差核验（merged 含 ATR 时，生产路径）：|(close_adj−止损价)−ATR×mult|
+        # 止损价必须与引擎比较基准 close_normal 同空间：
+        #  1) ATR 偏差核验（merged 含 ATR 时，生产路径）：|(close_normal−止损价)−ATR×mult|
         #     在正确空间仅为取整误差（<0.2%）；混用不复权空间时偏差 ≈ close×(adj_factor−1)。
-        #  2) 无 ATR 列（合成数据/旧缓存）：邻域软检 — 止损价明显更靠近不复权 close 时告警
+        #  2) 无 ATR 列（合成数据/旧缓存）：邻域软检 — 止损价明显更靠近不复权 close_raw 时告警
         #     并拒绝静默（旧版缓存重建后即转为硬报错）。
-        if "止损价" in merged.columns and "close_adj" in merged.columns and "close" in merged.columns:
+        if "止损价" in merged.columns and "close_normal" in merged.columns and "close_raw" in merged.columns:
             _stop_v = pd.to_numeric(merged["止损价"], errors="coerce").to_numpy(dtype=np.float64)
-            _ca_v = pd.to_numeric(merged["close_adj"], errors="coerce").to_numpy(dtype=np.float64)
-            _cl_v = pd.to_numeric(merged["close"], errors="coerce").to_numpy(dtype=np.float64)
-            _ok = np.isfinite(_stop_v) & np.isfinite(_ca_v) & np.isfinite(_cl_v)
-            _ok &= (_stop_v > 0) & (_ca_v > 0) & (_cl_v > 0)
+            _cn_v = pd.to_numeric(merged["close_normal"], errors="coerce").to_numpy(dtype=np.float64)
+            _cr_v = pd.to_numeric(merged["close_raw"], errors="coerce").to_numpy(dtype=np.float64)
+            _ok = np.isfinite(_stop_v) & np.isfinite(_cn_v) & np.isfinite(_cr_v)
+            _ok &= (_stop_v > 0) & (_cn_v > 0) & (_cr_v > 0)
             if _ok.any():
                 _bad = np.zeros(len(_ok), dtype=bool)
                 if "ATR" in merged.columns:
@@ -505,24 +511,24 @@ def prepare_backtest_data(
                     _atr_ok = _ok & np.isfinite(_atr_v) & (_atr_v > 0)
                     if _atr_ok.any():
                         _mult_ref = _saved_atr_stop if _saved_atr_stop not in (None, 0) else 1.5
-                        _dev = np.abs((_ca_v[_atr_ok] - _stop_v[_atr_ok]) - _atr_v[_atr_ok] * _mult_ref) / _ca_v[_atr_ok]
-                        _dev_bad = _dev > 0.05 + 0.05 / _ca_v[_atr_ok]
+                        _dev = np.abs((_cn_v[_atr_ok] - _stop_v[_atr_ok]) - _atr_v[_atr_ok] * _mult_ref) / _cn_v[_atr_ok]
+                        _dev_bad = _dev > 0.05 + 0.05 / _cn_v[_atr_ok]
                         _bad[np.where(_atr_ok)[0][_dev_bad]] = True
                 else:
-                    _near_raw = _ok & (np.abs(_stop_v - _cl_v) < np.abs(_stop_v - _ca_v) * 0.5)
+                    _near_raw = _ok & (np.abs(_stop_v - _cr_v) < np.abs(_stop_v - _cn_v) * 0.5)
                     if _near_raw.any():
                         _n_near = int(_near_raw.sum())
                         logger.warning(
-                            f"[P0-1] 检测到 {_n_near} 行止损价更接近不复权 close（疑似空间混用），"
+                            f"[P0-1] 检测到 {_n_near} 行止损价更接近不复权 close_raw（疑似空间混用），"
                             "merged 无 ATR 列无法硬校验；请清除信号缓存重建（旧版缓存为不复权止损价）。"
                         )
                 if _bad.any():
                     _rows = merged.iloc[np.where(_bad)[0][:5]][
-                        ["symbol", "trade_date", "close", "close_adj", "ATR", "止损价"]
+                        ["symbol", "trade_date", "close_raw", "close_normal", "ATR", "止损价"]
                     ]
                     raise RuntimeError(
-                        f"[P0-1] 止损价复权空间断言失败：{int(_bad.sum())} 行止损价与 close_adj/ATR 不同空间"
-                        f"（止损价必须按 后复权 close_adj − ATR×mult 计算，旧版信号缓存需清除重建）。"
+                        f"[P0-1] 止损价复权空间断言失败：{int(_bad.sum())} 行止损价与 close_normal/ATR 不同空间"
+                        f"（止损价必须按 后复权 close_normal − ATR×mult 计算，旧版信号缓存需清除重建）。"
                         f"样例：\n{_rows.to_string(index=False)}"
                     )
 
@@ -794,7 +800,9 @@ def _stock_worker_vectorized(
                 "risk_level": str(row["risk_level"]),
                 "score": float(row["score"]),
                 "atr": float(row["atr"]) if pd.notna(row["atr"]) else 0.0,
-                "macd_trend": float(row["macd_trend"]),
+                # 审计修复：macd_trend 为字符串类别，数值分从 macd_trend_value 读取
+                "macd_trend": str(row["macd_trend"]),
+                "macd_trend_value": float(row.get("macd_trend_value", row.get("macd_trend", 0.0))),
                 "golden_cross": float(row["golden_cross"]),
                 "hist_momentum": float(row["hist_momentum"]),
                 "dif_slope": float(row["dif_slope"]),
@@ -821,6 +829,7 @@ _SIGNAL_COL_MAP = {
     "score": "综合评分",
     "atr": "ATR",
     "macd_trend": "MACD趋势分",
+    "macd_trend_value": "MACD趋势数值分",
     "golden_cross": "金叉信号分",
     "hist_momentum": "柱状动能分",
     "dif_slope": "DIF斜评分",
@@ -913,22 +922,11 @@ def _compute_indicators(
 
     df = df_raw.copy()
     # P2-3/P0-2：技术指标统一使用后复权口径，除权日连续无跳跌。
-    # 上游（DB）提供 open_adj/high_adj/low_adj/close_adj 全量后复权列；
-    # 合成/测试帧缺失 *_adj 时按 adj_factor 精确还原（adj = raw × adj_factor），
-    # 再回退原始列。旧版"close 用后复权、high/low 用不复权"的近似已删除。
-    close = df["close_adj"] if "close_adj" in df.columns else df["close"]
-    if "high_adj" in df.columns:
-        high = df["high_adj"]
-    elif "adj_factor" in df.columns:
-        high = df["high"] * df["adj_factor"]
-    else:
-        high = df["high"]
-    if "low_adj" in df.columns:
-        low = df["low_adj"]
-    elif "adj_factor" in df.columns:
-        low = df["low"] * df["adj_factor"]
-    else:
-        low = df["low"]
+    # 上游（DB）提供 open_normal/high_normal/low_normal/close_normal 后复权列；
+    # 合成/测试帧缺失 *_normal 时回退原始列。
+    close = df["close_normal"] if "close_normal" in df.columns else df["close"]
+    high = df["high_normal"] if "high_normal" in df.columns else df["high"]
+    low = df["low_normal"] if "low_normal" in df.columns else df["low"]
     n = len(df)
     mode = degrade_mode()
 

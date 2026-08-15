@@ -16,17 +16,43 @@ DEFAULT_TIER_CAP: tuple[float, ...] = (0.10, 0.05, 0.05, 0.03)
 # 配置值低于此下限时一律抬升，防止策略 Alpha 未被真实市场摩擦覆盖。
 MIN_SLIPPAGE_FLOOR: float = 0.0005
 # 印花税日期分段表（配置驱动，替代硬编码）：date:rate 升序，取最晚 ≤ 交易日的档。
-# 2023-08-28 财政部减半：0.1% → 0.05%（卖出单向）。默认含历史兜底段 2000-01-01。
+# P2-3（审计）：补全 2008-09-19 前的历史分段——
+#   - 2023-08-28 起：0.05%（卖出单边，财政部减半）
+#   - 2008-09-19 起：0.1%（卖出单边；当日印花税改革，由双边改单边）
+#   - 2008-04-24 至 2008-09-18：0.1%（双边，买卖双方均收）
+#   - 2007-05-30 至 2008-04-23：0.3%（双边，买卖双方均收）
+#   - 兜底段（2000-01-01）：0.1%（双边；2005-01-24 前实际为 0.2%，回测起点
+#     通常晚于 2007 时无影响，此处为近似兜底——见 STAMP_TAX_UNILATERAL_DATE）
+# 单值 stamp_tax_rate 为"卖出侧费率"；双边区间内买入侧按 STAMP_TAX_UNILATERAL_DATE
+# 判定补收（buy_cost_breakdown）。
 DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2023-08-28", 0.0005),
+    ("2008-09-19", 0.001),
+    ("2008-04-24", 0.001),
+    ("2007-05-30", 0.003),
     ("2000-01-01", 0.001),
 )
+# P2-3（审计）：印花税征收方式改革日——2008-09-19（含）起仅卖出征收（单边）；
+# 此前为双边征收（买入卖出均按 stamp_tax_segments 当期税率收取）。
+STAMP_TAX_UNILATERAL_DATE: str = "2008-09-19"
 # 过户费日期分段表（双边收取，date:rate 升序，取最晚 ≤ 交易日的档）。
 # 2022-04-28 前 0.02‰（万分之零点零二），2022-04-29 起减半为 0.01‰。
+# P2-3（审计）：2015-08-01 起按成交金额 0.02‰（沪 A）；2015-08-01 前按
+# 成交股数 1 元/千股（见 TRANSFER_FEE_PER_SHARE_RATE，按股数分支优先于分段表）。
 DEFAULT_TRANSFER_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2022-04-29", 0.00001),
+    ("2015-08-01", 0.00002),
     ("2000-01-01", 0.00002),
 )
+# P2-3（审计）：沪市过户费计费方式改革日——2015-08-01（含）起按成交金额
+# 0.02‰ 双边收取；此前按成交股数收取（每 1000 股 1 元，双向，仅沪 A）。
+TRANSFER_FEE_AMOUNT_BASED_DATE: str = "2015-08-01"
+# P2-3（审计）：2015-08-01 前沪 A 按股数计费的单价（1 元/千股 = 0.001 元/股）。
+TRANSFER_FEE_PER_SHARE_RATE: float = 0.001
+# P0-12 审计修复：过户费征收范围统一日期。
+# 2022-04-29 起沪深两市 A 股均按 0.01‰ 双边征收过户费（此前深市 A 股不征收，
+# 仅沪市 A 股征收）。transfer_fee_segments 分段表日期与之对齐（首段即 2022-04-29）。
+TRANSFER_FEE_UNIFIED_DATE: str = "2022-04-29"
 # 经手费（双边，沪/深交易所）+ 证管费（双边，证监会），
 # 行业惯例通常已并入佣金，此处单独建模（拆分报告可见），并入 CostModel 统一收取。
 DEFAULT_HANDLING_FEE_RATE: float = 0.0000341
@@ -91,6 +117,11 @@ class CostModel:
     # ── 分档基础滑点下限（修复"小盘股静态滑点偏低"问题）──
     # 大盘股0.05%，中盘0.08%，小盘0.12%，微盘0.18%；基础滑点=max(配置值, 档下限)
     liquidity_tier_slippage_floor: tuple[float, ...] = (0.0018, 0.0012, 0.0008, 0.0005)
+    # ── 阶梯佣金费率（可选）──
+    # 空元组 = 统一 flat commission_rate（默认）；否则为 (成交额阈值, 费率) 升序对。
+    # 例: ((1_000_000, 0.00025), (5_000_000, 0.0002), (20_000_000, 0.00015))
+    # 佣金 = max(阶梯佣金, min_commission_per_trade)
+    tiered_commission_rates: tuple[tuple[float, float], ...] = ()
 
     def __post_init__(self) -> None:
         """构造时校验分档配置，避免档位错位导致成本失真。"""
@@ -166,6 +197,16 @@ class CostModel:
         for a, b in zip(edges, edges[1:]):
             if b <= a:
                 raise ValueError(f"liquidity_tier_edges 必须严格递增: {edges}")
+        # 校验阶梯佣金费率：升序阈值、非负费率
+        if self.tiered_commission_rates:
+            for i, (_threshold, _rate) in enumerate(self.tiered_commission_rates):
+                if _threshold <= 0:
+                    raise ValueError(f"tiered_commission_rates 阈值必须 > 0: {self.tiered_commission_rates}")
+                if _rate < 0:
+                    raise ValueError(f"tiered_commission_rates 费率不允许负值: {self.tiered_commission_rates}")
+            for i in range(1, len(self.tiered_commission_rates)):
+                if self.tiered_commission_rates[i][0] <= self.tiered_commission_rates[i - 1][0]:
+                    raise ValueError("tiered_commission_rates 阈值必须严格递增")
 
     def liquidity_tier(self, amount_ma20: float | None) -> int:
         """按 AMOUNT_MA20 将标的归入流动性档位（0 = 最不流动）。
@@ -330,6 +371,75 @@ class CostModel:
         )
         return base + impact
 
+    def _is_shanghai_a(self, symbol: str) -> bool:
+        """判断标的是否为上海 A 股（2022-04-29 前仅沪 A 收取过户费）。
+
+        沪 A 代码以 6 开头（60xxxx, 68xxxx）；
+        深 A（00xxxx, 30xxxx）、创业板、科创板为深市，2022-04-29 起统一征收。
+
+        引擎口径 symbol 为带前缀格式（sh600000/sz000001/bj…），
+        兼容 600000.SH / 600000 等历史口径：判定前剥离 sh/sz/bj 前缀
+        与 .SH/.SZ 后缀，再按裸代码判断（P0 审计修复）。
+        """
+        code = str(symbol)
+        for _prefix in ("sh", "sz", "bj"):
+            if code.lower().startswith(_prefix):
+                code = code[len(_prefix):]
+                break
+        for _suffix in (".sh", ".sz", ".bj"):
+            if code.lower().endswith(_suffix):
+                code = code[: -len(_suffix)]
+                break
+        return code.startswith("6")
+
+    def _transfer_fee_rate_for_symbol(self, symbol: str, dt: str | None) -> float:
+        """按市场 × 日期返回过户费率（P0-12 审计修复）。
+
+        2022-04-29 起沪深两市 A 股均按 transfer_fee_segments 日期表双边收取（0.01‰）；
+        此前仅上海 A 股（代码以 6 开头）收取，深圳 A 股（00/30 开头）不收取。
+        """
+        if dt is not None and str(dt) < TRANSFER_FEE_UNIFIED_DATE and not self._is_shanghai_a(symbol):
+            return 0.0
+        return self.transfer_fee_rate_for(dt)
+
+    def _transfer_fee_for(self, symbol: str, value: float, volume: float, dt: str | None) -> float:
+        """过户费金额（元）— P2-3（审计）：按市场 × 日期 × 计费方式收取。
+
+        - 2022-04-29 起：沪深两市均按金额（transfer_fee_segments，0.01‰）双边收取
+        - 2015-08-01 至 2022-04-28：仅沪 A 按金额（0.02‰）双边收取，深 A 不收
+        - 2015-08-01 前：仅沪 A 按成交股数（1 元/千股 = volume × 0.001 元）双边
+          收取，深 A 不收（按股数计费为历史事实，按金额近似将系统性低估）
+
+        Args:
+            symbol: 标的代码（决定沪深归属；空串按非沪处理）
+            value: 成交金额（元）
+            volume: 成交股数（股）
+            dt: 交易日（YYYY-MM-DD）；None 时按当前统一规则（金额口径）
+        """
+        if dt is None or str(dt) >= TRANSFER_FEE_UNIFIED_DATE:
+            return value * self.transfer_fee_rate_for(dt)
+        if not self._is_shanghai_a(symbol):
+            return 0.0
+        if str(dt) >= TRANSFER_FEE_AMOUNT_BASED_DATE:
+            return value * self.transfer_fee_rate_for(dt)
+        return volume * TRANSFER_FEE_PER_SHARE_RATE
+
+    def _commission_rate_for(self, value: float) -> float:
+        """按成交额返回阶梯佣金费率。
+
+        优先使用 tiered_commission_rates（升序），回退至 flat commission_rate。
+        匹配命中最高档阈值对应的费率。
+        """
+        if not self.tiered_commission_rates:
+            return self.commission_rate
+        matched_rate = self.commission_rate
+        for _threshold, _rate in self.tiered_commission_rates:
+            if value >= _threshold:
+                matched_rate = _rate
+            else:
+                break
+        return matched_rate
+
     def buy_cost_breakdown(
         self,
         value: float,
@@ -339,10 +449,13 @@ class CostModel:
         amount_ma20: float | None = None,
         dt: str | None = None,
         volatility_multiplier: float = 1.0,
+        symbol: str | None = None,
     ) -> dict[str, float]:
-        """买入成本拆解 = 佣金(含最低5元) + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。
+        """买入成本拆解 = 佣金(含最低5元) + 过户费 + 经手费 + 证管费 + 滑点 + 冲击
+        + P2-3（审计）：2008-09-19 印花税改革前的双边征收买入侧（买卖双方均收）。
 
-        过户费按 dt 查 transfer_fee_segments 日期分段表（2022-04-29 前后费率不同）。
+        过户费按市场 × 日期 × 计费方式收取（P2-3：2022-04-29 起沪深统一按金额；
+        2015-08-01 起仅沪 A 按金额；此前仅沪 A 按股数 1 元/千股）。
         返回各分项金额（元）与 total，供成本拆解报告按占比汇总。
 
         #1 审计修复：当 commission_includes_fees=True（默认）时，经手费/证管费已含在佣金中，
@@ -352,22 +465,30 @@ class CostModel:
             volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             volatility_multiplier=volatility_multiplier,
         )
-        commission = max(value * self.commission_rate, self.min_commission_per_trade)
-        transfer = value * self.transfer_fee_rate_for(dt)
+        commission_rate = self._commission_rate_for(value)
+        commission = max(value * commission_rate, self.min_commission_per_trade)
+        # P2-3（审计）：过户费按市场×日期×计费方式收取（按股数/按金额/沪深范围）
+        transfer = self._transfer_fee_for(symbol or "", value, volume, dt)
         # #1 修复：佣金为全包价时，经手费/证管费不单独收取
         # P0-10：经手费/证管费按日期分段表取历史费率（2023-08-28 / 2015-08-01 分界）
         handling = 0.0 if self.commission_includes_fees else value * self.handling_fee_rate_for(dt)
         csrc = 0.0 if self.commission_includes_fees else value * self.csrc_fee_rate_for(dt)
+        # P2-3（审计）：2008-09-19 前印花税双边征收（买卖双方均按当期税率缴纳）；
+        # 改革后买入不征收印花税
+        stamp = 0.0
+        if dt is not None and str(dt) < STAMP_TAX_UNILATERAL_DATE:
+            stamp = value * self.stamp_tax_rate_for(dt)
         slippage = value * base
         impact_v = value * impact
         return {
             "commission": commission,
+            "stamp": stamp,
             "transfer": transfer,
             "handling": handling,
             "csrc": csrc,
             "slippage": slippage,
             "impact": impact_v,
-            "total": commission + transfer + handling + csrc + slippage + impact_v,
+            "total": commission + stamp + transfer + handling + csrc + slippage + impact_v,
         }
 
     def sell_cost_breakdown(
@@ -380,16 +501,21 @@ class CostModel:
         dt: str | None = None,
         amount_ma20: float | None = None,
         volatility_multiplier: float = 1.0,
+        symbol: str | None = None,
     ) -> dict[str, float]:
-        """卖出成本拆解 = 买入成本项 + 印花税（按日期表，仅卖出）。
+        """卖出成本拆解 = 买入成本项 + 印花税（按日期表）。
 
         stamp_tax_rate 显式传入优先；否则按 dt 查 stamp_tax_segments 日期表。
-        过户费同样按 dt 查 transfer_fee_segments 日期分段表（2022-04-29 前后费率不同）。
+        P2-3（审计）：2008-09-19 起印花税仅卖出征收（本函数 stamp = 卖出侧）；
+        此前双边征收——买入侧已在 buy_cost_breakdown 中补收，此处覆盖的 stamp
+        为卖出侧份额，买卖两侧合计 = 双边全额。
+        过户费按市场×日期×计费方式收取（P2-3：按金额/按股数/沪深范围分段）。
         """
         parts = self.buy_cost_breakdown(
             value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             dt=dt,
             volatility_multiplier=volatility_multiplier,
+            symbol=symbol,
         )
         if stamp_tax_rate is None:
             stamp_tax_rate = self.stamp_tax_rate_for(dt)
@@ -407,12 +533,14 @@ class CostModel:
         amount_ma20: float | None = None,
         dt: str | None = None,
         volatility_multiplier: float = 1.0,
+        symbol: str | None = None,
     ) -> float:
-        """买入成本 = 佣金（含最低5元） + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。"""
+        """买入成本 = 佣金（含最低5元，支持阶梯费率） + 过户费(仅沪A) + 经手费 + 证管费 + 滑点 + 冲击。"""
         return self.buy_cost_breakdown(
             value, volume, adv, order_type=order_type, amount_ma20=amount_ma20,
             dt=dt,
             volatility_multiplier=volatility_multiplier,
+            symbol=symbol,
         )["total"]
 
     def sell_cost(
@@ -425,13 +553,15 @@ class CostModel:
         dt: str | None = None,
         amount_ma20: float | None = None,
         volatility_multiplier: float = 1.0,
+        symbol: str | None = None,
     ) -> float:
-        """卖出成本 = 佣金（含最低5元） + 印花税 + 过户费 + 经手费 + 证管费 + 滑点 + 冲击。"""
+        """卖出成本 = 佣金（含最低5元，支持阶梯费率） + 印花税 + 过户费(市场×日期) + 经手费 + 证管费 + 滑点 + 冲击。"""
         return self.sell_cost_breakdown(
             value, volume, adv, order_type=order_type,
             stamp_tax_rate=stamp_tax_rate, dt=dt,
             amount_ma20=amount_ma20,
             volatility_multiplier=volatility_multiplier,
+            symbol=symbol,
         )["total"]
 
     # ── 配置构建 ──────────────────────────────────────────────
@@ -574,6 +704,21 @@ class CostModel:
             except ValueError:
                 return DEFAULT_CSRC_FEE_SEGMENTS
 
+        def _tiered_commission(s: str) -> tuple[tuple[float, float], ...]:
+            """解析阶梯佣金: "threshold1:rate1;threshold2:rate2;..." 返回升序元组。"""
+            s = str(s).strip()
+            if not s:
+                return ()
+            pairs: list[tuple[float, float]] = []
+            for item in s.split(";"):
+                parts = item.strip().split(":")
+                if len(parts) != 2:
+                    raise ValueError(f"tiered_commission_rates 格式错误: {item!r}")
+                pairs.append((float(parts[0].strip()), float(parts[1].strip())))
+            # 按阈值升序排列
+            pairs.sort(key=lambda x: x[0])
+            return tuple(pairs)
+
         base_kw = dict(
             commission_rate=float(bt.COMMISSION_RATE),
             stamp_tax_rate=float(bt.STAMP_TAX_RATE),
@@ -590,6 +735,9 @@ class CostModel:
             impact_base=getattr(bt, "IMPACT_BASE", 0.002),
             impact_threshold=getattr(bt, "IMPACT_THRESHOLD", 0.01),
             impact_cap=getattr(bt, "IMPACT_CAP", 0.05),
+            tiered_commission_rates=_tiered_commission(
+                getattr(bt, "TIERED_COMMISSION_RATES", "")
+            ),
         )
         try:
             model = cls(

@@ -302,3 +302,31 @@ def fill_ratio_for(
         return r * (seal_decay ** max(0, board_streak - 1))
 
     return 1.0
+
+
+def auction_fill_ratio_for(
+    open_price: Optional[float],
+    limit_up: float,
+    limit_down: float,
+    *,
+    tradable_ratio: float = 0.30,
+    board_streak: int = 1,
+    seal_decay: float = 0.5,
+) -> float:
+    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复。
+
+    竞价撮合瞬间当日 high/low/close 尚不可知，档位判定只允许使用 9:25
+    已知信息：open（竞价成交价，9:25 产生）与 limit_up/limit_down（昨收推得）。
+    不得复用 fill_ratio_for 的全天档位口径（一字/炸板/盘中冲板依赖当日
+    close/high/low，属未来信息）：
+        - open 触及涨停/跌停价 → 取「开盘触板」档 tradable_ratio（是否全天
+          封死或盘中炸板不可知，保守取开盘触板档；撮合层另有 auction_fill_ratio
+          封顶兜底）
+        - 否则 1.0（竞价价未触板，无限制）
+    连板衰减沿用前日连板数（收盘已知，无前视）。
+    """
+    touched_up = open_price is not None and open_price >= limit_up - _LIMIT_EPS
+    touched_down = open_price is not None and open_price <= limit_down + _LIMIT_EPS
+    if touched_up or touched_down:
+        return tradable_ratio * (seal_decay ** max(0, board_streak - 1))
+    return 1.0

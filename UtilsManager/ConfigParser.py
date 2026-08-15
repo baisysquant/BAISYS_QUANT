@@ -408,6 +408,10 @@ class BacktestConfig(BaseModel):
                                      description="过户费（双边，万0.1）")
     MIN_COMMISSION_PER_TRADE: float = Field(default=5.0, ge=0, le=100,
                                             description="A股每笔最低佣金（5元）")
+    TIERED_COMMISSION_RATES: str = Field(
+        default="",
+        description="阶梯佣金费率（可选；空=统一COMMISSION_RATE）。格式: threshold1:rate1;threshold2:rate2;... 按成交额阈值升序匹配。例: 1000000:0.00025;5000000:0.0002"
+    )
     # ── 冲击成本（未提供 AMOUNT_MA20 时的统一参数） ──
     IMPACT_BASE: float = Field(default=0.002, ge=0, le=0.05,
                                description="大单冲击成本基数（阈值处）")

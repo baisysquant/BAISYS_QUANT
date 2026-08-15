@@ -174,9 +174,15 @@ def test_sync_delist_pit(engine, scratch, monkeypatch) -> None:
     sp.sync_st_pit(engine, ["sz002726", "sh600080"],
                    start_date="2024-01-01", end_date="2024-12-31")
     hist = sp.load_st_pit(engine, ["sz002726", "sh600080"], "2024-01-01", "2024-12-31")
-    assert hist["sz002726"]["2024-03-04"] == (False, True)
-    assert "2024-02-29" not in hist["sz002726"]   # 退市日前无标记
+    # P1-4 修复：退市整理期 = 摘牌日前 N 交易日（2020-12-31 后摘牌 N=15），
+    # 2024-03-01（周五）前 15 个交易日 → 2024-02-12 起标记，摘牌日后不再标记
+    assert hist["sz002726"]["2024-03-01"] == (False, True)
+    assert hist["sz002726"]["2024-02-12"] == (False, True)   # 整理期起点（前 15 交易日）
+    assert hist["sz002726"]["2024-02-29"] == (False, True)   # 整理期内（旧实现断言翻转）
+    assert "2024-02-09" not in hist["sz002726"]              # 起点前一日非整理期
+    assert "2024-03-04" not in hist["sz002726"]              # 摘牌日后不标记（旧实现方向错误）
     assert hist["sh600080"]["2024-04-01"] == (False, True)
+    assert "2024-04-02" not in hist["sh600080"]
 
 
 def test_load_pit_parametrized_any_no_injection(engine, scratch, monkeypatch) -> None:
@@ -212,7 +218,10 @@ def test_sync_coverage_guard_and_force(engine, scratch, monkeypatch) -> None:
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2099-12-31")
     assert calls["st"] == 1 and calls["names"] == 1
 
-    # 已覆盖（今日归档行落在窗口内）→ 跳过（不再拉取任何源）
+    # P1-1 修复后：覆盖检查按"PIT 行数 / K 线交易日"真实覆盖率判定——真实库中
+    # sz000001 有全历史 K 线而 PIT 表仅今日快照 → 覆盖率不足 → 会重跑（不跳过）。
+    # 模拟"历史行已齐备"（覆盖达标）→ 跳过（不再拉取任何源）
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: True)
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2099-12-31")
     assert calls["st"] == 1 and calls["names"] == 1
 

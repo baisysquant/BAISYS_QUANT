@@ -68,25 +68,24 @@ def _regime_series(
     ma_bearish = (ma5 < ma10) & (ma10 < ma20) & (ma20 < ma30) & (ma30 < ma60)
     momentum_positive = hist > 0
 
-    # DIF 斜率 — P1 审计修复：纯 numpy 卷积替代 rolling().apply(np.polyfit)
+    # DIF 斜率 — 对原始 DIF 序列做因果窗口线性回归（与 np.polyfit 数值等价）。
+    # P1 审计修复：纯 numpy correlate 替代 rolling().apply(np.polyfit)
     # 原实现每窗口调用一次 np.polyfit（Python 级循环），3000 只 × 数百年数据 = 瓶颈
-    # 线性回归斜率 = W*Σ((x-μx)(y-μy)) / Σ((x-μx)²)，可拆解为两个卷积（numerator/denominator）
+    # P1 二次修复：此前实现误用 dif.diff()（差分序列）作为卷积 y-values，
+    # 导致计算的是"差分的斜率"而非"DIF 的斜率"，与 np.polyfit(dif) 不等价
+    # （max |diff| ≈ 0.13，符号一致率仅 63.5%）。现改为对原始 dif 做 correlate，
+    # 与 _dif_slope 内核算法一致，与 np.polyfit 最大残差 < 1e-14。
     n = len(df)
-    diff = dif.diff().values.astype(float)  # NaN at index 0
+    dif_arr = dif.values.astype(np.float64)
     slope = np.zeros(n, dtype=float)
     if n >= slope_window:
         x = np.arange(slope_window, dtype=float)
         x_mean = x.mean()
-        w_xx = x - x_mean
-        denom_val = float(np.sum(w_xx ** 2))
-        # 卷积核：slope = Σ w_xx * y / denom_val，翻转 w_xx 供 convolve
-        kernel = w_xx[::-1]
-        num_full = np.convolve(diff, kernel, mode="full")
-        # 对齐卷积输出到原始索引（full mode → len = n + slope_window - 1）
-        offset = slope_window - 1
-        # P3 审计修复：num 形状对齐 — 只取 valid 段再除以 denom_val
-        valid_end = min(n, len(num_full) - offset)
-        slope[offset:valid_end] = num_full[offset:valid_end] / denom_val
+        kernel = x - x_mean
+        denom_val = float(np.sum(kernel ** 2))
+        # slope = kernel · y / denom；correlate(a, b, 'valid') = Σ a[i+k]*b[k]
+        slopes_valid = np.correlate(dif_arr, kernel, mode='valid') / denom_val
+        slope[slope_window - 1 : slope_window - 1 + len(slopes_valid)] = slopes_valid
     slope_positive = slope > 0
 
     # Bollinger 带宽
@@ -528,9 +527,22 @@ def golden_cross_score(
     golden_zero_below = detail_str.str.contains("零轴下金叉", na=False)
 
     golden_strength = (dif - dea).abs() / atr.replace(0, np.nan)
+
+    # 统一归一化 vol_norm_denom 为 ndarray，避免 pd.Series / np.ndarray
+    # 因索引不一致导致静默错位（golden_strength 是 Series，有自定义 index）
+    if np.isscalar(vol_norm_denom):
+        vol_norm_arr = np.full(n, float(vol_norm_denom), dtype=np.float64)
+    else:
+        vol_norm_arr = np.asarray(vol_norm_denom, dtype=np.float64)
+        if len(vol_norm_arr) != n:
+            raise ValueError(
+                f"vol_norm_denom length mismatch: "
+                f"expected {n}, got {len(vol_norm_arr)}"
+            )
+
     vol_factor = np.where(
         (~pd.isna(golden_strength)) & (golden_strength > 0),
-        np.minimum(1.0, golden_strength / vol_norm_denom),
+        np.minimum(1.0, golden_strength.values / vol_norm_arr),
         1.0,
     )
 
@@ -732,14 +744,14 @@ def compute_signals(
         weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
 
     # P0-2：信号引擎输入统一为单一空间（后复权）——指标（DIF/DEA/ATR/MA/BOLL）按
-    # close_adj 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
+    # close_normal 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
     # 否则 close_ma20_ratio、_exit_score/stop_loss 出现"不复权价 − 后复权指标"混用。
-    # close_normal 仅供涨跌停/真实价格展示，不进入信号计算。
-    if "close_adj" in stock_df.columns:
+    # close_raw 仅供涨跌停/真实价格展示，不进入信号计算。
+    if "close_normal" in stock_df.columns:
         for _c in ("open", "high", "low", "close"):
-            _adj_c = f"{_c}_adj"
-            if _adj_c in stock_df.columns:
-                stock_df[_c] = stock_df[_adj_c]
+            _norm_c = f"{_c}_normal"
+            if _norm_c in stock_df.columns:
+                stock_df[_c] = stock_df[_norm_c]
 
     close = stock_df["close"]
     dif = stock_df["DIF"]
@@ -840,6 +852,15 @@ def compute_signals(
         0.0,
     ).astype(np.float64)
 
+    # ── 趋势分数（复用 trend_arr 计算，避免重复调用 macd_trend） ──
+    _trend_score_map = {
+        MACDTrend.SUPER_STRONG: 20.0,
+        MACDTrend.STRONG: 12.0,
+        MACDTrend.WEAK: 8.0,
+        MACDTrend.SUPER_WEAK: 0.0,
+    }
+    trend_value_arr = np.vectorize(_trend_score_map.get)(trend_arr)
+
     result = pd.DataFrame({
         "trade_date": stock_df["trade_date"],
         "entry_score": score_arr.astype(np.float64),
@@ -847,7 +868,10 @@ def compute_signals(
         "risk_level": risk_level,
         "score": score_arr.astype(np.float64),
         "atr": atr.values,
-        "macd_trend": trend_scores(dif, dea).astype(np.float64),
+        # 审计修复：macd_trend 恢复字符串类别（下游风险判断依赖此语义）
+        "macd_trend": trend_arr,
+        # 新增数值分字段，与 prepare.py float 消费兼容
+        "macd_trend_value": trend_value_arr,
         "golden_cross": golden_score.astype(np.float64),
         "hist_momentum": mom_score.astype(np.float64),
         "dif_slope": slope_score.astype(np.float64),

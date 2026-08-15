@@ -46,24 +46,13 @@ def main() -> None:
         level="INFO", encoding="utf-8", enqueue=True, rotation="1 day",
     )
 
-    # ── 企业代理 SSL 兼容：AShareHub httpx 绕过自签名证书 ──
-    import asharehub.client as _ahc
-    _orig_init = _ahc.AShareHub.__init__
-    def _patched_init(self, api_key, base_url=None, timeout=30.0, version="v2"):
-        import httpx as _httpx
-        if base_url is None:
-            base_url = _ahc.DEFAULT_BASE_URL
-        _orig_init(self, api_key, base_url, timeout, version)
-        self._client = _httpx.Client(
-            base_url=base_url,
-            headers={"X-API-Key": api_key},
-            timeout=timeout,
-            verify=False,
-        )
-    _ahc.AShareHub.__init__ = _patched_init
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    logger.info("AShareHub SSL 验证已禁用（企业代理自签名证书兼容）")
+    # ── 企业代理 SSL 兼容（P2-2 审计修复） ──
+    # 原实现全局 monkeypatch 第三方 AShareHub.__init__ 并 verify=False 禁用 TLS
+    # 校验（中间人风险 + 第三方库升级脆弱）。已移除：所有 AShareHub 调用点统一
+    # 经 UtilsManager.AShareHubClient.make_asharehub_client() 工厂注入，仅信任
+    # 显式 CA（SSL_CERT_FILE / REQUESTS_CA_BUNDLE）或系统默认信任库，绝不降级。
+    # 企业代理自签名证书场景：导出代理 CA 为 PEM 并设置 SSL_CERT_FILE 即可。
+    logger.info("AShareHub TLS 校验已启用（仅信任显式 CA 或系统信任库）")
 
     # ── 额外回测专用日志文件（时间后缀，方便定位回测问题） ──
     from datetime import datetime as _dt

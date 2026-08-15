@@ -79,6 +79,24 @@ def _release_run_lock() -> None:
         _RUN_LOCK_CONN = None
 
 
+def _to_date(v: Any) -> date | None:
+    """统一日期归一化：任意时间类型 → datetime.date。
+
+    支持 str / pd.Timestamp / datetime.datetime / numpy.datetime64 / int 等。
+    解析失败返回 None（调用方负责处理）。
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return pd.Timestamp(v).date()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def _holdout_equity_slice(
     equity_curve: list[dict[str, Any]] | pd.DataFrame | None,
     final_prepared: pd.DataFrame,
@@ -100,23 +118,33 @@ def _holdout_equity_slice(
         return None, None
     if not isinstance(equity_curve, (list, pd.DataFrame)):
         return None, None
-    _fp_dates = sorted(pd.unique(final_prepared["trade_date"]))
+
+    # 统一归一化为 date 对象比较，消除 str[:10] 的时区/格式脆弱性
+    _fp_dates = [
+        d for d in map(_to_date, sorted(pd.unique(final_prepared["trade_date"])))
+        if d is not None
+    ]
     if len(_fp_dates) < holdout_days:
         return None, None
-    _start_date = str(_fp_dates[-holdout_days])[:10]
+    _start_date = _fp_dates[-holdout_days]  # datetime.date
+
     if isinstance(equity_curve, pd.DataFrame):
         if equity_curve.empty:
             return None, None
-        _ts = (
-            equity_curve["time"].astype(str).str[:10]
-            if "time" in equity_curve.columns
-            else equity_curve.index.astype(str).str[:10]
-        )
-        return equity_curve[_ts >= _start_date], _start_date
-    return [
+        # 将 time 列（或 index）归一化为 date 序列后比较
+        if "time" in equity_curve.columns:
+            _dates = equity_curve["time"].apply(_to_date)
+        else:
+            _dates = equity_curve.index.to_series().apply(_to_date)
+        mask = _dates >= _start_date
+        return equity_curve[mask], _start_date.isoformat()
+
+    # list[dict] 分支
+    result = [
         e for e in equity_curve
-        if str(e.get("time", ""))[:10] >= _start_date
-    ], _start_date
+        if _to_date(e.get("time")) is not None and _to_date(e.get("time")) >= _start_date
+    ]
+    return result, _start_date.isoformat()
 
 
 def _acceptance_gate(
@@ -240,8 +268,8 @@ def run_backtest_pipeline(
 
         logger.info(f"  K 线行数: {len(kline_df)}")
 
-        # P3.1: fetch 可能已增量同步新行，重算数据版本以匹配实际使用的数据
-        _data_version = _compute_kline_data_version(engine)
+        # P3.1: 从内存 DataFrame 计算数据版本（消除 fetch→version 竞态窗口）
+        _data_version = _compute_kline_data_version(engine, kline_df=kline_df)
 
         # ── ST/退市历史早加载（供 WFO / 模拟验证 / 最终回测全链路使用） ──
         # P0-5: 查询起点覆盖 K 线预热缓冲（_fetch_kline 用 360 日历日缓冲），
@@ -276,16 +304,29 @@ def run_backtest_pipeline(
         listing_days = _load_listing_days(engine, symbols, _st_query_start)
         _log_step("load_listing_days")
 
-        # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）
-        _delisted_syms = {
-            s for s, recs in st_history.items()
-            if any(_is_del for _is_st, _is_del in recs.values())
-        }
+        # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）。
+        # P3-5（审计）：评估改用独立数据源（AkShare 交易所退市列表）交叉验证，与
+        # stock_st_history PIT 表解耦——PIT 同步失败不应导致"生存偏差受控"误报。
+        # 独立源拉取失败 → 降级到 PIT 退市标记口径并注明降级（行为与旧版一致）。
         _kline_syms = set(kline_df["symbol"].astype(str))
+        _survival_source = "AkShare 退市列表（独立数据源）"
+        try:
+            from DataManager.StPitSync import fetch_delisted_symbols
+            _delisted_syms = fetch_delisted_symbols() or set()
+        except Exception as e:  # noqa: BLE001
+            _delisted_syms = set()
+            _survival_source = f"PIT 退市标记（独立源拉取失败降级: {e}）"
+        if not _delisted_syms:
+            _delisted_syms = {
+                s for s, recs in st_history.items()
+                if any(_is_del for _is_st, _is_del in recs.values())
+            }
+            if _survival_source.startswith("AkShare"):
+                _survival_source = "PIT 退市标记（独立源为空降级）"
         _missing_delisted = sorted(_delisted_syms - _kline_syms)
         if _delisted_syms:
             logger.info(
-                f"  股票池含 {len(_delisted_syms)} 只有退市/ST 历史标记的股票，"
+                f"  独立退市列表（{_survival_source}）识别 {len(_delisted_syms)} 只退市股，"
                 f"其中 {len(_delisted_syms & _kline_syms)} 只已纳入 K 线"
             )
             if _missing_delisted:
@@ -296,21 +337,24 @@ def run_backtest_pipeline(
                 )
             else:
                 logger.info(
-                    "生存偏差受控: 退市/ST 股历史 K 线已纳入股票池，"
+                    "生存偏差受控: 退市股历史 K 线已纳入股票池，"
                     "退市前负收益计入回测；ST/退市日的逐日剔除由引擎按 stock_st_history 执行"
                 )
         else:
             logger.warning(
-                "生存偏差: stock_st_history 无退市标记记录，股票池可能仅含当前存活股票，"
-                "已退市/ST 股票的历史负收益未被计入"
+                "生存偏差: 独立退市列表与 stock_st_history 均无退市记录，"
+                "股票池可能仅含当前存活股票，已退市/ST 股票的历史负收益未被计入"
             )
         _log_step("load_st_history")
 
         # 窗口坐标轴以正式回测起点为准（起点前为信号预热历史，不参与 WFO 交易）
-        def _ds(d) -> str:
-            return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
-        _bt_cut = f"{bt.BACKTEST_START_DATE[:4]}-{bt.BACKTEST_START_DATE[4:6]}-{bt.BACKTEST_START_DATE[6:8]}"
-        total_trading_days = sum(1 for d in kline_df["trade_date"].unique() if _ds(d) >= _bt_cut)
+        # 统一使用 _to_date 归一化，消除 str[:10] 时区/格式脆弱性
+        _bt_start = _to_date(bt.BACKTEST_START_DATE)
+        assert _bt_start is not None, f"无效的 BACKTEST_START_DATE: {bt.BACKTEST_START_DATE!r}"
+        total_trading_days = sum(
+            1 for d in kline_df["trade_date"].unique()
+            if _to_date(d) is not None and _to_date(d) >= _bt_start
+        )
         _oos = bt.OUT_OF_SAMPLE_DAYS
         # ── 末段独立 holdout：终验只在该段进行，WFO 全程禁触 ──
         # holdout_days = round(total * ratio)；钳制 ≥OOS 且 WFO 寻参域须留足 120+OOS，
@@ -360,7 +404,7 @@ def run_backtest_pipeline(
             portfolio_method=bt.PORTFOLIO_METHOD,
             point_in_time=bt.POINT_IN_TIME,
             show_progress=True,
-            backtest_start_date=_bt_cut,
+            backtest_start_date=_bt_start_iso,
             st_history=st_history,
             exclude_st=bool(bt.EXCLUDE_ST),
             listing_days=listing_days,
@@ -927,22 +971,38 @@ def run_backtest_pipeline(
         _release_run_lock()
 
 
-def _compute_kline_data_version(engine: Any) -> str:
-    """P3.1 数据版本标识：kline 表 max(trade_date) + 行数摘要。
+def _compute_kline_data_version(engine: Any, kline_df: pd.DataFrame | None = None) -> str:
+    """数据版本标识：用于信号缓存隔离与 calibration_log 调度。
 
-    增量同步写入新行 → max 日期或行数变化 → 版本号变化，
-    信号缓存 key 与 calibration_log 随之失效/重新绑定。
+    优先从内存 DataFrame 计算（runner 主路径），消除 fetch→version 之间的
+    竞态窗口（IncrementalSyncEngine 不回听 advisory lock，可能并发写入）；
+    无 DataFrame 时回退到数据库查询（should_rerun 调度场景）。
+
+    版本仅使用 max(trade_date) 作为粗粒度失效信号：
+    - COUNT 已移除：新增股票全量历史数据会剧烈变动 COUNT，但存量 OHLC
+      内容不变，导致不必要的整库重跑；细粒度内容变更由
+      _data_fingerprint 的 OHLCV 采样 hash + 行数覆盖。
+    - 仅 max(trade_date) 变动才失效：新交易日到达即触发重跑，符合业务直觉。
     """
+    # 路径 ①：从内存 DataFrame 计算（与消费数据严格一致，无竞态）
+    if kline_df is not None and not kline_df.empty and "trade_date" in kline_df.columns:
+        try:
+            _max_date = kline_df["trade_date"].max()
+            # 安全归一化为 ISO 日期字符串
+            _ts = pd.Timestamp(_max_date)
+            return _ts.strftime("%Y-%m-%d")
+        except Exception as exc:
+            logger.warning(f"从 DataFrame 计算数据版本失败: {exc}")
+
+    # 路径 ②：从数据库查询（should_rerun 调度场景，无 DataFrame）
     try:
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT COALESCE(MAX(trade_date)::text, ''), COUNT(*) FROM stock_daily_kline"
+                "SELECT COALESCE(MAX(trade_date)::text, '') FROM stock_daily_kline"
             )).fetchone()
         if row is None or not row[0]:
             return ""
-        import hashlib as _hl
-        _raw = f"{row[0]}_{row[1]}"
-        return f"{row[0]}_{_hl.sha256(_raw.encode()).hexdigest()[:6]}"
+        return str(row[0])
     except Exception as exc:
         logger.warning(f"计算 kline 数据版本失败: {exc}")
         return ""

@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 from loguru import logger
+from scipy.stats import norm
 
 from BackTrading.engine import EngineConfig, _run_single_backtest
 from BackTrading.prepare import _build_params, prepare_backtest_data
@@ -25,6 +26,11 @@ class SimTradeVerdict:
     promote: bool = False
     reason: str = ""
 
+    # 审计增强：统计与样本量元数据
+    sim_sample_days: int = 0
+    sim_trade_count: int = 0
+    stat_p_value: float = 1.0
+
     # 兼容性：保留旧字段名（degradation = sharpe_degradation）
     @property
     def degradation(self) -> float:
@@ -36,6 +42,10 @@ _DECAY_THRESHOLD = 0.30
 # warmup 天数（sim 段前预留交易日 buffer，让引擎建立 ADV/仓位后再进入 sim 段，
 # 避免 20 天 sim 窗口下 ADV 永不满载导致流动性约束失效）
 _SIM_WARMUP_DAYS = 30
+# ── 审计增强：硬性统计门槛 ──
+_MIN_SIM_DAYS = 20          # 模拟期最少交易日（低于此值统计噪声过大）
+_MIN_SIM_TRADES = 3         # 模拟期最少交易次数（少于3笔无法评估滑点/冲击成本）
+_MIN_OOS_SHARPE = 0.20      # OOS Sharpe 最低门槛（低于此值样本外信号极弱，拒绝自引用放行）
 
 
 def _cost_model_from_config(config: Any) -> Any:
@@ -59,6 +69,7 @@ def validate_params(
     engine_cfg: EngineConfig | None = None,
     oos_sortino: float = 0.0,  # 审计新增：样本外 Sortino
     validation_dates: set[str] | None = None,  # P0-10 ④：独立验证集（与选参区间无交集）
+    oos_sample_days: int = 60,  # 审计增强：OOS 样本量（用于统计检验 SE 估算）
 ) -> SimTradeVerdict:
     """用独立验证集验证 best_params 的稳定性。
 
@@ -77,9 +88,10 @@ def validate_params(
         oos_sortino: WFO 在样本外窗口上的 Sortino（审计新增，默认 0=跳过 Sortino 校验）。
         validation_dates: 独立验证集日期集合（与选参区间无交集）；
             None 时回退"最近 sim_days 日"（自引用，告警）。
+        oos_sample_days: OOS 样本交易日数（用于统计检验 SE 估算，默认 60）。
 
     Returns:
-        SimTradeVerdict 包含决策和原因。
+        SimTradeVerdict 包含决策、统计指标与拒绝原因。
     """
     if best_params is None or oos_sharpe is None:
         return SimTradeVerdict(promote=False, reason="WFO 结果为空，跳过模拟验证")
@@ -108,24 +120,45 @@ def validate_params(
         sim_dates_sorted = dates[-sim_days:]
 
     # 准备信号 + 止损价
-    if config is not None:
-        from UtilsManager.ConfigParser import Config as _Cfg
-        cfg = config if isinstance(config, _Cfg) else _Cfg()
-        structured = _build_params(cfg)
-        structured["scoring"].update(
-            {k: v for k, v in best_params.items() if k in (
-                "atr_stop_mult",
-            )}
-        )
-        prepared = prepare_backtest_data(kline_df, params=structured, compute_exit_strategy=False, vectorized=True)
-    else:
-        prepared = prepare_backtest_data(kline_df, params=best_params, compute_exit_strategy=False, vectorized=True)
+    # 统一使用 _build_params 构建结构化 params，消除 config is None 时
+    # 直接把扁平 best_params 传给 prepare_backtest_data 导致的参数不一致：
+    # 旧代码的 is_flat 转换白名单不完整（遗漏 atr_stop_mult, expected_return_lookback,
+    # conclusion_bullish/oscillate 等），导致 prepare/engine 参数口径不一致。
+    from UtilsManager.ConfigParser import Config as _Cfg
+
+    cfg = config if config is not None and isinstance(config, _Cfg) else _Cfg()
+    structured = _build_params(cfg)
+
+    # 将 best_params（WFO 产出的扁平 dict）合并进结构化 params 的对应分区
+    _SCORING_KEYS = frozenset((
+        "atr_stop_mult",
+        "cross_decay_days", "cross_decay_min",
+        "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
+        "expected_return_lookback",
+        "golden_cross_bonus", "divergence_penalty",
+    ))
+    _REGIME_KEYS = frozenset(("boll_narrow_ratio",))
+    _THRESHOLD_KEYS = frozenset(("conclusion_full_bull", "conclusion_bullish", "conclusion_oscillate"))
+
+    structured["scoring"].update(
+        {k: v for k, v in best_params.items() if k in _SCORING_KEYS}
+    )
+    for _k, _v in best_params.items():
+        if _k in _REGIME_KEYS:
+            structured["regime"][_k] = float(_v)
+    if any(k in best_params for k in _THRESHOLD_KEYS):
+        _thresh_base = structured["thresholds"]
+        structured["thresholds"] = {
+            "fully_bull": int(best_params.get("conclusion_full_bull", _thresh_base["fully_bull"])),
+            "bullish": int(best_params.get("conclusion_bullish", _thresh_base["bullish"])),
+            "oscillate": int(best_params.get("conclusion_oscillate", _thresh_base["oscillate"])),
+        }
+
+    prepared = prepare_backtest_data(
+        kline_df, params=structured, compute_exit_strategy=False, vectorized=True,
+    )
 
     # ── P1-1：warmup buffer 避免 ADV 冷启动 ──
-    # 引擎 ADV 20 日窗口从 0 开始填充，若仅传入 sim_days（20天）切片，
-    # 窗口永不满载 → _adv_val > 100 gate 失效 → 流动性约束（_max_order_pct）不触发 → 偏乐观。
-    # 回测从 sim 段前 30 个交易日开始，引擎建立 ADV/仓位后再进入 sim 段，
-    # 指标仅在 sim 段上计算（warmup 段不入指标）。
     _prep = prepared
     if pd.api.types.is_datetime64_any_dtype(_prep["trade_date"]):
         _prep = _prep.copy()
@@ -154,7 +187,7 @@ def validate_params(
     stop_mult = best_params.get("atr_stop_mult")
     if stop_mult is not None and "ATR" in ext_data.columns:
         # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
-        _stop_close = ext_data["close_adj"] if "close_adj" in ext_data.columns else ext_data["close"]
+        _stop_close = ext_data["close_normal"] if "close_normal" in ext_data.columns else ext_data["close"]
         ext_data["止损价"] = _stop_close - ext_data["ATR"] * stop_mult
     elif "止损价" not in ext_data.columns:
         ext_data["止损价"] = 0.0
@@ -180,31 +213,63 @@ def validate_params(
     if sim_sortino is None or not math.isfinite(sim_sortino):
         sim_sortino = 0.0
 
-    # ── Sharpe 衰减校验（审计要求：阈值 30%） ──
-    sharpe_deg = 1.0 - (sim_sharpe / oos_sharpe) if oos_sharpe > 0.01 else 0.0
+    # ── 统计元数据采集 ──
+    n_sim = len(ec_sim)
+    sim_trade_count = len([
+        t for t in tl
+        if str(t.get("trade_date", t.get("time", "")))[:10] in sim_dates_str
+    ])
 
-    # ── Sortino 衰减校验（若 oos_sortino 未传入则跳过） ──
-    sortino_deg = 0.0
-    if oos_sortino > 0.01:
-        sortino_deg = 1.0 - (sim_sortino / oos_sortino)
+    # ── 硬性门槛校验（审计增强：拒绝统计噪声与弱信号自引用） ──
+    min_sample_ok = n_sim >= _MIN_SIM_DAYS
+    min_trades_ok = sim_trade_count >= _MIN_SIM_TRADES
+    oos_robust = oos_sharpe > _MIN_OOS_SHARPE
 
-    # ── 判定：任一指标衰减超 30% 则拒绝 ──
-    promote = sim_sharpe > 0.0 and sharpe_deg < _DECAY_THRESHOLD and sortino_deg < _DECAY_THRESHOLD
+    if not (min_sample_ok and min_trades_ok and oos_robust):
+        return SimTradeVerdict(
+            sim_sharpe=sim_sharpe, oos_sharpe=oos_sharpe,
+            sim_sample_days=n_sim, sim_trade_count=sim_trade_count,
+            promote=False,
+            reason=(
+                f"拒绝: 样本量({n_sim}d<{_MIN_SIM_DAYS})或交易数({sim_trade_count}<{_MIN_SIM_TRADES})不足，"
+                f"或OOS_Sharp({oos_sharpe:.2f})过弱(<{_MIN_OOS_SHARPE})，统计效力不足"
+            ),
+        )
+
+    # ── Sharpe 衰减校验（修复 oos_sharpe<=0.01 误判 bug：极小值直接标记为 100% 衰减） ──
+    sharpe_deg = 1.0 - (sim_sharpe / oos_sharpe) if oos_sharpe > 0.01 else 1.0
+    sortino_deg = 1.0 - (sim_sortino / oos_sortino) if oos_sortino > 0.01 else 1.0
+
+    # ── 统计显著性检验（Lo 2002 SE 近似，单侧 t 检验） ──
+    se_sim = math.sqrt((sim_sharpe**2 + 0.5) / max(n_sim, 1))
+    se_oos = math.sqrt((oos_sharpe**2 + 0.5) / max(oos_sample_days, 1))
+    se_diff = math.sqrt(se_sim**2 + se_oos**2)
+    t_stat = (sim_sharpe - oos_sharpe) / se_diff if se_diff > 1e-9 else -99.0
+    p_value = float(norm.cdf(t_stat))
+
+    # ── 综合判定 ──
+    degrade_ok = sharpe_deg < _DECAY_THRESHOLD and sortino_deg < _DECAY_THRESHOLD
+    stat_ok = p_value > 0.05  # 5% 显著性水平拒绝
+    positive_ok = sim_sharpe > 0.1
+
+    promote = positive_ok and degrade_ok and stat_ok
 
     if promote:
         reason = (
-            f"模拟验证通过: sim_Sharpe={sim_sharpe:.2f} / oos_Sharpe={oos_sharpe:.2f}"
-            f" (衰减 {sharpe_deg:.0%}) | sim_Sortino={sim_sortino:.2f}"
-            f" 退化率={sharpe_deg:.0%} < {_DECAY_THRESHOLD:.0%}"
+            f"通过 | sim_SR={sim_sharpe:.2f}(n={n_sim}, trades={sim_trade_count}) / oos_SR={oos_sharpe:.2f} "
+            f"| 衰减 {sharpe_deg:.0%} | p={p_value:.3f}"
         )
     else:
+        fail_parts = []
+        if not positive_ok: fail_parts.append("sim_SR≤0.1")
+        if not degrade_ok: fail_parts.append(f"衰减{max(sharpe_deg, sortino_deg):.0%}≥{_DECAY_THRESHOLD:.0%}")
+        if not stat_ok: fail_parts.append(f"p={p_value:.3f}≤0.05显著衰减")
         reason = (
-            f"模拟验证不通过: sim_Sharpe={sim_sharpe:.2f} / oos_Sharpe={oos_sharpe:.2f}"
-            f" (衰减 {sharpe_deg:.0%}) | sim_Sortino={sim_sortino:.2f}"
-            f" 退化率 >= {_DECAY_THRESHOLD:.0%}（或 sim Sharpe ≤ 0），参数组不予上线"
+            f"拒绝 | sim_SR={sim_sharpe:.2f}(n={n_sim}, trades={sim_trade_count}) / oos_SR={oos_sharpe:.2f} "
+            f"| {'; '.join(fail_parts)}"
         )
 
-    logger.info(f"  {reason}")
+    logger.info(f"  [模拟验证] {reason}")
     return SimTradeVerdict(
         sim_sharpe=sim_sharpe,
         oos_sharpe=oos_sharpe,
@@ -214,4 +279,7 @@ def validate_params(
         sortino_degradation=sortino_deg,
         promote=promote,
         reason=reason,
+        sim_sample_days=n_sim,
+        sim_trade_count=sim_trade_count,
+        stat_p_value=p_value,
     )

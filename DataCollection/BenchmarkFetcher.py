@@ -32,8 +32,8 @@ class BenchmarkFetcher:
     @property
     def client(self) -> Any:  # noqa: ANN401
         if self._client is None and self._api_key:
-            from asharehub import AShareHub
-            self._client = AShareHub(api_key=self._api_key)
+            from UtilsManager.AShareHubClient import make_asharehub_client
+            self._client = make_asharehub_client(api_key=self._api_key)
         return self._client
 
     def fetch_index(self, index_code: str = "000001.SH",

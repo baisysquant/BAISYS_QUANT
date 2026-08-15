@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +25,7 @@ BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
 FETCH_WORKERS = 2         # 每管道并发取数线程数
-_STOCK_FETCH_LOCK = threading.Semaphore(2)  # Windows SSL 限制并发数，允许 2 路避免完全串行化
+_STOCK_FETCH_LOCK = threading.Semaphore(4)  # 两管道共 4 worker，各需 1 permit；原 Semaphore(2) 导致 B 管道饿死
 
 
 class IncrementalSyncEngine:
@@ -57,9 +58,9 @@ class IncrementalSyncEngine:
         except Exception:
             self._trade_date = date.today()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
-        # 全局共享 Session，限制并发连接数防 Windows SSL 崩溃
+        # 全局共享 Session，提升连接池匹配两管道各 2 worker（共 4 路并发）
         self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
         self._cleanup_old_cache()
@@ -306,7 +307,7 @@ class IncrementalSyncEngine:
         """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。"""
         try:
             from UtilsManager.ConfigParser import Config
-            from asharehub import AShareHub
+            from UtilsManager.AShareHubClient import make_asharehub_client
             cfg = Config()
             key = getattr(cfg, "ASHAREHUB_API_KEY", "") or ""
             if not key:
@@ -314,7 +315,7 @@ class IncrementalSyncEngine:
             code = symbol[2:]
             market = symbol[:2]
             suffix = {"sh": "SH", "sz": "SZ", "bj": "BJ"}.get(market, "SH")
-            client = AShareHub(api_key=key)
+            client = make_asharehub_client(api_key=key)
             df = client.adj_factor(
                 symbol=f"{code}.{suffix}",
                 start_date=start.replace("-", ""),
@@ -329,15 +330,22 @@ class IncrementalSyncEngine:
 
     def _build_qq_df_from_factor(self, symbol: str, start: str, end: str,
                                  raw_rows: list[list], factor_map: dict[str, float]) -> pd.DataFrame | None:
-        """用不复权行情 × asharehub 复权因子重建后复权 DataFrame（含除权日连续价格）。"""
+        """用不复权行情 × asharehub 复权因子重建 DataFrame（含除权日连续价格）。
+
+        P0-12 审计修复（复权语义统一）：
+        open/close/high/low = 不复权原始价（交易所真实成交价，涨跌停/成交/估值用）；
+        open_normal/close_normal/high_normal/low_normal = 后复权价（原始价 × 累计因子，
+        信号/止损/指标用）；adj_factor = 累计复权因子（后复权价 ÷ 原始价）。
+        """
         raw_map = {str(r[0]): r for r in raw_rows}
         filtered = [d for d in sorted(raw_map) if start <= d.replace("-", "") <= end]
         if not filtered:
             return None
         out: dict[str, list] = {
             "symbol": [], "trade_date": [], "open": [], "close": [],
-            "high": [], "low": [], "volume": [], "amount": [],
-            "adj_factor": [], "close_normal": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
         }
         skipped = 0
         for d in filtered:
@@ -353,20 +361,29 @@ class IncrementalSyncEngine:
                 continue
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
-            out["open"].append(float(raw[1]) * factor)
-            out["close"].append(close_raw * factor)
-            out["high"].append(float(raw[3]) * factor)
-            out["low"].append(float(raw[4]) * factor)
+            out["open"].append(float(raw[1]))
+            out["close"].append(close_raw)
+            out["high"].append(float(raw[3]))
+            out["low"].append(float(raw[4]))
+            out["open_normal"].append(float(raw[1]) * factor)
+            out["close_normal"].append(close_raw * factor)
+            out["high_normal"].append(float(raw[3]) * factor)
+            out["low_normal"].append(float(raw[4]) * factor)
             out["volume"].append(int(float(raw[5]) * 100))
             out["amount"].append(float(raw[8]) * 10000)
             out["adj_factor"].append(factor)
-            out["close_normal"].append(close_raw)
         if skipped:
             logger.warning(f"asharehub 因子重建 {symbol} 跳过 {skipped}/{len(filtered)} 天(因子缺失)")
         return pd.DataFrame(out)
 
     def _build_qq_df(self, symbol: str, start: str, end: str,
                      raw_rows: list[list], hfq_rows: list[list]) -> pd.DataFrame | None:
+        """原始价 + 后复权价合并重建 DataFrame。
+
+        P0-12 审计修复（复权语义统一）：open/close/high/low = 不复权原始价；
+        open_normal/close_normal/high_normal/low_normal = 后复权价；
+        adj_factor = 后复权收盘 ÷ 原始收盘（累计因子）。
+        """
         raw_map = {str(r[0]): r for r in raw_rows}
         hfq_map = {str(h[0]): h for h in hfq_rows}
         common = sorted(set(raw_map) & set(hfq_map))
@@ -375,8 +392,9 @@ class IncrementalSyncEngine:
             return None
         out: dict[str, list] = {
             "symbol": [], "trade_date": [], "open": [], "close": [],
-            "high": [], "low": [], "volume": [], "amount": [],
-            "adj_factor": [], "close_normal": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
         }
         skipped = 0
         for d in filtered:
@@ -392,14 +410,17 @@ class IncrementalSyncEngine:
                 continue
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
-            out["open"].append(float(hfq[1]))
-            out["close"].append(close_hfq)
-            out["high"].append(float(hfq[3]))
-            out["low"].append(float(hfq[4]))
+            out["open"].append(float(raw[1]))
+            out["close"].append(close_raw)
+            out["high"].append(float(raw[3]))
+            out["low"].append(float(raw[4]))
+            out["open_normal"].append(float(hfq[1]))
+            out["close_normal"].append(close_hfq)
+            out["high_normal"].append(float(hfq[3]))
+            out["low_normal"].append(float(hfq[4]))
             out["volume"].append(int(float(raw[5]) * 100))
             out["amount"].append(float(raw[8]) * 10000)
             out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
-            out["close_normal"].append(close_raw)
         if skipped:
             logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
@@ -414,7 +435,9 @@ class IncrementalSyncEngine:
         # Step 1: concurrent fetch
         all_data: dict[str, pd.DataFrame] = {}
         failed: list[str] = []
-        with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
+        # position 区分管道: A=0, B=1, 防止 tqdm 互相覆盖
+        _pos = 0 if 'A' in desc else (1 if 'B' in desc else None)
+        with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False, position=_pos) as pbar:
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
                 futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in symbols}
                 for future in as_completed(futures):
@@ -688,7 +711,9 @@ class IncrementalSyncEngine:
         if df.empty:
             return
         records = df.rename(columns={}).to_dict("records")
-        columns = ["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]
+        columns = ["symbol", "trade_date", "open", "close", "high", "low",
+                   "open_normal", "close_normal", "high_normal", "low_normal",
+                   "volume", "amount", "adj_factor"]
         placeholders = ", ".join(f":{c}" for c in columns)
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in ("symbol", "trade_date"))
         with self._engine.begin() as conn:

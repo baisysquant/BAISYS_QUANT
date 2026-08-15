@@ -1,5 +1,8 @@
 --stock_daily_kline definition
-CREATE TABLE public.stock_daily_kline ( trade_date text NULL, symbol text NULL, "open" float8 NULL, "close" float8 NULL, high float8 NULL, low float8 NULL, amount float8 NULL, close_normal float8 NULL, volume float8 NULL, adj_ratio float8 NULL);
+-- P0-12 复权语义统一：open/close/high/low = 不复权原始价；*_normal = 后复权价；
+-- adj_ratio/adj_factor = 累计因子（后复权价 ÷ 原始价）。
+-- 实际列以 ensure_table(DataManager/sync.py) 的 ALTER TABLE ADD COLUMN IF NOT EXISTS 为准。
+CREATE TABLE public.stock_daily_kline ( trade_date text NULL, symbol text NULL, "open" float8 NULL, "close" float8 NULL, high float8 NULL, low float8 NULL, amount float8 NULL, close_normal float8 NULL, volume float8 NULL, adj_ratio float8 NULL, open_normal float8 NULL, high_normal float8 NULL, low_normal float8 NULL);
 
 -- app_stock_strategy_report definition
 CREATE TABLE public.app_stock_strategy_report (
