@@ -160,7 +160,7 @@ def scan_all_symbols() -> list[dict]:
                 SELECT trade_date, symbol, open, close, high, low, volume
                 FROM stock_daily_kline
                 WHERE symbol = :symbol
-                ORDER BY trade_date
+                ORDER BY trade_date asc
                 """)
                 df = pd.read_sql(sql, conn, params={"symbol": symbol}, parse_dates=["trade_date"])
                 df.set_index("trade_date", inplace=True)

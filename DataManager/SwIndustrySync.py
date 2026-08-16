@@ -52,8 +52,8 @@ def fetch_sw_l1_memberships() -> pd.DataFrame:
     l1_df = ak.sw_index_first_info()
     if l1_df is None or l1_df.empty:
         raise RuntimeError("ak.sw_index_first_info() 返回空数据")
-    code_col = _match_columns(l1_df, "指数代码", "代码")
-    name_col = _match_columns(l1_df, "指数名称", "名称")
+    code_col = _match_columns(l1_df, "行业代码", "指数代码", "代码")
+    name_col = _match_columns(l1_df, "行业名称", "指数名称", "名称")
 
     frames: list[pd.DataFrame] = []
     for _, row in l1_df.iterrows():

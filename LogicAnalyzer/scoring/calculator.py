@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from scipy.stats import spearmanr
+import warnings
 from sqlalchemy import text as sql_text
 
 
@@ -656,7 +657,9 @@ class FactorCalculator:
             if valid.sum() < 10:
                 ic_weights[factor] = 0.0
                 continue
-            rho, _ = spearmanr(scores_df.loc[valid, factor], consensus.loc[valid])
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=RuntimeWarning)
+                rho, _ = spearmanr(scores_df.loc[valid, factor], consensus.loc[valid])
             ic_weights[factor] = max(0, 0.0 if np.isnan(rho) else rho)
 
         total_ic = sum(ic_weights.values())

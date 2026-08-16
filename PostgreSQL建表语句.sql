@@ -257,3 +257,4 @@ CREATE TABLE IF NOT EXISTS public.stock_basic_info_sw_l1 (
 CREATE INDEX IF NOT EXISTS idx_sbi_l1_name ON public.stock_basic_info_sw_l1 USING btree (l1_name);
 CREATE INDEX IF NOT EXISTS idx_sbi_l1_stock_code ON public.stock_basic_info_sw_l1 USING btree (stock_code);
 CREATE INDEX IF NOT EXISTS idx_sbi_l1_record_date ON public.stock_basic_info_sw_l1 USING btree (record_date);
+

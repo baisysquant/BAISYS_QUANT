@@ -233,7 +233,7 @@ class SWIndustryDataPipeline:
                 url = "https://www.swsresearch.com/institute-sw/api/index_publish/trend/"
                 params = {"swindexcode": code, "period": "DAY"}
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                r = requests.get(url, params=params, headers=headers, timeout=15)
+                r = requests.get(url, params=params, headers=headers, timeout=15, verify=False)
                 r.raise_for_status()
                 data_json = r.json()
                 df_hist = pd.DataFrame(data_json["data"])
