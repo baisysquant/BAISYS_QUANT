@@ -181,8 +181,8 @@ def check_sell_side_completeness(
 ) -> SplitReport:
     """引擎成交记录完整性：每笔卖出成本必须覆盖 佣金+印花税+过户费（及滑点）。
 
-    引擎成交记录 value=卖出净得、cost=总成本，故成交额 = value + cost。
-    校验：cost >= 成交额×(印花税+过户费) + min(最低佣金, 成交额×佣金率)。
+    引擎成交记录 value=卖出毛额（股数×成交价）、cost=总成本，成交额即 value
+    （净得 = value − cost）。校验：cost >= 成交额×(印花税+过户费) + min(最低佣金, 成交额×佣金率)。
     任何低于此下限的卖出记录 = 显性成本漏扣回归。
 
     Args:
@@ -203,7 +203,9 @@ def check_sell_side_completeness(
     violations: list[str] = []
     for t in trade_log:
         if str(t.get("action", "")).startswith("sell"):
-            amount = float(t.get("value", 0.0)) + float(t.get("cost", 0.0))
+            # P3 审计修复：成交额 = value（毛额），cost 已含于 value 内；
+            # 旧实现 value + cost 当成交额口径错位（cost 占比小未误报，现已修正）
+            amount = float(t.get("value", 0.0))
             if amount <= 0:
                 continue
             checked += 1

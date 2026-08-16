@@ -94,7 +94,6 @@ def get_last_run(engine: Any) -> dict[str, Any] | None:
                initial_cash, params, sharpe, total_return, max_drawdown, status,
                config_hash, data_version, git_commit
         FROM {TABLE}
-        WHERE status = 'success'
         ORDER BY run_time DESC
         LIMIT 1
     """)
@@ -143,6 +142,15 @@ def should_rerun(
         _last_ch = last_run.get("config_hash") or ""
         if _last_ch and _last_ch != config_hash:
             return True, f"配置哈希变化（{_last_ch} → {config_hash}），需重新回测"
+
+    # ── 上次失败保护：data/config 未变且上次失败，不再重复浪费算力 ──
+    _last_status = last_run.get("status", "success")
+    if _last_status == "failed":
+        logger.warning(
+            f"上次回测失败（于 {last_date}），数据/配置未发生变化，跳过重复执行。"
+            f"如需强制重跑请调用 run_backtest_pipeline(force=True)"
+        )
+        return False, f"上次回测于 {last_date} 失败（data/config 未变），跳过重复执行"
 
     if frequency == "initial":
         return False, f"频率=initial，上次执行于 {last_date}，不再自动重跑"

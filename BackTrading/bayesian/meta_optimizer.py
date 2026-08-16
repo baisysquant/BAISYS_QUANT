@@ -54,6 +54,24 @@ _SIGNAL_WARMUP_DAYS = 120
 _MAX_CONSECUTIVE_OOS_FAILURES = 3
 
 
+class WFOSystematicFailure(Exception):
+    """WFO 系统性优化失败异常。
+
+    当所有路径/窗口的 OOS 校验全部不通过时抛出，携带回退参数供
+    runner 记录失败状态并中断流水线，避免静默回退导致反复重跑。
+
+    Attributes:
+        fallback_params: 参数空间中间值兜底参数。
+        reason: 失败原因描述。
+        failed_windows: 连续失败的窗口数。
+    """
+    def __init__(self, fallback_params: dict[str, float], reason: str, failed_windows: int = 0) -> None:
+        self.fallback_params = fallback_params
+        self.reason = reason
+        self.failed_windows = failed_windows
+        super().__init__(f"WFO 系统性失败: {reason}")
+
+
 def _window_dates(
     unique_dates: list,
     train_period: int,
@@ -573,13 +591,16 @@ def bayesian_walk_forward_multi(
                     logger.critical(
                         f"连续 {_consecutive_oos_failures} 个窗口 OOS 全部失效"
                         f"（单窗口耗时 ~2-3h），策略在当前数据区间系统性泛化失败，"
-                        f"提前终止 WFO，回退配置中位数兜底"
+                        f"提前终止 WFO"
                     )
                     mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                    return pd.DataFrame([{
-                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
-                        "num_combos": 1, "num_paths": num_paths,
-                    }])
+                    raise WFOSystematicFailure(
+                        fallback_params=mid,
+                        reason=f"连续 {_consecutive_oos_failures} 个窗口 OOS 衰减校验全部失败；"
+                               f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}；"
+                               f"策略在当前数据区间无泛化能力",
+                        failed_windows=_consecutive_oos_failures,
+                    )
                 continue
 
             # ── 收集 IS Sharpe（优化器返回的真实样本内绩效） ──
@@ -632,13 +653,14 @@ def bayesian_walk_forward_multi(
 
     # ── 按窗口聚合（多路径取中位数） ──
     if not all_path_results:
-        logger.warning("所有路径均无有效窗口，使用配置中位数兜底")
+        logger.critical("所有路径均无有效窗口通过 OOS 校验，策略系统性泛化失败")
         mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-        return pd.DataFrame([{
-            "window": 0, "params": mid, "sharpe_ratio": 0.0,
-            "total_return": 0.0, "max_drawdown": 0.0,
-            "num_combos": 1, "num_paths": num_paths,
-        }])
+        raise WFOSystematicFailure(
+            fallback_params=mid,
+            reason=f"所有 {num_paths} 条路径均无有效窗口通过 OOS 校验；"
+                   f"策略在当前数据区间无泛化能力",
+            failed_windows=0,
+        )
 
     agg_rows: list[dict[str, Any]] = []
     for win_id in sorted(all_path_results.keys()):
@@ -685,11 +707,14 @@ def bayesian_walk_forward_multi(
                     logger.critical(
                         f"[OOS衰减校验] 聚合衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
                         f"OOS均值={_agg_oos:.2f}）> 30%，判定超参数过度网格搜索或特征工程隐性泄露，"
-                        f"本次寻优结果整体废弃，回退配置中位数"
+                        f"本次寻优结果整体废弃"
                     )
                     mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                    return pd.DataFrame([{
-                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
-                        "num_combos": 1, "num_paths": num_paths,
-                    }])
+                    raise WFOSystematicFailure(
+                        fallback_params=mid,
+                        reason=f"聚合 IS/OOS 衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
+                               f"OOS均值={_agg_oos:.2f}）超过 30% 阈值；"
+                               f"疑似超参数过度网格搜索或特征工程隐性泄露",
+                        failed_windows=len(agg_rows),
+                    )
     return result

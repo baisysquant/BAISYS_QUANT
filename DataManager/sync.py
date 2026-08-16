@@ -184,6 +184,7 @@ def _ensure_factor_tables(engine: Any) -> None:
             CREATE TABLE IF NOT EXISTS public.ods_financial_quality (
                 symbol VARCHAR(20) NOT NULL,
                 record_date DATE NOT NULL,
+                disclosure_date DATE,
                 roe FLOAT,
                 gross_profit_margin FLOAT,
                 net_profit_margin FLOAT,

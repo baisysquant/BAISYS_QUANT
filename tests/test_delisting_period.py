@@ -94,9 +94,8 @@ class TestDelistLimitPricing:
         close_raw = np.array([10.0])
         prev_bar = {"sh600001": (10.0, 1.0)}
         lu, ld, *_ = _build_day_limit_model(
-            syms, close_raw, None, None, None, prev_bar, set(st),
+            syms, close_raw, None, None, prev_bar, set(st),
             day_str, day_idx or {}, listing_map, {}, True,
-            0.05, 0.30, 0.10, 0.5,
             delist_first_syms=set(delist_first),
             delist_period_syms=set(delist_period),
         )

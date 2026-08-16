@@ -33,7 +33,8 @@ class TestHandlingCsrcSegments:
         )
 
         assert DEFAULT_HANDLING_FEE_SEGMENTS[0] == ("2023-08-28", 0.0000341)
-        assert DEFAULT_HANDLING_FEE_SEGMENTS[-1] == ("2000-01-01", 0.0000487)
+        assert DEFAULT_HANDLING_FEE_SEGMENTS[1] == ("2015-08-01", 0.0000487)
+        assert DEFAULT_HANDLING_FEE_SEGMENTS[-1] == ("2000-01-01", 0.0000696)
         assert DEFAULT_CSRC_FEE_SEGMENTS[0] == ("2015-08-01", 0.00002)
         assert DEFAULT_CSRC_FEE_SEGMENTS[-1] == ("2000-01-01", 0.00004)
 
@@ -46,6 +47,11 @@ class TestHandlingCsrcSegments:
         assert cm.handling_fee_rate_for("2023-08-28") == pytest.approx(0.0000341)
         assert cm.handling_fee_rate_for("2026-01-01") == pytest.approx(0.0000341)
         assert cm.handling_fee_rate_for(None) == pytest.approx(0.0000341)
+        # P2 审计修复：2015-08-01 起 0.00487%，此前 0.00696%（旧兜底段 0.00487%
+        # 实为 2015-08-01~2023-08-27 费率，更早历史被低估 30-55%）
+        assert cm.handling_fee_rate_for("2015-07-31") == pytest.approx(0.0000696)
+        assert cm.handling_fee_rate_for("2015-08-01") == pytest.approx(0.0000487)
+        assert cm.handling_fee_rate_for("2008-01-01") == pytest.approx(0.0000696)
         assert cm.csrc_fee_rate_for("2015-07-31") == pytest.approx(0.00004)
         assert cm.csrc_fee_rate_for("2015-08-01") == pytest.approx(0.00002)
         assert cm.csrc_fee_rate_for("2020-01-01") == pytest.approx(0.00002)
@@ -59,7 +65,7 @@ class TestHandlingCsrcSegments:
         value = 1_000_000.0
         old = cm.buy_cost_breakdown(value, 1000, 1e7, dt="2015-01-05")
         new = cm.buy_cost_breakdown(value, 1000, 1e7, dt="2024-01-02")
-        assert old["handling"] == pytest.approx(value * 0.0000487)
+        assert old["handling"] == pytest.approx(value * 0.0000696)
         assert new["handling"] == pytest.approx(value * 0.0000341)
         assert old["csrc"] == pytest.approx(value * 0.00004)
         assert new["csrc"] == pytest.approx(value * 0.00002)
@@ -82,7 +88,7 @@ class TestHandlingCsrcSegments:
         from BackTrading.domain.models import CostModel
 
         segs = CostModel._parse_handling_segments("2024-01-01:0.00003")
-        assert segs[0] == ("2000-01-01", 0.0000487)  # 兜底段强制注入
+        assert segs[0] == ("2000-01-01", 0.0000696)  # 兜底段强制注入（最老段）
         assert segs[-1] == ("2024-01-01", 0.00003)
         with pytest.raises(ValueError):
             CostModel._parse_handling_segments("2024-01-01")
@@ -108,7 +114,45 @@ class TestHandlingCsrcSegments:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ② 循环兜底路径删除
+# ② P2 费率分段修复（兜底段 [-1]；2012-09-01 过户费 0.06‰；2015-08-01 经手费）
+# ═══════════════════════════════════════════════════════════════════
+
+class TestP2FeeSegments:
+    @pytest.mark.unit
+    def test_custom_stamp_transfer_fallback_injects_oldest_segment(self):
+        """P2 审计修复：自定义分段缺历史段时，兜底注入最老段（[-1]）而非最新段（[0]）。
+
+        旧实现用 DEFAULT...[0]（源序最新在前 → 2023-08-28 印花税 / 2022-04-29 过户费），
+        早于自定义起始日的历史日期按最新费率 → 印花税 0.0005/过户费 1e-5 被低估。
+        """
+        from BackTrading.domain.models import CostModel
+
+        stamp = CostModel._parse_stamp_segments("2024-01-01:0.0005")
+        assert stamp[0] == ("2000-01-01", 0.001)  # 旧实现注入 ("2023-08-28", 0.0005)
+        assert stamp[-1] == ("2024-01-01", 0.0005)
+
+        transfer = CostModel._parse_transfer_segments("2024-01-01:0.00001")
+        assert transfer[0] == ("2000-01-01", 0.00006)  # 旧实现注入 ("2022-04-29", 0.00001)
+        assert transfer[-1] == ("2024-01-01", 0.00001)
+
+    @pytest.mark.unit
+    def test_transfer_fee_2012_09_amount_based(self):
+        """P2 审计修复：2012-09-01~2015-07-31 沪 A 过户费按金额 0.06‰（非 1 元/千股）。"""
+        from BackTrading.domain.models import CostModel
+
+        cm = CostModel()
+        fee = cm.buy_cost_breakdown(1_000_000.0, 200_000, 1e7, dt="2014-06-03", symbol="sh600000")
+        assert fee["transfer"] == pytest.approx(1_000_000.0 * 0.00006)
+        fee_old = cm.buy_cost_breakdown(1_000_000.0, 200_000, 1e7, dt="2012-08-31", symbol="sh600000")
+        assert fee_old["transfer"] == pytest.approx(200_000 * 0.001)  # 改革前仍按股数
+        fee_sz = cm.buy_cost_breakdown(1_000_000.0, 200_000, 1e7, dt="2014-06-03", symbol="sz000001")
+        assert fee_sz["transfer"] == pytest.approx(0.0)  # 深 A 该时期不征收
+        fee_15 = cm.buy_cost_breakdown(1_000_000.0, 200_000, 1e7, dt="2015-08-03", symbol="sh600000")
+        assert fee_15["transfer"] == pytest.approx(1_000_000.0 * 0.00002)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ③ 循环兜底路径删除
 # ═══════════════════════════════════════════════════════════════════
 
 class TestLoopPathRemoved:
@@ -146,7 +190,7 @@ class TestLoopPathRemoved:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ③ 背离/金叉：定点等价 + 性能基准
+# ④ 背离/金叉：定点等价 + 性能基准
 # ═══════════════════════════════════════════════════════════════════
 
 def _ref_divergence_scores(df: pd.DataFrame, base_distance: int = 10):
@@ -312,7 +356,7 @@ class TestDivergencePerfBenchmark:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ④ 模拟交易验证：独立验证集
+# ⑤ 模拟交易验证：独立验证集
 # ═══════════════════════════════════════════════════════════════════
 
 def _mk_kline(n_days: int = 80, n_syms: int = 1) -> pd.DataFrame:
@@ -418,7 +462,7 @@ class TestSimTradeIndependentValidation:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# ⑤ 已删除模块引用清理
+# ⑥ 已删除模块引用清理
 # ═══════════════════════════════════════════════════════════════════
 
 class TestDeletedModuleRefsCleaned:

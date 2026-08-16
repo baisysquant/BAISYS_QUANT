@@ -322,6 +322,15 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="USER_FOCUS_STOCKS", description="用户关注股池配置", optional=True, fields=[
         FieldRule("user_focus_stocks", "str", required=False, default=""),
     ]),
+    SectionRule(name="API", description="REST API 服务配置", optional=True, fields=[
+        FieldRule("enabled", "bool", required=False, default="0"),
+        FieldRule("host", "str", required=False, default="127.0.0.1"),
+        FieldRule("port", "int", required=False, default="8000", min_value=0, max_value=65535),
+        FieldRule("alert_webhook_url", "str", required=False, default=""),
+        FieldRule("alert_channel", "str", required=False, default="generic"),
+        FieldRule("alert_on_failure", "bool", required=False, default="1"),
+        FieldRule("alert_on_success", "bool", required=False, default="0"),
+    ]),
     SectionRule(name="ASHAREHUB", description="AShareHub筹码分布数据配置", optional=True, fields=[
         FieldRule("api_key", "str"),
         FieldRule("enable_chip_distribution", "bool", required=False, default="false"),

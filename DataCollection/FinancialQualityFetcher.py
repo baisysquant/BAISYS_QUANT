@@ -35,11 +35,16 @@ class FinancialQualityFetcher:
         """按监管披露截止日推导披露日：公告日 <= 截止日恒成立，用截止日近似最保守（无前视）。
 
         年报（12-31）截止次年 4-30；一季报 4-30；中报 8-31；三季报 10-31。
+        akShare stock_financial_abstract 的报告期列为紧凑格式 "YYYYMMDD"
+        （如 "20260331"），统一归一化为 "YYYY-MM-DD" 后再处理。
         """
-        y, m, _ = (int(x) for x in str(record_date).split("-"))
+        d = str(record_date).strip()
+        if len(d) == 8 and d.isdigit():
+            d = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+        y, m, _ = (int(x) for x in d.split("-"))
         md = cls._DISCLOSURE_DEADLINES.get(f"{m:02d}")
         if md is None:
-            return str(record_date)
+            return d
         year = y + 1 if m == 12 else y
         return f"{year}-{md}"
 
@@ -71,7 +76,13 @@ class FinancialQualityFetcher:
         date_cols = [c for c in df.columns if isinstance(c, str) and c[0].isdigit()]
         if not date_cols:
             return None
-        latest_date = sorted(date_cols, reverse=True)[0]
+        latest_col = sorted(date_cols, reverse=True)[0]
+        # akShare 报告期列为紧凑格式 "YYYYMMDD"：df.at 取值必须用原始列名，
+        # 输出（record_date/disclosure_date）统一归一化为 "YYYY-MM-DD"
+        # （DB record_date 为 DATE 类型，load_quality 按 ISO 字符串比较）
+        latest_date = latest_col
+        if len(latest_date) == 8 and latest_date.isdigit():
+            latest_date = f"{latest_date[:4]}-{latest_date[4:6]}-{latest_date[6:8]}"
 
         # 构建指标名 → 行索引映射
         # akShare 返回格式：col[0]="选项"（分类名）、col[1]="指标"（指标名）、col[2:]=报告日期
@@ -91,11 +102,11 @@ class FinancialQualityFetcher:
             "symbol": symbol,
             "record_date": latest_date,
             "disclosure_date": self._disclosure_deadline(latest_date),
-            "roe": self._safe_float(df.at[_find("净资产收益率"), latest_date]) if _find("净资产收益率") is not None else None,
-            "gross_profit_margin": self._safe_float(df.at[_find("毛利率"), latest_date]) if _find("毛利率") is not None else None,
-            "net_profit_margin": self._safe_float(df.at[_find("销售净利率"), latest_date]) if _find("销售净利率") is not None else None,
-            "revenue_growth_rate": self._safe_float(df.at[_find("营业总收入增长率"), latest_date]) if _find("营业总收入增长率") is not None else None,
-            "net_profit_growth_rate": self._safe_float(df.at[_find("归属母公司净利润增长率"), latest_date]) if _find("归属母公司净利润增长率") is not None else None,
+            "roe": self._safe_float(df.at[_find("净资产收益率"), latest_col]) if _find("净资产收益率") is not None else None,
+            "gross_profit_margin": self._safe_float(df.at[_find("毛利率"), latest_col]) if _find("毛利率") is not None else None,
+            "net_profit_margin": self._safe_float(df.at[_find("销售净利率"), latest_col]) if _find("销售净利率") is not None else None,
+            "revenue_growth_rate": self._safe_float(df.at[_find("营业总收入增长率"), latest_col]) if _find("营业总收入增长率") is not None else None,
+            "net_profit_growth_rate": self._safe_float(df.at[_find("归属母公司净利润增长率"), latest_col]) if _find("归属母公司净利润增长率") is not None else None,
         }
 
         return result
@@ -181,7 +192,7 @@ class FinancialQualityFetcher:
         return len(rows)
 
     def sync(self, stock_list: list[str], today_str: str | None = None,
-             max_workers: int = 2) -> int:
+             max_workers: int = 3) -> int:
         """并发采集全股池，增量补全，返回此次采集数量。
 
         流程：

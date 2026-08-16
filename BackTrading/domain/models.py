@@ -37,17 +37,23 @@ DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
 STAMP_TAX_UNILATERAL_DATE: str = "2008-09-19"
 # 过户费日期分段表（双边收取，date:rate 升序，取最晚 ≤ 交易日的档）。
 # 2022-04-28 前 0.02‰（万分之零点零二），2022-04-29 起减半为 0.01‰。
-# P2-3（审计）：2015-08-01 起按成交金额 0.02‰（沪 A）；2015-08-01 前按
-# 成交股数 1 元/千股（见 TRANSFER_FEE_PER_SHARE_RATE，按股数分支优先于分段表）。
+# P2-3（审计）：2015-08-01 起按成交金额 0.02‰（沪 A）；2012-09-01 至
+# 2015-07-31 按成交金额 0.06‰（沪 A，中登公司"成交面值 0.3‰"口径、面值 1 元
+# ≈ 金额 0.06‰，旧实现按股数 1 元/千股近似 → 低价股高估/高价股低估）；
+# 2012-09-01 前按成交股数 1 元/千股（见 TRANSFER_FEE_PER_SHARE_RATE，按股数
+# 分支优先于分段表，故兜底段仅为 transfer_fee_rate_for 直接调用的口径）。
 DEFAULT_TRANSFER_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2022-04-29", 0.00001),
     ("2015-08-01", 0.00002),
-    ("2000-01-01", 0.00002),
+    ("2012-09-01", 0.00006),
+    ("2000-01-01", 0.00006),
 )
 # P2-3（审计）：沪市过户费计费方式改革日——2015-08-01（含）起按成交金额
-# 0.02‰ 双边收取；此前按成交股数收取（每 1000 股 1 元，双向，仅沪 A）。
+# 0.02‰ 双边收取；2012-09-01 至 2015-07-31 按成交金额 0.06‰ 双边收取
+# （成交面值 0.3‰ 口径）；此前按成交股数收取（每 1000 股 1 元，双向，仅沪 A）。
 TRANSFER_FEE_AMOUNT_BASED_DATE: str = "2015-08-01"
-# P2-3（审计）：2015-08-01 前沪 A 按股数计费的单价（1 元/千股 = 0.001 元/股）。
+TRANSFER_FEE_AMOUNT_006_DATE: str = "2012-09-01"
+# P2-3（审计）：2012-09-01 前沪 A 按股数计费的单价（1 元/千股 = 0.001 元/股）。
 TRANSFER_FEE_PER_SHARE_RATE: float = 0.001
 # P0-12 审计修复：过户费征收范围统一日期。
 # 2022-04-29 起沪深两市 A 股均按 0.01‰ 双边征收过户费（此前深市 A 股不征收，
@@ -58,10 +64,13 @@ TRANSFER_FEE_UNIFIED_DATE: str = "2022-04-29"
 DEFAULT_HANDLING_FEE_RATE: float = 0.0000341
 DEFAULT_CSRC_FEE_RATE: float = 0.00002
 # 经手费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
-# 2023-08-28 起 0.00341%（万分之零点三四一），此前 0.00487%。
+# 2023-08-28 起 0.00341%（万分之零点三四一）；2015-08-01 起 0.00487%；
+# 此前 0.00696%（2012-09-01 起沪深统一按 0.0696‰ 双向，P2 审计修复：
+# 旧兜底段 0.00487% 实为 2015-08-01~2023-08-27 费率，更早历史被低估 30-55%）。
 DEFAULT_HANDLING_FEE_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2023-08-28", 0.0000341),
-    ("2000-01-01", 0.0000487),
+    ("2015-08-01", 0.0000487),
+    ("2000-01-01", 0.0000696),
 )
 # 证管费日期分段表（双边，date:rate 升序，取最晚 ≤ 交易日的档）。
 # 2015-08-01 起 0.002%（万分之零点二），此前 0.004%。
@@ -291,7 +300,7 @@ class CostModel:
     def handling_fee_rate_for(self, dt: str | None) -> float:
         """按配置日期表取经手费率（双边收取，替代固定费率）。
 
-        2023-08-28 起 0.00341%，此前 0.00487%（沪/深交易所）。
+        2023-08-28 起 0.00341%，2015-08-01 起 0.00487%，此前 0.00696%（沪/深交易所）。
         """
         if dt is None:
             return self.handling_fee_rate
@@ -392,22 +401,14 @@ class CostModel:
                 break
         return code.startswith("6")
 
-    def _transfer_fee_rate_for_symbol(self, symbol: str, dt: str | None) -> float:
-        """按市场 × 日期返回过户费率（P0-12 审计修复）。
-
-        2022-04-29 起沪深两市 A 股均按 transfer_fee_segments 日期表双边收取（0.01‰）；
-        此前仅上海 A 股（代码以 6 开头）收取，深圳 A 股（00/30 开头）不收取。
-        """
-        if dt is not None and str(dt) < TRANSFER_FEE_UNIFIED_DATE and not self._is_shanghai_a(symbol):
-            return 0.0
-        return self.transfer_fee_rate_for(dt)
-
     def _transfer_fee_for(self, symbol: str, value: float, volume: float, dt: str | None) -> float:
         """过户费金额（元）— P2-3（审计）：按市场 × 日期 × 计费方式收取。
 
         - 2022-04-29 起：沪深两市均按金额（transfer_fee_segments，0.01‰）双边收取
         - 2015-08-01 至 2022-04-28：仅沪 A 按金额（0.02‰）双边收取，深 A 不收
-        - 2015-08-01 前：仅沪 A 按成交股数（1 元/千股 = volume × 0.001 元）双边
+        - 2012-09-01 至 2015-07-31：仅沪 A 按金额（0.06‰，成交面值 0.3‰ 口径）
+          双边收取，深 A 不收（旧实现按股数 1 元/千股近似，低价股高估/高价股低估）
+        - 2012-09-01 前：仅沪 A 按成交股数（1 元/千股 = volume × 0.001 元）双边
           收取，深 A 不收（按股数计费为历史事实，按金额近似将系统性低估）
 
         Args:
@@ -421,6 +422,8 @@ class CostModel:
         if not self._is_shanghai_a(symbol):
             return 0.0
         if str(dt) >= TRANSFER_FEE_AMOUNT_BASED_DATE:
+            return value * self.transfer_fee_rate_for(dt)
+        if str(dt) >= TRANSFER_FEE_AMOUNT_006_DATE:
             return value * self.transfer_fee_rate_for(dt)
         return volume * TRANSFER_FEE_PER_SHARE_RATE
 
@@ -572,7 +575,9 @@ class CostModel:
 
         #2 审计修复：强制注入兜底段（date <= 2005-01-01），确保自定义配置
         不丢失早期历史数据的税率。若用户未提供兜底段，从 DEFAULT_STAMP_TAX_SEGMENTS
-        取最早段注入。
+        取最早段注入（[-1]——源序为最新在前，[-1] 即 2000-01-01 兜底段；
+        [0] 为最新段，注入会令早于自定义起始日的历史日期按 2023-08-28 后费率
+        被低估，P2 审计修复统一为 [-1] 口径）。
         """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):
@@ -586,9 +591,9 @@ class CostModel:
         if not segs:
             return DEFAULT_STAMP_TAX_SEGMENTS
         segs = sorted(segs, key=lambda x: x[0])
-        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底
+        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底（最老段）
         if segs[0][0] > "2005-01-01":
-            _fallback = DEFAULT_STAMP_TAX_SEGMENTS[0] if DEFAULT_STAMP_TAX_SEGMENTS else ("2000-01-01", 0.001)
+            _fallback = DEFAULT_STAMP_TAX_SEGMENTS[-1] if DEFAULT_STAMP_TAX_SEGMENTS else ("2000-01-01", 0.001)
             segs.insert(0, _fallback)
         return tuple(segs)
 
@@ -596,7 +601,8 @@ class CostModel:
     def _parse_transfer_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
         """解析 "date:rate;date:rate" 过户费日期表，按日期升序。
 
-        #2 审计修复：同上，强制注入兜底段。
+        #2 审计修复：同上，强制注入兜底段（[-1] 最老段，P2 审计修复与
+        经手费/证管费 parse 口径统一）。
         """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):
@@ -610,9 +616,9 @@ class CostModel:
         if not segs:
             return DEFAULT_TRANSFER_FEE_SEGMENTS
         segs = sorted(segs, key=lambda x: x[0])
-        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底
+        # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底（最老段）
         if segs[0][0] > "2005-01-01":
-            _fallback = DEFAULT_TRANSFER_FEE_SEGMENTS[0] if DEFAULT_TRANSFER_FEE_SEGMENTS else ("2000-01-01", 0.00002)
+            _fallback = DEFAULT_TRANSFER_FEE_SEGMENTS[-1] if DEFAULT_TRANSFER_FEE_SEGMENTS else ("2000-01-01", 0.00006)
             segs.insert(0, _fallback)
         return tuple(segs)
 
@@ -620,7 +626,7 @@ class CostModel:
     def _parse_handling_segments(cls, s: str) -> tuple[tuple[str, float], ...]:
         """解析 "date:rate;date:rate" 经手费日期表，按日期升序（P0-10）。
 
-        2023-08-28 起 0.00341%，此前 0.00487%；强制注入兜底段。
+        2023-08-28 起 0.00341%，2015-08-01 起 0.00487%，此前 0.00696%；强制注入兜底段。
         """
         segs: list[tuple[str, float]] = []
         for part in str(s).split(";"):
@@ -635,7 +641,7 @@ class CostModel:
             return DEFAULT_HANDLING_FEE_SEGMENTS
         segs = sorted(segs, key=lambda x: x[0])
         if segs[0][0] > "2005-01-01":
-            _fallback = DEFAULT_HANDLING_FEE_SEGMENTS[-1] if DEFAULT_HANDLING_FEE_SEGMENTS else ("2000-01-01", 0.0000487)
+            _fallback = DEFAULT_HANDLING_FEE_SEGMENTS[-1] if DEFAULT_HANDLING_FEE_SEGMENTS else ("2000-01-01", 0.0000696)
             segs.insert(0, _fallback)
         return tuple(segs)
 

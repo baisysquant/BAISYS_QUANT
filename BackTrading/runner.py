@@ -391,37 +391,71 @@ def run_backtest_pipeline(
             f"{_holdout_label}"
         )
         _log_step("fetch_kline")
-        wf_result = run_walk_forward(
-            kline_df=kline_df,
-            num_paths=_num_paths,
-            train_period=train_period,
-            test_period=bt.OUT_OF_SAMPLE_DAYS,
-            initial_cash=bt.INITIAL_CASH,
-            commission=bt.COMMISSION_RATE,
-            stamp_tax=bt.STAMP_TAX_RATE,
-            slippage=bt.SLIPPAGE,
-            max_position_pct=bt.MAX_POSITION_PCT,
-            portfolio_method=bt.PORTFOLIO_METHOD,
-            point_in_time=bt.POINT_IN_TIME,
-            show_progress=True,
-            backtest_start_date=_bt_start_iso,
-            st_history=st_history,
-            exclude_st=bool(bt.EXCLUDE_ST),
-            listing_days=listing_days,
-            # P2.1 CPCV 净化+禁运
-            purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
-            embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
-            # P2.4 预算制
-            time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
-            max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
-            # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
-            holdout_days=_holdout_days,
-            # P3.1 数据版本入缓存 key
-            data_version=_data_version,
-            # A2 失败快照上下文
-            run_id=_run_id,
-            task_id="backtest_pipeline",
-        )
+        # ── WFO 系统性失败拦截：捕获 WFOSystematicFailure，记录失败并中断流水线 ──
+        from BackTrading.bayesian.meta_optimizer import WFOSystematicFailure
+
+        try:
+            wf_result = run_walk_forward(
+                kline_df=kline_df,
+                num_paths=_num_paths,
+                train_period=train_period,
+                test_period=bt.OUT_OF_SAMPLE_DAYS,
+                initial_cash=bt.INITIAL_CASH,
+                commission=bt.COMMISSION_RATE,
+                stamp_tax=bt.STAMP_TAX_RATE,
+                slippage=bt.SLIPPAGE,
+                max_position_pct=bt.MAX_POSITION_PCT,
+                portfolio_method=bt.PORTFOLIO_METHOD,
+                point_in_time=bt.POINT_IN_TIME,
+                show_progress=True,
+                backtest_start_date=_bt_start_iso,
+                st_history=st_history,
+                exclude_st=bool(bt.EXCLUDE_ST),
+                listing_days=listing_days,
+                # P2.1 CPCV 净化+禁运
+                purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
+                embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
+                # P2.4 预算制
+                time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
+                max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
+                # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
+                holdout_days=_holdout_days,
+                # P3.1 数据版本入缓存 key
+                data_version=_data_version,
+                # A2 失败快照上下文
+                run_id=_run_id,
+                task_id="backtest_pipeline",
+            )
+        except WFOSystematicFailure as wfo_err:
+            # WFO 系统性失败：策略在当前数据区间无泛化能力，中断流水线
+            logger.critical("=" * 60)
+            logger.critical(f"[WFO系统性失败] {wfo_err.reason}")
+            logger.critical(
+                "策略在当前数据区间不具备泛化能力，建议检查：\n"
+                "  1. 特征工程是否存在隐性数据泄露\n"
+                "  2. 信号逻辑是否适应当前市场 regime\n"
+                "  3. 回看区间是否过短/过长导致过拟合\n"
+                "本次回测已标记为失败，不会覆盖 config.ini，下次调度将跳过（需手动 force=True 或数据/配置变化后重跑）"
+            )
+            logger.critical("=" * 60)
+
+            # 记录失败状态，避免下次调度重复执行
+            record_run(
+                engine=engine,
+                frequency=bt.OPTIMIZE_FREQUENCY,
+                backtest_start_date=bt.BACKTEST_START_DATE,
+                out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
+                initial_cash=bt.INITIAL_CASH,
+                params=wfo_err.fallback_params,
+                sharpe=0,
+                total_return=0,
+                max_drawdown=0,
+                status="failed",
+                config_hash=_cur_config_hash,
+                data_version=_data_version,
+            )
+            alert.on_failure(wfo_err)
+            return None
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
 
@@ -682,6 +716,20 @@ def run_backtest_pipeline(
 
         # 业绩报告 sharpe：优先 holdout 终验，其次 WFO Top 5
         report_sharpe = holdout_sharpe if holdout_sharpe is not None else sharpe_avg
+
+        # P3 审计修复：报告层注明区间口径——Sharpe 来自 holdout 末段/WFO Top5
+        # （选择期），total_return/max_drawdown 来自全周期最终回测（评估期），
+        # 选择期≠评估期，跨期对比指标时必须区分区间，避免口径混淆
+        if holdout_sharpe is not None:
+            _sharpe_scope = f"末段独立 holdout（{_holdout_days} 个交易日）"
+        else:
+            _sharpe_scope = "WFO Top5 窗口均值"
+        logger.info(
+            f"[指标口径] 报告 Sharpe={report_sharpe:.4f} 区间={_sharpe_scope}（选择期）；"
+            f"total_return={risk.get('total_return', 0):.2%} / "
+            f"max_drawdown={risk.get('max_drawdown', 0):.2%} 为全周期最终回测口径"
+            f"（评估期）——两者区间不一致属预期设计，跨期对比请注意"
+        )
 
         from BackTrading.calibration import _get_git_commit
         from BackTrading.prepare import _compute_config_hash

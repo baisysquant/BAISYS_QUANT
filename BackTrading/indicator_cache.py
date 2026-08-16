@@ -23,6 +23,10 @@ import pandas as pd
 from loguru import logger
 
 from BackTrading import output_store as _os
+from BackTrading.vectorized_signal import (
+    compute_param_independent_features as _p0_features,
+    _p0_feature_constants as _p0_constants,
+)
 
 _IN_MEMORY: dict[str, pd.DataFrame] = {}
 _PEAKS: dict[str, np.ndarray] = {}
@@ -227,8 +231,13 @@ def _load_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
         return False
     if meta.get("version") != _pipeline_version():
         return False
+    # 参数无关特征列依赖的配置常量（slope_window）变化时同样失效，
+    # 否则会静默复用旧窗口的斜率分（指标缓存 key 不含 config_hash）。
+    if meta.get("feat_const") != _p0_constants():
+        return False
     try:
         _IN_MEMORY[symbol] = pd.read_parquet(ipath)
+        _IN_MEMORY[symbol].attrs["_p0_feat_const"] = meta.get("feat_const") or {}
         _PEAKS[symbol] = np.load(ppath)
         _TROUGHS[symbol] = np.load(tpath)
         return True
@@ -242,6 +251,8 @@ def _save_to_disk(symbol: str, df: pd.DataFrame, peaks: np.ndarray, troughs: np.
         "fingerprint": _data_fingerprint(df),
         "n_rows": len(df),
         "version": _pipeline_version(),
+        # 参数无关特征列的计算常量（slope_window），加载时校验一致性
+        "feat_const": _p0_constants(),
     }
     if precheck_reasons:
         meta["precheck"] = precheck_reasons
@@ -315,6 +326,8 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
     df_ind = _compute_indicators_snapshotted(
         df_raw, symbol=symbol, context="precompute_all_indicators"
     )
+    # 参数无关特征（评分层跨试次复用）：一次性计算并随指标缓存落盘
+    df_ind = _p0_features(df_ind)
 
     _IN_MEMORY[symbol] = df_ind
     _PEAKS[symbol] = np.array([], dtype=int)
@@ -525,6 +538,7 @@ def get_precomputed(
     _pre_reasons = _pre_res.reasons if _pre_res.status.value != "OK" else None
 
     df_ind = _compute_indicators_snapshotted(df_raw, symbol=symbol, context="get_precomputed")
+    df_ind = _p0_features(df_ind)
 
     _IN_MEMORY[symbol] = df_ind
     _PEAKS[symbol] = np.array([], dtype=int)

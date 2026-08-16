@@ -124,6 +124,7 @@ def test_ensure_table_idempotent(engine, scratch) -> None:
 
 def test_sync_archive_today(engine, scratch, monkeypatch) -> None:
     _no_network(monkeypatch)
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: False)  # 解锁覆盖守卫，强制走同步路径
     monkeypatch.setattr(
         sp, "_fetch_st_list",
         lambda: pd.DataFrame({"代码": ["000001", "600000"]}),
@@ -149,8 +150,13 @@ def test_sync_sz_st_periods_expansion(engine, scratch, monkeypatch) -> None:
         "变更日期": ["2023-06-01", "2024-01-01", "2024-06-01"],
     })
     _no_network(monkeypatch)
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: False)  # 解锁覆盖守卫
     monkeypatch.setattr(sp, "_fetch_sz_change_names", lambda: names)
-    monkeypatch.setattr(sp, "_kline_days", _bday_days)
+    monkeypatch.setattr(
+        sp, "_kline_days_batch",
+        lambda engine, specs: {(sym, s, e): _bday_days(engine, sym, s, e)
+                               for sym, s, e in specs},
+    )
     stats = sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2024-12-31")
     assert stats["sz_st_rows"] > 0
     hist = sp.load_st_pit(engine, ["sz000001"], "2024-01-01", "2024-12-31")
@@ -164,13 +170,18 @@ def test_sync_sz_st_periods_expansion(engine, scratch, monkeypatch) -> None:
 
 def test_sync_delist_pit(engine, scratch, monkeypatch) -> None:
     _no_network(monkeypatch)
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: False)  # 解锁覆盖守卫
     monkeypatch.setattr(sp, "_fetch_sz_delist", lambda: pd.DataFrame({
         "证券代码": ["002726"], "终止上市日期": ["2024-03-01"],
     }))
     monkeypatch.setattr(sp, "_fetch_sh_delist", lambda: pd.DataFrame({
         "公司代码": ["600080"], "暂停上市日期": ["2024-04-01"],
     }))
-    monkeypatch.setattr(sp, "_kline_days", _bday_days)
+    monkeypatch.setattr(
+        sp, "_kline_days_batch",
+        lambda engine, specs: {(sym, s, e): _bday_days(engine, sym, s, e)
+                               for sym, s, e in specs},
+    )
     sp.sync_st_pit(engine, ["sz002726", "sh600080"],
                    start_date="2024-01-01", end_date="2024-12-31")
     hist = sp.load_st_pit(engine, ["sz002726", "sh600080"], "2024-01-01", "2024-12-31")
@@ -187,6 +198,7 @@ def test_sync_delist_pit(engine, scratch, monkeypatch) -> None:
 
 def test_load_pit_parametrized_any_no_injection(engine, scratch, monkeypatch) -> None:
     _no_network(monkeypatch)
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: False)  # 解锁覆盖守卫
     monkeypatch.setattr(sp, "_fetch_st_list", lambda: pd.DataFrame({"代码": ["000001"]}))
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2024-12-31")
     evil = "sz000001'; DROP TABLE stock_st_history_pit_test; --"
@@ -215,13 +227,13 @@ def test_sync_coverage_guard_and_force(engine, scratch, monkeypatch) -> None:
     for f in ("_fetch_spot_list", "_fetch_sz_delist", "_fetch_sh_delist"):
         monkeypatch.setattr(sp, f, lambda: None)
 
+    # P2P2 修复：空 PIT 表 + 窗口内从未出现 ST/退市标记 → 非 ST 股直接视为覆盖
+    # → 跳过同步（不再每次回测全量重拉网络源）
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2099-12-31")
-    assert calls["st"] == 1 and calls["names"] == 1
+    assert calls["st"] == 0 and calls["names"] == 0
 
-    # P1-1 修复后：覆盖检查按"PIT 行数 / K 线交易日"真实覆盖率判定——真实库中
-    # sz000001 有全历史 K 线而 PIT 表仅今日快照 → 覆盖率不足 → 会重跑（不跳过）。
-    # 模拟"历史行已齐备"（覆盖达标）→ 跳过（不再拉取任何源）
-    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: True)
+    # 覆盖不达标（标记股 PIT 历史缺失）→ 重跑回填源
+    monkeypatch.setattr(sp, "_pool_covered", lambda *a, **k: False)
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2099-12-31")
     assert calls["st"] == 1 and calls["names"] == 1
 
@@ -229,6 +241,32 @@ def test_sync_coverage_guard_and_force(engine, scratch, monkeypatch) -> None:
     sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01",
                    end_date="2099-12-31", force=True)
     assert calls["names"] == 2
+    assert calls["st"] == 1
+
+
+def test_pool_covered_never_st_skips_and_marked_reruns(engine, scratch, monkeypatch) -> None:
+    """P2P2 修复：覆盖率只统计"窗口内出现过 ST/退市标记的股票"，非 ST 股直接视为覆盖。"""
+    calls = {"st": 0}
+
+    def _st_list():
+        calls["st"] += 1
+        return pd.DataFrame({"代码": ["000001"]})
+
+    _no_network(monkeypatch)
+    monkeypatch.setattr(sp, "_fetch_st_list", _st_list)
+
+    # 空 PIT 表 + 非 ST 股 → 直接视为覆盖 → 跳过同步（不拉任何网络源）
+    sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2024-12-31")
+    assert calls["st"] == 0
+
+    # 该股窗口内出现 ST 标记（1 行）→ 计入覆盖检查：1 标记行 vs 数百 K 线交易日
+    # → 未覆盖 → 重跑同步（标记股历史缺失需回填）
+    with engine.begin() as c:
+        c.execute(text(
+            f"INSERT INTO {scratch} (symbol, trade_date, is_st, is_delisting) "
+            "VALUES ('sz000001', '2024-06-03', TRUE, FALSE)"
+        ))
+    sp.sync_st_pit(engine, ["sz000001"], start_date="2024-01-01", end_date="2024-12-31")
     assert calls["st"] == 1
 
 

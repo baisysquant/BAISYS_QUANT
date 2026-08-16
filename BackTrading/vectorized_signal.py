@@ -765,10 +765,14 @@ def compute_signals(
     slope_window = int(div_p.get("slope_window", 5))
     vol_norm_denom = float(score_p.get("vol_norm_denominator", 0.15))
     try:
-        _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-        # 扩展窗口分位数（因果）：只用截至当日的数据归一化，避免全样本
-        # 75% 分位数引入未来波动率分布的前视偏差。
-        _denom = _gs.expanding(min_periods=20).quantile(0.75)
+        if "_p0_golden_denom" in stock_df.columns:
+            # 扩展窗口分位数（因果）：Phase 0 已缓存，避免每试次 O(n²) 重算
+            _denom = stock_df["_p0_golden_denom"]
+        else:
+            _gs = (dif - dea).abs() / atr.replace(0, np.nan)
+            # 扩展窗口分位数（因果）：只用截至当日的数据归一化，避免全样本
+            # 75% 分位数引入未来波动率分布的前视偏差。
+            _denom = _gs.expanding(min_periods=20).quantile(0.75)
         _denom = _denom.fillna(vol_norm_denom).clip(lower=1e-9)
         if len(_denom) > 0 and float(_denom.iloc[-1]) > 0:
             vol_norm_denom = _denom.values
@@ -785,8 +789,11 @@ def compute_signals(
         "oscillate": int(th_p.get("oscillate", 40)),
     }
 
-    # ── 1. MACD 趋势 ──
-    trend_arr = macd_trend(dif, dea)
+    # ── 1. MACD 趋势（Phase 0 参数无关特征优先，缺失时内联回退） ──
+    if "_p0_macd_trend" in stock_df.columns:
+        trend_arr = stock_df["_p0_macd_trend"].values
+    else:
+        trend_arr = macd_trend(dif, dea)
 
     # ── 2. Divergence（滚动计算，不使用全局 precomputed peaks/troughs 防未来函数） ──
     if precomputed_divergence is not None:
@@ -804,17 +811,33 @@ def compute_signals(
     boll_bw = "BOLL_BANDWIDTH" if "BOLL_BANDWIDTH" in stock_df.columns else None
     regime = _regime_series(stock_df, boll_bw_col=boll_bw, params=params.get("regime"))
 
-    # ── 4. 动量分 ──
-    mom_score = _momentum(dif, dea, max_score=15)
+    # ── 4. 动量分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_momentum" in stock_df.columns:
+        mom_score = stock_df["_p0_momentum"].values
+    else:
+        mom_score = _momentum(dif, dea, max_score=15)
 
-    # ── 5. 斜率分 ──
-    slope_score = _dif_slope(dif, window=slope_window, max_score=10)
+    # ── 5. 斜率分（Phase 0 缓存优先；slope_window 与缓存常量不一致时重算） ──
+    _p0_feat_const = stock_df.attrs.get("_p0_feat_const") or {}
+    if (
+        "_p0_slope" in stock_df.columns
+        and int(_p0_feat_const.get("slope_window", -1)) == slope_window
+    ):
+        slope_score = stock_df["_p0_slope"].values
+    else:
+        slope_score = _dif_slope(dif, window=slope_window, max_score=10)
 
-    # ── 6. 量价分 ──
-    vol_score = _volume_price(stock_df, max_score=10)
+    # ── 6. 量价分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_vol_price" in stock_df.columns:
+        vol_score = stock_df["_p0_vol_price"].values
+    else:
+        vol_score = _volume_price(stock_df, max_score=10)
 
-    # ── 7. K 线形态分 ──
-    kp_score = _kline_pattern(stock_df, max_score=10)
+    # ── 7. K 线形态分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_kline_pattern" in stock_df.columns:
+        kp_score = stock_df["_p0_kline_pattern"].values
+    else:
+        kp_score = _kline_pattern(stock_df, max_score=10)
 
     # ── 8. 金叉评分 ──
     w_cross = weights["金叉信号"]
@@ -901,3 +924,76 @@ def trend_scores(dif: pd.Series, dea: pd.Series) -> np.ndarray:
         MACDTrend.SUPER_WEAK: 0,
     }
     return np.vectorize(trend_score_map.get)(t)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 参数无关特征（Phase 0 预计算缓存，跨参数试次复用）
+# ═══════════════════════════════════════════════════════════════════
+# 死循环根因（2026-08-16 诊断）：WFO 每个信号参数试次对全市场 3113 只
+# 重跑 compute_signals，其中 ~60-70% 的计算（macd_trend/_momentum/
+# _dif_slope/_volume_price/_kline_pattern/expanding 75% 分位数）与评分
+# 参数无关却被逐试次重算（expanding quantile 为 O(n²) 最重项）。
+# 现将这些列在 Phase 0 一次性计算并落盘（indicator_cache），compute_signals
+# 优先读取 _p0_* 列，缺失时内联回退，保证所有调用方语义完全一致。
+
+_P0_FEATURE_COLS = (
+    "_p0_macd_trend", "_p0_momentum", "_p0_slope",
+    "_p0_vol_price", "_p0_kline_pattern", "_p0_golden_denom",
+)
+
+
+def _p0_feature_constants() -> dict[str, int]:
+    """参数无关特征依赖的配置常量（仅 slope_window），供缓存 meta 校验。
+
+    slope_window 变化时必须使磁盘指标缓存失效（指标缓存 key 不含 config_hash），
+    否则会静默复用旧窗口的斜率分。
+    """
+    try:
+        from UtilsManager.ConfigParser import Config
+        _div = Config().app_config.divergence
+        return {"slope_window": int(getattr(_div, "slope_window", 5))}
+    except Exception:
+        return {"slope_window": 5}
+
+
+def compute_param_independent_features(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """计算评分层中与信号参数无关的逐 bar 特征列（Phase 0 一次性缓存）。
+
+    全部输出仅依赖指标列 + 配置常量（slope_window），与评分参数无关：
+      - _p0_macd_trend:    MACD 趋势分类（macd_trend）
+      - _p0_momentum:      动量分（_momentum）
+      - _p0_slope:         DIF 斜率分（_dif_slope，窗口=slope_window）
+      - _p0_vol_price:     量价配合分（_volume_price）
+      - _p0_kline_pattern: K 线形态分（_kline_pattern）
+      - _p0_golden_denom:  金叉归一化分母（expanding 75% 分位数，O(n²) 最重项，
+                           未填充/裁剪，保留 NaN 由调用方按当前配置常量填充）
+
+    与 compute_signals 一致：价格类特征必须使用后复权口径（_normal 列）。
+    返回带 _p0_* 列的新 DataFrame（不修改入参），attrs["_p0_feat_const"]
+    记录计算所用配置常量，供 compute_signals 校验 slope_window 一致性。
+    """
+    _const = _p0_feature_constants()
+    _slope_window = int(_const.get("slope_window", 5))
+
+    _fdf = stock_df
+    if "close_normal" in stock_df.columns:
+        _fdf = stock_df.copy()
+        for _c in ("open", "high", "low", "close"):
+            _norm_c = f"{_c}_normal"
+            if _norm_c in _fdf.columns:
+                _fdf[_c] = _fdf[_norm_c]
+
+    dif = _fdf["DIF"]
+    dea = _fdf["DEA"] if "DEA" in _fdf.columns else pd.Series(0.0, index=_fdf.index)
+    atr = _fdf["ATR"]
+
+    out = stock_df.copy()
+    out["_p0_macd_trend"] = macd_trend(dif, dea)
+    out["_p0_momentum"] = _momentum(dif, dea, max_score=15)
+    out["_p0_slope"] = _dif_slope(dif, window=_slope_window, max_score=10)
+    out["_p0_vol_price"] = _volume_price(_fdf, max_score=10)
+    out["_p0_kline_pattern"] = _kline_pattern(_fdf, max_score=10)
+    _gs = (dif - dea).abs() / atr.replace(0, np.nan)
+    out["_p0_golden_denom"] = _gs.expanding(min_periods=20).quantile(0.75)
+    out.attrs["_p0_feat_const"] = _const
+    return out

@@ -304,7 +304,14 @@ class IncrementalSyncEngine:
         return None
 
     def _fetch_ah_factor_map(self, symbol: str, start: str, end: str) -> dict[str, float] | None:
-        """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。"""
+        """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。
+
+        P2（审计）：trade_date 键统一归一化为 YYYYMMDD——API 可能返回
+        YYYY-MM-DD 字符串 / date / datetime（含 pandas Timestamp）对象；旧实现
+        直接 str() 作 key，回退路径（_build_qq_df_from_factor 用 d_compact=YYYYMMDD
+        查表）全部 miss → 每股被静默跳过（仅"跳过 N 天"告警）。格式探测：
+        无法解析为 YYYYMMDD 的行告警并跳过。
+        """
         try:
             from UtilsManager.ConfigParser import Config
             from UtilsManager.AShareHubClient import make_asharehub_client
@@ -323,7 +330,25 @@ class IncrementalSyncEngine:
             )
             if df is None or df.empty:
                 return None
-            return {str(r["trade_date"]): float(r["adj_factor"]) for _, r in df.iterrows()}
+            out: dict[str, float] = {}
+            bad = 0
+            for _, r in df.iterrows():
+                td = r["trade_date"]
+                if isinstance(td, (datetime, date)):
+                    key_n = td.strftime("%Y%m%d")
+                else:
+                    s = str(td).strip()
+                    key_n = s[:10].replace("-", "") if len(s) >= 10 and s[4] == "-" else s.replace("-", "").replace("/", "")
+                if len(key_n) != 8 or not key_n.isdigit():
+                    bad += 1
+                    continue
+                out[key_n] = float(r["adj_factor"])
+            if bad:
+                logger.warning(
+                    f"asharehub 复权因子 {symbol} 跳过 {bad}/{len(df)} 行："
+                    f"trade_date 格式异常（期望 YYYYMMDD/YYYY-MM-DD/date 对象）"
+                )
+            return out or None
         except Exception as e:
             logger.warning(f"asharehub 复权因子获取失败 {symbol}: {type(e).__name__}: {e}")
             return None
