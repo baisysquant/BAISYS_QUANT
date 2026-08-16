@@ -15,7 +15,7 @@
        <img src="https://img.shields.io/badge/Data-AkShare-red?logo=databricks&logoColor=white" />
     <img src="https://img.shields.io/badge/Data-Pandera-red?style=flat-square" />
      <img src="https://img.shields.io/badge/Data-Numpy-red?style=flat-square" />
-     <img src="https://img.shields.io/badge/Data-Akquant-red?style=flat-square" />
+     <img src="https://img.shields.io/badge/Data-AShareHub-red?style=flat-square" />
          </br> 
    <img src="https://img.shields.io/badge/Analysis-WalkForward-green?logo=pandas&logoColor=white" />
      <img src="https://img.shields.io/badge/Analysis-KDJ-green?logo=pandas&logoColor=white" />
@@ -23,8 +23,10 @@
      <img src="https://img.shields.io/badge/Analysis-BOLL-green?logo=pandas&logoColor=white" />
      <img src="https://img.shields.io/badge/Analysis-CCI-green?style=flat-square" />
      <img src="https://img.shields.io/badge/Analysis-ADX-green?style=flat-square" />
-     <img src="https://img.shields.io/badge/Analysis-XGBoost-brightgreen?style=flat-square" />
+<img src="https://img.shields.io/badge/Analysis-XGBoost-brightgreen?style=flat-square" />
      <img src="https://img.shields.io/badge/Analysis-Vectorized-9cf?style=flat-square" />
+     <img src="https://img.shields.io/badge/Analysis-FastAPI-blue?style=flat-square" />
+     <img src="https://img.shields.io/badge/Analysis-Scikit--learn-blue?style=flat-square" />
 </p>
 <br />
 
@@ -34,21 +36,21 @@
 
 ### 阶段 A — 回测校准
 
-通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 12 个核心策略参数（4 个信号参数 + 8 个组合参数）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。
+通过 Walk-Forward 滚动窗口优化 + 贝叶斯优化（Bayesian Optimization），自动寻优 8 个核心策略参数（5 个信号参数 + 3 个组合参数）用于日常运行。信号计算已全向量化（`numpy` + `np.select` / `np.correlate`，无 per-bar Python 循环），结合 Phase 0 指标预计算缓存与 ML 预测冻结缓存，单次信号计算 3000 只股票约 10 分钟。采用两级成本分层（信号计算分钟级 + 纯回测秒级）和 GP 代理模型（Gaussian Process + qEI 采集函数），在相同计算预算下覆盖完整参数空间。
 
 ### 阶段 B — 每日分析管线
 
-19 步 DAG 流水线从数据库增量同步 K 线 → 多门控评分 → 多因子 Alpha → 行业百分位过滤 → 组合构建 → 基准对比 → 因子衰减监控 → 跟仓回测 → 生成 Excel 报告 → 同步结果到 PostgreSQL。断点续跑 + run_id 版本管理。
+20 步 DAG 流水线从数据库增量同步 K 线 → 多门控评分 → 13 因子 Alpha → 行业百分位过滤 → 组合构建 → 基准对比 → 风险分析（VaR/Brinson 归因）→ 因子衰减监控 → 跟仓回测 → 生成 Excel 报告 → 同步结果到 PostgreSQL。断点续跑 + run_id 版本管理。
 
 ### 设计特点
 
 - **MACD 管线** — 默认12,26,9周期 + ATR 波动率归一化，7 维评分维度权重可配置
-- **5 道门控递进评分 + 组合约束** — Gate 0（数据质量）→ 1（信号共振，否决）→ 2（波动率/背离，否决）→ 3（资金流修饰）→ 4（仓位联动），Gate 5 组合级后处理（行业集中度 <30%）
-- **信号衰减模型** — 金叉 30 天半衰、背离 8 天半衰、K 线形态 10 天半衰
-- **多因子 Alpha 评分** — 5 因子加权：MACD(25%) + 动量(25%) + 资金流(20%) + 质量(15%) + 估值(15%)，因子权重可配置
+- **多门控递进评分 + 组合约束** — 数据质量（DAG 步骤 9a）→ 信号评分（金叉/背离/反转加分，无信号→评分参考）→ 风险否决（波动率/背离）→ 资金流修饰 → 仓位联动，组合级后处理（行业集中度 <30%、流动性否决、冲击成本控制）
+- **信号衰减模型** — 金叉线性衰减（默认 37 天，回测校准）、背离 8 天半衰、K 线形态 10 天半衰
+- **多因子 Alpha 评分** — 13 因子注册中心（`config/factor_registry.yaml`）：MACD(0.14) + 动量(0.16) + 资金流(0.17) + 质量(0.11) + 估值(0.11) 为核心权重，叠加龙虎榜/流动性/波动率/宏观/财务前瞻/事件驱动/舆情等卫星因子，权重经 IR-Weighted 正交化自动配权
 - **因子衰减监控** — 因子 IC 值、ICIR、Decile Spread 持续跟踪，超阈值自动告警
-- **行业中性化** — 行业内百分位排名的信号校准
-- **增量缓存续算** — 每日信号以 `signal_cache_{trade_date}/{symbol}.parquet` 按只写入，中断后可自动续算已完成的股票
+- **行业中性化** — 行业内百分位排名的信号校准 + 申万一级行业映射
+- **增量缓存续算** — 每日信号以 `signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/{bucket}/{symbol}.parquet` 按只写入，中断后可自动续算已完成的股票
 - **全量配置化** — 所有参数收口在 `config.ini`，支持 `ENC:` 加密敏感字段，Pydantic 自动类型校验
 
 ### 数据源
@@ -63,6 +65,12 @@
 | 强势股 / 连涨股 / 量价齐升 | AkShare 市场情绪接口 | 原始数据获取阶段一并拉取 |
 | 估值因子（PE/PB/市值）| AShareHub API | 日频增量同步 |
 | 质量因子（ROE/毛利率）| AkShare 财务摘要 | 季度数据，增量缓算 |
+| 龙虎榜 | AkShare 沪深交易所 | 上榜净买入 + 20 日聚合 |
+| 宏观因子（PMI/M2/CPI）| AkShare | 宏观周期 → 申万一级行业 tilt |
+| 舆情因子（新闻情感）| AkShare 百度新闻 | NLP 情感打分 [-1,1] |
+| 业绩预告 / 分析师评级 | AShareHub / AkShare | 预告超预期分 + 共识分 |
+| 事件驱动（回购/增减持/分红）| AkShare + AShareHub | 事件驱动总分 |
+| 基准指数日线 | AShareHub | 基准对比 / Brinson 归因 |
 
 <br>
 
@@ -71,19 +79,21 @@
 
 ### Walk-Forward 回测系统
 
-- **全向量化信号引擎** — 信号计算已从 per-bar 逐行 Python 循环重构为纯 numpy 向量化运算。`compute_signals()` 使用 `np.where`、`np.correlate`、`np.select`、前缀和、rolling window broadcast 等技术，消除所有逐行 Python 回调。次核心指标（MACD/BOLL/KDJ/RSI/CCI/ADX）及其峰值/谷值检测在 Phase 0 预计算阶段一次性完成，后续所有参数评估直接复用。
-- **机器学习信号增强** — 引入 XGBoost 模型（`BackTrading/model.py` `BacktestXGBScorer`）作为信号修偏层。`BacktestXGBScorer` 以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度，在 `compute_signals` 中叠加到综合评分，提升回测信号质量。
-- **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标 + 峰值/谷值检测，结果写磁盘（`.indicators.parquet` + `.peaks.npy` + `.troughs.npy`）。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
-- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。默认 IS=120 天、OOS=120 天（`out_of_sample_days` 可配置，半年窗口保证 2 个 WFO 周期的统计量），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
-- **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化（~15 组）→ GP+qEI Level 1 搜索（~35 次）→ GP+qEI Level 2 搜索（~150 次，信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 12 个参数：boll_narrow_ratio, cross_decay_days, golden_cross_bonus, divergence_penalty（信号参数），atr_stop_mult, atr_t1_mult, atr_t2_mult, kelly_fraction, position_a, liq_veto_ratio, conclusion_full_bull, risk_none_multiplier（组合参数）
-- **两级成本分层** — 信号参数（4 个）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（8 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
+- **全向量化信号引擎** — 信号计算已从 per-bar 逐行 Python 循环重构为纯 numpy 向量化运算。`compute_signals()` 使用 `np.where`、`np.correlate`、`np.select`、前缀和、rolling window broadcast 等技术，消除所有逐行 Python 回调。次核心指标（MACD/BOLL/KDJ/RSI/CCI/ADX）在 Phase 0 预计算阶段一次性完成，后续所有参数评估直接复用。
+- **机器学习信号增强** — 引入 XGBoost/Ridge 双模型（`LogicAnalyzer/ml/signal_model.py`）作为信号修偏层。以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度（`apply_ml_signal`），叠加到综合评分。预测结果按 (config_hash, data_fp) 冻结缓存，窗口内仅重训一次，避免重复计算。
+- **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标，结果写磁盘（`.indicators.parquet`）；背离峰值/谷值在 `_divergence_scores` 中滚动计算（避免未来函数 lookahead），缓存于 `.divergence.npz`。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
+- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。OOS 默认 120 天（`out_of_sample_days` 可配置），IS 按数据长度自适应（`train_period = max(120, 总长度 - OOS - 路径数×OOS)`），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
+- **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 信号层搜索 → GP+qEI 组合层搜索（信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 8 个参数：boll_narrow_ratio, cross_decay_days, golden_cross_bonus, divergence_penalty, conclusion_full_bull（信号参数），atr_stop_mult, buy_threshold, max_holdings（组合参数）。预算可在 `config.ini [BACKTEST]` 配置（默认 12 组初始化 + 24 次信号层迭代 + 20 组初始化 + 60 次组合层迭代）
+- **两级成本分层** — 信号参数（5 个）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（3 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
 - **高斯过程代理模型** — `ConstantKernel × Matern(ARD) + WhiteKernel` 组合核，自动相关性长度尺度学习。`save_gp_state` / `restore_gp_state` 序列化核参数实现跨窗口迁移学习
 - **混合采集函数** — `Expected Improvement - λ·σ/|μ|`（DSR 惩罚项，λ=0.05），抑制高不确定性低预期区域的采样，L-BFGS-B 多起点优化
 - **性能指标** — Sharpe、Sortino、Calmar、最大回撤、VaR(95%)、CVaR(95%)、年化收益率/波动率、胜率、盈亏比、PBO（概率过拟合）、DSR（缩水 Sharpe 比）
-- **仓位优化** — 支持风险平价、最小方差、均值-方差（含换手率惩罚 + 行业约束）、评分加权四种组合权重分配
+- **仓位分配** — 引擎执行 Top-K 评分等权分配（`core.py`），候选按综合评分排序后等权买入，遵守单票上限/行业暴露约束
 - **校准持久化** — 最优参数自动写入 `config.ini [BACKTEST_CALIBRATED]` 分区，回测日志记录到 `backtest_calibration_log` 表
-- **信号预计算缓存** — `prepare_backtest_data()` 按 `signal_cache_{trade_date}_{config_hash}_{param_hash}/{bucket}/{symbol}.parquet` 增量写入，分桶减小单目录文件数，zstd 压缩，断点自动续算。Phase 0 缓存位于 `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet`，子进程通过磁盘共享。
-- **独立验证集模拟验证** — WFO 选参后优先使用与选参区间**无交集**的 holdout 独立验证集（P0-10 ④）做 Sharpe/Sortino 衰减校验（衰减 >30% 拒绝上线），替代旧的自引用"最近 N 日"验证；独立验证集未提供时回退并告警
+- **信号预计算缓存** — `prepare_backtest_data()` 按 `signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/{bucket}/{symbol}.parquet` 增量写入（`data_fp` 为数据指纹，用于 WFO 窗口切片隔离），分桶减小单目录文件数，断点自动续算。Phase 0 缓存位于 `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet`，线程间通过磁盘共享。
+- **独立验证集模拟验证** — WFO 选参后优先使用与选参区间**无交集**的 holdout 独立验证集（默认 `holdout_ratio=0.20`，全程禁触）做 Sharpe/Sortino 衰减校验（衰减 >30% 拒绝上线），替代旧的自引用"最近 N 日"验证；独立验证集未提供时回退并告警
+- **过拟合防护体系** — CPCV 净化 + 禁运（purge 5 天 / embargo 3 天剔除训练窗口重叠样本）、Diebold-Mariano (DM) 检验（Newey-West HAC，仅采纳 DM 显著窗口参数）、多重测试惩罚（同区间调参超 10 次 Sharpe/Sortino 扣 20%，超 30 次判失效）、参数稳健性自检（Sharpe>2 时最优参数 ±10% 扰动验证）、统一采纳门控（模拟验证 / OOS 衰减 / 多重测试 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50% 七项硬门槛，任一不过则不写入校准结果）
+- **WFO 可靠性保障** — 时间预算熔断（默认 8 小时）+ 连续无改进早停（3 个窗口）、系统性失败拦截（连续 3 窗口 OOS 失效即中断流水线）、四方绑定调度（数据版本 + 配置哈希 + 频率 + 时间）、失败快照持久化（保留 14 天）、窗口预检（RELAX/OK/SKIP/LOW_CONFIDENCE/NEED_FILL 多档）+ 指标降级缩窗重算
 
 ### 真实价格体系（P0-11 审计重构）
 
@@ -99,8 +109,8 @@
 
 ### 数据同步（IncrementalSyncEngine）
 
-- 增量同步 A 股日 K 线（Sina `stock_zh_a_daily`，HFQ 前复权），自动检测除权事件并全量重写
-- 申万行业分类基础信息拉取（`ThreadPoolExecutor(10)`，~40s）
+- 增量同步 A 股日 K 线（腾讯行情接口，HFQ 后复权 + 不复权收盘 + 复权因子），自动检测除权事件并全量重写
+- 申万行业分类基础信息拉取（`ThreadPoolExecutor(10)`，~40s），含申万一级行业映射（`SwIndustrySync`）
 - 交易日期历本地缓存（24h TTL，chinesecalendar 兜底）
 - 失败股票自动记录，下次运行重试
 - 全局 HTTP 30s 超时（`AkshareConfig` 补丁）
@@ -118,15 +128,15 @@
 | KDJ | 9,3,3 | 14 种信号模式 + 金叉死叉 + 三金叉共振 |
 | K 线形态 | 25+ 种 | TA-Lib 吞没/十字星/锤子线等，评分 -10~+10 叠加衰减 |
 
-### 评分管道（5 道门控 + 组合约束）
+### 评分管道（多门控评分 + 组合约束）
 
 ```
-Gate 0: 数据质量   →  K线<60日/ATR缺失/MA60缺失 → 否决
-Gate 1: 入场信号   →  无金叉/背离/反转 → C 级（拦截 ~50%）
+Gate 0: 数据质量   →  由 DAG 步骤 9a DataQualityChecker 执行（写 dash_quality_log 表）
+Gate 1: 入场信号   →  金叉/背离/反转等加分规则评分；无信号时追加"评分参考"，级别由综合评分阈值决定
 Gate 2: 风险过滤   →  高波/顶背离/低成交额 → 否决（拦截 ~10~15%）
 Gate 3: 资金修饰   →  资金流/量价修饰评分
 Gate 4: 仓位联动   →  风险等级驱动 position_adjust 系数 (ATR/止损比)
-Gate 5: 组合约束   →  行业集中度 <30%，总仓位 <100%（由 PortfolioBuilder 执行）
+Gate 5: 组合约束   →  行业集中度 <30%，总仓位 <100%（由 PortfolioBuilder 执行）+ 流动性否决（liq_veto_ratio）
 ```
 
 ### 资金流 & 筹码
@@ -134,11 +144,13 @@ Gate 5: 组合约束   →  行业集中度 <30%，总仓位 <100%（由 Portfol
 - 多周期资金净流入（3/5/10/20 日），主力/大户/散户细分
 - 筹码分布：获利比例、成本分位（5%/50%/95%）、集中度、阻力位规则
 - 市场状态分类：STRONG_TREND / WEAK_TREND / BOTTOM_REVERSAL / TOP_RISK / OSCILLATION
+- 宏观前置过滤：L1 上证指数 MA60/120 空头排列 → L2 量价验证 → L3 全 A 上涨比例；HIGH_RISK → 跳过全部标的，MEDIUM → 评分阈值上浮 15%
+- 资金动能双因子：趋势（权重 0.4）+ 速度（权重 0.6）
 
 ### 输出
 
 - **Excel 报告** — 输出个股分析报告
-- **数据库同步** — 结果写入 `ods_ak_ranking_stocks`、`ods_ak_industry_analysis`、`app_stock_strategy_report`、`ods_factor_ic_history`、`dash_pipeline_checkpoint`
+- **数据库同步** — 结果写入 `ods_ak_ranking_stocks`、`ods_ak_industry_analysis`、`app_stock_strategy_report`、`ods_factor_ic_history`、`dash_pipeline_checkpoint`、`dash_run_log`、`dash_quality_log` 等表
 
 <br />
 
@@ -152,8 +164,8 @@ Gate 5: 组合约束   →  行业集中度 <30%，总仓位 <100%（由 Portfol
 [TECHNICAL_INDICATORS]
 macd_params = 6,13,5              ; 超短敏感 MACD
 
-[SYSTEM]
-FUND_FLOW_PERIODS = [3, 5]        ; 短期资金流
+[FUND_FLOW]
+fund_flow_periods = 3,5,10        ; 短期资金流（仅允许 3,5,10 / 3,5,20 / 5,10,20 / 3,10,20 四种三周期组合）
 
 [FILTER_RULES]
 exempt_levels = 完全主升,趋势加速   ; 仅保留强势股
@@ -169,13 +181,13 @@ kelly_fraction = 0.5              ; 激进仓位
 [TECHNICAL_INDICATORS]
 macd_params = 24,52,18            ; 中线趋势 MACD
 
-[SYSTEM]
-FUND_FLOW_PERIODS = [5, 10, 20]   ; 多周期验证
+[FUND_FLOW]
+fund_flow_periods = 5,10,20       ; 多周期验证
 
 [FULL_BULL_SCORING]
 conclusion_full_bull = 80         ; 提高完全主升门槛
 
-[BACKTEST_CALIBRATED]
+[POSITION_SIZING]
 kelly_fraction = 0.25             ; 保守仓位
 max_single_position = 0.15        ; 单只上限 15%
 ```
@@ -186,22 +198,22 @@ max_single_position = 0.15        ; 单只上限 15%
 [TECHNICAL_INDICATORS]
 macd_params = 12,26,9             ; 经典均衡 MACD
 
-[SYSTEM]
-FUND_FLOW_PERIODS = [10, 20]      ; 中长期资金流
+[FUND_FLOW]
+fund_flow_periods = 5,10,20       ; 中长期资金流
 
-[BACKTEST_CALIBRATED]
-kelly_fraction = 0.2
-position_a = 0.3                  ; A 级仓位 30%
-max_single_position = 0.2
+[POSITION_SIZING]
+kelly_fraction = 0.3
+position_a = 0.35                 ; A 级仓位 35%
+max_single_position = 0.33
 ```
 </br> </br> 
 ## 🛠️ 安装与配置
 
 ### 环境要求
 
-- **Python 3.12+**（推荐 3.12~3.13）
+- **Python 3.10+**（推荐 3.12~3.13）
 - **PostgreSQL 14+** — 数据持久化存储
-- **AkShare** — 免费使用，内置频率限制和 30s 全局超时
+- **AkShare** — 免费使用，项目通过 `AkshareConfig` 补丁提供全局 30s 超时
 
 ### 数据库准备
 
@@ -211,13 +223,13 @@ max_single_position = 0.2
 
 ### AShareHub API
 
-筹码分布数据需要 [AShareHub](https://www.asharehub.com) API 密钥。
+筹码分布、资金流向、估值、财务预告等数据需要 [AShareHub](https://www.asharehub.com) API 密钥。
 
 ```ini
 [ASHAREHUB]
 api_key = ENC:gAAAAAB...         ; 支持 ENC 加密
 enable_chip_distribution = true
-chip_limit = 1
+enable_fundamentals = true
 ```
 
 密钥加密使用 `UtilsManager/ConfigCipher.py`，与数据库密码共用密钥。
@@ -258,7 +270,6 @@ cd BAISYS_QUAN
 | `host` | 字符串 | 是 | - | 数据库主机地址 |
 | `port` | 字符串 | 是 | - | 数据库端口号 |
 | `db_name` | 字符串 | 是 | - | 数据库名称 |
-| `main_board_only` | 布尔 | 否 | `true` | 是否仅获取主板股票（60/00开头） |
 | `encryption_key_path` | 字符串 | 否 | `~/.baisys_quant_key` | 加密密钥文件路径 |
 
 ---
@@ -273,7 +284,6 @@ cd BAISYS_QUAN
 | `data_fetch_retries` | 整数 | 否 | `3` | 数据获取失败重试次数 |
 | `data_fetch_delay` | 整数 | 否 | `5` | 重试间隔秒数 |
 | `stock_basic_info_expire_days` | 整数 | 否 | `30` | 基础信息缓存过期天数 |
-| `signal_processing_processes` | 整数 | 否 | CPU 核数 | 技术指标信号处理线程数 |
 
 ---
 
@@ -302,6 +312,7 @@ cd BAISYS_QUAN
 |------|------|--------|------|
 | `api_key` | 字符串 | - | AShareHub API 密钥（支持 ENC 加密） |
 | `enable_chip_distribution` | 布尔 | `true` | 是否获取筹码分布数据 |
+| `enable_fundamentals` | 布尔 | `true` | 是否获取估值/财务等基本面数据 |
 | `moneyflow_retry` | 整数 | `3` | 资金流向 API 重试次数 |
 | `moneyflow_page_delay` | 浮点 | `1.0` | 资金流向分页间隔（秒） |
 
@@ -426,7 +437,14 @@ cd BAISYS_QUAN
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| `atr_t1_mult` | `4.0` | T1 目标价 = close + ATR × 此值 |
 | `atr_t2_mult` | `5.0` | T2 目标价 = close + ATR × 此值 |
+
+**行业估值聚合：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `industry_valuation_agg_method` | `aggregate_profitable` | 行业估值聚合方式 |
 
 **移动止损：**
 
@@ -486,7 +504,8 @@ cd BAISYS_QUAN
 | `financial_quality_batch_size` | 整数 | `500` | 质量因子每批采集股票数 |
 | `financial_quality_batch_sleep` | 整数 | `20` | 质量因子批间休眠秒数 |
 | `financial_quality_file_cache_days` | 整数 | `30` | 质量因子离线文件缓存天数 |
-| 因子权重 | — | — | 权重定义已迁移至 `config/factor_registry.yaml` |
+| `fundamentals_retry` | 整数 | `3` | 基本面数据拉取重试次数 |
+| 因子权重 | — | — | 权重定义已迁移至 `config/factor_registry.yaml`（13 因子注册表） |
 
 
 ---
@@ -496,7 +515,7 @@ cd BAISYS_QUAN
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `max_single_position` | `0.33` | 单只股票最大仓位比例 |
-| `default_win_rate` | `0.50` | 默认胜率 |
+| `default_win_rate` | `0.55` | 默认胜率 |
 | `position_b` | `0.15` | B 级基础仓位 |
 | `position_c` | `0.05` | C 级基础仓位 |
 | `max_industry_exposure` | `0.30` | 单行业最大暴露 |
@@ -504,27 +523,32 @@ cd BAISYS_QUAN
 | `risk_aversion` | `1.0` | 风险厌恶系数 |
 | `risk_budget` | `0.02` | 风险预算（组合波动率上限） |
 | `risk_none_multiplier` | `1.0` | NONE 风险等级仓位系数 |
+| `max_single_impact` | `0.02` | 单票最大冲击成本 |
+| `impact_threshold` | `0.01` | 冲击成本阈值 |
+| `impact_base` | `0.002` | 冲击成本基数 |
 
 ---
 
 #### [BACKTEST_CALIBRATED] — 回测自动校准参数
 
-这些参数由 Walk-Forward 寻优引擎在回测期间自动搜索最优值并写回本分区，日常运行无需手动修改。
+其中 8 个参数（boll_narrow_ratio / cross_decay_days / conclusion_full_bull / golden_cross_bonus / divergence_penalty / atr_stop_mult / buy_threshold / max_holdings）由 Walk-Forward 寻优引擎在回测期间自动搜索最优值并写回本分区；其余为静态默认值，日常运行无需手动修改。
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `boll_narrow_ratio` | <font color="red">`0.9`</font> | 窄布林判定：带宽/历史均值 < 此值 → 震荡（由回测优化） |
-| `cross_decay_days` | <font color="red">`37`</font> | 金叉信号衰减半衰期，天（由回测优化） |
+| `cross_decay_days` | <font color="red">`37`</font> | 金叉信号衰减天数，天（由回测优化） |
 | `atr_stop_mult` | <font color="red">`2`</font> | ATR 止损倍数：止损价 = close - ATR × 此值（由回测优化） |
-| `atr_t1_mult` | <font color="red">`4`</font> | T1 目标价 ATR 倍数（由回测优化） |
-| `liq_veto_ratio` | <font color="red">`0.065`</font> | 流动性否决比（由回测优化） |
-| `kelly_fraction` | <font color="red">`0.3`</font> | Kelly 仓位比例系数（由回测优化） |
-| `position_a` | <font color="red">`0.35`</font> | A 级基础仓位（由回测优化） |
-| `atr_t2_mult` | <font color="red">`5.0`</font> | T2 目标价 ATR 倍数（由回测优化） |
 | `conclusion_full_bull` | <font color="red">`80`</font> | MACD 综合评分 ≥ 此值 → A 级（由回测优化） |
 | `golden_cross_bonus` | <font color="red">`10`</font> | R04: 金叉量价确认加分（由回测优化） |
 | `divergence_penalty` | <font color="red">`20`</font> | R41: 顶背离量缩扣分（由回测优化） |
-| `risk_none_multiplier` | <font color="red">`1.0`</font> | NONE 风险等级仓位系数（由回测优化） |
+| `buy_threshold` | <font color="red">`17`</font> | 买入评分阈值（由回测优化） |
+| `max_holdings` | <font color="red">`11`</font> | 最大持仓数（由回测优化） |
+| `atr_t1_mult` | `4` | T1 目标价 ATR 倍数（静态） |
+| `liq_veto_ratio` | `0.065` | 流动性否决比（静态） |
+| `kelly_fraction` | `0.3` | Kelly 仓位比例系数（静态） |
+| `position_a` | `0.35` | A 级基础仓位（静态） |
+| `atr_t2_mult` | `5.0` | T2 目标价 ATR 倍数（静态） |
+| `risk_none_multiplier` | `1.0` | NONE 风险等级仓位系数（静态） |
 
 ---
 
@@ -534,51 +558,67 @@ cd BAISYS_QUAN
 |------|--------|------|
 | `enabled` | `true` | 是否启用回测校准 |
 | `optimize_frequency` | `monthly` | 校准频率 |
-| `backtest_start_date` | `20230101` | 回测起始日期 |
-| `out_of_sample_days` | `60` | Walk-Forward 样本外窗口天数 |
+| `backtest_start_date` | `20240101` | 回测起始日期 |
+| `out_of_sample_days` | `120` | Walk-Forward 样本外窗口天数 |
+| `holdout_ratio` | `0.20` | holdout 独立验证集比例（全程禁触） |
+| `wfo_num_paths` | `3` | Walk-Forward 多路径数 |
+| `exclude_st` | `true` | 是否剔除 ST/退市整理股 |
 | `initial_cash` | `1000000` | 初始资金 |
-| `full_a_share_mode` | `false` | 是否全 A 股回测 |
-| `signal_pipelines` | `3` | 信号预计算并行管道数 |
-| `execution_model` | `next_open` | 成交时点模型：`close` 信号日收盘成交（老行为）/ `next_open` 信号次日开盘成交（默认，符合A股T+1）/ `vwap` 信号次日VWAP成交 |
+| `signal_pipelines` | `6` | 信号预计算并行管道数 |
+| `execution_model` | `next_open` | 成交时点模型：`next_open` 信号次日开盘成交（默认，符合A股T+1）/ `vwap` 信号次日VWAP成交 |
+| `bayesian_n_init_signal` | `12` | 信号层 Sobol 初始化组数 |
+| `bayesian_n_iter_signal` | `24` | 信号层 GP+qEI 迭代次数 |
+| `bayesian_n_init_portfolio` | `20` | 组合层 Sobol 初始化组数 |
+| `bayesian_n_iter_portfolio` | `60` | 组合层 GP+qEI 迭代次数 |
+| `bayesian_cpcv_purge_days` | `5` | CPCV 净化天数 |
+| `bayesian_cpcv_embargo_days` | `3` | CPCV 禁运天数 |
+| `bayesian_time_budget_seconds` | `28800` | 贝叶斯优化时间预算（秒，8h） |
+| `bayesian_max_no_improve_windows` | `3` | 连续无改进早停窗口数 |
+| `snapshot_enabled` | `true` | 失败快照持久化 |
+| `precheck_mode` | `RELAX` | 窗口预检模式（RELAX/OK/SKIP/LOW_CONFIDENCE/NEED_FILL） |
+| `calendar_align_mode` | `on` | 交易日历对齐（官方日轴） |
+| `indicator_degradation` | `RELAX` | 指标降级模式（窗口不足时缩窗重算） |
+| `simulate_limit_up_down` | `true` | 涨跌停分档撮合模拟 |
+| `limit_seal_ratio` / `limit_tradable_ratio` / `limit_intraday_ratio` / `limit_seal_decay` | — | 一字/盘中/冲板三类成交比例 + 连板衰减 |
+| `max_order_pct` | `0.30` | 单笔委托占成交量上限 |
+| `resume_gap_up` / `resume_gap_down` | `0.05` | 复牌跳空处理阈值 |
+| `handling_fee_rate` | `0.0000341` | 经手费率 |
+| `csrc_fee_rate` | `0.00002` | 证管费率 |
+| `stamp_tax_segments` | `2023-08-28:0.0005;2000-01-01:0.001` | 印花税历史分段费率 |
 
-**网格搜索参数范围（逗号分隔 min,max,step）：**
+**贝叶斯寻优参数范围（逗号分隔 min,max,step）：**
 
-**趋势 + 止损：**
+**信号参数：**
+
+| 参数 | 默认值 | 寻优对象 |
+|------|--------|----------|
+| `boll_narrow_ratio_range` | `0.6,1.2,0.1` | 布林窄幅比 |
+| `cross_decay_days_range` | `3,60,3` | 金叉衰减天数 |
+| `conclusion_full_bull_range` | `60,95,5` | A 级评分阈值 |
+| `golden_cross_bonus_range` | `5,20,5` | R04 金叉加分 |
+| `divergence_penalty_range` | `10,40,5` | R41 顶背离扣分 |
+
+**组合参数：**
 
 | 参数 | 默认值 | 寻优对象 |
 |------|--------|----------|
 | `atr_stop_mult_range` | `1.0,3.0,0.5` | ATR 止损倍数 |
-| `atr_t1_mult_range` | `2.0,6.0,1.0` | T1 目标倍数 |
-| `atr_t2_mult_range` | `3.0,10.0,1.0` | T2 目标倍数 |
-| `boll_narrow_ratio_range` | `0.6,1.2,0.1` | 布林窄幅比 |
-| `cross_decay_days_range` | `15,60,5` | 金叉衰减天数 |
-
-**仓位 + 风控：**
-
-| 参数 | 默认值 | 寻优对象 |
-|------|--------|----------|
-| `kelly_fraction_range` | `0.1,0.5,0.1` | Kelly 比例 |
-| `position_a_range` | `0.2,0.5,0.05` | A 级仓位 |
-| `liq_veto_ratio_range` | `0.03,0.10,0.01` | 流动性否决比 |
-| `conclusion_full_bull_range` | `60,95,5` | A 级评分阈值 |
-| `risk_none_multiplier_range` | `0.5,2.0,0.25` | NONE 风险系数 |
-
-**Rule 评分偏移：**
-
-| 参数 | 默认值 | 寻优对象 |
-|------|--------|----------|
-| `golden_cross_bonus_range` | `5,20,5` | R04 金叉加分 |
-| `divergence_penalty_range` | `10,40,5` | R41 顶背离扣分 |
+| `buy_threshold_range` | `5,30,5` | 买入评分阈值 |
+| `max_holdings_range` | `3,20,1` | 最大持仓数 |
 
 ---
 
-#### [TRADING_COST] — A股交易成本（跟仓回测）
+#### [TRADING_COST] — A股交易成本（回测 + 跟仓）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `commission_rate` | `0.0003` | 佣金费率（万三） |
-| `stamp_tax_rate` | `0.001` | 印花税费率（卖出单向，千一） |
+| `stamp_tax_rate` | `0.0005` | 印花税费率（卖出单向，2023-08-28 起万五） |
+| `stamp_tax_segments` | `2023-08-28:0.0005;2000-01-01:0.001` | 印花税历史分段费率 |
 | `transfer_fee_rate` | `0.00001` | 过户费率（双向，万0.1） |
+| `handling_fee_rate` | `0.0000341` | 经手费率 |
+| `csrc_fee_rate` | `0.00002` | 证管费率 |
+| `min_commission_per_trade` | `5.0` | 单笔最低佣金（元） |
 
 ---
 
@@ -587,6 +627,28 @@ cd BAISYS_QUAN
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `pool_file_path` | `证券交割单.xlsx` | 历史交易记录池文件路径（FIFO 匹配） |
+
+---
+
+#### [API] — API 服务（ApiServer）
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | 布尔 | `0` | 是否启用 FastAPI 服务 |
+| `host` | 字符串 | `127.0.0.1` | 监听地址 |
+| `port` | 整数 | `8000` | 监听端口 |
+| `alert_webhook_url` | 字符串 | 空 | 告警 Webhook 地址 |
+| `alert_channel` | 字符串 | `generic` | 告警渠道：generic/wecom/feishu/dingtalk |
+| `alert_on_failure` | 布尔 | `1` | 管线失败时告警 |
+| `alert_on_success` | 布尔 | `0` | 管线成功时告警 |
+
+---
+
+#### [DISTRIBUTION] — 东方财富主力成本 API
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api_token` | 字符串 | - | 主力成本数据 API Token（当前为明文，建议改用 ENC 加密） |
 
 ---
 
@@ -609,43 +671,45 @@ cd BAISYS_QUAN
 MainShareAnalysis
   │
   ├── [阶段 A] 回测校准 (run_backtest_pipeline)
-  │     ├── 解析股票列表 → 拉取 K 线
+  │     ├── 解析股票列表 → 拉取 K 线（数据库 advisory lock 防并发）
   │     ├── 信号预计算 (prepare_backtest_data)
   │     │   ├── Phase 0: 技术指标预计算 (indicator_cache.py)
-  │     │   │   └── MACD/A股/BOLL/KDJ/CCI/RSI/ADX → 磁盘缓存 + 峰值谷值检测
+  │     │   │   └── MACD/ATR/BOLL/KDJ/CCI/RSI/ADX → 磁盘缓存 + 背离峰值谷值 (divergence.npz)
   │     │   ├── 全向量化信号评分 (vectorized_signal.py)
   │     │   │   └── numpy 向量化: 背离广播/斜率卷积/形态前缀和/金叉衰减曲线
-  │     │   ├── XGBoost 信号修偏 (BacktestXGBScorer)
-  │     │   │   └── 概率校准 → 叠加到综合评分
-  │     │   └── 并行 ProcessPoolExecutor + 增量 parquet 缓存
-  │     ├── Walk-Forward 滚动优化
-  │     │   ├── 滑动窗口: in-sample 120 天 grid search
-  │     │   └── out-of-sample 20 天验证
+  │     │   ├── XGBoost 信号修偏 (LogicAnalyzer/ml/signal_model.py)
+  │     │   │   └── 概率校准 → 叠加到综合评分（预测冻结缓存，仅重训一次）
+  │     │   └── 并行 ThreadPoolExecutor + 增量 parquet 缓存
+  │     ├── Walk-Forward 滚动优化（多路径 + 贝叶斯优化）
+  │     │   ├── 滑动窗口: in-sample 数据自适应（≥120 天）贝叶斯寻优
+  │     │   └── out-of-sample 120 天验证 + holdout 独立终验集
   │     ├── 全量回测 (run_full_backtest) — 最优参数
-  │     ├── 绩效指标计算 (Sharpe/Sortino/Calmar/VaR/胜率)
+  │     ├── 绩效指标计算 (Sharpe/Sortino/Calmar/VaR/胜率/PBO/DSR)
+  │     ├── 统一采纳门控（7 项硬门槛校验）
   │     └── 保存校准结果 → calibration_result.json + config.ini
   │
-  └── [阶段 B] 每日分析管线 DAG 19 步 (StockAnalysisCoordinator)
+  └── [阶段 B] 每日分析管线 DAG 20 步 (StockAnalysisCoordinator)
         ├─ 01 同步历史K线 (IncrementalSyncEngine)
         ├─ 02 格式化股票代码 (CodeNormalizer)
-        ├─ 03 获取原始数据 (资金流/强势股/行业板块)              ─┐
-        ├─ 04 获取K线数据及最新价                                ─┤ 并行可独立执行
-        ├─ 05 处理技术指标信号 (MACD 7维/KDJ/CCI/RSI/BOLL)      ─┤
-        ├─ 06 行业分析 (IndustryFlowAnalyzer)                   ─┘
-        ├─ 07 处理均线突破数据 (依赖 03+04)
+        ├─ 03 获取原始数据 (资金流/强势股/行业板块/龙虎榜/宏观/舆情/事件)  ─┐
+        ├─ 04 获取K线数据及最新价                                        ─┤ 并行可独立执行
+        ├─ 05 处理技术指标信号 (MACD 7维/KDJ/CCI/RSI/BOLL)              ─┤
+        ├─ 06 行业分析 (IndustryFlowAnalyzer)                           ─┘
+        ├─ 07 均线突破及过滤 (依赖 03+04)
         ├─ 08 准备处理数据字典 (合并 05+06+07)
         ├─ 09 合并分析数据 (DataProcessingService)
-        ├─ 10 数据质量检查 (DataQualityChecker)
-        ├─ 11 行业信号映射 + 行业中性化
-        ├─ 12 多因子 Alpha 评分 (5 因子加权 → fuse_scores)
+        ├─ 9a 数据质量检查 (DataQualityChecker, 写 dash_quality_log)
+        ├─ 10 映射行业信号 + 行业中性化（含申万一级 tilt）
+        ├─ 11 多因子 Alpha 评分 (13 因子注册表加权 → fuse_scores + 正交化)
         │     └── 行业百分位 Stage 1：in-cache 缓存
-        ├─ 13 剔除弱势股 (三级过滤：趋势豁免→硬百分位→D/C级)
-        ├─ 14 组合构建 (PortfolioBuilder: Kelly+风险平价+流动性)
-        ├─ 15 基准对比 (BenchmarkEvaluator: 沪深300/全A等权)
-        ├─ 16 因子衰减监控 (FactorDecayMonitor: IC/ICIR 跟踪)
-        ├─ 17 跟仓回测分析 (PositionTrackingService: FIFO 匹配)
-        ├─ 18 生成Excel报告 (ReportService: 58列+行业/因子子表)
-        └─ 19 同步结果到数据库 (ods_* / app_stock_strategy_report)
+        ├─ 12 剔除弱势股 (三级过滤：趋势豁免→硬百分位→D/C级)
+        ├─ 13 组合构建 (PortfolioBuilder: Kelly+流动性+冲击成本)
+        ├─ 14 基准对比 (BenchmarkEvaluator: 沪深300/全A等权)
+        ├─ 15 因子衰减监控 (FactorDecayMonitor: IC/ICIR 跟踪)
+        ├─ 16 跟仓回测分析 (PositionTrackingService: FIFO 匹配)
+        ├─ 风险分析 (VaR/ES、Brinson 归因、因子风险归因)
+        ├─ 17 生成Excel报告 (ReportService: 52列+行业/因子/风险子表)
+        └─ 18 同步结果到数据库 (ods_* / app_stock_strategy_report / dash_*)
 ```
 
 ### 调度模式
@@ -668,7 +732,7 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 
 ### Excel 报告
 
-**`审计报告_YYYYMMDD.xlsx`** — 每日全市场分析结果，包含 58+ 列及多个子表：
+**`审计报告_YYYYMMDD.xlsx`** — 每日全市场分析结果，默认 52 列及多个子表：
 
 | 区块 | 列数 | 包含列 |
 |------|------|--------|
@@ -679,35 +743,60 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 | 均线参考 | 3 | 10/30/60 日均线价 |
 | 背离 | 4 | 背离信号, 背离距今, 背离位置, MACD上穿零轴时间 |
 | 风控 | 2 | 风险等级, 宏观风险 |
-| 仓位 | 3 | 建议仓位比例, 目标权重, 仓位依据 |
-| 退出策略 | 5 | 止损价, T1/T2目标价, 移动止损, 盈亏比 |
+| 仓位 | 2 | 建议仓位比例, 目标权重 |
+| 退出策略 | 4 | 止损价, T1/T2目标价, 移动止损 |
 | 综合报告 | 3 | 多头排列趋势, 综合分析结论/评分/级别 |
-| 多因子评分 | 5 | 基本面评分, 估值评分, 动量评分, 资金流评分, MACD评分 |
-| 行业百分位 | 4 | 行业内评分百分位, 动量百分位, 基本面百分位, 估值百分位 |
+| 多因子评分 | 11+ | 基本面/估值/动量/资金流/MACD 等 13 因子评分 |
+| 行业百分位 | 10 | 行业内评分/动量/基本面/估值等百分位 |
 | 资金 | 5 | 研报买入次数, 资金动能, 5/10/20 日资金流入 |
 | 链接 | 1 | 股票链接 |
 
-子表：行业深度分析、主力研报筛选、均线多头排列、资金流向、强势股池、技术指标信号、因子衰减监控、跟仓回测详情等。
+子表：数据汇总、行业深度分析、主力研报筛选、主力成本分析、跟仓回测、基准对比，以及风险分析子表（风险 VaR 分析、Brinson 归因、因子风险归因）。
 
 ### 回测校准结果
 
-每次回测运行后，结果保存在 `calibration_result.json` 中，最优参数自动写入 `config.ini`。运行日志记录到 `backtest_calibration_log` 数据库表。
+每次回测运行后，结果保存在 `calibration_result.json` 中，通过 7 项硬门槛（模拟验证 / OOS 衰减 / 多重测试惩罚 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50%）后方写入 `config.ini`。运行日志记录到 `backtest_calibration_log` 数据库表。
 
 ### 缓存文件
 
 | 文件/目录 | 说明 |
 |-----------|------|
-| `backtest_signal_cache/{trade_date}/{symbol}.parquet` | 信号预计算缓存（按日 + 按只，支持中断续算）|
-| `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet` | Phase 0 技术指标预计算缓存（含峰值/谷值）|
+| `signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/<bucket>/<symbol>.parquet` | 信号预计算缓存（按日 + 按只 + 分桶，支持中断续算）|
+| `CACHE_DIR/indicator_cache_v1/<bucket>/<symbol>.indicators.parquet` | Phase 0 技术指标预计算缓存（含 `.divergence.npz` 背离峰谷）|
+| `failure_snapshots/<yyyy-mm-dd>/<bucket>/<snapshot_id>.parquet` | 回测失败快照（保留 14 天）|
 | `calendar/official_trading_dates.json` | 交易日历缓存（24h TTL）|
 | `StockIndes_YYYYMMDD.txt` | 股票基础信息缓存 |
 | `ShareData/` | 原始数据及清洗后数据缓存 |
 | `failed_symbols_{YYYYMMDD}.txt` | 当日同步失败的股票，下次运行自动重试 |
 
+## 🖥️ API 服务（ApiServer）
+
+内置 FastAPI 服务（`python -m ApiServer.app`），默认关闭（`[API] enabled=0`）。提供：
+
+- `GET /api/v1/health` — 数据库探活
+- `POST /api/v1/pipeline/run` + `GET /pipeline/status` / `runs` / `runs/{run_id}` / `steps/{run_id}` — 管线触发与状态查询（基于 `dash_run_log` / `dash_pipeline_checkpoint`）
+- `GET /api/v1/factors/registry` / `ic-history` — 因子注册表与 IC 历史
+- `GET /api/v1/pipeline/quality-log` — 数据质量日志
+- `GET/POST /api/v1/alert/config` + `POST /alert/test` — 告警配置
+- 告警渠道：企业微信 / 飞书 / 钉钉 / 通用 Webhook（管线完成/失败通知）
+
+## 🧰 工具集（TreasureBox）
+
+独立运行的辅助分析工具：
+
+| 工具 | 功能 |
+|------|------|
+| `SingleStockAnalyzer.py` | 交互式单只股票技术分析（MACD 7 维/K线形态/KDJ/CCI/RSI/BOLL 全信号 + 综合结论）|
+| `DoubleBottomAnalyzer.py` | 全市场 MACD+KDJ 双谷（双重底）形态扫描，输出"双谷探底机会点"Excel |
+| `KDJ_Signal.py` | 从 `app_stock_strategy_report` 筛选 KDJ 信号并验证信号日后股价表现 |
+| `MacdZeroAxisPattern.py` | 全市场 MACD"零轴完整反弹形态"扫描 |
+| `个股新闻查询.py` | 东方财富个股新闻批量查询导出 |
+
+<br />
+
 ## ⚠️ 特别提醒
 
-- 回测测试默认使用后复权
-- 复盘中除价格字段之外各因子的计算默认使用后复权
+- 复盘计算中除价格字段之外各因子的计算默认使用后复权
 - 复盘计算后输出的报告中价格字段均采用不复权（以方便用户直接查看）
 
 ## ⚠️ 注意事项
@@ -715,11 +804,12 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 - 请确保 PostgreSQL 服务已启动且 `config.ini` 中数据库连接信息正确
 - 首次运行前：`pip install -r requirements.txt`
 - 数据同步依赖 AkShare，建议在交易日 15:30 后运行
-- 信号预计算阶段使用 `ProcessPoolExecutor`，需确保 Python 环境支持 multiprocessing spawn
-- 若 `config.ini` 缺少某些节，系统会自动补全默认值（`ConfigValidator`）
-- 敏感信息（数据库密码、API Key）支持 `ENC:` 加密前缀，使用 `ConfigCipher` 工具生成
+- 信号预计算阶段使用 `ThreadPoolExecutor`（Windows spawn 下进程池会死锁）
+- 若 `config.ini` 缺少必需节（DATABASE/SYSTEM/LOGGING/MULTI_HEAD_ARRANGEMENT/FUND_FLOW/TECHNICAL_INDICATORS），`ConfigValidator` 自动补全默认值并备份 `config.ini.bak`
+- 敏感信息（数据库密码、API Key）支持 `ENC:` 加密前缀，使用 `ConfigCipher` 工具生成；注意 `[DISTRIBUTION]` 的 `api_token` 目前为明文，建议改用加密值
 - 信号缓存按交易日后缀存储，历史缓存文件永不删除，仅在缺少当前交易日缓存时重新计算
 - DAG 流水线 checkpoint 存于 `dash_pipeline_checkpoint` 表，run_id 隔离，支持断点续跑和跨日隔离
+- 回测与流水线通过数据库 advisory lock 互斥，避免并发冲突
 
 <br />
 
