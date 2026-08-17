@@ -203,6 +203,59 @@ def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -
         return "unknown"
 
 
+def merge_best_params_into_structured(
+    best_params: dict[str, Any],
+    base: dict[str, Any],
+    *,
+    full_bull_default: int | None = None,
+) -> dict[str, Any]:
+    """将 WFO 优化输出的 flat best_params 注入 structured base（唯一事实来源）。
+
+    所有调用方（runner.py 终验回测、simulated_trading.py 模拟验证、
+    prepare.py flat 转换）必须使用此函数，杜绝"回测一套、验证一套"。
+
+    路由规则以 PREPARE_CONSUMED 为信号参数白名单，非信号参数（如 cross_decay_min
+    等）通过 _SCORING_EXTRA 纳入，与 prepare.py flat-to-structured 白名单保持一致。
+
+    Args:
+        best_params: WFO 输出的扁平参数 dict（key 为参数名）。
+        base: _build_params(config) 输出的结构化 dict。
+        full_bull_default: conclusion_full_bull 缺失时的默认值（None 时取 base）。
+
+    Returns:
+        注入后的结构化 dict（base 被就地修改并返回）。
+    """
+    from BackTrading.parameter_robustness import PREPARE_CONSUMED
+
+    # 分区白名单（与 CALIB_PARAM_MAP / vectorized_signal 消费路径对齐）
+    _REGIME_KEYS = frozenset({"boll_narrow_ratio"})
+    _THRESHOLD_FLAT = frozenset({"conclusion_full_bull", "conclusion_bullish", "conclusion_oscillate"})
+    # scoring = PREPARE_CONSUMED 中排除 regime/thresholds 后剩余的 + 非信号扩展
+    _SCORING_EXTRA = frozenset({
+        "cross_decay_min", "vol_norm_denominator",
+        "kline_decay_days", "kline_decay_min",
+        "expected_return_lookback",
+    })
+    _SCORING_KEYS = (PREPARE_CONSUMED - _REGIME_KEYS - _THRESHOLD_FLAT) | _SCORING_EXTRA
+
+    # 1) scoring 段
+    base["scoring"].update({k: v for k, v in best_params.items() if k in _SCORING_KEYS})
+
+    # 2) regime 段
+    for k in _REGIME_KEYS & best_params.keys():
+        base["regime"][k] = float(best_params[k])
+
+    # 3) thresholds 段
+    fb_cfg = full_bull_default if full_bull_default is not None else base["thresholds"]["fully_bull"]
+    base["thresholds"] = {
+        "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg)),
+        "bullish": int(best_params.get("conclusion_bullish", base["thresholds"]["bullish"])),
+        "oscillate": int(best_params.get("conclusion_oscillate", base["thresholds"]["oscillate"])),
+    }
+
+    return base
+
+
 def _cache_dir_for(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> Path:
     """信号缓存目录路径。
 
@@ -370,11 +423,15 @@ def prepare_backtest_data(
     data_version: str | None = None,
     confirmed_suspension_days: set[str] | None = None,
 ) -> pd.DataFrame:
-    is_flat = params is not None and (
-        "atr_stop_mult" in params
-        or "boll_narrow_ratio" in params
-        or "conclusion_full_bull" in params or "golden_cross_bonus" in params
-    )
+    # is_flat 检测：检查 params 顶层是否有任一信号参数或组合参数键。
+    # 白名单 = PREPARE_CONSUMED (prepare 消费) ∪ ENGINE_CONSUMED (引擎消费)
+    # 注：conclusion_bullish / conclusion_oscillate 不在寻优空间，但校准结果中可能出现。
+    _flat_keys = frozenset((
+        "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
+        "golden_cross_bonus", "divergence_penalty", "conclusion_full_bull",
+        "buy_threshold", "max_holdings",
+    ))
+    is_flat = params is not None and bool(_flat_keys & params.keys())
 
     # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO 单值
     _saved_atr_stop = params.get("atr_stop_mult") if isinstance(params, dict) else None
@@ -390,23 +447,8 @@ def prepare_backtest_data(
     elif is_flat:
         cfg = Config()
         base = _build_params(cfg)
-        # 白名单对齐 CALIB_PARAM_MAP，确保所有校准参数都能正确落入 structured 分区。
-        # atr_stop_mult 属于 scoring 段（_build_params 默认也放在 scoring_params 中），
-        # 但已通过 _saved_atr_stop 单独提取；此处一并纳入白名单以保证 params 一致性。
-        base["scoring"].update({k: v for k, v in params.items() if k in (
-            "atr_stop_mult",
-            "cross_decay_days", "cross_decay_min",
-            "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
-            "expected_return_lookback",
-            "golden_cross_bonus", "divergence_penalty",
-        )})
-        if "boll_narrow_ratio" in params:
-            base["regime"]["boll_narrow_ratio"] = float(params["boll_narrow_ratio"])
-        base["thresholds"] = {
-            "fully_bull": int(params.get("conclusion_full_bull", base["thresholds"]["fully_bull"])),
-            "bullish": int(params.get("conclusion_bullish", base["thresholds"]["bullish"])),
-            "oscillate": int(params.get("conclusion_oscillate", base["thresholds"]["oscillate"])),
-        }
+        # 统一使用 merge_best_params_into_structured，与 runner/simulated_trading 路由一致
+        merge_best_params_into_structured(params, base)
         params = base
 
     config_hash = _compute_config_hash()

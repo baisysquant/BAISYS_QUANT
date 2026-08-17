@@ -215,8 +215,10 @@ def bayesian_walk_forward_multi(
     from UtilsManager.ConfigParser import Config as _Config
 
     if spaces is None:
-        cfg = _Config().app_config.backtest
-        spaces = build_spaces(cfg)
+        full_cfg = _Config()
+        bt_cfg = full_cfg.app_config.backtest
+        po_cfg = getattr(full_cfg.app_config, "portfolio_optimizer", None)
+        spaces = build_spaces(bt_cfg, portfolio_optimizer_config=po_cfg)
 
     # ── A2 失败快照：开启会话（重置计数 + 过期清理），注入 run/task 上下文 ──
     begin_snapshot_session()

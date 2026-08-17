@@ -49,6 +49,16 @@ class EngineConfig:
     # 当日成交量 × min(触板档比例, auction_fill_ratio)。假设文档化：
     # 成交价=开盘价（集合竞价价），开盘后向限价收敛的盘中成交不单独建模。
     auction_fill_ratio: float = 0.12
+    # ── 经验填充模型（limit_calibration.py）：用历史日线 V_t/V_prev 分位数
+    # 替代固定比例常量（技术债：固定比例缺经验依据）。分钟/tick/盘口数据
+    # 不在数据源内，经验分位是可行的统计替代：
+    #   fixed            = 旧行为（固定比例常量）
+    #   empirical_median = 经验中位数（中性口径，竞价触板日可成交量=前日量×p50）
+    #   empirical_p10    = 经验 10% 分位（worst-case 保守口径，暴露流动性枯竭）
+    # 单元格样本不足 limit_calib_min_samples → 回退 fixed 档；校准表全样本静态
+    # 统计（静态参数选择，应用时不带前视——竞价可成交量 = 前日量 × 校准分位）。
+    limit_ratio_mode: str = "fixed"
+    limit_calib_min_samples: int = 20
     # ── 0.6 复牌跳空（停牌后复牌日开盘大幅跳空：补涨兑现 / 补跌标记） ──
     resume_gap_up: float = 0.05  # 复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买
     resume_gap_down: float = 0.05  # 复牌低开≤-该比例 → 日志标记（风控卖出照常）
@@ -76,14 +86,48 @@ class EngineConfig:
     regime_half_multiplier: float = 0.5  # 半仓倍率
     regime_min_multiplier: float = 0.25  # 最低仓位倍率
 
+    # ── 组合优化器配置（P4 数学规划驱动） ──
+    # 优化方法: mean_variance / min_variance / risk_parity / topk_equal(兼容旧版 Top-K 等权)
+    optimizer_method: str = "topk_equal"
+    # 风险厌恶系数 (γ, 越大越保守; 2.0 = 平衡, 5.0 = 保守)
+    optimizer_risk_aversion: float = 2.0
+    # 换手率惩罚系数 (λ_TC, 建议取年化交易成本 0.5~1.5 倍; 0.001 = 千1 轻度惩罚)
+    optimizer_turnover_penalty: float = 0.001
+    # 单票权重上限 (w_max, 默认 10%)
+    optimizer_max_weight: float = 0.10
+    # 协方差估计窗口 (交易日, 默认 60)
+    optimizer_cov_lookback: int = 60
+    # 协方差收缩 (Ledoit-Wolf, True = 小样本稳健)
+    optimizer_shrinkage: bool = True
+    # 行业中性约束 (是否启用)
+    optimizer_industry_neutral: bool = False
+    # 行业暴露偏离上限 (绝对值)
+    optimizer_industry_deviation: float = 0.05
+    # 最大持仓数 (0 = 不限制)
+    optimizer_max_holdings: int = 0
+    # 目标现金比例
+    optimizer_target_cash: float = 0.0
+    # 求解超时 (秒)
+    optimizer_solve_timeout: float = 5.0
+
     @property
     def buy_fee_rate(self) -> float:
-        """买入费率（不含滑点）：佣金 + 过户费"""
+        """买入费率（不含滑点）：佣金 + 过户费。
+
+        ⚠️ 仅供展示/兼容：简单相加不含逐笔最低佣金（min_commission_per_trade）
+        与历史费率分段表，不能用于费用核算。引擎实际费用一律经
+        engine_cfg.cost_model（CostModel.buy_cost_breakdown，逐笔强制下限）。
+        """
         return self.commission_rate + self.transfer_fee_rate
 
     @property
     def sell_fee_rate(self) -> float:
-        """卖出费率（不含滑点）：佣金 + 过户费 + 印花税"""
+        """卖出费率（不含滑点）：佣金 + 过户费 + 印花税。
+
+        ⚠️ 仅供展示/兼容：简单相加不含逐笔最低佣金（min_commission_per_trade）
+        与历史费率分段表，不能用于费用核算。引擎实际费用一律经
+        engine_cfg.cost_model（CostModel.sell_cost_breakdown，逐笔强制下限）。
+        """
         return self.commission_rate + self.transfer_fee_rate + self.stamp_tax_rate
 
 

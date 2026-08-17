@@ -82,7 +82,7 @@
 - **全向量化信号引擎** — 信号计算已从 per-bar 逐行 Python 循环重构为纯 numpy 向量化运算。`compute_signals()` 使用 `np.where`、`np.correlate`、`np.select`、前缀和、rolling window broadcast 等技术，消除所有逐行 Python 回调。次核心指标（MACD/BOLL/KDJ/RSI/CCI/ADX）在 Phase 0 预计算阶段一次性完成，后续所有参数评估直接复用。
 - **机器学习信号增强** — 引入 XGBoost/Ridge 双模型（`LogicAnalyzer/ml/signal_model.py`）作为信号修偏层。以历史金叉/背离信号及量价特征为输入，输出概率校准后的信号置信度（`apply_ml_signal`），叠加到综合评分。预测结果按 (config_hash, data_fp) 冻结缓存，窗口内仅重训一次，避免重复计算。
 - **Phase 0 指标预计算缓存** — `indicator_cache.py` 在每个 WFO 窗口首次运行时预计算全部技术指标，结果写磁盘（`.indicators.parquet`）；背离峰值/谷值在 `_divergence_scores` 中滚动计算（避免未来函数 lookahead），缓存于 `.divergence.npz`。窗口内后续贝叶斯评估（信号参数变化）跳过指标复算，仅重跑评分逻辑，单次评估从 ~1 小时降至 ~5 分钟。
-- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。OOS 默认 120 天（`out_of_sample_days` 可配置），IS 按数据长度自适应（`train_period = max(120, 总长度 - OOS - 路径数×OOS)`），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
+- **Walk-Forward 滚动优化** — 以 in-sample 训练窗口做贝叶斯优化选出最优参数，在 out-of-sample 验证，滚动覆盖全历史。OOS 默认 120 天（`out_of_sample_days` 可配置），IS 按数据长度自适应（`train_period = max(120, 总长度 - OOS - 路径数×OOS - embargo)`，embargo 必须扣减，否则末条路径必然越界跳过），多路径偏移取中位数聚合，相邻窗口 GP 状态热启动加速收敛
 - **贝叶斯优化引擎** — 4 阶段优化器：Sobol 准随机初始化 → GP+qEI 信号层搜索 → GP+qEI 组合层搜索（信号固定）→ GP 代理 L-BFGS-B 精炼 Top-3。联合寻优 8 个参数：boll_narrow_ratio, cross_decay_days, golden_cross_bonus, divergence_penalty, conclusion_full_bull（信号参数），atr_stop_mult, buy_threshold, max_holdings（组合参数）。预算可在 `config.ini [BACKTEST]` 配置（默认 12 组初始化 + 24 次信号层迭代 + 20 组初始化 + 60 次组合层迭代）
 - **两级成本分层** — 信号参数（5 个）触发完整管线（`prepare_backtest_data`，分钟级）；纯组合参数（3 个）直接从缓存加载信号（秒级）。`FidelityController` 自动检测输入数据是否有预计算信号列，避免不必要的重算
 - **高斯过程代理模型** — `ConstantKernel × Matern(ARD) + WhiteKernel` 组合核，自动相关性长度尺度学习。`save_gp_state` / `restore_gp_state` 序列化核参数实现跨窗口迁移学习
@@ -95,7 +95,7 @@
 - **过拟合防护体系** — CPCV 净化 + 禁运（purge 5 天 / embargo 3 天剔除训练窗口重叠样本）、Diebold-Mariano (DM) 检验（Newey-West HAC，仅采纳 DM 显著窗口参数）、多重测试惩罚（同区间调参超 10 次 Sharpe/Sortino 扣 20%，超 30 次判失效）、参数稳健性自检（Sharpe>2 时最优参数 ±10% 扰动验证）、统一采纳门控（模拟验证 / OOS 衰减 / 多重测试 / 统计显著性 / 参数稳健性 / PBO≤5% / DSR≥50% 七项硬门槛，任一不过则不写入校准结果）
 - **WFO 可靠性保障** — 时间预算熔断（默认 8 小时）+ 连续无改进早停（3 个窗口）、系统性失败拦截（连续 3 窗口 OOS 失效即中断流水线）、四方绑定调度（数据版本 + 配置哈希 + 频率 + 时间）、失败快照持久化（保留 14 天）、窗口预检（RELAX/OK/SKIP/LOW_CONFIDENCE/NEED_FILL 多档）+ 指标降级缩窗重算
 
-### 真实价格体系（P0-11 审计重构）
+### 真实价格体系
 
 回测引擎的成交、现金、净值、费用一律使用**不复权真实价**，复权价仅用于信号/止损/市场状态判定：
 
@@ -106,6 +106,52 @@
 - **可成交量** — 涨跌停开盘撮合的可成交量取**前日成交量**（PIT 合规，避免当日量前视）；数据首日（无前收）标的禁买
 - **前视合规** — 当日指标一律 shift(1) 后使用（如 AMOUNT_MA20），信号日收盘决策 → 次日开盘执行（A 股 T+1）
 - **效果** — 修复三类失真：①净值收益被持仓加权复权因子放大；②真实仓位低于目标仓位（目标 10% 实际仅 3.3%）；③费用按复权成交额高估
+
+### 涨跌停可成交量模型（撮合约束）
+
+- **固定比例模型（默认）** — 触板日按 `limit_seal_ratio`（一字板 5%）/ `limit_tradable_ratio`（炸板 30%）/ `limit_intraday_ratio`（盘中冲板 10%）× 连板衰减 `limit_seal_decay` 折算可成交量；开盘集合竞价档（9:25 仅知 open/前收限价，PIT 合规）取 `min(触板档, auction_fill_ratio)` 封顶，可成交量 = 前日量 × 比例
+- **经验填充模型（`limit_ratio_mode=empirical_median / empirical_p10`）** — 技术债修复：固定比例缺经验依据。系统无分钟/tick/盘口数据源，用历史日线可观测量 `V_t/V_prev`（触板日实际成交量/前日量）分位数构建经验填充模型（`BackTrading/limit_calibration.py`）：竞价触板日可成交量 = 前日量 × 历史分位数（median=中性口径，p10=worst-case 保守口径）；单元格样本 < `limit_calib_min_samples` 回退 fixed 档；校准表全样本静态统计，应用时无前视
+- **涨跌停专项压力测试（`limit_stress_enabled=true`）** — 在既有危机段压力测试外新增场景专项测试（`BackTrading/limit_stress.py`）：自动检测一字涨停密集期/一字跌停密集期/炸板高发期/开盘竞价触板高发期窗口，报告成交率、部分/未成交单数、未成交金额、一字板撤销（踏空/套牢）敞口与单日 worst-case 敞口，并输出经验校准指引对照 fixed 比例
+
+### 复权空间
+
+系统全程维护**双价格空间**：不复权原始价（真实成交/估值口径）与后复权价（跨除权日连续，信号口径）。换算关系：
+
+```
+后复权价 = 不复权价 × adj_factor（当日累计因子）
+不复权价 = 后复权价 ÷ adj_factor
+```
+
+除权日 adj_factor 跳变：后复权序列连续（信号友好），不复权序列跳变（真实成交价）。
+
+**① 数据层（IncrementalSyncEngine）**
+
+| 列 | 口径 |
+|------|------|
+| `open/high/low/close` | **不复权**原始价（交易所真实价） |
+| `open_normal/high_normal/low_normal/close_normal` | **后复权**价 |
+| `adj_factor` | 累计因子 = close_normal ÷ close |
+
+腾讯行情同时拉取 `day`（不复权）+ `hfqday`（后复权）两套数据；次新股无后复权数据时降级 `adj_factor=1.0`。`sync.py` 内置 P0-12 语义修复，自动纠正历史误写（旧版 close 误存后复权）的数据。
+
+**② 回测单元（阶段 A）**
+
+| 环节 | 空间 | 说明 |
+|------|------|------|
+| 信号/指标（MACD/ATR/KDJ/BOLL/背离等）| **后复权** `close_normal` | 避免除权跳变扭曲指标（`vectorized_signal.py` 明确 close_raw 不进入信号）|
+| 止损价 | **后复权** | 止损价 = close_normal − ATR×mult，P0-1 断言硬校验混用空间直接报错 |
+| 涨跌停判断 | 不复权 | 真实涨停价口径 |
+| 成交价/市值/净值/费用 | **不复权** `close_raw` | P0-11 真实价格体系 |
+| 除权日 | 股数调整 | 按 adj_factor 跳变调整持仓股数，净值零跳变 |
+
+**③ 复盘单元（阶段 B）**
+
+| 环节 | 空间 | 说明 |
+|------|------|------|
+| 最新价 | 不复权 | 报告展示口径 |
+| 技术指标/评分/止损价/T1/T2/移动止损 | 不复权（当前实现）| 因子基于 `df['close']` 计算 |
+
+> ⚠️ **已知口径分裂**：回测单元信号/止损在后复权空间计算，复盘单元信号/止损在不复权空间计算，除权日附近两侧信号与止损价不一致，回测校准参数在复盘上存在偏差。修复方向：复盘因子切换至 `close_normal`（与回测同口径），价格字段保持不复权输出。
 
 ### 数据同步（IncrementalSyncEngine）
 
@@ -558,7 +604,7 @@ cd BAISYS_QUAN
 |------|--------|------|
 | `enabled` | `true` | 是否启用回测校准 |
 | `optimize_frequency` | `monthly` | 校准频率 |
-| `backtest_start_date` | `20240101` | 回测起始日期 |
+| `backtest_start_date` | `20230101` | 回测起始日期（2023 起约 875 交易日，可撑满 3 条 WFO 路径） |
 | `out_of_sample_days` | `120` | Walk-Forward 样本外窗口天数 |
 | `holdout_ratio` | `0.20` | holdout 独立验证集比例（全程禁触） |
 | `wfo_num_paths` | `3` | Walk-Forward 多路径数 |
@@ -580,6 +626,9 @@ cd BAISYS_QUAN
 | `indicator_degradation` | `RELAX` | 指标降级模式（窗口不足时缩窗重算） |
 | `simulate_limit_up_down` | `true` | 涨跌停分档撮合模拟 |
 | `limit_seal_ratio` / `limit_tradable_ratio` / `limit_intraday_ratio` / `limit_seal_decay` | — | 一字/盘中/冲板三类成交比例 + 连板衰减 |
+| `limit_ratio_mode` | `fixed` | 涨跌停可成交量比例来源：`fixed` 固定常量 / `empirical_median` 历史经验中位数 / `empirical_p10` 历史经验 10% 分位（worst-case 保守） |
+| `limit_calib_min_samples` | `20` | 经验填充模型单元格最少样本数（不足回退 `fixed` 档） |
+| `limit_stress_enabled` | `true` | 涨跌停专项压力测试（一字涨停/竞价触板/炸板高发窗口 worst-case 成本报告） |
 | `max_order_pct` | `0.30` | 单笔委托占成交量上限 |
 | `resume_gap_up` / `resume_gap_down` | `0.05` | 复牌跳空处理阈值 |
 | `handling_fee_rate` | `0.0000341` | 经手费率 |
@@ -796,8 +845,7 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 
 ## ⚠️ 特别提醒
 
-- 复盘计算中除价格字段之外各因子的计算默认使用后复权
-- 复盘计算后输出的报告中价格字段均采用不复权（以方便用户直接查看）
+- 复权口径详见「复权空间」章节：回测信号/止损用后复权，成交/净值/费用用不复权；复盘价格字段输出不复权（当前复盘因子计算口径存在已知分裂，见「复权空间」③）
 
 ## ⚠️ 注意事项
 

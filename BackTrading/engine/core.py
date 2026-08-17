@@ -22,6 +22,12 @@ from BackTrading.limit_pricing import (
     lot_size_for,
 )
 from BackTrading.domain.models import CostModel
+# ── P4 组合优化器（数学规划驱动，替代 Top-K 等权） ──
+from BackTrading.portfolio_optimizer import (
+    PortfolioOptimizer,
+    OptimizerConfig,
+    CovarianceEstimator,
+)
 
 ParamsDict: TypeAlias = dict[str, Any]
 TradeLog: TypeAlias = list[dict[str, Any]]
@@ -102,13 +108,119 @@ def _regime_multiplier_for(mkt_ret20: float, vol_pct: float, engine_cfg: EngineC
     return engine_cfg.regime_min_multiplier
 
 
+# ── P4 组合优化器辅助函数（数学规划驱动） ─────────────────────
+
+# 行业映射缓存 (模块级，避免每次调仓重复查库)
+_industry_cache: dict[str, str] = {}
+
+
+def _build_returns_history(
+    date_groups: dict[str, pd.DataFrame],
+    candidate_symbols: list[str],
+    lookback: int = 60,
+) -> pd.DataFrame:
+    """从 date_groups 中提取候选股票的历史收益率矩阵 (T, n)。
+
+    从最近 lookback 个交易日的 close 列计算 pct_change。
+    """
+    frames: list[pd.DataFrame] = []
+    # 取最近 lookback+1 个日期的数据（多取一日用于 pct_change）
+    all_dates = sorted(date_groups.keys(), key=lambda x: str(x))
+    recent_dates = all_dates[-(lookback + 1):]
+
+    for dt_key in recent_dates:
+        df_day = date_groups[dt_key]
+        if "symbol" not in df_day.columns or "close" not in df_day.columns:
+            continue
+        # 仅保留候选股票
+        mask = df_day["symbol"].isin(candidate_symbols)
+        sub = df_day.loc[mask, ["symbol", "close"]].copy()
+        if sub.empty:
+            continue
+        # 用日期作为行索引
+        date_str = str(dt_key)[:10] if hasattr(dt_key, "__str__") else str(dt_key)
+        sub["trade_date"] = date_str
+        frames.append(sub)
+
+    if not frames:
+        return pd.DataFrame()
+
+    concat_df = pd.concat(frames, ignore_index=True)
+    pivot = concat_df.pivot_table(
+        index="trade_date", columns="symbol", values="close"
+    )
+    if pivot.empty:
+        return pd.DataFrame()
+
+    returns = pivot.pct_change().dropna(how="all").tail(lookback)
+    # 仅保留候选列
+    available_cols = [c for c in candidate_symbols if c in returns.columns]
+    if not available_cols:
+        return pd.DataFrame()
+    return returns[available_cols]
+
+
+def _load_industry_map_from_cache(
+    candidate_symbols: list[str],
+) -> dict[str, str]:
+    """从模块级缓存返回行业映射 {symbol: industry}。
+
+    缓存由 _refresh_industry_cache 在回测启动时填充。
+    若缓存为空，返回空 dict（优化器会静默跳过行业约束）。
+    """
+    return {s: _industry_cache[s] for s in candidate_symbols if s in _industry_cache}
+
+
+def _refresh_industry_cache(
+    db_engine: Any,
+    symbols: list[str] | None = None,
+) -> None:
+    """刷新行业映射缓存。
+
+    从 stock_basic_info_sw_l1 表加载申万一级行业分类。
+    失败时记录日志（不阻断回测）。
+    """
+    global _industry_cache
+    if db_engine is None:
+        return
+
+    try:
+        from sqlalchemy import text as sql_text
+
+        with db_engine.connect() as conn:
+            if symbols:
+                # 仅加载需要的股票
+                result = conn.execute(
+                    sql_text(
+                        "SELECT stock_code, l1_name FROM stock_basic_info_sw_l1 "
+                        "WHERE stock_code IN :syms"
+                    ),
+                    {"syms": symbols},
+                )
+            else:
+                result = conn.execute(
+                    sql_text("SELECT stock_code, l1_name FROM stock_basic_info_sw_l1")
+                )
+            _industry_cache = dict(result.fetchall())
+            logger.debug(f"[行业缓存] 加载 {len(_industry_cache)} 条映射")
+    except Exception as e:
+        logger.debug(f"[行业缓存] 加载失败: {e}（行业约束将跳过）")
+
+
+# ── 回测引擎核心函数 ─────────────────────────────────────────
+
+
 def run_full_backtest(
     data: pd.DataFrame,
     params: dict[str, Any],
     engine_cfg: EngineConfig | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if engine_cfg is None:
-        engine_cfg = EngineConfig()
+        # 审计（成本外部化）：默认仍显式携带 CostModel（含逐笔最低佣金 + 分段表），
+        # 但显式传入的 EngineConfig 若缺 cost_model 会在引擎内 fail-fast。
+        from BackTrading.domain.models import CostModel
+
+        engine_cfg = EngineConfig(cost_model=CostModel())
     tl: list[dict[str, Any]] = []
     ec: list[dict[str, Any]] = []
     _run_single_backtest(data, params, engine_cfg, tl, ec)
@@ -270,7 +382,16 @@ def _run_single_backtest(
     engine_cfg: EngineConfig,
     trade_log: TradeLog,
     equity_curve: EquityCurve,
+    stats_sink: dict[str, Any] | None = None,
 ) -> float:
+    """单次回测。
+
+    Args:
+        stats_sink: 可选撮合统计收集器（涨跌停专项压力测试消费）。非 None 时
+            引擎累计涨跌停撮合事件（竞价触板成交/部分/未成交、一字板撤销、
+            未成交金额、worst-case 单日未成交敞口），键见 LIMIT_SINK_KEYS；
+            None 时零开销（默认路径无行为变化）。
+    """
     global _LISTING_DAYS_WARNED
     if pd.api.types.is_datetime64_any_dtype(data["trade_date"]):
         data = data.copy()
@@ -393,6 +514,28 @@ def _run_single_backtest(
     # P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理）——开盘价触板日，
     # 集合竞价可成交量 = 当日成交量 × min(触板档比例, auction_fill_ratio)
     _auction_ratio = float(getattr(engine_cfg, "auction_fill_ratio", 0.12))
+    # ── 经验填充模型（技术债修复）：limit_ratio_mode=empirical_median/p10 时，
+    # 用历史日线 V_t/V_prev 分位数替代固定比例常量（limit_calibration.py）。
+    # 校准表全样本静态统计（等价静态参数选择，应用无前视）；构建失败告警回退 fixed。
+    _limit_mode = str(getattr(engine_cfg, "limit_ratio_mode", "fixed")).lower()
+    _calib_min_samples = int(getattr(engine_cfg, "limit_calib_min_samples", 20))
+    _emp_calib = None
+    if _sim_limits and _limit_mode in ("empirical_median", "empirical_p10"):
+        try:
+            from BackTrading.limit_calibration import build_empirical_calibration as _bec
+
+            _calib_pct = 0.1 if _limit_mode == "empirical_p10" else 0.5
+            _emp_calib = _bec(
+                data, percentile=_calib_pct, min_samples=_calib_min_samples
+            )
+            logger.info(
+                f"[经验填充] limit_ratio_mode={_limit_mode} 校准表构建完成: "
+                f"分位={_calib_pct:.0%} 竞价触板单元格={len(_emp_calib.auction_table)}"
+                f" 全天口径单元格={len(_emp_calib.day_type_table)}"
+            )
+        except Exception as _ce:
+            logger.warning(f"[经验填充] 校准表构建失败，回退 fixed 档: {_ce}")
+            _emp_calib = None
     # ── 0.6 复牌跳空：停牌后复牌日开盘大幅跳空（补涨兑现卖出 / 补跌日志标记 / 追高禁买） ──
     # 阈值 0 = 关闭该决策（仅识别复牌不动作）
     _resume_gap_up = float(getattr(engine_cfg, "resume_gap_up", 0.05))
@@ -452,16 +595,17 @@ def _run_single_backtest(
                     _st_syms_by_day.setdefault(str(_d_str), set()).add(_s)
 
     # 成本单一来源：CostModel（佣金含最低5元 / 印花税日期分段表 / 过户费日期分段表 / 经手费+证管费 /
-    # 滑点 / 流动性分档冲击）。未显式注入时由 EngineConfig 字段自动构建，行为与原回退路径一致。
+    # 滑点 / 流动性分档冲击）。审计（成本外部化）：禁止回退"统一成本"口径——统一成本缺失
+    # 逐笔最低佣金下限、历史费率日期分段表与流动性分档，静默回落会低估小额交易成本、忽略
+    # 历史费率变更，导致回测结果口径分裂。EngineConfig.cost_model 必须显式传入（主流程
+    # runner/meta_optimizer 已通过 CostModel.from_backtest_config 构建）；缺失时 fail-fast。
     cm = engine_cfg.cost_model
     if cm is None:
-        cm = CostModel(
-            commission_rate=engine_cfg.commission_rate,
-            stamp_tax_rate=engine_cfg.stamp_tax_rate,
-            market_slippage=max(engine_cfg.slippage, _MIN_SLIPPAGE_FLOOR),
-            limit_slippage=max(engine_cfg.slippage, _MIN_SLIPPAGE_FLOOR) * 0.5,
-            min_commission_per_trade=engine_cfg.min_commission_per_trade,
-            transfer_fee_rate=engine_cfg.transfer_fee_rate,
+        raise ValueError(
+            "[成本模型] EngineConfig.cost_model 未显式传入：交易成本必须由 CostModel 显式构建"
+            "（逐笔最低佣金 min_commission_per_trade + 印花税/过户费/经手费/证管费日期分段表"
+            " + 流动性分档冲击）。请通过 CostModel.from_backtest_config(bt, trading_cost=...) "
+            "构建后传入，禁止回退统一成本口径。"
         )
     # 成本拆解累计（佣金/印花税/过户费/经手费/证管费/滑点/冲击 + 买卖成交额），
     # 回测结束输出 [成本拆解] 报告（各项占总成本百分比）
@@ -632,17 +776,25 @@ def _run_single_backtest(
                 sell_shares = sh
             # 撮合约束：跌停/涨停日按可成交量比例部分成交或未成交（日志可追溯）
             _limit_note = None
+            if s_fill_ratio is not None:
+                _sink_inc("sell_limit_orders", 1)
             if s_fill_ratio is not None and s_fill_ratio[j] < 1.0:
                 _req = sell_shares
                 _avail = int(float(s_vol[j]) * float(s_fill_ratio[j])) // lot * lot
                 _updown = "涨停" if (s_limit_tag is not None and s_limit_tag[j] == "up") else "跌停"
                 if _avail < lot:
+                    _sink_inc("sell_limit_rejected", 1)
+                    _sink_val("sell_limit_unfilled_value", float(_req) * float(s_close[j]))
+                    _u_sell += float(_req) * float(s_close[j])
                     _day_agg["reject_sell"] += 1
                     logger.debug(
                         f"[撮合约束] {dt} {s_syms[j]} {_updown} 可成交量不足 → 未成交（卖出） 请求={_req}股 可成交={_avail}股"
                     )
                     continue
                 if _avail < sell_shares:
+                    _sink_inc("sell_limit_partial", 1)
+                    _sink_val("sell_limit_unfilled_value", float(_req - _avail) * float(s_close[j]))
+                    _u_sell += float(_req - _avail) * float(s_close[j])
                     sell_shares = _avail
                     _limit_note = s_limit_tag[j] if s_limit_tag is not None else "down"
                     _day_agg["partial_sell"] += 1
@@ -650,6 +802,8 @@ def _run_single_backtest(
                         f"[撮合约束] {dt} {s_syms[j]} {_updown} 部分成交（卖出） 请求={_req}股 成交={sell_shares}股 fill_ratio={float(s_fill_ratio[j]):.3f}"
                     )
             mv = sell_shares * float(s_close[j])
+            if s_fill_ratio is not None:
+                _sink_val("sell_limit_fill_value", mv)
             pos_shares[si] -= sell_shares
             if pos_shares[si] <= 0:
                 pos_value[si] = 0.0
@@ -729,6 +883,28 @@ def _run_single_backtest(
     # P3-2（审计）：撮合约束/现金不足逐笔日志聚合器——全市场回测逐笔 logger.info
     # 日志量巨大，改为每日一次汇总（INFO）+ 逐笔降级 DEBUG（保留可追溯性）。
     _day_agg = {"reject_sell": 0, "partial_sell": 0, "partial_buy": 0, "cash_cancel": 0}
+
+    # ── 涨跌停撮合统计（stats_sink，涨跌停专项压力测试消费） ──
+    # 统计语义：
+    #   buy/sell_limit_*：开盘触板（竞价路径）单子，成交额以决策价×成交股数计
+    #   seal_*_rejected：一字板撤销（买入=踏空敞口，卖出=套牢敞口）
+    #   *_unfilled_value：请求价值 - 实际成交价值（可成交量不足的未成交敞口）
+    #   *_worst_day：[日期, 当日未成交金额]（worst-case 单日敞口）
+    _sink = stats_sink
+
+    def _sink_inc(key: str, n: int = 1) -> None:
+        if _sink is not None:
+            _sink[key] = _sink.get(key, 0) + n
+
+    def _sink_val(key: str, v: float) -> None:
+        if _sink is not None and v > 0:
+            _sink[key] = _sink.get(key, 0.0) + v
+
+    def _sink_worst(key: str, dt_day, v: float) -> None:
+        if _sink is not None and v > 0:
+            _prev = _sink.get(key)
+            if _prev is None or v > _prev[1]:
+                _sink[key] = [str(dt_day), round(v, 2)]
 
     def _exec_price_for(day_data_ld: pd.DataFrame, j: int, close_local) -> float:
         """成交参考价（0.1 执行时点模型）— 真实价格体系（不复权原始价）。
@@ -836,7 +1012,40 @@ def _run_single_backtest(
         if not _pending_sells and not _pending_buys:
             return 0.0, 0.0
         buy_val, sell_val = 0.0, 0.0
+        _u_buy, _u_sell = 0.0, 0.0  # 当日未成交金额（stats_sink worst-case 用）
         sym_row = {s: j for j, s in enumerate(syms_str_ld)}
+
+        def _auction_fill_for(sym: str, j: int) -> float:
+            """开盘触板日集合竞价可成交量比例（PIT：仅用 9:25 已知 open/限价）。
+
+            fixed 档：min(auction_fill_ratio_for, auction_fill_ratio)（原行为）；
+            经验档（limit_ratio_mode=empirical_median/p10）：校准表分位数，
+            单元格样本不足回退 fixed 档（limit_calibration.py）。
+            """
+            _o = float(open_arr_ld[j]) if open_arr_ld is not None else None
+            _fixed = min(
+                auction_fill_ratio_for(
+                    _o,
+                    float(limit_up_ld[j]), float(limit_down_ld[j]),
+                    tradable_ratio=_tradable_ratio,
+                    board_streak=abs(_limit_streak_prev.get(sym, 0)) + 1,
+                    seal_decay=_seal_decay,
+                ),
+                _auction_ratio,
+            )
+            if _emp_calib is None or _o is None:
+                return _fixed
+            _t_up = _o >= float(limit_up_ld[j]) - 1e-9
+            _t_down = _o <= float(limit_down_ld[j]) + 1e-9
+            if not (_t_up or _t_down):
+                return _fixed
+            return _emp_calib.auction_fill_ratio(
+                open_at_limit_up=_t_up,
+                open_at_limit_down=_t_down,
+                streak=abs(_limit_streak_prev.get(sym, 0)) + 1,
+                fallback=_fixed,
+            )
+
         # 一字板判定：开=收=限价（sealed board）
         def _is_seal_up(j: int) -> bool:
             return at_limit_up_ld[j] and open_arr_ld is not None and abs(open_arr_ld[j] - close_raw_ld[j]) <= 1e-9
@@ -862,6 +1071,9 @@ def _run_single_backtest(
                 continue
             px = _exec_price_for(day_data_ld, jj, close_raw_ld)
             if _is_seal_down(jj):
+                _sink_inc("seal_sell_rejected", 1)
+                _sink_val("seal_sell_rejected_value", float(pos_shares[idx_ld[jj]]) * px)
+                _u_sell += float(pos_shares[idx_ld[jj]]) * px
                 if p.get("force"):
                     remaining_sells.append(p)  # 退市/ST强平遇一字跌停 → 顺延（继续尝试卖出）
                     continue
@@ -878,19 +1090,12 @@ def _run_single_backtest(
             # 开盘竞价时不可知）；前日无数据（数据起点/长期停牌复牌首日）回退当日量。
             # P1-2 修复：触板档比例改用 auction_fill_ratio_for（仅用 9:25 已知的
             # open/限价判定，不复用依赖当日 close/high/low 的盘中档位——前视消除）。
+            # 技术债修复：经验档（limit_ratio_mode=empirical_*）改查校准表分位数，
+            # 固定比例常量（0.30/0.12）仅作经验单元格样本不足时的回退。
             # 假设文档化：成交价 = 开盘价（集合竞价价）；开盘后向限价收敛的盘中成交
             # 不单独建模（对卖出保守：跌停开盘成交价=跌停价，且成交率受竞价档上限约束）
             _auction_ratio_sell = (
-                min(
-                    auction_fill_ratio_for(
-                        float(open_arr_ld[jj]) if open_arr_ld is not None else None,
-                        float(limit_up_ld[jj]), float(limit_down_ld[jj]),
-                        tradable_ratio=_tradable_ratio,
-                        board_streak=abs(_limit_streak_prev.get(p["sym"], 0)) + 1,
-                        seal_decay=_seal_decay,
-                    ),
-                    _auction_ratio,
-                )
+                _auction_fill_for(p["sym"], jj)
                 if (_sim_limits and _open_at_limit_down)
                 else None
             )
@@ -952,6 +1157,9 @@ def _run_single_backtest(
                 logger.info(f"[执行模型] {dt} {p['sym']} 复牌高开 → 买入挂单撤销（追高）")
                 continue
             if _is_seal_up(jj):
+                _sink_inc("seal_buy_rejected", 1)
+                _sink_val("seal_buy_rejected_value", float(p["tv"]))
+                _u_buy += float(p["tv"])
                 logger.info(f"[执行模型] {dt} {p['sym']} 一字涨停 → 买入未成交（撤销）")
                 continue
             px = _exec_price_for(day_data_ld, jj, close_raw_ld)
@@ -999,22 +1207,17 @@ def _run_single_backtest(
             # 时，集合竞价可成交量 = 可参考成交量 × min(触板档比例, auction_fill_ratio)。
             # P1-2 修复：触板档比例改用 auction_fill_ratio_for（仅 9:25 已知信息，
             # 当日 high/low/close 不参与档位判定，消除前视）。
+            # 技术债修复：经验档（limit_ratio_mode=empirical_*）改查校准表分位数，
+            # 固定比例常量仅作经验单元格样本不足时的回退。
             # 假设文档化：成交价 = 开盘价（集合竞价价）；开盘后向限价收敛的盘中成交
             # 不单独建模（对买入保守：涨停开盘成交价=涨停价，且成交率受竞价档上限约束）
             _auction_ratio_buy = (
-                min(
-                    auction_fill_ratio_for(
-                        float(open_arr_ld[jj]) if open_arr_ld is not None else None,
-                        float(limit_up_ld[jj]), float(limit_down_ld[jj]),
-                        tradable_ratio=_tradable_ratio,
-                        board_streak=abs(_limit_streak_prev.get(p["sym"], 0)) + 1,
-                        seal_decay=_seal_decay,
-                    ),
-                    _auction_ratio,
-                )
+                _auction_fill_for(p["sym"], jj)
                 if (_sim_limits and _open_at_limit_up)
                 else None
             )
+            if _auction_ratio_buy is not None:
+                _sink_inc("buy_limit_orders", 1)
             if _auction_ratio_buy is not None and _auction_ratio_buy < 1.0:
                 _req = shares
                 # P0-11：可参考成交量用前日量（当日全天量开盘时不可知，前视合规）；
@@ -1024,11 +1227,17 @@ def _run_single_backtest(
                 _avail = int(_vol_ref_buy * _auction_ratio_buy) // lot * lot
                 _updown = "涨停" if _limit_tag_ld[jj] == "up" else "跌停"
                 if _avail < lot:
+                    _sink_inc("buy_limit_rejected", 1)
+                    _sink_val("buy_limit_unfilled_value", float(_req) * px)
+                    _u_buy += float(_req) * px
                     logger.info(
                         f"[撮合约束/执行模型] {dt} {p['sym']} {_updown} 可成交量不足 → 未成交（买入） 请求={_req}股 可成交={_avail}股"
                     )
                     continue
                 if _avail < shares:
+                    _sink_inc("buy_limit_partial", 1)
+                    _sink_val("buy_limit_unfilled_value", float(_req - _avail) * px)
+                    _u_buy += float(_req - _avail) * px
                     shares = _avail
                     _limit_note = _limit_tag_ld[jj]
                     _day_agg["partial_buy"] += 1
@@ -1086,6 +1295,8 @@ def _run_single_backtest(
                 continue
             cash -= tv + cst
             pos_value[si] = tv
+            if _auction_ratio_buy is not None:
+                _sink_val("buy_limit_fill_value", tv)
             # P0-11：记录成交日复权因子，供除权日持仓股数调整基准（真实价格体系）
             if "adj_factor" in day_data_ld.columns:
                 _af_now = float(day_data_ld["adj_factor"].values[jj])
@@ -1126,6 +1337,8 @@ def _run_single_backtest(
             )
             filled += 1
         _pending_buys[:] = remaining_buys
+        _sink_worst("buy_limit_worst_day", dt, _u_buy)
+        _sink_worst("sell_limit_worst_day", dt, _u_sell)
         return buy_val, sell_val
 
     _market_multiplier = 1.0
@@ -1620,57 +1833,165 @@ def _run_single_backtest(
             b_vol = volume[bi]
             b_amount = amount_ma20[bi] if amount_ma20 is not None else None
 
-            # Top-K 等权分配：集中资金到评分最高的 _top_k 只
-            if len(bi) > _top_k:
-                b_scores = buy_score[bi]
-                _top_indices = np.argpartition(-b_scores, _top_k)[:_top_k]
-                b_syms = b_syms[_top_indices]
-                b_idx = b_idx[_top_indices]
-                b_close = b_close[_top_indices]
-                b_vol = b_vol[_top_indices]
-            n_candidates = len(b_syms)
+            # ── P4 组合优化器接入（数学规划驱动，替代 Top-K 等权） ──
+            _use_optimizer = engine_cfg.optimizer_method != "topk_equal"
 
-            existing = int((pos_shares > 0).sum())
-            max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else _top_k
-            # P1-2：等权分母取 min(候选数, 实际可买入槽位)，避免候选>槽位时资金闲置
-            _w_denom = min(n_candidates, max_new)
-            equal_weight = 1.0 / _w_denom if _w_denom > 0 else 0.0
-            bought = 0
-            for j in range(n_candidates):
-                if bought >= max_new:
-                    break
-                si = b_idx[j]
-                if pos_shares[si] > 0:
-                    continue
-                price = float(b_close[j])
-                if not np.isfinite(price) or price <= 0:
-                    continue
-                # 申报数量单位：按板块（科创 200 股/手，其余 100 股/手），一处定义全链路复用
-                lot = lot_size_for(b_syms[j])
-                tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
-                shares = int(tv / price) // lot * lot if price > 0 else 0
-                if shares < lot:
-                    continue
-                # 0.1 执行时序：挂单次日开盘成交，撮合成本/可成交量在次日判定
-                _pending_buys.append({
-                    "sym": b_syms[j], "si": si, "tv": tv,
-                    "sig_dt": str(dt), "sig_close": float(b_close[j]),
-                    "buy_score": float(buy_score[bi[j]]),
-                })
-                bought += 1
-                continue
+            if _use_optimizer:
+                # 构建优化器配置
+                _opt_cfg = OptimizerConfig(
+                    method=engine_cfg.optimizer_method,
+                    risk_aversion=engine_cfg.optimizer_risk_aversion,
+                    turnover_penalty=engine_cfg.optimizer_turnover_penalty,
+                    max_weight=engine_cfg.optimizer_max_weight,
+                    cov_lookback=engine_cfg.optimizer_cov_lookback,
+                    shrinkage=engine_cfg.optimizer_shrinkage,
+                    max_holdings=engine_cfg.optimizer_max_holdings,
+                    target_cash_ratio=engine_cfg.optimizer_target_cash,
+                    max_industry_deviation=engine_cfg.optimizer_industry_deviation,
+                    solve_timeout=engine_cfg.optimizer_solve_timeout,
+                )
 
-            if bought == 0 and len(date_groups) > 100:
-                _p0 = float(b_close[0]) if n_candidates > 0 else 0
-                _tv0 = (
-                    min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
-                    if n_candidates > 0
-                    else 0
+                # 1. 计算当前持仓权重
+                _current_weights: dict[str, float] = {}
+                _total_value_for_w = cash + _calc_market_value()
+                if _total_value_for_w > 0:
+                    for _si in range(n_syms):
+                        if pos_shares[_si] > 0:
+                            _px = close_lookup.get(symbols[_si]) or _last_close.get(symbols[_si], 0)
+                            _current_weights[symbols[_si]] = pos_shares[_si] * _px / _total_value_for_w
+
+                # 2. 构建收益率历史 (从 date_groups 提取)
+                _candidate_list = b_syms.tolist()
+                _returns_df = _build_returns_history(
+                    date_groups, _candidate_list, engine_cfg.optimizer_cov_lookback
                 )
-                _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
-                logger.info(
-                    f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}"
+
+                # 3. 行业映射 (若启用行业中性)
+                _industry_map: dict[str, str] | None = None
+                _bench_industry_weights: dict[str, float] | None = None
+                if engine_cfg.optimizer_industry_neutral:
+                    _industry_map = _load_industry_map_from_cache(_candidate_list)
+
+                # 4. Alpha 信号
+                _alpha = buy_score[bi].astype(np.float64)
+
+                # 5. 执行优化
+                _optimizer = PortfolioOptimizer(_opt_cfg)
+                _target_weights = _optimizer.optimize(
+                    candidate_symbols=_candidate_list,
+                    alpha_signals=_alpha,
+                    returns_history=_returns_df,
+                    current_weights=_current_weights,
+                    industry_map=_industry_map,
+                    benchmark_industry_weights=_bench_industry_weights,
                 )
+
+                # 6. 将优化权重映射到挂单 (权重 → 金额 → 股数)
+                n_candidates = len(b_syms)
+                existing = int((pos_shares > 0).sum())
+                _opt_max_holdings = engine_cfg.optimizer_max_holdings
+                max_new = (
+                    max(0, _opt_max_holdings - existing)
+                    if _opt_max_holdings > 0
+                    else len(_candidate_list)
+                )
+
+                equal_weight = 0.0  # 用于 diag
+                bought = 0
+                for j in range(n_candidates):
+                    if bought >= max_new:
+                        break
+                    si = b_idx[j]
+                    if pos_shares[si] > 0:
+                        continue
+                    price = float(b_close[j])
+                    if not np.isfinite(price) or price <= 0:
+                        continue
+                    lot = lot_size_for(b_syms[j])
+                    # 优化器权重 → 目标金额
+                    _w_target = _target_weights.get(b_syms[j], 0.0)
+                    tv = min(
+                        _total_value_for_w * _w_target,
+                        total_value * max_pos_pct * _market_multiplier,
+                    )
+                    shares = int(tv / price) // lot * lot if price > 0 else 0
+                    if shares < lot:
+                        continue
+                    _pending_buys.append({
+                        "sym": b_syms[j], "si": si, "tv": tv,
+                        "sig_dt": str(dt), "sig_close": float(b_close[j]),
+                        "buy_score": float(buy_score[bi[j]]),
+                    })
+                    bought += 1
+                    continue
+
+                if bought == 0 and len(date_groups) > 100:
+                    _p0 = float(b_close[0]) if n_candidates > 0 else 0
+                    _tv0 = (
+                        min(_total_value_for_w * max(_target_weights.values(), default=0),
+                            total_value * max_pos_pct * _market_multiplier)
+                        if n_candidates > 0
+                        else 0
+                    )
+                    _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
+                    logger.info(
+                        f"[ENGINE-DIAG/OPT] {dt}: {len(bi)}候选→{n_candidates} 0买入  "
+                        f"cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  max_pos_pct={max_pos_pct}"
+                    )
+
+            else:
+                # ── 兼容旧版 Top-K 等权分配 ──
+                # Top-K 等权分配：集中资金到评分最高的 _top_k 只
+                if len(bi) > _top_k:
+                    b_scores = buy_score[bi]
+                    _top_indices = np.argpartition(-b_scores, _top_k)[:_top_k]
+                    b_syms = b_syms[_top_indices]
+                    b_idx = b_idx[_top_indices]
+                    b_close = b_close[_top_indices]
+                    b_vol = b_vol[_top_indices]
+                n_candidates = len(b_syms)
+
+                existing = int((pos_shares > 0).sum())
+                max_new = max(0, _max_holdings - existing) if _max_holdings > 0 else _top_k
+                # P1-2：等权分母取 min(候选数, 实际可买入槽位)，避免候选>槽位时资金闲置
+                _w_denom = min(n_candidates, max_new)
+                equal_weight = 1.0 / _w_denom if _w_denom > 0 else 0.0
+                bought = 0
+                for j in range(n_candidates):
+                    if bought >= max_new:
+                        break
+                    si = b_idx[j]
+                    if pos_shares[si] > 0:
+                        continue
+                    price = float(b_close[j])
+                    if not np.isfinite(price) or price <= 0:
+                        continue
+                    # 申报数量单位：按板块（科创 200 股/手，其余 100 股/手），一处定义全链路复用
+                    lot = lot_size_for(b_syms[j])
+                    tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
+                    shares = int(tv / price) // lot * lot if price > 0 else 0
+                    if shares < lot:
+                        continue
+                    # 0.1 执行时序：挂单次日开盘成交，撮合成本/可成交量在次日判定
+                    _pending_buys.append({
+                        "sym": b_syms[j], "si": si, "tv": tv,
+                        "sig_dt": str(dt), "sig_close": float(b_close[j]),
+                        "buy_score": float(buy_score[bi[j]]),
+                    })
+                    bought += 1
+                    continue
+
+                if bought == 0 and len(date_groups) > 100:
+                    _p0 = float(b_close[0]) if n_candidates > 0 else 0
+                    _tv0 = (
+                        min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)
+                        if n_candidates > 0
+                        else 0
+                    )
+                    _s0 = int(_tv0 / _p0) // 100 * 100 if _p0 > 0 else 0
+                    logger.info(
+                        f"[ENGINE-DIAG] {dt}: {len(bi)}候选→{n_candidates}TopK 0买入  cash={cash:.0f}  tv[0]={_tv0:.0f}  p[0]={_p0:.0f}  s[0]={_s0}  eq_w={equal_weight:.4f}  max_pos_pct={max_pos_pct}"
+                    )
 
         for i_sym, i_vol in zip(syms_str, volume):
             _update_adv(i_sym, i_vol)

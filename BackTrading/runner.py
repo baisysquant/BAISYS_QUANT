@@ -24,7 +24,7 @@ from BackTrading.calibration import (
 )
 from BackTrading.calibration_log import ensure_table, get_last_run, record_run, should_rerun
 from UtilsManager.IDataProvider import BacktestDataProvider
-from BackTrading.prepare import _build_params, prepare_backtest_data
+from BackTrading.prepare import _build_params, merge_best_params_into_structured, prepare_backtest_data
 from UtilsManager.ConfigParser import Config
 from DataManager.DbEngine import get_engine
 
@@ -375,12 +375,21 @@ def run_backtest_pipeline(
                 )
                 _holdout_days = 0
         _wfo_total = total_trading_days - _holdout_days
-        # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS <= n，
+        # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS + embargo <= n，
         # 否则路径 2/3 必然越界跳过（如 IS=805+OOS=60 在 865 天数据上只有 1 条路径有效）。
+        # ⚠️ 公式必须扣减 embargo：否则 max_offset 恒 = (num_paths-1)*OOS - embargo < 末路径 offset，
+        # 末条路径在任何数据长度下都被跳过（train = n - num_paths*OOS 时 span 恰好越界 embargo 天）。
+        _embargo_days = max(0, int(bt.BAYESIAN_CPCV_EMBARGO_DAYS))
         _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
-        _max_np = max(1, (_wfo_total - 120) // _oos) if _wfo_total > _oos + 120 else 1
+        _max_np = max(1, (_wfo_total - 120 - _embargo_days) // _oos) if _wfo_total > _oos + 120 + _embargo_days else 1
         _num_paths = min(_np_cfg, _max_np)
-        train_period = max(120, min(_wfo_total - _oos, _wfo_total - _oos * _num_paths))
+        train_period = max(
+            120,
+            min(
+                _wfo_total - _oos - _embargo_days,
+                _wfo_total - _oos * _num_paths - _embargo_days,
+            ),
+        )
         _holdout_label = (
             f" | Holdout: {_holdout_days}天(占比{_holdout_days/total_trading_days:.0%},独立终验)"
             if _holdout_active else " | Holdout: 禁用(自引用回退)"
@@ -435,7 +444,8 @@ def run_backtest_pipeline(
                 "  1. 特征工程是否存在隐性数据泄露\n"
                 "  2. 信号逻辑是否适应当前市场 regime\n"
                 "  3. 回看区间是否过短/过长导致过拟合\n"
-                "本次回测已标记为失败，不会覆盖 config.ini，下次调度将跳过（需手动 force=True 或数据/配置变化后重跑）"
+                "本次回测已标记为失败；回退参数（参数空间中位）仍会写入 config.ini，"
+                "下次调度将跳过（需手动 force=True 或数据/配置变化后重跑）"
             )
             logger.critical("=" * 60)
 
@@ -454,6 +464,21 @@ def run_backtest_pipeline(
                 config_hash=_cur_config_hash,
                 data_version=_data_version,
             )
+
+            # 即使 WFO 系统性失败，本次回测实际评估过的参数（回退参数 =
+            # 参数空间中位）仍直接写入 config.ini [BACKTEST_CALIBRATED]，
+            # 与成功路径写回闭环同口径，保证下次加载沿用本次结果。
+            try:
+                write_calibration_to_ini(wfo_err.fallback_params)
+                logger.warning(
+                    f"[WFO系统性失败] 回退参数已写入 config.ini "
+                    f"[BACKTEST_CALIBRATED]: {wfo_err.fallback_params}"
+                )
+            except Exception as _wfo_write_err:
+                logger.opt(exception=True).warning(
+                    f"[WFO系统性失败] 回退参数写入 config.ini 失败: {_wfo_write_err}"
+                )
+
             alert.on_failure(wfo_err)
             return None
         _log_step("walk_forward")
@@ -502,23 +527,35 @@ def run_backtest_pipeline(
             limit_seal_decay=float(bt.LIMIT_SEAL_DECAY),
             # P0-6 ⑥：开盘集合竞价成交率分档
             auction_fill_ratio=float(bt.AUCTION_FILL_RATIO),
+            # 技术债修复：经验填充模型（历史日线分位数替代固定比例常量）
+            limit_ratio_mode=str(bt.LIMIT_RATIO_MODE),
+            limit_calib_min_samples=int(bt.LIMIT_CALIB_MIN_SAMPLES),
             # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
             regime_ret20_full=float(bt.REGIME_RET20_FULL),
             regime_ret20_half=float(bt.REGIME_RET20_HALF),
             regime_vol_pct_max=float(bt.REGIME_VOL_PCT_MAX),
             resume_gap_up=float(bt.RESUME_GAP_UP),
             resume_gap_down=float(bt.RESUME_GAP_DOWN),
+            # ── P4 组合优化器配置 ──
+            optimizer_method=config.app_config.portfolio_optimizer.METHOD,
+            optimizer_risk_aversion=config.app_config.portfolio_optimizer.RISK_AVERSION,
+            optimizer_turnover_penalty=config.app_config.portfolio_optimizer.TURNOVER_PENALTY,
+            optimizer_max_weight=config.app_config.portfolio_optimizer.MAX_WEIGHT,
+            optimizer_cov_lookback=config.app_config.portfolio_optimizer.COV_LOOKBACK,
+            optimizer_shrinkage=config.app_config.portfolio_optimizer.SHRINKAGE,
+            optimizer_industry_neutral=config.app_config.portfolio_optimizer.INDUSTRY_NEUTRAL,
+            optimizer_industry_deviation=config.app_config.portfolio_optimizer.INDUSTRY_DEVIATION,
+            optimizer_max_holdings=config.app_config.portfolio_optimizer.MAX_HOLDINGS,
+            optimizer_target_cash=config.app_config.portfolio_optimizer.TARGET_CASH_RATIO,
+            optimizer_solve_timeout=config.app_config.portfolio_optimizer.SOLVE_TIMEOUT,
         )
         final_params = _build_params(config)
-        final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
-        if "boll_narrow_ratio" in best_params:
-            final_params["regime"]["boll_narrow_ratio"] = float(best_params["boll_narrow_ratio"])
+        # 统一信号参数注入：使用 prepare.merge_best_params_into_structured 唯一入口，
+        # 杜绝 runner / simulated_trading / prepare 三处白名单各自维护导致的漂移。
         fb_cfg = config.app_config.full_bull_scoring
-        final_params["thresholds"] = {
-            "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg.CONCLUSION_FULL_BULL)),
-            "bullish": fb_cfg.CONCLUSION_BULLISH,
-            "oscillate": fb_cfg.CONCLUSION_OSCILLATE,
-        }
+        merge_best_params_into_structured(
+            best_params, final_params, full_bull_default=fb_cfg.CONCLUSION_FULL_BULL
+        )
 
         # ── 模拟交易验证：优先用末段独立 holdout 验证集（WFO 全程禁触），
         #    未激活时回退最近交易日（自引用，validate_params 内告警）──
@@ -533,6 +570,7 @@ def run_backtest_pipeline(
             oos_sharpe=_wf_sharpe, sim_days=20,
             config=config, engine_cfg=ecfg,
             validation_dates=_holdout_dates,
+            oos_returns=_extract_oos_returns(wf_result),
         )
         _promote = _sim_verdict.promote
         if not _promote:
@@ -864,6 +902,19 @@ def run_backtest_pipeline(
             logger.warning("[OOS衰减校验] 未通过 —— 参数组不予写入 config.ini，结果已废弃")
             logger.warning("=" * 50)
 
+        # ── 序列化当前成本模型快照（方案C：持久化回测验证假设）──
+        from dataclasses import asdict as _dc_asdict
+        _full_cost = _dc_asdict(ecfg.cost_model)
+        _cost_snapshot = {
+            k: _full_cost[k] for k in [
+                "commission_rate", "stamp_tax_rate", "market_slippage", "limit_slippage",
+                "impact_threshold", "impact_base", "impact_cap",
+                "min_commission_per_trade", "transfer_fee_rate",
+                "handling_fee_rate", "csrc_fee_rate",
+                "commission_includes_fees",
+            ] if k in _full_cost
+        }
+
         cal_result = CalibrationResult(
             params=best_params,
             score=report_sharpe,
@@ -886,6 +937,7 @@ def run_backtest_pipeline(
             pbo=round(pbo, 4),
             dsr=round(dsr, 4),
             num_trials=num_trials,
+            cost_model_snapshot=_cost_snapshot,
         )
 
         # ── 统一参数采纳门控（P0-5 审计修复） ──
@@ -941,6 +993,21 @@ def run_backtest_pipeline(
                 logger.warning(f"  压力测试: 历史极端场景最大回撤 {_worst_dd:.2%} > 30%，建议评估风险")
         except Exception as e:
             logger.warning(f"  压力测试异常: {e}")
+
+        # ── 涨跌停专项压力测试（技术债修复：一字涨停/竞价触板/炸板 worst-case 成本） ──
+        try:
+            if bool(getattr(bt, "LIMIT_STRESS_ENABLED", True)):
+                from BackTrading.limit_stress import run_limit_stress as _rls
+                _limit_stress = _rls(kline_df, ecfg, best_params)
+                _wc = _limit_stress.get("worst_case", {})
+                logger.info(
+                    f"  涨跌停压力: 买入成交率最低={_wc.get('min_buy_fill_rate', 1):.2%} "
+                    f"卖出成交率最低={_wc.get('min_sell_fill_rate', 1):.2%} "
+                    f"买入未成交敞口最大={_wc.get('max_unfilled_buy_value', 0):.0f}元 "
+                    f"卖出未成交敞口最大={_wc.get('max_unfilled_sell_value', 0):.0f}元"
+                )
+        except Exception as e:
+            logger.warning(f"  涨跌停压力测试异常: {e}")
 
         if _gate_pass:
             write_calibration_to_ini(best_params)
@@ -1215,6 +1282,37 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
                 logger.info(f"  预热回填完成，新增 {w_total} 行")
         except Exception as e:
             logger.warning(f"  预热回填失败（回测继续，指标前文可能不足）: {e}")
+
+
+def _extract_oos_returns(wf_result: pd.DataFrame) -> np.ndarray | None:
+    """从 WFO 结果提取 rank-1 组合的 OOS 日收益序列（逐窗口内拼接）。
+
+    每窗口的 oos_equity 独立以 initial_cash 起步，窗口边界净值有重置跳变，
+    因此按窗口内计算日收益、跨窗口拼接收益（丢弃窗口边界收益）。
+    无 oos_combos 列或数据不足时返回 None（validate_params 回退 iid 近似并告警）。
+    """
+    if wf_result is None or wf_result.empty or "oos_combos" not in wf_result.columns:
+        return None
+    rets: list[float] = []
+    for row in wf_result["oos_combos"]:
+        if not row:
+            continue
+        rank1 = next((c for c in row if c.get("is_rank") == 1), row[0])
+        ec = rank1.get("oos_equity") if isinstance(rank1, dict) else None
+        if not ec:
+            continue
+        vals = np.asarray(
+            [float(e["portfolio_value"]) for e in ec
+             if e.get("portfolio_value") is not None and np.isfinite(float(e["portfolio_value"]))],
+            dtype=float,
+        )
+        if len(vals) < 2 or vals[0] <= 0:
+            continue
+        r = vals[1:] / vals[:-1] - 1.0
+        rets.extend(r[np.isfinite(r)].tolist())
+    if len(rets) < 10:
+        return None
+    return np.asarray(rets, dtype=float)
 
 
 def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config | None = None) -> dict[str, float]:

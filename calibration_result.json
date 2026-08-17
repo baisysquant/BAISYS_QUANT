@@ -21,5 +21,6 @@
   "config_hash": "",
   "pbo": 0.0,
   "dsr": 0.0,
-  "num_trials": 0
+  "num_trials": 0,
+  "cost_model_snapshot": {}
 }

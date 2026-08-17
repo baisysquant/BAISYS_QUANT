@@ -56,7 +56,7 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
     result = df.copy()
     _max_single = cfg.get("max_single_position", 0.33)
     _kelly_frac = cfg.get("kelly_fraction", 0.25)
-    _win_rate = cfg.get("default_win_rate", 0.50)
+    _win_rate = cfg.get("default_win_rate", 0.55)  # 与 PositionSizingConfig.DEFAULT_WIN_RATE 一致
     _risk_budget = cfg.get("risk_budget", 0.02)
     _atr_stop_mult = cfg.get("atr_stop_mult", 1.5)
     _level_pos = {
@@ -65,6 +65,7 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
         "C": cfg.get("position_c", 0.05),
         "D": cfg.get("position_d", 0.00),
     }
+    _cfg_risk_none = cfg.get("risk_none_multiplier", 1.0)  # 从 POSITION_SIZING 读取
 
     levels = result[ColumnNames.COMPREHENSIVE_LEVEL].fillna("C").astype(str).str.strip().str.upper()
     scores = pd.to_numeric(result[ColumnNames.COMPREHENSIVE_SCORE], errors='coerce').fillna(0).clip(0, 100)
@@ -73,7 +74,7 @@ def calculate_positions(df: pd.DataFrame, config: dict | None = None) -> pd.Data
     bases = level_bases * score_factors
 
     risks = result[ColumnNames.RISK_LEVEL].fillna("MEDIUM").astype(str).str.strip().str.upper()
-    risk_map_s = pd.Series(risks).map({"NONE": 1.0, "LOW": 0.85, "MEDIUM": 0.50, "HIGH": 0.0}).fillna(0.50)
+    risk_map_s = pd.Series(risks).map({"NONE": _cfg_risk_none, "LOW": 0.85, "MEDIUM": 0.50, "HIGH": 0.0}).fillna(0.50)
     high_risk = risks == "HIGH"
 
     trends = result[ColumnNames.MACD_TREND_TYPE].fillna("").astype(str)

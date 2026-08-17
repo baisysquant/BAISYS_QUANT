@@ -29,9 +29,13 @@ from loguru import logger
 from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 
 # config.ini 中参数名 → (section, key) 映射
-# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
-# 为引擎死参数（审计确认引擎仓位恒等权），不再寻优亦不再回写。
+# ── 寻优参数（bayesian optimizer 搜索，写回闭环）──
+# ── 受控静态参数（POSITION_SIZING；回测引擎等权不消费，但复盘 PositionSizer 使用）──
+# 受控参数写在 [BACKTEST_CALIBRATED] 同一分区，由 ConfigParser.apply_backtest_calibrated_override() 读取；
+# 此处不加入 bayesian 搜索空间（见 bayesian/space.py DEAD_KEYS），但保留写回路径，
+# 以便 apply_calibration_to_config 和 write_calibration_to_ini 能处理手动写入的校准值。
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
+    # 寻优参数
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
     "boll_narrow_ratio": ("BACKTEST_CALIBRATED", "boll_narrow_ratio"),
     "cross_decay_days": ("BACKTEST_CALIBRATED", "cross_decay_days"),
@@ -40,6 +44,18 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "divergence_penalty": ("BACKTEST_CALIBRATED", "divergence_penalty"),
     "buy_threshold": ("BACKTEST_CALIBRATED", "buy_threshold"),
     "max_holdings": ("BACKTEST_CALIBRATED", "max_holdings"),
+    # ── P4 组合优化器超参数 ──
+    "optimizer_risk_aversion": ("BACKTEST_CALIBRATED", "optimizer_risk_aversion"),
+    "optimizer_turnover_penalty": ("BACKTEST_CALIBRATED", "optimizer_turnover_penalty"),
+    "optimizer_max_weight": ("BACKTEST_CALIBRATED", "optimizer_max_weight"),
+    "optimizer_cov_lookback": ("BACKTEST_CALIBRATED", "optimizer_cov_lookback"),
+    # ── 受控静态参数（Position Sizer 消费；回测引擎等权不消费）──
+    # 注：position_d 不在此处 —— PositionSizingConfig 无 POSITION_D 字段（D 级恒为 0 仓位）
+    "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
+    "position_a": ("BACKTEST_CALIBRATED", "position_a"),
+    "position_b": ("BACKTEST_CALIBRATED", "position_b"),
+    "position_c": ("BACKTEST_CALIBRATED", "position_c"),
+    "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
 }
 
 
@@ -66,6 +82,8 @@ class CalibrationResult:
     pbo: float = 0.0
     dsr: float = 0.0
     num_trials: int = 0
+    # ── 成本模型快照（方案C：回测验证假设的持久化记录）──
+    cost_model_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CalibrationResult:
@@ -123,8 +141,10 @@ def run_bayesian_walk_forward(
     from UtilsManager.ConfigParser import Config as _Config
 
     if spaces is None:
-        cfg = _Config().app_config.backtest
-        spaces = build_spaces(cfg)
+        full_cfg = _Config()
+        bt_cfg = full_cfg.app_config.backtest
+        po_cfg = getattr(full_cfg.app_config, "portfolio_optimizer", None)
+        spaces = build_spaces(bt_cfg, portfolio_optimizer_config=po_cfg)
 
     signal_sp, portfolio_sp = split_by_cost(spaces)
     logger.info(f"贝叶斯 WFO 参数空间:\n{describe(spaces)}")
@@ -168,6 +188,82 @@ def load_calibration() -> CalibrationResult | None:
         return None
 
 
+def audit_cost_model_vs_calibration() -> list[str]:
+    """运行时审计：比对当前成本假设与回测校准快照。
+
+    在复盘/实盘启动时调用，加载 calibration_result.json 中持久化的
+    回测验证假设，与当前 CostModel 默认值（或 config.ini 配置）比对，
+    若发现实盘成本假设低于回测值则返回告警列表。
+
+    Returns:
+        告警信息字符串列表。空列表表示无差异或无校准数据可供比对。
+    """
+    warnings_list: list[str] = []
+
+    cal = load_calibration()
+    if cal is None:
+        warnings_list.append("[成本审计] calibration_result.json 不存在，跳过比对")
+        return warnings_list
+
+    snapshot = cal.cost_model_snapshot
+    if not snapshot:
+        warnings_list.append("[成本审计] calibration_result.json 中无 cost_model_snapshot，跳过比对")
+        return warnings_list
+
+    # 获取当前 CostModel 默认值用于比对
+    try:
+        from BackTrading.domain.models import CostModel
+    except ImportError:
+        warnings_list.append("[成本审计] 无法导入 CostModel，跳过比对")
+        return warnings_list
+
+    current = CostModel()
+
+    # 关键审计字段：实盘值不得低于回测值（否则收益会被高估）
+    # 即 commission/slippage/impact 等 "成本类" 参数，实盘 >= 回测
+    critical_fields = [
+        "commission_rate", "stamp_tax_rate", "market_slippage",
+        "limit_slippage", "impact_threshold", "impact_base",
+        "min_commission_per_trade", "transfer_fee_rate",
+        "handling_fee_rate", "csrc_fee_rate",
+    ]
+
+    for field in critical_fields:
+        snap_val = snapshot.get(field)
+        curr_val = getattr(current, field, None)
+        if snap_val is None or curr_val is None:
+            continue
+        # 数值化比对（容忍浮点精度差异）
+        try:
+            s = float(snap_val)
+            c = float(curr_val)
+        except (TypeError, ValueError):
+            continue
+
+        tolerance = 1e-10  # 绝对容差
+        if c < s - tolerance:
+            warnings_list.append(
+                f"[成本审计告警] {field}: 当前值({c}) < 回测验证值({s}) — "
+                f"实盘摩擦成本假设过低，策略收益可能不及预期"
+            )
+
+    # 布尔字段检查（commission_includes_fees 变更会导致总佣金跳变）
+    bool_fields = ["commission_includes_fees"]
+    for field in bool_fields:
+        snap_val = snapshot.get(field)
+        curr_val = getattr(current, field, None)
+        if snap_val is not None and curr_val is not None and snap_val != curr_val:
+            warnings_list.append(
+                f"[成本审计告警] {field}: 当前值({curr_val}) != 回测验证值({snap_val})"
+            )
+
+    if not warnings_list:
+        logger.info("[成本审计] 当前成本模型与回测校准快照一致，通过检查")
+
+    return warnings_list
+
+
+
 def apply_calibration_to_config(config: object) -> None:
     from UtilsManager.ConfigParser import Config
 
@@ -205,6 +301,19 @@ def apply_calibration_to_config(config: object) -> None:
             cfg.app_config.backtest.BUY_THRESHOLD = int(val)
         elif key == "max_holdings":
             cfg.app_config.backtest.MAX_HOLDINGS = int(val)
+        # 受控静态参数（Position Sizer 消费；回测引擎等权不消费）
+        # 若校准结果中出现了这些键（如手动写入 calibration_result.json），
+        # 则写回至 PositionSizingConfig，确保复盘与配置一致。
+        elif key == "kelly_fraction":
+            ps.KELLY_FRACTION = float(val)
+        elif key == "position_a":
+            ps.POSITION_A = float(val)
+        elif key == "position_b":
+            ps.POSITION_B = float(val)
+        elif key == "position_c":
+            ps.POSITION_C = float(val)
+        elif key == "risk_none_multiplier":
+            ps.RISK_NONE_MULTIPLIER = float(val)
 
 
 def _get_git_commit() -> str:

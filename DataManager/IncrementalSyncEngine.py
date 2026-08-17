@@ -7,7 +7,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -53,8 +53,10 @@ class IncrementalSyncEngine:
         os.makedirs(self._cache_dir, exist_ok=True)
         try:
             _cal = TradingCalendarAnalyzer()
-            _today_str = _cal.get_last_trading_day()
-            self._trade_date = datetime.strptime(_today_str, "%Y-%m-%d").date()
+            # 北京时间：本机挂钟 → 本机实际 UTC 偏移 → UTC → UTC+8。
+            # 本机时区非北京时间时，直接用本地时间会偏移数小时（如 UTC-7 机器）。
+            _bj_now = datetime.now().astimezone().astimezone(timezone(timedelta(hours=8)))
+            self._trade_date = self._expected_kline_date(_cal, _bj_now) or date.today()
         except Exception:
             self._trade_date = date.today()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
@@ -64,6 +66,33 @@ class IncrementalSyncEngine:
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
         self._cleanup_old_cache()
+
+    @staticmethod
+    def _expected_kline_date(cal: Any, now_bj: datetime) -> date | None:
+        """K 线新鲜度基准日（回测/复盘共表去重下载的核心）。
+
+        now_bj 须为北京时间（aware/naive 均可，仅用 date/hour/minute）。
+        兜底逻辑：若日历在收盘前仍返回"今天"（旧版行为），回退到上一交易日；
+        当前 TradingCalendarAnalyzer 已按北京时间 15:30 收盘阈值修正，该回退
+        通常不再触发，仅作防御。
+        """
+        try:
+            last_str = cal.get_last_trading_day()
+            last = datetime.strptime(last_str, "%Y-%m-%d").date()
+            if (
+                last == now_bj.date()
+                and (now_bj.hour < 15 or (now_bj.hour == 15 and now_bj.minute < 30))
+            ):
+                dates = sorted(cal.get_official_trading_dates())
+                try:
+                    idx = dates.index(last_str)
+                except ValueError:
+                    idx = -1
+                if idx > 0:
+                    last = datetime.strptime(dates[idx - 1], "%Y-%m-%d").date()
+            return last
+        except Exception:
+            return None
 
     # ── public API ──────────────────────────────────────────────
 

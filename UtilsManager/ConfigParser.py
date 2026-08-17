@@ -541,6 +541,13 @@ class BacktestConfig(BaseModel):
     # ── P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理） ──
     AUCTION_FILL_RATIO: float = Field(default=0.12, ge=0.0, le=1.0,
                                       description="开盘价触板日集合竞价可成交量比例上限（= 当日量 × min(触板档, 该值)）")
+    # ── 经验填充模型（技术债修复）：历史日线 V_t/V_prev 分位数替代固定比例 ──
+    LIMIT_RATIO_MODE: str = Field(default="fixed",
+                                  description="涨跌停可成交量比例来源: fixed 固定比例常量 / empirical_median 历史经验中位数（中性口径） / empirical_p10 历史经验10%分位（worst-case 保守口径）")
+    LIMIT_CALIB_MIN_SAMPLES: int = Field(default=20, ge=1, le=1000000,
+                                         description="经验填充模型单元格最少样本数，不足回退 fixed 档（防稀疏样本噪声）")
+    LIMIT_STRESS_ENABLED: bool = Field(default=True,
+                                       description="涨跌停专项压力测试（一字涨停/竞价触板/炸板高发窗口 worst-case 成本报告）")
     # ── P0-6 ⑤：市场状态仓位调节（客观状态变量，替代旧评分中位数口径） ──
     REGIME_RET20_FULL: float = Field(default=0.02, ge=-1.0, le=1.0,
                                      description="指数20日收益（全市场 ret_20d 中位数代理）≥ 此值 → 全仓倍率")
@@ -613,6 +620,60 @@ class PositionBacktestConfig(BaseModel):
     POOL_FILE_PATH: str = Field(default="证券交割单.xlsx", description="证券交割单文件路径（XLSX格式）")
 
 
+class PortfolioOptimizerConfig(BaseModel):
+    """P4 组合优化器配置模型（数学规划驱动，替代 Top-K 等权）"""
+
+    METHOD: str = Field(
+        default="topk_equal",
+        description="优化方法: mean_variance / min_variance / risk_parity / topk_equal(兼容旧版)",
+    )
+    RISK_AVERSION: float = Field(
+        default=2.0, ge=0.01, le=20.0,
+        description="风险厌恶系数 (γ, 越大越保守)",
+    )
+    TURNOVER_PENALTY: float = Field(
+        default=0.001, ge=0.0, le=0.01,
+        description="换手率惩罚系数 (λ_TC)",
+    )
+    MAX_WEIGHT: float = Field(
+        default=0.10, ge=0.01, le=0.50,
+        description="单票权重上限 (w_max)",
+    )
+    COV_LOOKBACK: int = Field(
+        default=60, ge=10, le=250,
+        description="协方差估计窗口 (交易日)",
+    )
+    SHRINKAGE: bool = Field(
+        default=True,
+        description="协方差收缩 (Ledoit-Wolf)",
+    )
+    INDUSTRY_NEUTRAL: bool = Field(
+        default=False,
+        description="行业中性约束",
+    )
+    INDUSTRY_DEVIATION: float = Field(
+        default=0.05, ge=0.0, le=0.20,
+        description="行业暴露偏离上限",
+    )
+    MAX_HOLDINGS: int = Field(
+        default=0, ge=0, le=200,
+        description="最大持仓数 (0=不限制)",
+    )
+    TARGET_CASH_RATIO: float = Field(
+        default=0.0, ge=0.0, le=0.50,
+        description="目标现金比例",
+    )
+    SOLVE_TIMEOUT: float = Field(
+        default=5.0, ge=0.1, le=60.0,
+        description="求解超时 (秒)",
+    )
+    # ── 超参数寻优范围 ──
+    OPTIMIZER_RISK_AVERSION_RANGE: str = Field(default="0.5,5.0,0.5", description="风险厌恶系数寻优范围")
+    OPTIMIZER_TURNOVER_PENALTY_RANGE: str = Field(default="0.0005,0.003,0.0005", description="换手率惩罚寻优范围")
+    OPTIMIZER_MAX_WEIGHT_RANGE: str = Field(default="0.05,0.15,0.01", description="单票权重上限寻优范围")
+    OPTIMIZER_COV_LOOKBACK_RANGE: str = Field(default="30,120,10", description="协方差窗口寻优范围")
+
+
 class PositionSizingConfig(BaseModel):
     """仓位管理配置模型"""
 
@@ -681,6 +742,7 @@ class AppConfig(BaseSettings):
     trading_cost: TradingCostConfig
     distribution: DistributionConfig
     multi_factor_alpha: MultiFactorAlphaConfig
+    portfolio_optimizer: PortfolioOptimizerConfig
 
 
 class Config:
@@ -775,6 +837,7 @@ class Config:
             trading_cost=TradingCostConfig(**self._section_upper("TRADING_COST")),
             distribution=DistributionConfig(**dist_raw),
             multi_factor_alpha=MultiFactorAlphaConfig(**self._section_upper("MULTI_FACTOR_ALPHA")),
+            portfolio_optimizer=PortfolioOptimizerConfig(**self._section_upper("PORTFOLIO_OPTIMIZER")),
             api=ApiConfig(**self._section_upper("API")),
         )
 
@@ -800,6 +863,10 @@ class Config:
                 ps.KELLY_FRACTION = float(bt_cal["KELLY_FRACTION"])
             if "POSITION_A" in bt_cal:
                 ps.POSITION_A = float(bt_cal["POSITION_A"])
+            if "POSITION_B" in bt_cal:
+                ps.POSITION_B = float(bt_cal["POSITION_B"])
+            if "POSITION_C" in bt_cal:
+                ps.POSITION_C = float(bt_cal["POSITION_C"])
             if "CONCLUSION_FULL_BULL" in bt_cal:
                 self.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(bt_cal["CONCLUSION_FULL_BULL"])
             if "GOLDEN_CROSS_BONUS" in bt_cal:
@@ -1174,6 +1241,7 @@ class Config:
             "position_a": p.POSITION_A,
             "position_b": p.POSITION_B,
             "position_c": p.POSITION_C,
+            "risk_none_multiplier": p.RISK_NONE_MULTIPLIER,
             "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": p.RISK_BUDGET,
             "max_day_turnover": p.MAX_DAY_TURNOVER,
@@ -1182,6 +1250,25 @@ class Config:
             "liq_w_timeseries": f.LIQ_W_TIMESERIES,
             "liq_w_marketcap": f.LIQ_W_MARKETCAP,
             "liq_min_discount": f.LIQ_MIN_DISCOUNT,
+        }
+
+    # ── P4 组合优化器配置 ──────────────────────────────────────────────
+
+    @property
+    def PORTFOLIO_OPTIMIZER(self) -> dict:
+        o = self.app_config.portfolio_optimizer
+        return {
+            "method": o.METHOD,
+            "risk_aversion": o.RISK_AVERSION,
+            "turnover_penalty": o.TURNOVER_PENALTY,
+            "max_weight": o.MAX_WEIGHT,
+            "cov_lookback": o.COV_LOOKBACK,
+            "shrinkage": o.SHRINKAGE,
+            "industry_neutral": o.INDUSTRY_NEUTRAL,
+            "industry_deviation": o.INDUSTRY_DEVIATION,
+            "max_holdings": o.MAX_HOLDINGS,
+            "target_cash_ratio": o.TARGET_CASH_RATIO,
+            "solve_timeout": o.SOLVE_TIMEOUT,
         }
 
     # ── 工具方法 ────────────────────────────────────────────────────────

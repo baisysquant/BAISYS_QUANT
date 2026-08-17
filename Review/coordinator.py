@@ -155,6 +155,15 @@ class StockAnalysisCoordinator:
         # P0-7 ①：申万一级行业映射缓存（None=未加载；{} = 加载失败/为空）
         self._sw_l1_map: dict[str, str] | None = None
 
+        # ── 方案C：回测成本模型审计（复盘启动时验证认知对齐）──
+        try:
+            from BackTrading.calibration import audit_cost_model_vs_calibration
+            _cost_warnings = audit_cost_model_vs_calibration()
+            for _w in _cost_warnings:
+                self.logger.warning(_w)
+        except Exception:
+            pass  # 审计失败不阻断复盘启动
+
     # ──────────────────────────────────────────────
     # Pipeline 定义
     # ──────────────────────────────────────────────

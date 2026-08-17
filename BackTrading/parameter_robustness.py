@@ -201,8 +201,16 @@ def _build_engine_cfg(
     flat_params: dict[str, float],
     engine_cfg: EngineConfig | None,
 ) -> EngineConfig:
-    """从扰动参数重建 EngineConfig，保证引擎参数扰动真实生效。"""
-    cfg = engine_cfg if engine_cfg is not None else EngineConfig()
+    """从扰动参数重建 EngineConfig，保证引擎参数扰动真实生效。
+
+    审计（成本外部化）：engine_cfg 缺失时显式携带默认 CostModel()（含逐笔最低
+    佣金与分段表），不再构造无 cost_model 的 EngineConfig（引擎内会 fail-fast）。
+    """
+    if engine_cfg is None:
+        from BackTrading.domain.models import CostModel
+
+        engine_cfg = EngineConfig(cost_model=CostModel())
+    cfg = engine_cfg
     updates = {
         k: flat_params[k] for k in ENGINE_CONSUMED if k in flat_params
     }
