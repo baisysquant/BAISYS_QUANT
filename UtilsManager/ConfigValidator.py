@@ -99,7 +99,6 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
     "ASHAREHUB": [
         "[ASHAREHUB]",
         "api_key = (请设置 AShareHub API 密钥)",
-        "enable_chip_distribution = false",
     ],
     "MACRO_FILTER": [
         "[MACRO_FILTER]",
@@ -333,7 +332,6 @@ SECTION_RULES: list[SectionRule] = [
     ]),
     SectionRule(name="ASHAREHUB", description="AShareHub筹码分布数据配置", optional=True, fields=[
         FieldRule("api_key", "str"),
-        FieldRule("enable_chip_distribution", "bool", required=False, default="false"),
         FieldRule("chip_limit", "int", required=False, default="1", min_value=1, max_value=200),
     ]),
     SectionRule(name="FULL_BULL_SCORING", description="MACD完全多头评分配置", optional=True, fields=[
@@ -373,8 +371,6 @@ SECTION_RULES: list[SectionRule] = [
     ]),
     SectionRule(name="SCORING_PARAMS", description="评分计算参数", optional=True, fields=[
         FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
-        FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
-        FieldRule("atr_t2_mult", "float", required=False, default="5.0", min_value=2.0, max_value=20.0),
         FieldRule("cross_decay_days", "int", required=False, default="30", min_value=5, max_value=120),
         FieldRule("cross_decay_min", "float", required=False, default="0.3", min_value=0.1, max_value=1.0),
         FieldRule("kline_decay_days", "int", required=False, default="10", min_value=2, max_value=60),
@@ -461,8 +457,8 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="MULTI_FACTOR_ALPHA", description="多因子Alpha评分配置", optional=True, fields=[
         FieldRule("enabled", "bool", required=False, default="true"),
         FieldRule("financial_quality_cache_days", "int", required=False, default="90", min_value=1, max_value=365),
-        FieldRule("financial_quality_batch_size", "int", required=False, default="500", min_value=1, max_value=5000),
-        FieldRule("financial_quality_batch_sleep", "int", required=False, default="20", min_value=0, max_value=600),
+        FieldRule("financial_quality_batch_size", "int", required=False, default="100", min_value=1, max_value=5000),
+        FieldRule("financial_quality_batch_sleep", "int", required=False, default="10", min_value=0, max_value=600),
         FieldRule("financial_quality_file_cache_days", "int", required=False, default="30", min_value=1, max_value=365),
         FieldRule("fundamentals_retry", "int", required=False, default="3", min_value=1, max_value=10),
     ]),

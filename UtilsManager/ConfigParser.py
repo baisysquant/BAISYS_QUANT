@@ -232,13 +232,6 @@ class ColumnAliasesConfig(BaseModel):
     )
 
 
-class ResearchReportFilterConfig(BaseModel):
-    """研报过滤配置"""
-
-    ENABLE_RESEARCH_REPORT_FILTER: bool = Field(default=False)
-    RESEARCH_REPORT_MIN_COUNT: int = Field(default=1, ge=1)
-
-
 class FullBullScoringConfig(BaseModel):
     """MACD 完全多头评分维度权重 + 规则阈值"""
 
@@ -273,9 +266,9 @@ class MultiFactorAlphaConfig(BaseModel):
     ENABLED: bool = Field(default=True, description="是否启用多因子 Alpha 评分")
     FINANCIAL_QUALITY_CACHE_DAYS: int = Field(default=90, ge=1, le=365,
                                                description="质量因子缓存天数")
-    FINANCIAL_QUALITY_BATCH_SIZE: int = Field(default=500, ge=1, le=5000,
+    FINANCIAL_QUALITY_BATCH_SIZE: int = Field(default=100, ge=1, le=5000,
                                               description="质量因子每批采集股票数")
-    FINANCIAL_QUALITY_BATCH_SLEEP: int = Field(default=20, ge=0, le=600,
+    FINANCIAL_QUALITY_BATCH_SLEEP: int = Field(default=10, ge=0, le=600,
                                                description="质量因子批间休眠秒数")
     FINANCIAL_QUALITY_FILE_CACHE_DAYS: int = Field(default=30, ge=1, le=365,
                                                    description="质量因子离线文件缓存天数")
@@ -288,7 +281,6 @@ class AShareHubConfig(BaseModel):
     """AShareHub 筹码分布数据配置"""
 
     API_KEY: str = Field(default="")
-    ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
     MONEYFLOW_RETRY: int = Field(default=3, ge=0, le=10,
                                    description="资金流向 API 429 重试次数")
     MONEYFLOW_PAGE_DELAY: float = Field(default=1.0, ge=0.0, le=30.0,
@@ -346,10 +338,6 @@ class ScoringParamsConfig(BaseModel):
                                          description="金叉强度波动率归一化分母：(DIF-DEA)/ATR/此值→vol_factor")
     ATR_STOP_MULT: float = Field(default=1.5, ge=0.5, le=5.0,
                                   description="止损ATR倍数：止损价=close-ATR×此值")
-    ATR_T1_MULT: float = Field(default=3.0, ge=1.0, le=10.0,
-                                description="T1目标价ATR倍数")
-    ATR_T2_MULT: float = Field(default=5.0, ge=2.0, le=20.0,
-                                description="T2目标价ATR倍数")
     TRAILING_STOP_HIGH_RATIO: float = Field(default=0.98, ge=0.9, le=1.0,
                                               description="移动止损高位触发比：close≥近N日最高价×此值")
     TRAILING_STOP_LOOKBACK: int = Field(default=10, ge=5, le=60,
@@ -367,6 +355,11 @@ class ScoringParamsConfig(BaseModel):
         description="行业估值聚合口径: aggregate_profitable(剔除亏损股, 中证口径) / "
                     "aggregate_full(整体法含负利润, 申万口径, 行业整体亏损时 PE 为负)",
     )
+    # ── 波动率自适应退出参数（VAEO 学习产出）──
+    LEARNED_T1_MULT: float = Field(default=3.0, ge=1.0, le=10.0,
+                                    description="回测学习到的 T1 止盈 ATR 倍数（替代硬编码默认值）")
+    LEARNED_T2_MULT: float = Field(default=5.0, ge=1.0, le=15.0,
+                                    description="回测学习到的 T2 止盈 ATR 倍数（替代硬编码默认值）")
 
 
 class TechnicalConstantsConfig(BaseModel):
@@ -667,6 +660,11 @@ class PortfolioOptimizerConfig(BaseModel):
         default=5.0, ge=0.1, le=60.0,
         description="求解超时 (秒)",
     )
+    # P3-3：优化器日志详细度（WFO路径下降噪）
+    VERBOSE: bool = Field(
+        default=False,
+        description="优化器日志详细度（True=输出所有debug/info；False=仅warning以上）",
+    )
     # ── 超参数寻优范围 ──
     OPTIMIZER_RISK_AVERSION_RANGE: str = Field(default="0.5,5.0,0.5", description="风险厌恶系数寻优范围")
     OPTIMIZER_TURNOVER_PENALTY_RANGE: str = Field(default="0.0005,0.003,0.0005", description="换手率惩罚寻优范围")
@@ -701,6 +699,14 @@ class PositionSizingConfig(BaseModel):
                                          description="NONE 风险等级仓位系数")
 
 
+class ResearchReportFilterConfig(BaseModel):
+    """研报过滤配置"""
+
+    ENABLE_RESEARCH_REPORT_FILTER: bool = Field(default=False, description="是否启用研报过滤")
+    RESEARCH_REPORT_MIN_COUNT: int = Field(default=1, ge=1, le=100,
+                                           description="买入评级最低次数")
+
+
 class ApiConfig(BaseModel):
     """API 服务配置模型"""
 
@@ -727,7 +733,6 @@ class AppConfig(BaseSettings):
     fund_flow: FundFlowConfig
     technical_indicators: TechnicalIndicatorsConfig
     column_aliases: ColumnAliasesConfig
-    research_report_filter: ResearchReportFilterConfig
     full_bull_scoring: FullBullScoringConfig
     user_focus_stocks: UserFocusStocksConfig
     asharehub: AShareHubConfig
@@ -743,6 +748,7 @@ class AppConfig(BaseSettings):
     distribution: DistributionConfig
     multi_factor_alpha: MultiFactorAlphaConfig
     portfolio_optimizer: PortfolioOptimizerConfig
+    research_report_filter: ResearchReportFilterConfig = ResearchReportFilterConfig()
 
 
 class Config:
@@ -822,7 +828,6 @@ class Config:
             fund_flow=FundFlowConfig(**self._section_upper("FUND_FLOW")),
             technical_indicators=TechnicalIndicatorsConfig(**self._section_upper("TECHNICAL_INDICATORS")),
             column_aliases=ColumnAliasesConfig(**col_raw),
-            research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
             full_bull_scoring=FullBullScoringConfig(**self._section_upper("FULL_BULL_SCORING")),
             user_focus_stocks=UserFocusStocksConfig(**self._section_upper("USER_FOCUS_STOCKS")),
             asharehub=AShareHubConfig(**ah_raw),
@@ -838,6 +843,7 @@ class Config:
             distribution=DistributionConfig(**dist_raw),
             multi_factor_alpha=MultiFactorAlphaConfig(**self._section_upper("MULTI_FACTOR_ALPHA")),
             portfolio_optimizer=PortfolioOptimizerConfig(**self._section_upper("PORTFOLIO_OPTIMIZER")),
+            research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
             api=ApiConfig(**self._section_upper("API")),
         )
 
@@ -857,6 +863,11 @@ class Config:
                 sc.CROSS_DECAY_DAYS = int(bt_cal["CROSS_DECAY_DAYS"])
             if "ATR_STOP_MULT" in bt_cal:
                 sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
+            # VAEO 波动率自适应退出参数覆写
+            if "LEARNED_T1_MULT" in bt_cal:
+                sc.LEARNED_T1_MULT = float(bt_cal["LEARNED_T1_MULT"])
+            if "LEARNED_T2_MULT" in bt_cal:
+                sc.LEARNED_T2_MULT = float(bt_cal["LEARNED_T2_MULT"])
             if "LIQ_VETO_RATIO" in bt_cal:
                 fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
             if "KELLY_FRACTION" in bt_cal:
@@ -1051,9 +1062,6 @@ class Config:
     def ASHAREHUB_API_KEY(self) -> str: return self.app_config.asharehub.API_KEY
 
     @property
-    def ENABLE_CHIP_DISTRIBUTION(self) -> bool: return self.app_config.asharehub.ENABLE_CHIP_DISTRIBUTION
-
-    @property
     def MONEYFLOW_RETRY(self) -> int: return self.app_config.asharehub.MONEYFLOW_RETRY
 
     @property
@@ -1206,14 +1214,15 @@ class Config:
             "kline_decay_min": s.KLINE_DECAY_MIN,
             "vol_norm_denominator": s.VOL_NORM_DENOMINATOR,
             "atr_stop_mult": s.ATR_STOP_MULT,
-            "atr_t1_mult": s.ATR_T1_MULT,
-            "atr_t2_mult": s.ATR_T2_MULT,
             "trailing_stop_high_ratio": s.TRAILING_STOP_HIGH_RATIO,
             "trailing_stop_lookback": s.TRAILING_STOP_LOOKBACK,
             "trailing_stop_high_lookback": s.TRAILING_STOP_HIGH_LOOKBACK,
             "expected_return_lookback": s.EXPECTED_RETURN_LOOKBACK,
             "golden_cross_bonus": s.GOLDEN_CROSS_BONUS,
             "divergence_penalty": s.DIVERGENCE_PENALTY,
+            # VAEO 波动率自适应退出参数
+            "learned_t1_mult": s.LEARNED_T1_MULT,
+            "learned_t2_mult": s.LEARNED_T2_MULT,
         }
 
     @property
@@ -1269,6 +1278,7 @@ class Config:
             "max_holdings": o.MAX_HOLDINGS,
             "target_cash_ratio": o.TARGET_CASH_RATIO,
             "solve_timeout": o.SOLVE_TIMEOUT,
+            "verbose": o.VERBOSE,
         }
 
     # ── 工具方法 ────────────────────────────────────────────────────────

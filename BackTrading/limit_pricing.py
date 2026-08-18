@@ -100,6 +100,42 @@ def _round_half_up_vec(x: np.ndarray) -> np.ndarray:
     return np.floor(y + 0.5) / 100.0
 
 
+def exright_reference_price(
+    prev_close_raw: float,
+    adj_factor_today: float,
+    adj_factor_yesterday: float,
+) -> float:
+    """计算交易所"除权除息参考价"用作涨跌停基准。
+
+    涨跌停价以交易所除权除息参考价为基准，而非原始前收盘。
+    除权日若直接用原始前收计算涨跌停价，偏差 = 每股分红 / 前收，
+    一字板判定随之失真（close ≥ limit_up 误判 / 漏判）。
+
+    原理：adj_factor 为不复权→后复权的累积乘数，
+    adj_factor_today / adj_factor_yesterday = 1（普通日）
+    adj_factor_today / adj_factor_yesterday < 1（除权日：比值 = 除权系数）
+
+    ref_price = prev_close_raw × (adj_factor_today / adj_factor_yesterday)
+
+    等价于交易所公式：(前收 − 每股现金红利) / (1 + 送转比例)
+
+    Args:
+        prev_close_raw: 前收盘价（不复权原始价）
+        adj_factor_today: 当日 adj_factor（后复权因子）
+        adj_factor_yesterday: 前日 adj_factor
+
+    Returns:
+        涨跌停基准参考价；无法计算时退化为 prev_close_raw。
+    """
+    if (np.isfinite(adj_factor_today) and np.isfinite(adj_factor_yesterday)
+            and adj_factor_yesterday > 0 and adj_factor_today > 0):
+        ratio = adj_factor_today / adj_factor_yesterday
+        # 除权系数应在合理范围内（防止脏数据导致极端偏差）
+        if 0.1 < ratio < 5.0:
+            return prev_close_raw * ratio
+    return prev_close_raw
+
+
 def calc_limit_prices(
     prev_close: float,
     ratio_up: float,
@@ -128,9 +164,9 @@ def calc_limit_prices_batch(
     不再使用 np.round（银行家舍入）。
 
     Args:
-        prev_close: 前收盘价数组 (n,)
-        ratio_up: 涨停比例数组 (n,)
-        ratio_down: 跌停比例数组 (n,)
+        prev_close: 前收盘价数组（n,）。除权日应为"除权除息参考价"。
+        ratio_up: 涨停比例数组（n,）
+        ratio_down: 跌停比例数组（n,）
 
     Returns:
         (limit_up, limit_down) 各 (n,)
@@ -244,22 +280,27 @@ def fill_ratio_for(
     board_streak: int = 1,
     *,
     seal_ratio: float = 0.05,
-    tradable_ratio: float = 0.30,
+    tradable_up_ratio: float = 0.30,
+    tradable_down_ratio: float = 0.30,
+    tradable_ratio: float = 0.30,  # [deprecated] 保留兼容，默认与 up 一致
     intraday_ratio: float = 0.10,
     seal_decay: float = 0.5,
 ) -> float:
     """可成交量比例（撮合层消费）——三档触板口径。
+
+    注意：此函数依赖当日 close/high/low（未来信息），P2 审计已将其从引擎
+    核心路径移除。保留仅供校准参考 / 离线分析使用。
 
     触板判定（日线近似，无需分钟数据）：
         - 涨停方向：high >= limit_up 或 open >= limit_up（一字/高开触及涨停价）
         - 跌停方向：low <= limit_down 或 open <= limit_down
     三档口径（按触板方式区分，全天量 × 比例 = 可成交量）：
         1. 一字板（开=收=限价）：seal_ratio（默认 5%）—— 全天封死，流动性最差
-        2. 开盘触板后炸板（open≥限价 但 close<限价）：tradable_ratio（默认 30%）
-           —— 开盘即封板、随后打开，早盘限价附近有大量挂单，30% 合理
+        2. 开盘触板后炸板（open≥限价 但 close<限价）：
+           涨停方向用 tradable_up_ratio（默认 30%），跌停方向用 tradable_down_ratio
+           —— 开盘即封板、随后打开，早盘限价附近有大量挂单
         3. 盘中冲板（open<限价, high≥限价）：intraday_ratio（默认 10%）
-           —— 盘中才触板，全天大部分成交量不在限价附近，30%×全天量严重高估，
-              用更低比例折算
+           —— 盘中才触板，全天大部分成交量不在限价附近
     - 非触板日：1.0（不限制）
     - 连续板数 n 板 → 比例 × seal_decay^(n-1)
     """
@@ -276,7 +317,7 @@ def fill_ratio_for(
             r = seal_ratio
         elif open_price is not None and open_price >= limit_up - _LIMIT_EPS:
             # 开盘涨停后炸板：open≥limit 但 close<limit
-            r = tradable_ratio
+            r = tradable_up_ratio
         else:
             # 盘中冲板：open<limit, high≥limit
             r = intraday_ratio
@@ -295,7 +336,7 @@ def fill_ratio_for(
             r = seal_ratio
         elif open_price is not None and open_price <= limit_down + _LIMIT_EPS:
             # 开盘跌停后炸板：open≤limit 但 close>limit
-            r = tradable_ratio
+            r = tradable_down_ratio
         else:
             # 盘中触跌停：open>limit, low≤limit
             r = intraday_ratio
@@ -309,24 +350,28 @@ def auction_fill_ratio_for(
     limit_up: float,
     limit_down: float,
     *,
-    tradable_ratio: float = 0.30,
+    tradable_up_ratio: float = 0.30,
+    tradable_down_ratio: float = 0.30,
     board_streak: int = 1,
     seal_decay: float = 0.5,
 ) -> float:
-    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复。
+    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复 + 方向区分。
 
     竞价撮合瞬间当日 high/low/close 尚不可知，档位判定只允许使用 9:25
     已知信息：open（竞价成交价，9:25 产生）与 limit_up/limit_down（昨收推得）。
     不得复用 fill_ratio_for 的全天档位口径（一字/炸板/盘中冲板依赖当日
     close/high/low，属未来信息）：
-        - open 触及涨停/跌停价 → 取「开盘触板」档 tradable_ratio（是否全天
-          封死或盘中炸板不可知，保守取开盘触板档；撮合层另有 auction_fill_ratio
-          封顶兜底）
+        - open 触及涨停价 → 取 tradable_up_ratio（涨停开盘买方排队深，
+          流动性不对称：卖方提供流动性相对容易，买方成交难）
+        - open 触及跌停价 → 取 tradable_down_ratio（跌停开盘恐慌抛压，
+          卖方成交困难，但炸板后流动性通常好于涨停封板）
         - 否则 1.0（竞价价未触板，无限制）
     连板衰减沿用前日连板数（收盘已知，无前视）。
     """
     touched_up = open_price is not None and open_price >= limit_up - _LIMIT_EPS
     touched_down = open_price is not None and open_price <= limit_down + _LIMIT_EPS
-    if touched_up or touched_down:
-        return tradable_ratio * (seal_decay ** max(0, board_streak - 1))
+    if touched_up:
+        return tradable_up_ratio * (seal_decay ** max(0, board_streak - 1))
+    if touched_down:
+        return tradable_down_ratio * (seal_decay ** max(0, board_streak - 1))
     return 1.0

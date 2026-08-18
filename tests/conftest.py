@@ -98,8 +98,6 @@ def temp_config_ini() -> Path:
         "boll_narrow_ratio = 0.8\n"
         "cross_decay_days = 30\n"
         "liq_veto_ratio = 0.05\n"
-        "atr_t1_mult = 3.0\n"
-        "atr_t2_mult = 5.0\n"
         "conclusion_full_bull = 80\n"
         "golden_cross_bonus = 10\n"
         "divergence_penalty = 20\n"

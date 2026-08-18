@@ -172,6 +172,12 @@ def validate_params(
     Args:
         kline_df: 全量 K 线数据（含信号列或原始数据均可）。
         best_params: WFO 选出的最佳参数（flat dict，至少含 atr_stop_mult）。
+            P1-18：调用方需确保 best_params 包含以下夹具键，否则 ST 5% 涨跌幅
+            与次新股豁免逻辑在模拟验证路径将被停用：
+            - best_params["_st_history"]: ST/退市逐日状态
+            - best_params["_listing_days"]: 上市日期映射
+            - best_params["_exclude_st"]: 是否启用 ST 剔除
+            （runner.py 已自动注入；独立调用 verify_strategy 时需手动传入）
         oos_sharpe: WFO 在样本外窗口上的 Sharpe。
         sim_days: 验证集交易日数。
         config: Config 实例（可选，用于构建结构化 params）。

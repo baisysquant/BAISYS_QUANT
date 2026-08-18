@@ -402,9 +402,17 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     signal_subset = signal_df[["symbol", "trade_date"] + _signal_cols].copy()
     result = kline_df.merge(signal_subset, on=["symbol", "trade_date"], how="left")
     del signal_subset, signal_df
-    for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
+    for col in ["进场评分", "退出评分", "综合评分"]:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
+    # P1-9 修复：止损价信号缺失日用 ffill 沿前值延续，而非填0。
+    # 填0 → core.py 的 >0 守卫跳过 _prev_stop 更新 → 旧止损线残留 → 止损静默失效
+    if "止损价" in result.columns:
+        result["止损价"] = pd.to_numeric(result["止损价"], errors="coerce")
+        # 按 symbol 分组 ffill，信号缺失日沿用最近有效止损价
+        result["止损价"] = result.groupby("symbol")["止损价"].transform(lambda s: s.ffill())
+        # 整票全无信号时仍填0（core.py >0 守卫自动跳过）
+        result["止损价"] = result["止损价"].fillna(0)
     if "风险等级" in result.columns:
         result["风险等级"] = result["风险等级"].fillna("LOW")
     return result
@@ -802,6 +810,12 @@ def _stock_worker_vectorized(
     import sys as _sys
     try:
         stock_df, _peaks, _troughs = get_precomputed(symbol, stock_dir)
+        # P1-14 文档化：次新股 <60 个交易日整票无信号。
+        # 取舍原因：
+        #   1) 上市前5日A股无涨跌幅限制（2018年起），价格剧烈波动，MA/ATR等指标统计无意义；
+        #   2) 60根bar可覆盖MA60窗口（P1-10已设min_periods=60），指标预热充分；
+        #   3) 次新股上市初期流动性不稳定，回测滑点模型不可靠。
+        # 影响：次新股上市前3个月不参与回测。此属有意设计，非Bug。
         if stock_df.empty or len(stock_df) < 60:
             return []
 

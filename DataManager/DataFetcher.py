@@ -159,7 +159,11 @@ class DataFetcher:
         for i in range(self.config.DATA_FETCH_RETRIES):
             try:
                 logger.info(f"正在尝试第 {i + 1}/{self.config.DATA_FETCH_RETRIES} 次获取数据: {file_base_name}...")
-                df = fetch_func(**kwargs)
+                # 屏蔽 akShare 内部 DataFrame 碎片化 PerformanceWarning（每只股票刷 ~14 条）
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+                    df = fetch_func(**kwargs)
                 if df is not None and not df.empty:
                     break
                 else:

@@ -43,6 +43,16 @@ def _check_cvxpy() -> bool:
 
 
 HAVE_CVXPY = _check_cvxpy()
+cp = None
+if HAVE_CVXPY:
+    try:
+        import cvxpy as cp
+    except Exception:  # 子进程检测通过但主进程加载失败
+        logger.warning(
+            "[PortfolioOptimizer] cvxpy 主进程导入失败，将回退至 scipy SLSQP。"
+        )
+        HAVE_CVXPY = False
+        cp = None
 if not HAVE_CVXPY:
     logger.warning(
         "[PortfolioOptimizer] cvxpy 不可用（DLL 加载失败或未安装），将回退至 scipy SLSQP。"
@@ -73,8 +83,14 @@ class OptimizerConfig:
     # 行业暴露偏离上限 (对基准, 绝对值)
     max_industry_deviation: float = 0.05
 
+    # P1-4 修复：A股融券限制——默认禁止做空（A股融券标的有限且成本高）
+    short_allowed: bool = False
+    # 融券成本（年化，默认7%），做空时叠加到目标函数中作为持有成本惩罚
+    short_cost_annual: float = 0.07
+
     # 协方差估计窗口 (交易日)
-    cov_lookback: int = 60
+    # P1-3 修复：A股市场结构变化快，60天不足以捕捉稳定协方差结构，提升至120天
+    cov_lookback: int = 120
 
     # EWMA 衰减因子 (RiskMetrics 标准 0.94)
     ewma_lambda: float = 0.94
@@ -96,6 +112,10 @@ class OptimizerConfig:
 
     # 是否用上期权重做 warm start
     warm_start: bool = True
+
+    # P3-3：日志详细度控制（WFO 路径下降噪）
+    # True = 输出所有 debug/info；False = 仅输出 warning 以上
+    verbose: bool = False
 
     # 求解超时 (秒) — 超过则回退
     solve_timeout: float = 5.0
@@ -204,12 +224,20 @@ class CovarianceEstimator:
         Returns:
             (N, N) 协方差矩阵 (确保正定)
         """
-        if shrinkage or method == "ledoit_wolf":
-            cov = cls.ledoit_wolf(returns)
-        elif method == "ewma":
+        # P1-3 修复：EWMA 与 Ledoit-Wolf 收缩组合使用
+        # 先用 method 计算基础协方差，再可选叠加收缩增强稳健性
+        if method == "ewma":
             cov = cls.ewma(returns, lam)
+        elif method == "ledoit_wolf":
+            cov = cls.ledoit_wolf(returns)
         else:
             cov = cls.sample(returns)
+
+        # 若启用收缩且未使用 ledoit_wolf，则对基础估计再叠加收缩
+        if shrinkage and method != "ledoit_wolf":
+            shrunk = cls.ledoit_wolf(returns)
+            # 以基础估计为主，收缩估计为稳健锚，加权平均
+            cov = 0.7 * cov + 0.3 * shrunk
 
         # 确保正定 (最小特征值平移)
         eigvals = np.linalg.eigvalsh(cov)
@@ -373,19 +401,31 @@ class PortfolioOptimizer:
         import cvxpy as cp
         w = cp.Variable(n)
 
-        # 目标函数:  min  -wᵀμ + (γ/2)wᵀΣw + λ_TC · ‖w - w₀‖₁
+        # 目标函数:  min  -wᵀμ + (γ/2)wᵀΣw + λ_TC · ‖w - w₀‖₁ + 融券成本
         risk_term = (self.cfg.risk_aversion / 2.0) * cp.quad_form(w, cov)
         return_term = -mu.T @ w
         turnover_term = self.cfg.turnover_penalty * cp.norm(w - w0, 1)
 
-        objective = cp.Minimize(return_term + risk_term + turnover_term)
+        # P1-4 修复：融券成本项 — 对负权重部分加收年化融券成本（折算为日成本）
+        short_cost_term = cp.Constant(0.0)
+        if self.cfg.short_allowed:
+            short_cost_daily = self.cfg.short_cost_annual / 252.0
+            w_neg = cp.maximum(-w, 0)
+            short_cost_term = short_cost_daily * cp.sum(w_neg)
+
+        objective = cp.Minimize(return_term + risk_term + turnover_term + short_cost_term)
 
         # 约束
         constraints = [
             cp.sum(w) == target_sum,
-            0 <= w,
-            w <= self.cfg.max_weight,
         ]
+
+        # P1-4 修复：A股默认禁止做空；short_allowed=False 时禁止负权重
+        if self.cfg.short_allowed:
+            constraints.append(w >= -self.cfg.max_weight)
+        else:
+            constraints.append(0 <= w)
+            constraints.append(w <= self.cfg.max_weight)
 
         # 行业中性约束
         if industry_groups is not None and benchmark_weights is not None:
@@ -434,8 +474,10 @@ class PortfolioOptimizer:
                     w_opt = np.clip(w.value, 0, None)
                     if w_opt.sum() > 0:
                         w_opt = w_opt / w_opt.sum() * target_sum
-                    # 清理微小权重
+                    # P1-17 修复：清理微小权重后重归一化，避免 Σw 偏离约束
                     w_opt[w_opt < 0.001] = 0
+                    if w_opt.sum() > 0:
+                        w_opt = w_opt / w_opt.sum() * target_sum
                     return dict(zip(symbols, w_opt))
                 elif prob.status in ("infeasible", "unbounded"):
                     logger.debug(f"[Optimizer] CVXPY {solver}: {prob.status}")
@@ -469,6 +511,11 @@ class PortfolioOptimizer:
             return_term = -w @ mu
             risk_term = (self.cfg.risk_aversion / 2.0) * w @ cov @ w
             turnover = self.cfg.turnover_penalty * np.sum(np.abs(w - w0))
+            # P1-4 修复：融券成本项（日成本）
+            if self.cfg.short_allowed:
+                short_cost_daily = self.cfg.short_cost_annual / 252.0
+                short_pos = np.minimum(w, 0)
+                return return_term + risk_term + turnover + short_cost_daily * np.sum(np.abs(short_pos))
             return return_term + risk_term + turnover
 
         constraints: list[dict[str, Any]] = [
@@ -501,11 +548,18 @@ class PortfolioOptimizer:
                         self.cfg.max_weight * 3 - np.sum(w[g]),
                 })
 
-        bounds = [(0, self.cfg.max_weight)] * n
+        # P1-4 修复：bounds 根据 short_allowed 配置
+        if self.cfg.short_allowed:
+            bounds = [(-self.cfg.max_weight, self.cfg.max_weight)] * n
+        else:
+            bounds = [(0, self.cfg.max_weight)] * n
 
         # Warm start
         if self.cfg.warm_start and w0.sum() > 0:
-            x0 = np.clip(w0, 0, self.cfg.max_weight)
+            if self.cfg.short_allowed:
+                x0 = np.clip(w0, -self.cfg.max_weight, self.cfg.max_weight)
+            else:
+                x0 = np.clip(w0, 0, self.cfg.max_weight)
             if x0.sum() > 0:
                 x0 = x0 / x0.sum() * target_sum
             else:
@@ -523,7 +577,10 @@ class PortfolioOptimizer:
             w_opt = np.clip(result.x, 0, None)
             if w_opt.sum() > 0:
                 w_opt = w_opt / w_opt.sum() * target_sum
+            # P1-17 修复：清理微小权重后重归一化
             w_opt[w_opt < 0.001] = 0
+            if w_opt.sum() > 0:
+                w_opt = w_opt / w_opt.sum() * target_sum
             return dict(zip(symbols, w_opt))
 
         logger.warning(
@@ -577,6 +634,7 @@ class PortfolioOptimizer:
                     prob.solve(solver=solver, verbose=False)
                     if prob.status in ("optimal", "optimal_inaccurate"):
                         w_opt = np.clip(w.value, 0, None)
+                        # P1-17 修复：清零微小权重后重归一化
                         w_opt[w_opt < 0.001] = 0
                         if w_opt.sum() > 0:
                             w_opt /= w_opt.sum()
@@ -600,6 +658,7 @@ class PortfolioOptimizer:
 
         if result.success:
             w_opt = np.clip(result.x, 0, None)
+            # P1-17 修复：清零微小权重后重归一化
             w_opt[w_opt < 0.001] = 0
             if w_opt.sum() > 0:
                 w_opt /= w_opt.sum()
@@ -684,6 +743,8 @@ class PortfolioOptimizer:
         问题: buy_score (0~100) 与日收益率 (~0.01) 量级不同，
               直接相减会导致优化器被收益项主导。
         解决: 将 Alpha 线性映射到历史收益率范围。
+        P1-17 修复：映射到 [-ret_std, +ret_std] 范围而非全正值，
+              避免优化器因全正 alpha 盲目重仓。
         """
         if len(alpha) == 0:
             return alpha
@@ -693,16 +754,16 @@ class PortfolioOptimizer:
         if ret_mean < 1e-10:
             return np.zeros_like(alpha)
 
-        # 将 Alpha 归一化到 [0, 1]
+        # 将 Alpha 归一化到 [-1, 1]（而非 [0,1]），保留正负区分
         a_min, a_max = alpha.min(), alpha.max()
         if a_max - a_min < 1e-10:
-            normalized = np.ones_like(alpha) * 0.5
+            normalized = np.zeros_like(alpha)  # 全相同分 → 中性预期
         else:
-            normalized = (alpha - a_min) / (a_max - a_min)
+            normalized = 2.0 * (alpha - a_min) / (a_max - a_min) - 1.0  # [-1, 1]
 
-        # 映射到收益率尺度 (均值 ± 1 个标准差范围)
+        # 映射到收益率尺度 (均值 ± 标准化偏差范围)
         ret_std = np.std(returns)
-        mu = ret_mean + normalized * ret_std * 2
+        mu = ret_mean + normalized * ret_std
 
         return mu
 
@@ -764,5 +825,14 @@ class PortfolioOptimizer:
         n = len(symbols)
         if n == 0:
             return {}
-        w = min(1.0 / n, self.cfg.max_weight)
-        return {s: w for s in symbols}
+        # P1-17 修复：当 n < 1/max_weight 时，min(1/n, max_weight) 导致权重和 < 1。
+        # 先取上限，再归一化确保 Σw = 1。
+        w_raw = min(1.0 / n, self.cfg.max_weight)
+        w_sum = w_raw * n
+        if w_sum < 1.0 - 1e-12:
+            w_raw = 1.0 / n  # 回退等权，忽略 max_weight（fallback 场景无优化器约束）
+            logger.debug(
+                f"[Optimizer] fallback_equal_weight 权重和不足(Σw={w_sum:.4f})，"
+                f"回退等权 1/n={1.0/n:.4f}"
+            )
+        return {s: w_raw for s in symbols}

@@ -46,11 +46,8 @@ def main() -> None:
         level="INFO", encoding="utf-8", enqueue=True, rotation="1 day",
     )
 
-    # ── 企业代理 SSL 兼容（P2-2 审计修复） ──
+
     # 原实现全局 monkeypatch 第三方 AShareHub.__init__ 并 verify=False 禁用 TLS
-    # 校验（中间人风险 + 第三方库升级脆弱）。已移除：所有 AShareHub 调用点统一
-    # 经 UtilsManager.AShareHubClient.make_asharehub_client() 工厂注入，仅信任
-    # 显式 CA（SSL_CERT_FILE / REQUESTS_CA_BUNDLE）或系统默认信任库，绝不降级。
     # 企业代理自签名证书场景：导出代理 CA 为 PEM 并设置 SSL_CERT_FILE 即可。
     logger.info("AShareHub TLS 校验已启用（仅信任显式 CA 或系统信任库）")
 

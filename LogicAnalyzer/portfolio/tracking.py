@@ -426,8 +426,8 @@ class PositionTrackingService:
             return None, None
 
         params = self.config.SCORING_PARAMS
-        t1 = current_close + atr * params["atr_t1_mult"]
-        t2 = current_close + atr * params["atr_t2_mult"]
+        t1 = current_close + atr * params.get("atr_t1_mult", 3.0)
+        t2 = current_close + atr * params.get("atr_t2_mult", 5.0)
         return t1, t2
 
     # ── 组合层汇总行 ──────────────────────────────────────────

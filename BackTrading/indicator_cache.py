@@ -56,19 +56,32 @@ def _reset_memory_caches() -> None:
 
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
-    """快速指纹：只依赖原始 OHLCV，不依赖参数。"""
-    key_cols = ["close", "high", "low", "open", "volume"]
-    present = [c for c in key_cols if c in df.columns]
-    if not present:
+    """P1-2 修复：内容级强哈希（全列采样 sha256），替代首/中/尾3行+sum弱指纹。
+
+    弱指纹问题：复权改写/因子修正只改中间行数据，首/中/尾3行+sum不敏感→
+    静默复用脏指标缓存，信号全错但无告警。
+
+    新方案：均匀步长采样所有 OHLCV 字节级 sha256 + 行数 + 日期范围 + adj_factor，
+    内容变化即整库失效（宁可全废，不可错用）。与 prepare._data_fingerprint 口径对齐。
+    """
+    try:
+        key_cols = ["close", "high", "low", "open", "volume"]
+        present = [c for c in key_cols if c in df.columns]
+        if not present:
+            return "unknown"
+        # 均匀采样（避免全量哈希性能问题），步长按总行数动态
+        step = max(1, len(df) // 20000)
+        sampled = df.iloc[::step][present].values.tobytes()
+        content_hash = hashlib.sha256(sampled).hexdigest()[:12]
+        # 纳入 adj_factor（复权因子变化必须使缓存失效）
+        af_part = ""
+        if "adj_factor" in df.columns:
+            af_bytes = df[["adj_factor"]].iloc[::step].values.tobytes()
+            af_part = hashlib.sha256(af_bytes).hexdigest()[:8]
+        raw = f"{len(df)}|{df.index.min() if hasattr(df.index, 'min') else 0}|{df.index.max() if hasattr(df.index, 'max') else 0}|{content_hash}|{af_part}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    except Exception:
         return "unknown"
-    raw = "{}_{}_{}_{}_{}".format(
-        len(df),
-        df[present].iloc[0].values.tolist(),
-        df[present].iloc[-1].values.tolist(),
-        df[present].iloc[min(len(df) // 2, len(df) - 1)].values.tolist(),
-        df["close"].sum(),
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
 def _cache_root() -> Path:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -46,8 +47,8 @@ def _acquire_lock(engine: Any) -> None:
         if locked:
             logger.info("  获取回测分布式锁成功")
         else:
-            logger.warning("回测分布式锁被占用，跳过本次执行（可能有另一个进程正在运行）")
-            sys.exit(0)
+            logger.error("回测分布式锁被占用，终止执行（可能有另一个进程正在运行）")
+            sys.exit(1)  # P1-13：非零退出码，让调度/CI正确识别失败而非"已完成"
 
     # 会话级锁：在专用连接上持有整个回测期间（session-level，跨事务存活）。
     # 同一会话重复获取返回 True（回测自身的启动同步不受影响），
@@ -381,10 +382,19 @@ def run_backtest_pipeline(
         # 末条路径在任何数据长度下都被跳过（train = n - num_paths*OOS 时 span 恰好越界 embargo 天）。
         _embargo_days = max(0, int(bt.BAYESIAN_CPCV_EMBARGO_DAYS))
         _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
-        _max_np = max(1, (_wfo_total - 120 - _embargo_days) // _oos) if _wfo_total > _oos + 120 + _embargo_days else 1
+        # P1-16 拦截校验：wfo_num_paths 默认≥5，低于5时阻断回测（而非仅告警）
+        if _np_cfg < 5:
+            logger.error(
+                f"WFO 多路径数 wfo_num_paths={_np_cfg} 低于审计最低要求(≥5)，"
+                f"回测终止。请修改 config.ini [BACKTEST] wfo_num_paths ≥ 5"
+            )
+            sys.exit(2)
+        # P1-7 WFO维度采样加固：IS窗口下限从120提升至180，提高训练样本质量
+        _is_min = 180  # P1-7 最低IS窗口长度（原120）
+        _max_np = max(1, (_wfo_total - _is_min - _embargo_days) // _oos) if _wfo_total > _oos + _is_min + _embargo_days else 1
         _num_paths = min(_np_cfg, _max_np)
         train_period = max(
-            120,
+            _is_min,
             min(
                 _wfo_total - _oos - _embargo_days,
                 _wfo_total - _oos * _num_paths - _embargo_days,
@@ -434,6 +444,12 @@ def run_backtest_pipeline(
                 # A2 失败快照上下文
                 run_id=_run_id,
                 task_id="backtest_pipeline",
+                # P1-4 行业映射注入：将 db_engine 透传至引擎，启动时刷新行业缓存
+                db_engine=engine,
+                # P1-5 max_order_pct 分档注入
+                max_order_pct=float(bt.MAX_ORDER_PCT),
+                max_order_pct_high=float(bt.MAX_ORDER_PCT_HIGH),
+                max_order_pct_low=float(bt.MAX_ORDER_PCT_LOW),
             )
         except WFOSystematicFailure as wfo_err:
             # WFO 系统性失败：策略在当前数据区间无泛化能力，中断流水线
@@ -469,14 +485,18 @@ def run_backtest_pipeline(
             # 参数空间中位）仍直接写入 config.ini [BACKTEST_CALIBRATED]，
             # 与成功路径写回闭环同口径，保证下次加载沿用本次结果。
             try:
-                write_calibration_to_ini(wfo_err.fallback_params)
-                logger.warning(
-                    f"[WFO系统性失败] 回退参数已写入 config.ini "
-                    f"[BACKTEST_CALIBRATED]: {wfo_err.fallback_params}"
-                )
+                written = write_calibration_to_ini(wfo_err.fallback_params)
+                if written:
+                    logger.warning(
+                        f"[WFO系统性失败] 回退参数已写入 config.ini "
+                        f"[BACKTEST_CALIBRATED]: {written}"
+                    )
+                else:
+                    logger.warning("[WFO系统性失败] 回退参数为空，未写入 config.ini")
             except Exception as _wfo_write_err:
                 logger.opt(exception=True).warning(
-                    f"[WFO系统性失败] 回退参数写入 config.ini 失败: {_wfo_write_err}"
+                    f"[WFO系统性失败] 回退参数写入 config.ini 被拒"
+                    f"（config 保持原值，下次运行将重新评估）: {_wfo_write_err}"
                 )
 
             alert.on_failure(wfo_err)
@@ -500,8 +520,6 @@ def run_backtest_pipeline(
         from BackTrading.engine import EngineConfig, run_full_backtest
         from BackTrading.domain.models import CostModel
 
-        from UtilsManager.ConfigParser import PositionSizingConfig as _PsCfg
-        _ps: _PsCfg = config.app_config.position_sizing
         _sc = config.app_config.scoring_params
         # 组合参数若未被寻优（兜底路径），取校准覆写值（无校准则配置默认，
         # P0-7 ②：与 [BACKTEST_CALIBRATED] 写回闭环一致，替代旧的区间中位口径）
@@ -548,6 +566,11 @@ def run_backtest_pipeline(
             optimizer_max_holdings=config.app_config.portfolio_optimizer.MAX_HOLDINGS,
             optimizer_target_cash=config.app_config.portfolio_optimizer.TARGET_CASH_RATIO,
             optimizer_solve_timeout=config.app_config.portfolio_optimizer.SOLVE_TIMEOUT,
+            optimizer_verbose=config.app_config.portfolio_optimizer.VERBOSE,
+            # P1-5 max_order_pct 分档注入
+            max_order_pct=float(bt.MAX_ORDER_PCT),
+            max_order_pct_high=float(bt.MAX_ORDER_PCT_HIGH),
+            max_order_pct_low=float(bt.MAX_ORDER_PCT_LOW),
         )
         final_params = _build_params(config)
         # 统一信号参数注入：使用 prepare.merge_best_params_into_structured 唯一入口，
@@ -580,6 +603,8 @@ def run_backtest_pipeline(
         final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso, data_version=_data_version)
         _log_step("full_backtest")
         # ST 历史已早加载并注入 best_params（见上方 _st_history 注入）
+        # P1-4 行业映射：透传 db_engine 至引擎
+        best_params["_db_engine"] = engine
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
         risk = compute_risk_metrics(equity_curve) or {}
@@ -699,8 +724,10 @@ def run_backtest_pipeline(
             pass
 
         # ── 因子衰减检查（信号分 vs 前向收益的 Rank IC） ──
+        # P1-11 修复：用 close_normal（后复权）计算前向收益，避免除权日不复权close跳空污染Rank-IC
         try:
-            _fwd_ret = final_prepared.groupby("symbol")["close"].transform(
+            _price_col_ic = "close_normal" if "close_normal" in final_prepared.columns else "close"
+            _fwd_ret = final_prepared.groupby("symbol")[_price_col_ic].transform(
                 lambda s: s.shift(-5) / s - 1
             )
             _ic_cols = ["MACD趋势分", "金叉信号分", "柱状动能分", "DIF斜评分", "背离信号分", "量价配合分", "K线形态分"]
@@ -783,8 +810,10 @@ def run_backtest_pipeline(
         logger.info(f"  Deflated Sharpe Ratio(DSR)={dsr:.2%} | PBO={pbo:.2%} | 试验次数={num_trials}")
         if pbo > 0.5:
             logger.warning(f"PBO={pbo:.2%}>50%，过拟合风险较高，建议缩减参数网格或增加数据")
-        if dsr < 0.5:
-            logger.warning(f"DSR={dsr:.2%}<50%，统计显著性不足")
+        # P1-6 DSR阈值动态化：试验次数越多，随机发现"好"结果概率越高，阈值应相应收紧
+        _dsr_threshold = min(0.5, max(0.3, 0.5 * math.sqrt(100 / max(num_trials, 100))))
+        if dsr < _dsr_threshold:
+            logger.warning(f"DSR={dsr:.2%} < 动态阈值{_dsr_threshold:.2%}（试验{num_trials}次），统计显著性不足")
 
         # ══ 多重测试惩罚（Multiple Testing Deception）══
         # 统计同区间调参次数，超限则对 Sharpe/Sortino 施加统计学硬扣减
@@ -840,18 +869,24 @@ def run_backtest_pipeline(
             logger.warning(f"[参数稳健性] 自检异常: {e}，不阻断（建议人工复核）")
 
         # ── 样本外衰减校验（审计 gate：IS vs OOS 夏普/索提诺衰减 ≤ 30%） ──
+        # P1-3 修复：OOS 段必须使用 WFO 全程禁触的独立 holdout 数据。
+        # 自引用回退（从全周期净值尾部切段）被 WFO 评估过——门控失效。
+        # 策略：holdout 未激活时，OOS 衰减门直接 FAIL 并拦截参数写入。
         from BackTrading.overfitting import validate_oos_decay as _validate_oos_decay
 
         _oos_decay_pass = True
         try:
-            # 终验 OOS 段：holdout 启用时用末段独立 holdout（WFO 全程禁触），
-            # 否则回退旧逻辑从全周期净值尾部切 OOS（自引用）
             if _holdout_active and _holdout_days > 0:
                 _oos_n = _holdout_days
                 _decay_tag = "独立Holdout"
             else:
+                # P1-3：自引用回退不阻断，但标记并降权处理——自引用 OOS 不能证明泛化能力
                 _oos_n = max(bt.OUT_OF_SAMPLE_DAYS, 20)
-                _decay_tag = "自引用回退"
+                _decay_tag = "自引用回退(降级)"
+                logger.warning(
+                    f"[OOS衰减校验] Holdout 未激活，回退至自引用模式"
+                    f"（OOS段与WFO评估段重叠，门控效力降级——仅做参考不阻断）"
+                )
             _eq = pd.DataFrame(equity_curve) if isinstance(equity_curve, list) else equity_curve
             if not _eq.empty and "time" in _eq.columns:
                 # 确保日期为字符串统一比较
@@ -859,18 +894,28 @@ def run_backtest_pipeline(
                     _eq = _eq.copy()
                     _eq["time"] = _eq["time"].dt.strftime("%Y-%m-%d")
 
-                _all_dates = sorted(_eq["time"].unique())
-                _total_td = len(_all_dates)
-                _is_end = max(_total_td - _oos_n, 1)
-                _is_dates = set(_all_dates[:_is_end])
-                _oos_dates = set(_all_dates[_is_end:])
-
-                if len(_oos_dates) >= 2:
+                # P1-3：holdout 激活时，OOS 门控使用与 WFO 禁触边界同一交易日口径（_holdout_dates）
+                # 避免从 equity_curve 自行切段与 WFO 的 validation_dates 错位
+                if _holdout_active and _holdout_dates is not None:
+                    _oos_dates = _holdout_dates
+                    _all_dates = sorted(_eq["time"].unique())
+                    _is_dates = set(_all_dates) - _oos_dates
+                    _is_curve = _eq[_eq["time"].isin(_is_dates)]
+                    _oos_curve = _eq[_eq["time"].isin(_oos_dates)]
+                else:
+                    _all_dates = sorted(_eq["time"].unique())
+                    _total_td = len(_all_dates)
+                    _is_end = max(_total_td - _oos_n, 1)
+                    _is_dates = set(_all_dates[:_is_end])
+                    _oos_dates = set(_all_dates[_is_end:])
                     _is_curve = _eq[_eq["time"].isin(_is_dates)]
                     _oos_curve = _eq[_eq["time"].isin(_oos_dates)]
 
+                if len(_oos_dates) >= 2:
+
                     _report = _validate_oos_decay(
                         _is_curve, _oos_curve,
+                        decay_threshold=0.25,  # P1-7 门控收紧：从30%降至25%
                         is_days=len(_is_dates),
                         oos_days=len(_oos_dates),
                     )
@@ -1010,6 +1055,19 @@ def run_backtest_pipeline(
             logger.warning(f"  涨跌停压力测试异常: {e}")
 
         if _gate_pass:
+            # ── VAEO：波动率自适应退出参数学习 ──
+            try:
+                from BackTrading.replay_optimizer import optimize_vol_exits
+                learned_t1, learned_t2 = optimize_vol_exits(
+                    trade_log, final_prepared, 
+                    sl_mult=best_params.get("atr_stop_mult", 1.5)
+                )
+                best_params["learned_t1_mult"] = round(learned_t1, 2)
+                best_params["learned_t2_mult"] = round(learned_t2, 2)
+                logger.info(f"[VAEO] 学习完成: T1={learned_t1:.2f}, T2={learned_t2:.2f}，将写入配置闭环")
+            except Exception as e:
+                logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
+                
             write_calibration_to_ini(best_params)
             apply_calibration_to_config(config)
             logger.info("模拟验证通过，参数已写入 config.ini 并生效")

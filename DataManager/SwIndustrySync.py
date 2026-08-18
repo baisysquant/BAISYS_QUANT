@@ -37,8 +37,32 @@ def _normalize_code(raw: Any) -> str | None:
         if s.lower().startswith(pfx):
             s = s[len(pfx):]
             break
+    # akShare 成分股代码带交易所后缀（"000019.SZ"）→ 去后缀
+    if "." in s:
+        s = s.split(".")[0]
     s = s.zfill(6)
     return s if s.isdigit() else None
+
+
+def _fetch_with_retry(fn, desc: str, retries: int = 3) -> Any:
+    """带指数退避的 AkShare 拉取包装（legulegu.com 偶发 DNS/连接抖动，重试可显著提高成功率）。"""
+    import random
+
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < retries:
+                _backoff = 2 ** attempt + random.uniform(0, 1)
+                logger.warning(
+                    f"[申万一级] {desc} 拉取失败({attempt}/{retries}): {type(e).__name__}: {e}，"
+                    f"等待 {_backoff:.1f}s 后重试"
+                )
+                time.sleep(_backoff)
+    assert last is not None
+    raise last
 
 
 def fetch_sw_l1_memberships() -> pd.DataFrame:
@@ -49,7 +73,7 @@ def fetch_sw_l1_memberships() -> pd.DataFrame:
     """
     import akshare as ak
 
-    l1_df = ak.sw_index_first_info()
+    l1_df = _fetch_with_retry(ak.sw_index_first_info, "申万一级列表")
     if l1_df is None or l1_df.empty:
         raise RuntimeError("ak.sw_index_first_info() 返回空数据")
     code_col = _match_columns(l1_df, "行业代码", "指数代码", "代码")
@@ -62,7 +86,9 @@ def fetch_sw_l1_memberships() -> pd.DataFrame:
         if not l1_code:
             continue
         try:
-            cons = ak.sw_index_third_cons(symbol=l1_code)
+            cons = _fetch_with_retry(
+                lambda: ak.sw_index_third_cons(symbol=l1_code), f"{l1_name}({l1_code}) 成分"
+            )
         except Exception as e:
             logger.error(
                 f"[申万一级] 拉取 {l1_name}({l1_code}) 成分失败: {type(e).__name__}: {e}"
@@ -72,7 +98,7 @@ def fetch_sw_l1_memberships() -> pd.DataFrame:
             logger.error(f"[申万一级] {l1_name}({l1_code}) 成分股为空")
             continue
         c_code = _match_columns(cons, "股票代码", "代码")
-        c_name = _match_columns(cons, "股票名称", "名称")
+        c_name = _match_columns(cons, "股票名称", "名称", "股票简称")
         frames.append(pd.DataFrame({
             "l1_code": l1_code,
             "l1_name": l1_name,

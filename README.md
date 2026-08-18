@@ -274,7 +274,6 @@ max_single_position = 0.33
 ```ini
 [ASHAREHUB]
 api_key = ENC:gAAAAAB...         ; 支持 ENC 加密
-enable_chip_distribution = true
 enable_fundamentals = true
 ```
 
@@ -357,7 +356,6 @@ cd BAISYS_QUAN
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `api_key` | 字符串 | - | AShareHub API 密钥（支持 ENC 加密） |
-| `enable_chip_distribution` | 布尔 | `true` | 是否获取筹码分布数据 |
 | `enable_fundamentals` | 布尔 | `true` | 是否获取估值/财务等基本面数据 |
 | `moneyflow_retry` | 整数 | `3` | 资金流向 API 重试次数 |
 | `moneyflow_page_delay` | 浮点 | `1.0` | 资金流向分页间隔（秒） |
@@ -547,8 +545,8 @@ cd BAISYS_QUAN
 |------|------|--------|------|
 | `enabled` | 布尔 | `true` | 启用多因子 Alpha 评分 |
 | `financial_quality_cache_days` | 整数 | `90` | 质量因子缓存天数 |
-| `financial_quality_batch_size` | 整数 | `500` | 质量因子每批采集股票数 |
-| `financial_quality_batch_sleep` | 整数 | `20` | 质量因子批间休眠秒数 |
+| `financial_quality_batch_size` | 整数 | `100` | 质量因子每批采集股票数 |
+| `financial_quality_batch_sleep` | 整数 | `10` | 质量因子批间休眠秒数 |
 | `financial_quality_file_cache_days` | 整数 | `30` | 质量因子离线文件缓存天数 |
 | `fundamentals_retry` | 整数 | `3` | 基本面数据拉取重试次数 |
 | 因子权重 | — | — | 权重定义已迁移至 `config/factor_registry.yaml`（13 因子注册表） |

@@ -56,6 +56,9 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "position_b": ("BACKTEST_CALIBRATED", "position_b"),
     "position_c": ("BACKTEST_CALIBRATED", "position_c"),
     "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
+    # ── 波动率自适应退出参数（VAEO 学习产出；复盘/跟盘单元消费）──
+    "learned_t1_mult": ("BACKTEST_CALIBRATED", "learned_t1_mult"),
+    "learned_t2_mult": ("BACKTEST_CALIBRATED", "learned_t2_mult"),
 }
 
 
@@ -339,31 +342,34 @@ def _format_val(key: str, val: Any) -> str:
     return s if s not in ("", "-0") else "0"
 
 
-def write_calibration_to_ini(params: dict) -> None:
+def write_calibration_to_ini(params: dict) -> dict | None:
     """将校准参数写入 config.ini 的 [BACKTEST_CALIBRATED]。
 
     已有键原位替换（保留行尾注释），新键追加到 section 末尾；
     整型参数取整写入，避免下次加载时 int() 解析崩溃；原子写防半截文件。
+    返回实际落盘参数（整数参数已取整），未写入时返回 None。
     """
     if not params:
         logger.info("无校准参数，跳过写入")
-        return
-    # P0-7 ②：落盘前类型断言 —— 整数参数必须为整数值，否则以 "17.0" 落盘
-    # 会在加载端 int() 解析崩溃；此处 fail-fast，拒绝污染 config.ini。
-    for k in sorted(_INT_KEYS & set(params)):
-        v = params[k]
+        return None
+    # P0-1 修复：整数参数统一取整 —— WFO 回退参数 = 参数空间中点，会产生
+    # 31.5/17.5/11.5 等非整值；旧实现在此 fail-fast 抛 ValueError 后被调用方
+    # except 吞掉，导致 config.ini 实际未写但日志谎报"已写入"。现在仅对
+    # 无法转换为数值的值 fail-fast，非整数值 round 后落盘。
+    sanitized = dict(params)
+    for k in sorted(_INT_KEYS & set(sanitized)):
+        v = sanitized[k]
         try:
-            is_integral = isinstance(v, (int, float, str)) and float(v).is_integer()
+            sanitized[k] = int(round(float(v)))
         except (TypeError, ValueError):
-            is_integral = False
-        if not is_integral:
             raise ValueError(
-                f"[校准写回] 整数参数 {k} = {v!r} 必须为整数值，拒绝写入 config.ini（防 int() 解析崩溃）"
-            )
+                f"[校准写回] 整数参数 {k} = {v!r} 无法转换为数值，拒绝写入 config.ini（防 int() 解析崩溃）"
+            ) from None
+    params = sanitized
     ini_path = CONFIG_INI
     if not ini_path.exists():
         logger.warning(f"config.ini 不存在: {ini_path}")
-        return
+        return None
 
     text = ini_path.read_text(encoding="utf-8")
     section_header = "[BACKTEST_CALIBRATED]"
@@ -422,3 +428,4 @@ def write_calibration_to_ini(params: dict) -> None:
     tmp_path.write_text("".join(out), encoding="utf-8")
     os.replace(tmp_path, ini_path)
     logger.info(f"校准参数已写入 {ini_path} [{section_header}]")
+    return params

@@ -132,8 +132,9 @@ def _calc_exit_strategy(df: pd.DataFrame, params: dict | None = None) -> dict:
         close = float(close_series.iloc[-1])
 
     atr_stop = params.get('atr_stop_mult', 1.5)
-    atr_t1 = params.get('atr_t1_mult', 3.0)
-    atr_t2 = params.get('atr_t2_mult', 5.0)
+    # 优先使用回测学习到的止盈倍数 (VAEO)，未学习则降级到 params 传入值，最后硬编码
+    atr_t1 = params.get('learned_t1_mult', params.get('atr_t1_mult', 3.0))
+    atr_t2 = params.get('learned_t2_mult', params.get('atr_t2_mult', 5.0))
     stop_loss = round(float(close - atr_val * atr_stop), 2)
     t1 = round(float(close + atr_val * atr_t1), 2)
     t2 = round(float(close + atr_val * atr_t2), 2)

@@ -49,8 +49,8 @@ _RANGE_TO_PARAM: dict[str, str] = {
     "BOLL_NARROW_RATIO_RANGE": "boll_narrow_ratio",
     "CROSS_DECAY_DAYS_RANGE": "cross_decay_days",
     "CONCLUSION_FULL_BULL_RANGE": "conclusion_full_bull",
-    "GOLDEN_CROSS_BONUS_RANGE": "golden_cross_bonus",
-    "DIVERGENCE_PENALTY_RANGE": "divergence_penalty",
+    # P1-7 低敏感参数固定：golden_cross_bonus / divergence_penalty 对OOS绩效影响微弱
+    # 但显著膨胀搜索空间维度，固定为配置默认值，不参与WFO寻优
     "BUY_THRESHOLD_RANGE": "buy_threshold",
     "MAX_HOLDINGS_RANGE": "max_holdings",
     # ── P4 组合优化器超参数 ──

@@ -108,6 +108,7 @@ class FidelityController:
         exclude_st: bool = True,
         data_version: str | None = None,
         listing_days: dict | None = None,
+        db_engine: Any = None,
     ):
         self._kline = kline_df
         self._base_cfg = base_engine_cfg
@@ -123,6 +124,8 @@ class FidelityController:
         self._listing_days = listing_days
         # P3.1 数据版本（入 ML 冻结缓存 key 与信号缓存指纹，增量同步后整库失效）
         self._data_version = data_version
+        # P1-4 行业映射：透传 db_engine 至引擎，启动时刷新 _industry_cache
+        self._db_engine = db_engine
         # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
         #（跨参数组合的命中率本来就低，多窗口下每份 ~0.7GiB 是 OOM 主因）
         self._signal_cache: dict[str, pd.DataFrame] = {}
@@ -212,6 +215,9 @@ class FidelityController:
         # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if self._listing_days:
             engine_params["_listing_days"] = self._listing_days
+        # P1-4 行业映射：透传 db_engine 至引擎，启动时刷新 _industry_cache
+        if self._db_engine is not None:
+            engine_params["_db_engine"] = self._db_engine
         _t_b = time.perf_counter()
         total_return = _run_single_backtest(
             data, engine_params, eval_cfg, trade_log, equity_curve

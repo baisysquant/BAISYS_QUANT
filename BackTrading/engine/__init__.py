@@ -40,8 +40,16 @@ class EngineConfig:
     execution_model: str = "next_open"  # next_open / vwap
     # ── 涨跌停撮合约束（simulate_limit_up_down=true 开启可成交量模型） ──
     simulate_limit_up_down: bool = True  # false=回退简化撮合（触板一律禁买/禁卖）
-    limit_seal_ratio: float = 0.05  # 一字板（开=收=限价）可成交量比例
-    limit_tradable_ratio: float = 0.30  # 开盘触板后炸板（open≥限价, close<限价）可成交量比例
+    limit_seal_ratio: float = 0.05  # [deprecated] 保留兼容
+    # P1-2 修复：一字板封死方向流动性不对称——
+    # 涨停板卖出相对容易（排队少，提供流动性），跌停板买入极难（恐慌情绪，逆势挂单）。
+    limit_seal_sell_ratio: float = 0.05  # 一字涨停/跌停封板时卖出可成交量比例（提供流动性，相对容易）
+    limit_seal_buy_ratio: float = 0.02   # 一字涨停/跌停封板时买入可成交量比例（逆势排队，极难）
+    # P1-2 修复：涨跌停方向流动性不对称——涨停开盘买方排队深，买方成交难；
+    # 跌停开盘恐慌抛压，卖方成交困难但炸板后流动性通常好于涨停封板。
+    limit_tradable_up_ratio: float = 0.30   # 涨停开盘触板可成交量比例（买方保守）
+    limit_tradable_down_ratio: float = 0.30  # 跌停开盘触板可成交量比例
+    limit_tradable_ratio: float = 0.30  # [deprecated] 保留兼容，不再被核心路径消费
     limit_intraday_ratio: float = 0.10  # 盘中冲板（open<限价, high≥限价）可成交量比例
     limit_seal_decay: float = 0.5  # 连续板每板可成交量衰减系数
     # ── P0-6 ⑥ 开盘集合竞价成交率分档（封单量/可成交量代理） ──
@@ -62,8 +70,18 @@ class EngineConfig:
     # ── 0.6 复牌跳空（停牌后复牌日开盘大幅跳空：补涨兑现 / 补跌标记） ──
     resume_gap_up: float = 0.05  # 复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买
     resume_gap_down: float = 0.05  # 复牌低开≤-该比例 → 日志标记（风控卖出照常）
+    # P2-5 修复：复牌跳空买入集合竞价成交率限制
+    # 复牌跳空高开日集合竞价买入可成交比例（复牌日买方抢筹激烈，实际成交受限）
+    resume_auction_fill_ratio: float = 0.15
+    # P1-6 修复：复牌跳空卖出流动性冲击放大系数
+    # 复牌日成交量放大但实际流动性不足，冲击成本高于正常日
+    resume_impact_multiplier: float = 2.0
     # ── 交易参数（P1-2：从 core.py 硬编码提升为配置驱动） ──
-    max_order_pct: float = 0.1  # 单笔订单上限（占 ADV 比例），超过则缩减股数
+    max_order_pct: float = 0.30  # 默认单笔订单上限（占 ADV 股数比例）
+    max_order_pct_high: float = 0.20  # 高流动性股上限 (ADV成交额>adv_amount_threshold_high)
+    max_order_pct_low: float = 0.10   # 低流动性股上限 (ADV成交额<adv_amount_threshold_low)
+    adv_amount_threshold_high: float = 1e8  # 高流动性阈值（元）
+    adv_amount_threshold_low: float = 2e7   # 低流动性阈值（元）
     top_k: int = 20  # 每日最大候选买入数（集中资金，避免每只分到极小额度 < 1 手）
     # ── P3-3（审计）挂单过期天数（P0-6 ②：A股订单当日有效，信号次日未成交即撤销） ──
     # 从 core.py 硬编码提升为配置项，便于研究（如"连续重挂 N 日"实验）；默认 1 保持原语义。
@@ -86,6 +104,13 @@ class EngineConfig:
     regime_half_multiplier: float = 0.5  # 半仓倍率
     regime_min_multiplier: float = 0.25  # 最低仓位倍率
 
+    # ── P2-1 停牌盯市：停牌天数保守衰减折扣（无行业指数数据时的务实替代方案） ──
+    # 停牌天数 > susp_decay_start_days 时，盯市价按 (1 - susp_daily_decay_rate)^(天数 - 起始天数) 折扣
+    # 目的：防止长期停牌期间净值虚高（重大事项不确定性）；复牌日按实际成交价结算
+    susp_decay_start_days: int = 10       # 停牌超过此天数开始衰减
+    susp_daily_decay_rate: float = 0.002  # 每日衰减率 0.2%（年化 ~47% 保守折扣）
+    susp_max_discount: float = 0.30       # 最大折扣上限 30%（防止极端停牌过度压低净值）
+
     # ── 组合优化器配置（P4 数学规划驱动） ──
     # 优化方法: mean_variance / min_variance / risk_parity / topk_equal(兼容旧版 Top-K 等权)
     optimizer_method: str = "topk_equal"
@@ -95,8 +120,8 @@ class EngineConfig:
     optimizer_turnover_penalty: float = 0.001
     # 单票权重上限 (w_max, 默认 10%)
     optimizer_max_weight: float = 0.10
-    # 协方差估计窗口 (交易日, 默认 60)
-    optimizer_cov_lookback: int = 60
+    # 协方差估计窗口 (交易日, P1-3 修复：A股市场结构变化快，60天不足，提升至120天)
+    optimizer_cov_lookback: int = 120
     # 协方差收缩 (Ledoit-Wolf, True = 小样本稳健)
     optimizer_shrinkage: bool = True
     # 行业中性约束 (是否启用)
@@ -109,6 +134,9 @@ class EngineConfig:
     optimizer_target_cash: float = 0.0
     # 求解超时 (秒)
     optimizer_solve_timeout: float = 5.0
+    # P3-3 优化：优化器日志详细度控制（WFO 路径下大量重复日志降噪）
+    # True = 输出所有 debug/info 日志；False = 仅输出 warning 以上级别
+    optimizer_verbose: bool = False
 
     @property
     def buy_fee_rate(self) -> float:

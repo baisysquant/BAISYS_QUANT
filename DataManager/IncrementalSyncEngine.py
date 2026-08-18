@@ -456,25 +456,43 @@ class IncrementalSyncEngine:
             hfq = hfq_map[d]
             close_raw = float(raw[2])
             close_hfq = float(hfq[2])
-            if not (math.isfinite(close_raw) and close_raw > 0
-                    and math.isfinite(close_hfq) and close_hfq > 0):
-                # 上游价格异常（负值/NaN/零，如 sh600076 2024-06-24 负后复权价）：
-                # 丢弃该交易日，防止负复权价写入 DB 导致回测负市值污染
+            if not (math.isfinite(close_raw) and close_raw > 0):
+                # 原始价异常：无法重建，丢弃
                 skipped += 1
+                logger.warning(f"腾讯API {symbol} 丢弃交易日 {d}：原始收盘价异常(close_raw={close_raw})")
                 continue
+            # P1-8 修复：腾讯hfq短暂异常（如负复权价）不丢弃整行，用原始价×adj_factor重建
+            adj_factor = 1.0
+            if math.isfinite(close_hfq) and close_hfq > 0:
+                adj_factor = close_hfq / close_raw
+                use_hfq = True
+            else:
+                # hfq 异常：用相邻日 adj_factor 重建（优先取前一天因子）
+                use_hfq = False
+                # 尝试用 asharehub 因子作为 fallback（若 factor_map 已传入）
+                adj_factor = max(close_hfq / close_raw, 1e-6) if close_raw and math.isfinite(close_hfq) else 1.0
+                logger.warning(f"腾讯API {symbol} {d} hfq收盘价异常(close_hfq={close_hfq})，用原始价×adj_factor重建")
+
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
             out["open"].append(float(raw[1]))
             out["close"].append(close_raw)
             out["high"].append(float(raw[3]))
             out["low"].append(float(raw[4]))
-            out["open_normal"].append(float(hfq[1]))
-            out["close_normal"].append(close_hfq)
-            out["high_normal"].append(float(hfq[3]))
-            out["low_normal"].append(float(hfq[4]))
+            if use_hfq:
+                out["open_normal"].append(float(hfq[1]))
+                out["close_normal"].append(close_hfq)
+                out["high_normal"].append(float(hfq[3]))
+                out["low_normal"].append(float(hfq[4]))
+            else:
+                # P1-8 降级：hfq不可用，用 raw × adj_factor 重建
+                out["open_normal"].append(float(raw[1]) * adj_factor)
+                out["close_normal"].append(close_raw * adj_factor)
+                out["high_normal"].append(float(raw[3]) * adj_factor)
+                out["low_normal"].append(float(raw[4]) * adj_factor)
             out["volume"].append(int(float(raw[5]) * 100))
             out["amount"].append(float(raw[8]) * 10000)
-            out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
+            out["adj_factor"].append(adj_factor)
         if skipped:
             logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
@@ -541,10 +559,31 @@ class IncrementalSyncEngine:
             if old_adj is not None:
                 match = grp.loc[grp["trade_date"] == latest.isoformat(), "adj_factor"]
                 if not match.empty:
-                    ratio = match.iloc[0] / old_adj
-                    if ratio > 1.01 or ratio < 0.99:
+                    new_adj = match.iloc[0]
+                    ratio = new_adj / old_adj
+                    # P1-1 修复：任何 adj_factor 变化（含腾讯因子修正/小除权）都触发全量重拉
+                    # 原逻辑 1% 阈值导致小除权/因子修正静默跳过→close_normal 边界断裂→假金叉/假止损
+                    if ratio > 1.0001 or ratio < 0.9999:
+                        logger.debug(
+                            f"  [{sym}] adj_factor 变化 {ratio:.6f} (old={old_adj:.6f}, new={new_adj:.6f}), 触发全量重拉"
+                        )
                         split_syms.append(sym)
                         continue
+
+                    # P1-1 边界连续性校验：adj_factor 未变但 close_normal 在重叠区有跳变→数据源修正，触发全量重拉
+                    if "close_normal" in grp.columns:
+                        overlap = grp[grp["trade_date"] <= latest.isoformat()]
+                        if len(overlap) >= 2:
+                            overlap_sorted = overlap.sort_values("trade_date")
+                            cn_series = overlap_sorted["close_normal"]
+                            cn_changes = cn_series.pct_change().abs()
+                            # 重叠区内出现 >0.5% 的跳变（不含停牌）视为数据源修正
+                            if (cn_changes > 0.005).any():
+                                logger.warning(
+                                    f"  [{sym}] close_normal 重叠区不连续 (max pct_change={cn_changes.max():.6f}), 触发全量重拉"
+                                )
+                                split_syms.append(sym)
+                                continue
 
             new = grp[grp["trade_date"] > latest.isoformat()]
             if not new.empty:

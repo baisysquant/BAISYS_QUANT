@@ -2,6 +2,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 from DataManager.ColumnNames import ColumnNames
 
@@ -34,15 +35,21 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
     if len(df) < 30:
         return _generate_empty_result("数据不足30个交易日")
 
+    # P1-10 修复：优先使用 close_normal（后复权价），避免不复权 close 在除权日跳变扭曲MA；
+    # min_periods=1 导致上市首日/数据起始即出指标（窗口不足，统计无效）
+    _price_col = "close_normal" if "close_normal" in df.columns else "close"
+    if "close_normal" not in df.columns and _price_col == "close":
+        logger.debug("Indicators calculate_full_bull_score: 无 close_normal 列，降级使用不复权 close")
+
     for _period in [5, 10, 20, 30, 60, 90, 120]:
         _col = f"MA{_period}"
         if _col not in df.columns:
-            df[_col] = df["close"].rolling(window=_period, min_periods=1).mean()
+            df[_col] = df[_price_col].rolling(window=_period, min_periods=_period).mean()
     if "MA_Volume_5" not in df.columns:
-        df["MA_Volume_5"] = df["volume"].rolling(window=5, min_periods=1).mean()
+        df["MA_Volume_5"] = df["volume"].rolling(window=5, min_periods=5).mean()
 
     latest = df.iloc[-1]
-    close_price = latest["close"]
+    close_price = latest[_price_col]  # P1-10：与MA口径一致，使用复权价比较
 
     def _trend_skeleton_score() -> tuple[int, str]:
         ma30, ma60, ma90 = latest["MA30"], latest["MA60"], latest["MA90"]

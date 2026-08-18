@@ -116,6 +116,7 @@ def _oos_validate(
     exclude_st: bool = True,
     data_version: str | None = None,
     listing_days: dict | None = None,
+    db_engine: Any = None,
 ) -> list[dict[str, Any]]:
     """对 top-M 参数组合做 OOS 验证。
 
@@ -161,6 +162,9 @@ def _oos_validate(
         # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if listing_days:
             engine_params["_listing_days"] = listing_days
+        # P1-4 行业映射：透传 db_engine 至引擎
+        if db_engine is not None:
+            engine_params["_db_engine"] = db_engine
         _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
@@ -261,6 +265,10 @@ def bayesian_walk_forward_multi(
         point_in_time=kwargs.get("point_in_time", True),
         execution_model=kwargs.get("execution_model", "next_open"),
         cost_model=_wfo_cost,
+        # P1-5 max_order_pct 分档注入
+        max_order_pct=kwargs.get("max_order_pct", 0.30),
+        max_order_pct_high=kwargs.get("max_order_pct_high", 0.20),
+        max_order_pct_low=kwargs.get("max_order_pct_low", 0.10),
     )
 
     # 从 config 读取 BO 预算
@@ -350,10 +358,12 @@ def bayesian_walk_forward_multi(
     exclude_st = bool(kwargs.get("exclude_st", True))
     # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
     listing_days = kwargs.get("listing_days")
+    # P1-4 行业映射：透传 db_engine 至引擎
+    db_engine = kwargs.get("db_engine")
 
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
-    _K_FOR_OOS = 3  # OOS 验证 top-K 参数数，供 PBO 计算
+    _K_FOR_OOS = 10  # P1-6 OOS验证top-K参数数提升至≥10，供PBO计算（原3组合随机1/3违反概率）
 
     for path_idx in range(num_paths):
         # 确定性偏移：各路径互不重叠，避免 IS/OOS 数据泄露
@@ -452,6 +462,7 @@ def bayesian_walk_forward_multi(
                     exclude_st=exclude_st,
                     data_version=data_version,
                     listing_days=listing_days,
+                    db_engine=db_engine,
                 )
             except Exception as opt_err:
                 _sid = save_failure_snapshot(
@@ -493,6 +504,7 @@ def bayesian_walk_forward_multi(
                     exclude_st=exclude_st,
                     data_version=data_version,
                     listing_days=listing_days,
+                    db_engine=db_engine,
                 )
             except Exception as oos_err:
                 _sid = save_failure_snapshot(
@@ -531,6 +543,7 @@ def bayesian_walk_forward_multi(
                     st_history=st_history, exclude_st=exclude_st,
                     data_version=data_version,
                     listing_days=listing_days,
+                    db_engine=db_engine,
                 )
                 _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
                 _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []
@@ -626,7 +639,7 @@ def bayesian_walk_forward_multi(
                 "win_rate": oos.get("win_rate", 0),
                 "profit_factor": oos.get("profit_factor", 0),
                 "total_trades": oos.get("total_trades", 0),
-                "num_combos": n_init_signal + n_iter_signal + n_init_portfolio + n_iter_portfolio,
+                "num_combos": n_init_signal + n_iter_signal + n_init_portfolio + n_iter_portfolio + 3,  # +3=P1-6 Phase4 refine_top 默认值，纳入 DSR num_trials
                 "oos_combos": oos_results,
             }
             if _dm_stat is not None:

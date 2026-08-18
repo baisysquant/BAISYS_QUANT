@@ -50,7 +50,6 @@ class ChipDistributionFetcher:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.api_key = config.ASHAREHUB_API_KEY
-        self.enabled = config.ENABLE_CHIP_DISTRIBUTION
         self._client = None
         self._cache_dir = getattr(config, 'TEMP_DATA_DIRECTORY', os.path.expanduser("~/Downloads/CoreNews_Reports/cache"))
 
@@ -92,8 +91,8 @@ class ChipDistributionFetcher:
         """
         if date:
             self._override_today = str(date).replace("-", "")
-        if not self.enabled or not self.api_key:
-            logger.info("[ChipDist] 筹码分布获取未启用或 API 密钥未配置，跳过。")
+        if not self.api_key:
+            logger.info("[ChipDist] 筹码分布获取未配置 API 密钥，跳过。")
             return pd.DataFrame()
 
         # ── 读缓存（当日已有文件） ──

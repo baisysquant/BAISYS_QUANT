@@ -127,7 +127,11 @@ def run_limit_stress(
     Args:
         kline_df: 全量 K 线数据（prepare 管线输入；prepared 已注入时仅用于校准指引）
         engine_cfg: 引擎配置
-        params: WFO 最佳参数
+        params: WFO 最佳参数。P1-18：调用方需确保 params 包含以下夹具
+            键，否则 ST 股 5% 涨跌幅与次新股豁免将被停用：
+            - params["_st_history"]: ST/退市逐日状态 {symbol: {date: (is_st, is_delisted)}}
+            - params["_listing_days"]: 上市日期映射 {symbol: "YYYY-MM-DD"}
+            - params["_exclude_st"]: 是否启用 ST 剔除（bool）
         prepared: 可选已 prepare 的数据（测试注入；None 时内部走 prepare 管线）
         min_win_days: 高发窗口最小交易日数
         top_n: 每场景窗口数

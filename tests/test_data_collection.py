@@ -165,12 +165,12 @@ class TestChipDistributionFetcher:
     """筹码分布采集器测试。"""
 
     @pytest.mark.unit
-    def test_disabled(self, config_fixture):
-        with patch.object(type(config_fixture), "ENABLE_CHIP_DISTRIBUTION", False, create=True):
-            from DataCollection.ChipDistributionFetcher import ChipDistributionFetcher
-            fetcher = ChipDistributionFetcher(config_fixture)
-            result = fetcher.fetch_chip_data(date="20260105")
-            assert result.empty
+    def test_no_api_key(self, config_fixture):
+        from DataCollection.ChipDistributionFetcher import ChipDistributionFetcher
+        fetcher = ChipDistributionFetcher(config_fixture)
+        fetcher.api_key = ""
+        result = fetcher.fetch_chip_data(date="20260105")
+        assert result.empty
 
 
 # ── 共享 Fixture ───────────────────────────────────────────────
@@ -182,7 +182,6 @@ def config_fixture():
 
     cfg = MagicMock()
     cfg.ASHAREHUB_API_KEY = "test_key_123"
-    cfg.ENABLE_CHIP_DISTRIBUTION = True
     cfg.ENABLE_FUNDAMENTALS = True
     cfg.FUNDAMENTALS_RETRY = 1
     cfg.MONEYFLOW_RETRY = 1
