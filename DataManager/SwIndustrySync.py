@@ -12,6 +12,7 @@ sw_index_third_cons 逐一级取成分股）。失败时记录 error 日志（�
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime
 from typing import Any
 

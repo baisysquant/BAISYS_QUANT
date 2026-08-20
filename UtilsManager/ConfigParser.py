@@ -426,6 +426,13 @@ class BacktestConfig(BaseModel):
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
+    # ── P1-5 单笔委托占成交量上限（按 ADV 成交额分档） ──
+    MAX_ORDER_PCT: float = Field(default=0.30, ge=0.01, le=1.0,
+                                 description="单笔委托占成交量上限（默认档，中流动性）")
+    MAX_ORDER_PCT_HIGH: float = Field(default=0.20, ge=0.01, le=1.0,
+                                      description="高流动性股单笔委托上限（日均成交额>1亿）")
+    MAX_ORDER_PCT_LOW: float = Field(default=0.10, ge=0.01, le=1.0,
+                                     description="低流动性股单笔委托上限（日均成交额<2000万）")
     # 0.1 成交时点模型（执行时序合规）：next_open 信号次日开盘（默认，A股T+1）/ vwap 信号次日VWAP
     # close 模式已移除（固有前视偏差：信号依赖当日收盘数据计算，以同日收盘价成交=先知交易）
     EXECUTION_MODEL: str = Field(default="next_open",
