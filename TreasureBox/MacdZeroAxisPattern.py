@@ -28,7 +28,6 @@ from DataManager.ColumnNames import ColumnNames
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from loguru import logger
 
-# P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:

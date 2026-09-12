@@ -41,9 +41,15 @@ class CostAccum:
         )
 
     def reset(self) -> None:
-        for k in ("buy_value", "sell_value", "commission", "stamp", "transfer",
-                   "handling", "csrc", "slippage", "impact"):
-            setattr(self, k, 0.0)
+        self.buy_value = 0.0
+        self.sell_value = 0.0
+        self.commission = 0.0
+        self.stamp = 0.0
+        self.transfer = 0.0
+        self.handling = 0.0
+        self.csrc = 0.0
+        self.slippage = 0.0
+        self.impact = 0.0
 
 
 @dataclass
@@ -80,9 +86,14 @@ class CostCalculator:
             volatility_multiplier=volatility_multiplier,
             symbol=sym,
         )
-        self.accumulator["buy_value"] += value
-        for _k in ("commission", "stamp", "transfer", "handling", "csrc", "slippage", "impact"):
-            self.accumulator[_k] += parts[_k]
+        self.accumulator.buy_value += value
+        self.accumulator.commission += parts["commission"]
+        self.accumulator.stamp += parts["stamp"]
+        self.accumulator.transfer += parts["transfer"]
+        self.accumulator.handling += parts["handling"]
+        self.accumulator.csrc += parts["csrc"]
+        self.accumulator.slippage += parts["slippage"]
+        self.accumulator.impact += parts["impact"]
         return parts["total"]
 
     def sell_proceeds_and_cost(
@@ -109,9 +120,14 @@ class CostCalculator:
             volatility_multiplier=volatility_multiplier,
             symbol=sym,
         )
-        self.accumulator["sell_value"] += value
-        for _k in ("commission", "stamp", "transfer", "handling", "csrc", "slippage", "impact"):
-            self.accumulator[_k] += parts[_k]
+        self.accumulator.sell_value += value
+        self.accumulator.commission += parts["commission"]
+        self.accumulator.stamp += parts["stamp"]
+        self.accumulator.transfer += parts["transfer"]
+        self.accumulator.handling += parts["handling"]
+        self.accumulator.csrc += parts["csrc"]
+        self.accumulator.slippage += parts["slippage"]
+        self.accumulator.impact += parts["impact"]
         return value - parts["total"], parts["total"]
 
     def process_sell_vectorized(

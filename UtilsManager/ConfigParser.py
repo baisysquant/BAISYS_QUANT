@@ -464,7 +464,6 @@ class BacktestConfig(BaseModel):
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
     BUY_THRESHOLD_RANGE: str = "5,30,5"
     MAX_HOLDINGS_RANGE: str = "3,20,1"
-    # P0-7 ②：校准闭环 —— [BACKTEST_CALIBRATED] 覆写目标（默认取区间中位，
     # 与旧日频回退口径 int(17.5)=17 / int(11.5)=11 保持一致；校准后由
     # write_calibration_to_ini 写回、此处读取，供日频路径 EngineConfig 兜底使用）
     BUY_THRESHOLD: int = Field(default=12, ge=1, le=100,
@@ -665,7 +664,6 @@ class PortfolioOptimizerConfig(BaseModel):
         default=5.0, ge=0.1, le=60.0,
         description="求解超时 (秒)",
     )
-    # P3-3：优化器日志详细度（WFO路径下降噪）
     VERBOSE: bool = Field(
         default=False,
         description="优化器日志详细度（True=输出所有debug/info；False=仅warning以上）",
@@ -901,7 +899,6 @@ class Config:
                 sc.DIVERGENCE_PENALTY = int(bt_cal["DIVERGENCE_PENALTY"])
             if "RISK_NONE_MULTIPLIER" in bt_cal:
                 ps.RISK_NONE_MULTIPLIER = float(bt_cal["RISK_NONE_MULTIPLIER"])
-            # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
             # 日频路径不生效；现覆写到 backtest 配置供 EngineConfig 兜底读取。
             # 注：历史版本可能以 "17.0" 浮点落盘，此处 int(float()) 容错兼容，
             # 新写入已由 calibration.py 类型断言保证整值。

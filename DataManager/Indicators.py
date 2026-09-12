@@ -62,7 +62,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
         df[ColumnNames.MA_VOLUME_5] = df[ColumnNames.VOLUME_DATA].rolling(window=5, min_periods=5).mean()
 
     latest = df.iloc[-1]
-    close_price = latest[_price_col]  # P1-10：与MA口径一致，使用复权价比较
+    close_price = latest[_price_col]
 
     def _trend_skeleton_score() -> tuple[int, str]:
         ma30, ma60, ma90 = latest["MA30"], latest["MA60"], latest["MA90"]

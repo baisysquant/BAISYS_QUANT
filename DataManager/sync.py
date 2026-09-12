@@ -8,7 +8,6 @@ from sqlalchemy import text
 
 _UNIQUE_INDEX_NAME = "uq_stock_daily_kline_symbol_trade_date"
 
-# P0-12 审计修复：后复权价列（open/close/high/low 为不复权原始价，
 # *_normal 为后复权价，adj_factor = close_normal / close）。
 _ADJ_COLUMNS = ("open_normal", "high_normal", "low_normal")
 
@@ -42,7 +41,6 @@ def ensure_table(
             """)
         )
 
-    # P0-12 审计修复：历史存量数据复权语义检测与迁移（幂等）
     migrate_price_semantics(engine, table)
 
     _ensure_factor_tables(engine)

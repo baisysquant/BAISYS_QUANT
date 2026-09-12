@@ -11,8 +11,8 @@ from loguru import logger
 from scipy import stats
 
 
-def _ann_factor() -> int:
-    return 244  # A股实际年化交易日数均值（非美股252）
+# A股实际年化交易日数均值（非美股252）
+ANN_FACTOR = 244
 
 
 def _compute_sharpe_from_equity(
@@ -50,7 +50,7 @@ def _compute_sharpe_from_equity(
     if len(returns) < 2:
         return 0.0
 
-    ann_factor = _ann_factor()
+    ann_factor = ANN_FACTOR
     mu = returns.mean() * ann_factor
     excess_mu = mu - risk_free_rate
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
@@ -83,8 +83,8 @@ def probabilistic_sharpe_ratio(
     if n_obs <= 1:
         return 0.5
 
-    sd = sharpe / math.sqrt(_ann_factor())
-    td = target_sr / math.sqrt(_ann_factor())
+    sd = sharpe / math.sqrt(ANN_FACTOR)
+    td = target_sr / math.sqrt(ANN_FACTOR)
 
     num = (sd - td) * math.sqrt(n_obs - 1)
     den = math.sqrt(1.0 - skew * sd + ((kurt - 1.0) / 4.0) * sd * sd)
@@ -119,7 +119,8 @@ def compute_dm_test(
     b = np.asarray(returns_b, dtype=float)
     n = min(len(a), len(b))
     if n < 10:
-        return 0.0, 1.0
+        # 样本不足时返回 NaN，让下游显式判断（与 dm_stat=0 的完美平局可区分）
+        return float('nan'), float('nan')
 
     d = a[:n] - b[:n]
     mean_d = float(d.mean())
@@ -332,18 +333,17 @@ def _compute_risk_from_curve(
     if len(returns) < 2:
         return 0.0, 0.0
 
-    ann_factor = _ann_factor()
+    ann_factor = ANN_FACTOR
     mu = returns.mean() * ann_factor
     excess_mu = mu - risk_free_rate
 
     downside = returns[returns < 0]
-    _SORTINO_CEILING = 100.0
     if len(downside) == 0:
-        sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
+        # 全部正收益时下行标准差为 0，Sortino 理论上为 +∞
+        sortino = float('inf') if excess_mu > 0 else 0.0
     else:
         downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
-        raw_sortino = excess_mu / downside_std if downside_std > 0 else (_SORTINO_CEILING if excess_mu > 0 else 0.0)
-        sortino = min(raw_sortino, _SORTINO_CEILING)
+        sortino = excess_mu / downside_std if downside_std > 0 else (float('inf') if excess_mu > 0 else 0.0)
 
     return float(sharpe), float(sortino)
 
@@ -389,7 +389,8 @@ def validate_oos_decay(
     report.oos_sortino = oos_sortino
 
     # ── Gate 1: IS Sharpe ≤ 0 → 策略无效（不是过拟合） ──
-    if is_sharpe <= 0:
+    # 含极小正值保护：浮点精度问题可能导致 Sharpe ≈ 1e-9，此时衰减比无统计意义
+    if is_sharpe < 1e-9:
         report.passed = False
         report.overfit_type = OverfitType.INVALID
         report.reason = (

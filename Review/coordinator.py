@@ -152,7 +152,6 @@ class StockAnalysisCoordinator:
         self.quality_checker = DataQualityChecker(db_engine=db_engine)
         self.force_rerun = False
         self.start_time = time.time()
-        # P0-7 ①：申万一级行业映射缓存（None=未加载；{} = 加载失败/为空）
         self._sw_l1_map: dict[str, str] | None = None
 
         # ── 方案C：回测成本模型审计（复盘启动时验证认知对齐）──
@@ -269,7 +268,6 @@ class StockAnalysisCoordinator:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return False
 
-            # P0 合规过滤：复盘单元硬编码排除 ST/*ST 风险警示股
             # 业务上不能推荐 ST 标的给投资者（合规风险/5%涨跌幅限制），
             # 不复归 config 配置项控制，从源头杜绝误配风险。
             filtered_pure_codes = self._filter_st_stocks(filtered_pure_codes)
@@ -372,7 +370,6 @@ class StockAnalysisCoordinator:
         except Exception as e:
             self.logger.warning(f"[因子数据] 质量因子同步失败: {e}")
 
-        # P0-7 ①：申万一级行业映射表（行业一级中性化 / 宏观 tilt 依赖，独立于
         # stock_basic_info_sw 的二级语义；失败时响亮报错，不吞异常）
         try:
             from DataManager.SwIndustrySync import sync_sw_l1_industries
@@ -429,7 +426,6 @@ class StockAnalysisCoordinator:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
         # 从 hist_df_all 获取每只股票最新的 close（不复权原始价）作为 spot_data
-        # P0-12 修复：close_normal 为后复权价，界面展示/报告用原始价
         try:
             cn = hist_df_all[hist_df_all["close"].notna()]
             if not cn.empty:
@@ -812,7 +808,6 @@ class StockAnalysisCoordinator:
 
         symbols = list(consolidated_report["股票代码"].unique())
 
-        # P0-8① PIT：质量/估值按本交易日 as-of 加载（历史复盘时 today_str 为回放日）
         quality_df = self.factor_calculator.load_quality_from_db(symbols, as_of=self.today_str)
         valuation_df = self.factor_calculator.load_valuation_from_db(symbols, trade_date=self.today_str)
 
@@ -1265,7 +1260,6 @@ class StockAnalysisCoordinatorFactory:
         calendar_mgr = TradingCalendarAnalyzer()
         today_str = calendar_mgr.get_last_trading_day()
 
-        # P0-10 ⑤：LoggerManager 已删除，改用 loguru 文件 sink（原 get_logger 语义）
         _log_path = os.path.join(config.LOG_DIR, f"Corenews_Main_{today_str}.log")
         os.makedirs(config.LOG_DIR, exist_ok=True)
         logger.add(
@@ -1291,7 +1285,6 @@ class StockAnalysisCoordinatorFactory:
                 research_report_min_count=config.RESEARCH_REPORT_MIN_COUNT,
             )
 
-            # P0-10 ⑤：GetStockBasicinfo.py 已删除（申万行业同步由
             # DataManager.SwIndustrySync 承担），此处不再调用；异常捕获面
             # 扩大到 ImportError，防止残留引用导致日频管线启动即崩。
 

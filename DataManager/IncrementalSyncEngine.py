@@ -139,7 +139,6 @@ class IncrementalSyncEngine:
                 return 0
 
             start_iso = force_start_iso or self._calc_start_iso(remaining)
-            # P2 审计修复：end_iso 不允许超过当前日期，防止请求未来数据导致腾讯 API SSL 失败
             _today = date.today().isoformat()
             end_iso = min(self._trade_date.isoformat(), _today)
             logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}" + ("（强制回填）" if force_start_iso else ""))
@@ -273,7 +272,6 @@ class IncrementalSyncEngine:
     def _do_fetch_one_stock(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
         start_year = int(start[:4])
         end_year = int(end[:4])
-        # P2 审计修复：跳过未来年份，腾讯 API 对不存在数据的未来年份返回 SSL 错误
         _current_year = date.today().year
         if start_year > _current_year:
             logger.warning(f"腾讯API {symbol} 同步起始年份 {start_year} 超过当前年份 {_current_year}，跳过")
@@ -292,10 +290,8 @@ class IncrementalSyncEngine:
                 key = "hfqday" if adjust == "hfq" else "day"
                 param = f"{symbol},day,{year}-01-01,{year+1}-12-31,640,{adjust}"
                 var = f"kline_day{adjust}{year}"
-                # P2 审计修复：指数退避重试 — 所有异常统一退避，重试次数 5，per-symbol 速率限制
                 for attempt in range(5):
                     try:
-                        # P2 SSL 容错降级：首次失败后使用 verify=False 重试
                         _verify = True if not _ssl_degraded[0] else False
                         r = self._session.get(
                             self.TX_URL,
@@ -317,7 +313,6 @@ class IncrementalSyncEngine:
                             time.sleep(0.5)
                             break
                         data = json.loads(r.text[r.text.find("={") + 1:])
-                        # P2 审计修复：退市股/无数据年份，腾讯返回 data=[] 等非标准结构，
                         # 按 data["data"][symbol] 取数会抛 TypeError 并烧掉 5 次指数退避重试；
                         # 结构异常按"该年无数据"优雅跳过（继续下一年的正常年份数据）。
                         node = data.get("data") if isinstance(data, dict) else None
@@ -330,11 +325,9 @@ class IncrementalSyncEngine:
                             time.sleep(0.5)
                             break
                         rows.extend(sub.get(key, []))
-                        # P2 速率限制：每只股票请求间隔 ≥ 0.5s
                         time.sleep(0.5)
                         break
                     except Exception as e:
-                        # P2 SSL 容错：如果是 SSL 错误且未降级，标记降级后重试
                         if "SSL" in type(e).__name__ and not _ssl_degraded[0]:
                             _ssl_degraded[0] = True
                             logger.warning(
@@ -342,7 +335,6 @@ class IncrementalSyncEngine:
                             )
                             continue  # 立即重试，不消耗 attempt 计时
                         if attempt < 4:
-                            # P2 指数退避：base_delay=2s, max=30s, 加 0~1s 抖动防雷群效应
                             _backoff = min(2 ** attempt + random.uniform(0, 1), 30)
                             logger.warning(
                                 f"腾讯API {symbol} {adjust} {year} 异常: {type(e).__name__}，"
@@ -517,7 +509,6 @@ class IncrementalSyncEngine:
                 skipped += 1
                 logger.warning(f"腾讯API {symbol} 丢弃交易日 {d}：原始收盘价异常(close_raw={close_raw})")
                 continue
-            # P1-8/P1-9 修复：腾讯hfq短暂异常（如负复权价）不丢弃整行
             # 使用上一个有效交易日的 adj_factor 进行降级重建
             adj_factor = 1.0
             use_hfq = math.isfinite(close_hfq) and close_hfq > 0
@@ -550,7 +541,6 @@ class IncrementalSyncEngine:
                 out["high_normal"].append(float(hfq[3]))
                 out["low_normal"].append(float(hfq[4]))
             else:
-                # P1-8 降级：hfq不可用，用 raw × adj_factor 重建
                 out["open_normal"].append(float(raw[1]) * adj_factor)
                 out["close_normal"].append(close_raw * adj_factor)
                 out["high_normal"].append(float(raw[3]) * adj_factor)

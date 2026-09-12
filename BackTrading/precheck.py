@@ -28,6 +28,7 @@ API:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +39,27 @@ import pandas as pd
 from loguru import logger
 
 _REQUIRED_COLS = ("open", "high", "low", "close", "volume")
+
+_PRECHECK_AGGR: dict[str, list[tuple[str, str]]] = {}
+_PRECHECK_AGGR_LOCK = threading.Lock()
+_PRECHECK_AGGR_FLUSH_THRESHOLD = 500
+
+
+def flush_precheck_aggregation() -> None:
+    with _PRECHECK_AGGR_LOCK:
+        for key, items in list(_PRECHECK_AGGR.items()):
+            if len(items) > 0:
+                if key == "uc":
+                    logger.warning(
+                        f"预检漏采嫌疑汇总（前20条）: "
+                        f"{'; '.join(items[:20])} ... (共{len(items)}只，RELAX 放行)"
+                    )
+                else:
+                    logger.warning(
+                        f"预检 LOW_CONFIDENCE 汇总（前20条）: "
+                        f"{'; '.join(items[:20])} ... (共{len(items)}只，RELAX 放行)"
+                    )
+        _PRECHECK_AGGR.clear()
 
 
 class PrecheckStatus(str, Enum):
@@ -294,7 +316,6 @@ def _check_adjust_jump(df: pd.DataFrame, p: PrecheckParams,
     if "adj_factor" in df.columns and len(df) >= 2:
         f = df["adj_factor"].to_numpy(dtype=float)
         valid = ~np.isnan(f)
-        # P1-9 审计修复：adj_factor 是累计因子，除权日正常向上跳变（5%~15%）。
         # 3% 阈值会误报所有正常送转/配权事件，改为只检测**回溯跳变**（因子不应该减小）。
         # 正常：f[t] >= f[t-1]；异常：f[t] < f[t-1] × 0.99 表示数据源断裂/混用。
         # 源修正由同步层保证全量重拉(见 IncrementalSyncEngine 重叠区检测),DB 内不应残留混用段。
@@ -487,7 +508,6 @@ def apply_precheck(
     Returns:
         (处理后 df, PrecheckResult)；df 为空表示调用方应跳过。
     """
-    # P1 防御性断言：非主板代码进入 precheck 时立即拦截（fail-fast）
     _sym_clean = symbol.replace("sh", "").replace("sz", "")
     if _sym_clean.startswith(("300", "688")) or (
         len(_sym_clean) >= 1 and _sym_clean[0] in ("8", "4")
@@ -520,14 +540,27 @@ def apply_precheck(
     if result.status == PrecheckStatus.LOW_CONFIDENCE:
         if "UNDER_COLLECTION_SUSPECTED" in result.reasons:
             _uc = result.metrics.get("UNDER_COLLECTION_SUSPECTED") or {}
-            logger.warning(
-                f"[{symbol}] 预检漏采嫌疑（{result.reasons}），"
-                f"确认停牌占比 {_uc.get('confirmed_ratio')}，非硬拒，RELAX 放行（{context}）"
-            )
+            with _PRECHECK_AGGR_LOCK:
+                _PRECHECK_AGGR.setdefault("uc", []).append(
+                    f"[{symbol}] 确认停牌占比 {_uc.get('confirmed_ratio')}"
+                )
+                if len(_PRECHECK_AGGR["uc"]) >= _PRECHECK_AGGR_FLUSH_THRESHOLD:
+                    logger.warning(
+                        f"预检漏采嫌疑汇总（前20条）: "
+                        f"{'; '.join(_PRECHECK_AGGR['uc'][:20])} ... (共{len(_PRECHECK_AGGR['uc'])}只，RELAX 放行{f' ({context})' if context else ''})"
+                    )
+                    _PRECHECK_AGGR.pop("uc")
         else:
-            logger.warning(
-                f"[{symbol}] 预检 LOW_CONFIDENCE（{result.reasons}），RELAX 模式放行（{context}）"
-            )
+            with _PRECHECK_AGGR_LOCK:
+                _PRECHECK_AGGR.setdefault("low_conf", []).append(
+                    f"[{symbol}] {result.reasons}"
+                )
+                if len(_PRECHECK_AGGR["low_conf"]) >= _PRECHECK_AGGR_FLUSH_THRESHOLD:
+                    logger.warning(
+                        f"预检 LOW_CONFIDENCE 汇总（前20条）: "
+                        f"{'; '.join(_PRECHECK_AGGR['low_conf'][:20])} ... (共{len(_PRECHECK_AGGR['low_conf'])}只，RELAX 放行{f' ({context})' if context else ''})"
+                    )
+                    _PRECHECK_AGGR.pop("low_conf")
         return df_raw, result
 
     # SKIP：失败写快照（A2 schema 的 precheck_status 字段）

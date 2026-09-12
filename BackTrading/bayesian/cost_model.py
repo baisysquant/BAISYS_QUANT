@@ -42,8 +42,8 @@ _TUNABLE_CFG_FIELDS = frozenset({
 # 内存保留最近 _GLOBAL_CACHE_MAX 份：Phase1/2/3 交替评估的信号组
 # （默认参数、best 信号、refine 候选）可同时驻留，避免来回踢缓存导致
 # 同一参数组反复全量重算。4 份 ≈ 2.8GiB，若内存紧张可调回 2。
-# #6b 审计修复：存入时 deep copy，防止外部线程修改缓存中的 DataFrame
-_GLOBAL_SIGNAL_CACHE: dict[tuple[str, str, str], pd.DataFrame] = {}
+# 审计修复：使用 collections.OrderedDict 替代普通 dict，支持 move_to_end/pop(FIFO驱逐)
+_GLOBAL_SIGNAL_CACHE: collections.OrderedDict[tuple[str, str, str], pd.DataFrame] = collections.OrderedDict()
 _GLOBAL_CACHE_MAX = 4
 _GLOBAL_CACHE_LOCK = threading.Lock()
 
@@ -120,11 +120,8 @@ class FidelityController:
         # ST/退市逐日动态剔除（与 runner 最终回测口径一致，注入引擎 params）
         self._st_history = st_history
         self._exclude_st = exclude_st
-        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         self._listing_days = listing_days
-        # P3.1 数据版本（入 ML 冻结缓存 key 与信号缓存指纹，增量同步后整库失效）
         self._data_version = data_version
-        # P1-4 行业映射：透传 db_engine 至引擎，启动时刷新 _industry_cache
         self._db_engine = db_engine
         # 实例级缓存（信号参数 hash → DataFrame），上限 1 防 OOM
         #（跨参数组合的命中率本来就低，多窗口下每份 ~0.7GiB 是 OOM 主因）
@@ -137,7 +134,6 @@ class FidelityController:
         self._data_key = _data_fingerprint(kline_df) if not self._has_signals else ""
         if data_version:
             self._data_key = f"{self._data_key or 'pre'}:{data_version}"
-        # P4-Fix: 将 eval_start_date 纳入缓存 key，隔离不同 WFO 窗口的信号缓存。
         # 即使 K 线数据相同，不同窗口的 expanding 统计量起点不同（已改为 rolling(252)），
         # 仍应在缓存层面显式隔离，防微杜渐。
         if eval_start_date:
@@ -217,10 +213,8 @@ class FidelityController:
         if self._st_history:
             engine_params["_st_history"] = self._st_history
             engine_params["_exclude_st"] = self._exclude_st
-        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if self._listing_days:
             engine_params["_listing_days"] = self._listing_days
-        # P1-4 行业映射：注入 db_engine_url 至引擎（FIX：用 URL 字符串替代 Engine 对象，
         # 阻断 Engine 混入 best_params → json.dumps 崩溃）
         if self._db_engine is not None:
             engine_params["_db_engine_url"] = str(self._db_engine.url)

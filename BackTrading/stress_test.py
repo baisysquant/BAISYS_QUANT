@@ -69,7 +69,6 @@ def run_stress_tests(
 
     stop_mult = params.get("atr_stop_mult", 2.0)
     if "ATR" in prepared.columns:
-        # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
         _stop_close = prepared["close_normal"] if "close_normal" in prepared.columns else prepared["close"]
         prepared["止损价"] = _stop_close - prepared["ATR"] * stop_mult
     else:

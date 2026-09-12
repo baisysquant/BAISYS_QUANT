@@ -51,7 +51,6 @@ _ST_TABLE = "stock_st_history"
 # 如 "退市金亚" / "*ST金泰退"）→ is_delisting。简称变化以变更日为生效日。
 _ST_NAME_KEY = "ST"
 
-# P1-4 修复：退市整理期规则分段（退市新规）——
 # 2020-12-31（含）后摘牌的整理期为 15 个交易日；此前为 30 个交易日。
 DELISTING_PERIOD_DAYS_NEW = 15
 DELISTING_PERIOD_DAYS_OLD = 30

@@ -11,7 +11,6 @@ import pandas as pd
 import requests
 from loguru import logger
 
-# P2-2（审计）：AShareHub 客户端统一走工厂注入（原全局 monkeypatch + verify=False
 # 已移除；TLS 校验仅信任显式 CA 或系统信任库）
 from UtilsManager.AShareHubClient import make_asharehub_client
 from UtilsManager.ConfigParser import Config

@@ -49,7 +49,6 @@ _RANGE_TO_PARAM: dict[str, str] = {
     "BOLL_NARROW_RATIO_RANGE": "boll_narrow_ratio",
     "CROSS_DECAY_DAYS_RANGE": "cross_decay_days",
     "CONCLUSION_FULL_BULL_RANGE": "conclusion_full_bull",
-    # P1-7 低敏感参数固定：golden_cross_bonus / divergence_penalty 对OOS绩效影响微弱
     # 但显著膨胀搜索空间维度，固定为配置默认值，不参与WFO寻优
     "BUY_THRESHOLD_RANGE": "buy_threshold",
     "MAX_HOLDINGS_RANGE": "max_holdings",
@@ -72,7 +71,6 @@ _SIGNAL_PARAMS: set[str] = {
 }
 
 
-# P4-Fix: 低敏感参数固定（降低搜索空间维度，抑制维度灾难）
 # 以下参数经敏感性分析对 OOS 绩效影响微小，但显著膨胀搜索空间维度（10→6 维）。
 # GP 在 10 维空间需 ~1024 个观测点才能充分覆盖，实际只有 ~350 次评估。
 _FIXED_PARAMS: dict[str, tuple[float, str]] = {

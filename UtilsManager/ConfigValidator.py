@@ -433,14 +433,12 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("limit_seal_ratio", "float", required=False, default="0.05", min_value=0, max_value=1),
         FieldRule("limit_tradable_ratio", "float", required=False, default="0.30", min_value=0, max_value=1),
         FieldRule("limit_seal_decay", "float", required=False, default="0.5", min_value=0, max_value=1),
-        # P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理）
         FieldRule("auction_fill_ratio", "float", required=False, default="0.12", min_value=0, max_value=1),
         # 经验填充模型（技术债修复）：历史日线分位数替代固定比例常量
         FieldRule("limit_ratio_mode", "str", required=False, default="fixed",
                   allowed_values=["fixed", "empirical_median", "empirical_p10"]),
         FieldRule("limit_calib_min_samples", "int", required=False, default="20", min_value=1, max_value=1000000),
         FieldRule("limit_stress_enabled", "bool", required=False, default="true"),
-        # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
         FieldRule("regime_ret20_full", "float", required=False, default="0.02", min_value=-1, max_value=1),
         FieldRule("regime_ret20_half", "float", required=False, default="-0.02", min_value=-1, max_value=1),
         FieldRule("regime_vol_pct_max", "float", required=False, default="0.8", min_value=0, max_value=1),
@@ -452,7 +450,6 @@ SECTION_RULES: list[SectionRule] = [
                    default="2023-08-28:0.0005;2000-01-01:0.001"),
     ]),
     SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True, fields=[
-        # P0-7 ②：整数参数必须整值落盘（float "17.0" 会在加载端 int() 解析崩溃）
         FieldRule("buy_threshold", "int", required=False, default="17", min_value=1, max_value=100),
         FieldRule("max_holdings", "int", required=False, default="11", min_value=0, max_value=100),
     ]),

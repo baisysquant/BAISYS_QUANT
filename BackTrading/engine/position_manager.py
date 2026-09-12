@@ -69,7 +69,6 @@ class PositionState:
         避免停牌期 0 值拉低 ADV → 复牌后冲击成本/分档上限失真。
         """
         dq, run = self.adv_state.get(sym, (None, 0.0))
-        # P2.7：停牌/零量日不推进窗口，保持历史 ADV 不变
         if vol <= 0:
             return
         if dq is None:

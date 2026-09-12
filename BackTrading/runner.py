@@ -48,7 +48,7 @@ def _acquire_lock(engine: Any) -> None:
             logger.info("  获取回测分布式锁成功")
         else:
             logger.error("回测分布式锁被占用，终止执行（可能有另一个进程正在运行）")
-            sys.exit(1)  # P1-13：非零退出码，让调度/CI正确识别失败而非"已完成"
+            sys.exit(1)
 
     # 会话级锁：在专用连接上持有整个回测期间（session-level，跨事务存活）。
     # 同一会话重复获取返回 True（回测自身的启动同步不受影响），
@@ -122,7 +122,6 @@ def _holdout_equity_slice(
     if not isinstance(equity_curve, (list, pd.DataFrame)):
         return None, None
 
-    # P2.4 修复：净值曲线必需列名断言（防上游列名漂移导致下游 KeyError 静默崩溃）
     EQUITY_REQUIRED_COLS = {"time", "portfolio_value"}
     if isinstance(equity_curve, pd.DataFrame):
         actual_cols = set(equity_curve.columns)
@@ -151,7 +150,6 @@ def _holdout_equity_slice(
     else:
         _total_symbols = 0
 
-    # P1.11 最小标的数守卫：holdout 窗口参与标的过少时告警
     if _total_symbols < 3:
         logger.warning(
             f"[Holdout] 仅{_total_symbols}只标的参与窗口，覆盖率极低——"
@@ -201,7 +199,6 @@ def _holdout_equity_slice(
         mask = _dates >= _start_date
         result = equity_curve[mask]
 
-        # P1.5 日志输出：holdout 期有效标的数量与缺失天数
         _ec_dates = set(_dates[mask].dropna().astype(str).str[:10])
         if _total_symbols > 0:
             _holdout_counts = None
@@ -307,7 +304,6 @@ def run_backtest_pipeline(
     )
 
     if not should_run and not force:
-        # P0-11：移除阻塞式 input() 交互（生产调度/每日 02:00 DAG 中无终端会挂起）。
         # 默认跳过并提示；需强制重跑时显式传 force=True（或在调度侧传参）。
         logger.info(f"{reason} → 跳过（如需强制重跑请调用 run_backtest_pipeline(force=True)）")
         return load_calibration()
@@ -346,18 +342,22 @@ def run_backtest_pipeline(
             logger.warning("K 线数据为空，跳过回测")
             return None
 
-        # P3-5 审计修复：退市股历史 K 线已在 _fetch_kline 内部完成同步
+        _available_syms = set(kline_df["symbol"].astype(str).unique())
+        _original_count = len(symbols)
+        symbols = [s for s in symbols if s in _available_syms]
+        _filtered = _original_count - len(symbols)
+        if _filtered:
+            logger.info(f"  剔除无 K 线数据股票 {_filtered} 只，有效股票 {len(symbols)} 只")
+
         # （_sync_delisted_stocks 仅接收 engine 与起始日期，且返回退市股集合，
         # 同步结果已并入本次查询）——此处不再重复调用，避免签名不匹配/覆盖 DataFrame。
         _log_step("sync_delisted_stocks")
 
         logger.info(f"  K 线行数: {len(kline_df)}")
 
-        # P3.1: 从内存 DataFrame 计算数据版本（消除 fetch→version 竞态窗口）
         _data_version = _compute_kline_data_version(engine, kline_df=kline_df)
 
         # ── ST/退市历史早加载（供 WFO / 模拟验证 / 最终回测全链路使用） ──
-        # P0-5: 查询起点覆盖 K 线预热缓冲（_fetch_kline 用 360 日历日缓冲），
         # 否则缓冲期内 ST 涨跌幅 5% 判定缺失。
         _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
         _st_query_start = (
@@ -366,7 +366,6 @@ def run_backtest_pipeline(
         _end_date = kline_df["trade_date"].max()
         if pd.api.types.is_datetime64_any_dtype(kline_df["trade_date"]):
             _end_date = _end_date.strftime("%Y-%m-%d")
-        # P0-5: ST/退市 PIT 同步（全历史逐日状态回填；网络失败优雅降级，仅告警不阻断）
         try:
             from DataManager.StPitSync import ensure_st_history_table, sync_st_pit
             ensure_st_history_table(engine)
@@ -390,7 +389,6 @@ def run_backtest_pipeline(
         _log_step("load_listing_days")
 
         # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）。
-        # P3-5（审计）：评估改用独立数据源（AkShare 交易所退市列表）交叉验证，与
         # stock_st_history PIT 表解耦——PIT 同步失败不应导致"生存偏差受控"误报。
         # 独立源拉取失败 → 降级到 PIT 退市标记口径并注明降级（行为与旧版一致）。
         _kline_syms = set(kline_df["symbol"].astype(str))
@@ -496,15 +494,13 @@ def run_backtest_pipeline(
         # 末条路径在任何数据长度下都被跳过（train = n - num_paths*OOS 时 span 恰好越界 embargo 天）。
         _embargo_days = max(0, int(bt.BAYESIAN_CPCV_EMBARGO_DAYS))
         _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
-        # P1-16 拦截校验：wfo_num_paths 默认≥5，低于5时阻断回测（而非仅告警）
         if _np_cfg < 5:
             logger.error(
                 f"WFO 多路径数 wfo_num_paths={_np_cfg} 低于审计最低要求(≥5)，"
                 f"回测终止。请修改 config.ini [BACKTEST] wfo_num_paths ≥ 5"
             )
             sys.exit(2)
-        # P1-7 WFO维度采样加固：IS窗口下限从120提升至180，提高训练样本质量
-        _is_min = 180  # P1-7 最低IS窗口长度（原120）
+        _is_min = 180
         _max_np = max(1, (_wfo_total - _is_min - _embargo_days) // _oos) if _wfo_total > _oos + _is_min + _embargo_days else 1
         _num_paths = min(_np_cfg, _max_np)
         train_period = max(
@@ -547,22 +543,17 @@ def run_backtest_pipeline(
                 # 复盘单元的 ST 过滤已在 Review/coordinator.py 硬编码执行（不复归 config 控制），
                 # 回测时排除 ST 会导致模型在"干净"样本池训练 → OOS 失效。
                 listing_days=listing_days,
-                # P2.1 CPCV 净化+禁运
                 purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
                 embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
-                # P2.4 预算制
                 time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
                 max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
                 # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
                 holdout_days=_holdout_days,
-                # P3.1 数据版本入缓存 key
                 data_version=_data_version,
                 # A2 失败快照上下文
                 run_id=_run_id,
                 task_id="backtest_pipeline",
-                # P1-4 行业映射注入：将 db_engine 透传至引擎，启动时刷新行业缓存
                 db_engine=engine,
-                # P1-5 max_order_pct 分档注入（getattr 回退防止旧版模型缺少字段）
                 max_order_pct=float(getattr(bt, "MAX_ORDER_PCT", 0.30)),
                 max_order_pct_high=float(getattr(bt, "MAX_ORDER_PCT_HIGH", 0.20)),
                 max_order_pct_low=float(getattr(bt, "MAX_ORDER_PCT_LOW", 0.10)),
@@ -631,7 +622,6 @@ def run_backtest_pipeline(
         best_params["_exclude_st"] = False  # FIX(P0): 回测不排除 ST，防止 train/serve skew
         #   ST 过滤已在复盘单元（Review/coordinator.py）硬编码执行（不复归 config 控制）
         #   回测时排除 ST → 模型在"干净"样本池训练 → 生产含 ST → OOS 失效（过拟合）
-        # P0-6 ④：上市日期显式注入（引擎禁止数据推断；空表时豁免逻辑整体停用）
         if listing_days:
             best_params["_listing_days"] = listing_days
 
@@ -649,7 +639,6 @@ def run_backtest_pipeline(
 
         _sc = config.app_config.scoring_params
         # 组合参数若未被寻优（兜底路径），取校准覆写值（无校准则配置默认，
-        # P0-7 ②：与 [BACKTEST_CALIBRATED] 写回闭环一致，替代旧的区间中位口径）
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
             commission_rate=bt.COMMISSION_RATE,
@@ -670,12 +659,10 @@ def run_backtest_pipeline(
             limit_tradable_ratio=float(bt.LIMIT_TRADABLE_RATIO),
             limit_intraday_ratio=float(bt.LIMIT_INTRADAY_RATIO),
             limit_seal_decay=float(bt.LIMIT_SEAL_DECAY),
-            # P0-6 ⑥：开盘集合竞价成交率分档
             auction_fill_ratio=float(bt.AUCTION_FILL_RATIO),
             # 技术债修复：经验填充模型（历史日线分位数替代固定比例常量）
             limit_ratio_mode=str(bt.LIMIT_RATIO_MODE),
             limit_calib_min_samples=int(bt.LIMIT_CALIB_MIN_SAMPLES),
-            # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
             regime_ret20_full=float(bt.REGIME_RET20_FULL),
             regime_ret20_half=float(bt.REGIME_RET20_HALF),
             regime_vol_pct_max=float(bt.REGIME_VOL_PCT_MAX),
@@ -700,7 +687,6 @@ def run_backtest_pipeline(
             market_filter_min_stocks=int(getattr(bt, "MARKET_FILTER_MIN_STOCKS", 10)),
             # ── ATR 风险驱动仓位控制（A4） ──
             risk_per_trade=float(getattr(bt, "RISK_PER_TRADE", 0.02)),
-            # P1-5 max_order_pct 分档注入（getattr 回退防止旧版模型缺少字段）
             max_order_pct=float(getattr(bt, "MAX_ORDER_PCT", 0.30)),
             max_order_pct_high=float(getattr(bt, "MAX_ORDER_PCT_HIGH", 0.20)),
             max_order_pct_low=float(getattr(bt, "MAX_ORDER_PCT_LOW", 0.10)),
@@ -736,7 +722,6 @@ def run_backtest_pipeline(
         final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso, data_version=_data_version)
         _log_step("full_backtest")
         # ST 历史已早加载并注入 best_params（见上方 _st_history 注入）
-        # P1-4 行业映射：透传 db_engine 至引擎
         best_params["_db_engine"] = engine
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
@@ -881,7 +866,6 @@ def run_backtest_pipeline(
             pass
 
         # ── 因子衰减检查（信号分 vs 前向收益的 Rank IC） ──
-        # P1-11 修复：用 close_normal（后复权）计算前向收益，避免除权日不复权close跳空污染Rank-IC
         try:
             _price_col_ic = "close_normal" if "close_normal" in final_prepared.columns else "close"
             _fwd_ret = final_prepared.groupby("symbol")[_price_col_ic].transform(
@@ -939,7 +923,6 @@ def run_backtest_pipeline(
         # 业绩报告 sharpe：优先 holdout 终验，其次 WFO Top 5
         report_sharpe = holdout_sharpe if holdout_sharpe is not None else sharpe_avg
 
-        # P3 审计修复：报告层注明区间口径——Sharpe 来自 holdout 末段/WFO Top5
         # （选择期），total_return/max_drawdown 来自全周期最终回测（评估期），
         # 选择期≠评估期，跨期对比指标时必须区分区间，避免口径混淆
         if holdout_sharpe is not None:
@@ -967,7 +950,6 @@ def run_backtest_pipeline(
         logger.info(f"  Deflated Sharpe Ratio(DSR)={dsr:.2%} | PBO={pbo:.2%} | 试验次数={num_trials}")
         if pbo > 0.5:
             logger.warning(f"PBO={pbo:.2%}>50%，过拟合风险较高，建议缩减参数网格或增加数据")
-        # P1-6 DSR阈值动态化：试验次数越多，随机发现"好"结果概率越高，阈值应相应收紧
         _dsr_threshold = min(0.5, max(0.3, 0.5 * math.sqrt(100 / max(num_trials, 100))))
         if dsr < _dsr_threshold:
             logger.warning(f"DSR={dsr:.2%} < 动态阈值{_dsr_threshold:.2%}（试验{num_trials}次），统计显著性不足")
@@ -1026,7 +1008,6 @@ def run_backtest_pipeline(
             logger.warning(f"[参数稳健性] 自检异常: {e}，不阻断（建议人工复核）")
 
         # ── 样本外衰减校验（审计 gate：IS vs OOS 夏普/索提诺衰减 ≤ 30%） ──
-        # P1-3 修复：OOS 段必须使用 WFO 全程禁触的独立 holdout 数据。
         # 自引用回退（从全周期净值尾部切段）被 WFO 评估过——门控失效。
         # 策略：holdout 未激活时，OOS 衰减门直接 FAIL 并拦截参数写入。
         from BackTrading.overfitting import validate_oos_decay as _validate_oos_decay
@@ -1037,7 +1018,6 @@ def run_backtest_pipeline(
                 _oos_n = _holdout_days
                 _decay_tag = "独立Holdout"
             else:
-                # P0.1 修复：自引用 OOS 不能证明泛化能力，直接 FAIL
                 _oos_decay_pass = False
                 _decay_tag = "自引用回退(已禁用)"
                 logger.warning(
@@ -1051,7 +1031,6 @@ def run_backtest_pipeline(
                     _eq = _eq.copy()
                     _eq["time"] = _eq["time"].dt.strftime("%Y-%m-%d")
 
-                # P1-3：holdout 激活时，OOS 门控使用与 WFO 禁触边界同一交易日口径（_holdout_dates）
                 # 避免从 equity_curve 自行切段与 WFO 的 validation_dates 错位
                 if _holdout_active and _holdout_dates is not None:
                     _oos_dates = _holdout_dates
@@ -1072,7 +1051,7 @@ def run_backtest_pipeline(
 
                     _report = _validate_oos_decay(
                         _is_curve, _oos_curve,
-                        decay_threshold=0.25,  # P1-7 门控收紧：从30%降至25%
+                        decay_threshold=0.25,
                         is_days=len(_is_dates),
                         oos_days=len(_oos_dates),
                     )
@@ -1251,7 +1230,6 @@ def run_backtest_pipeline(
             apply_calibration_to_config(config)
             logger.info("模拟验证通过，参数已写入 config.ini 并生效")
         else:
-            # P0-5：同一统一门控——任一关键项未通过，config.ini 保持不变
             logger.warning("=" * 50)
             logger.warning(
                 "[采纳门控] config.ini 参数保持不变（结果可作回测报告参考，已记录数据库）: "
@@ -1260,7 +1238,6 @@ def run_backtest_pipeline(
             logger.warning("=" * 50)
             # 仍将结果写入数据库用于历史追踪
 
-        # P2 防御性过滤：从记录参数中剔除运行时依赖对象（Engine、DataFrame），
         # 防止不可序列化类型进入 json.dumps。_pyval 兜底已能处理，但源头清理更优。
         _runtime_keys = {"_db_engine", "_st_history", "_listing_days"}
         clean_params = {k: v for k, v in best_params.items() if k not in _runtime_keys}
@@ -1476,7 +1453,6 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
             logger.warning(
                 f"  兜底名单经主板过滤后未带来新增（可能全市场数据本身不完整）"
             )
-    # P1 防御性断言：即使补齐后仍低于阈值，给出严重警告但不阻断（避免在线环境断网死锁）
     if len(raw) < _MIN_MAIN_BOARD:
         logger.warning(
             f"  [数据完整性告警] 主板股票池仅 {len(raw)} 只，回测结果可能不可靠。"
@@ -1549,7 +1525,6 @@ def _fetch_kline(
     # 补齐缺失股票的历史 K 线
     _sync_missing_stocks(engine, symbols, aligned_start)
 
-    # P3-5 审计修复(P0): 同步退市股历史K线（消除生存偏差）
     # 获取已同步的退市股symbols集，后续合并到K线查询列表
     _delisted_syms, _delisted_synced = _sync_delisted_stocks(engine, backtest_start_date)
 
@@ -1803,7 +1778,6 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
             "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
             "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
             "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
-            # P0-7 ②：组合参数兜底优先取校准覆写值（与日频路径 EngineConfig 一致）
             "buy_threshold": bt.BUY_THRESHOLD,
             "max_holdings": bt.MAX_HOLDINGS,
         }

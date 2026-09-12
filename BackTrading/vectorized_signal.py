@@ -86,7 +86,6 @@ def _regime_series(
     is_narrow = pd.Series(False, index=df.index)
     if boll_bw_col and boll_bw_col in df.columns:
         bw = df[boll_bw_col]
-        # P4-Fix: expanding().mean() 随数据量增加收敛到全样本均值，
         # 早期 bar 的窄带判定受后期数据影响。改为有限窗口 rolling(252) + history shift。
         hist_bw = bw.rolling(252, min_periods=10).mean().shift(1)
         narrow_ratio = float(params.get("boll_narrow_ratio", 0.8))
@@ -376,7 +375,6 @@ def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarr
 
 def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> np.ndarray:
     """逐 bar 量价配合得分 — 全向量化。"""
-    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
     # 强制 .values 转为 numpy 数组：Series 按整数数组索引是label-based，
     # 与非默认 index 混用时会造成 shape mismatch，必须走位置索引。
     if "close_normal" in df.columns:
@@ -427,7 +425,6 @@ def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> n
 
 def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     """逐 bar K 线形态得分 — 全向量化。"""
-    # P1.16 修复：_regime_series 中 close 必须也使用复权价，与 prepare.py / Indicators.py 对齐。
     # 强制 .values 转 numpy 数组：Series 按整数数组/布尔掩码索引是 label-based，
     # 与非默认 index 混用时可能错位，必须走位置索引。
     if "close_normal" in df.columns:
@@ -494,7 +491,6 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     prev_body = shift_v(body, 1)
     prev2_bullish = shift_v(bullish, 2).astype(bool)
     _body_ma = pd.Series(body).rolling(20, min_periods=5).mean()
-    # P4-Fix: 原代码 fillna(expanding().mean()) 用后期均值"推回"早期 bar 的缺失值，
     # 造成前视偏差。改为填充 body 序列自身的 rolling 均值近似（早期样本少的 bar 用 NaN
     # 填充后统一设为 0，即早期 bar 不参与晨星/夜星判定，保守但因果安全）。
     body_ma20 = _body_ma.fillna(0.0).values
@@ -768,7 +764,6 @@ def compute_signals(
     if _ws > 0 and _ws != 100:
         weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
 
-    # P0-2：信号引擎输入统一为单一空间（后复权）——指标（DIF/DEA/ATR/MA/BOLL）按
     # close_normal 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
     # 否则 close_ma20_ratio、_exit_score/stop_loss 出现"不复权价 − 后复权指标"混用。
     # close_raw 仅供涨跌停/真实价格展示，不进入信号计算。
@@ -795,7 +790,6 @@ def compute_signals(
             _denom = stock_df["_p0_golden_denom"]
         else:
             _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-            # P4-Fix: expanding(min_periods=20).quantile(0.75) 收敛到全样本 75% 分位数，
             # WFO 中训练窗口的 expanding 分布受全周期数据影响，信号已对训练窗口做过拟合。
             # 改为滚动窗口 252 天（1 年），限制最大窗口长度。
             _denom = _gs.rolling(252, min_periods=20).quantile(0.75)
@@ -1020,7 +1014,6 @@ def compute_param_independent_features(stock_df: pd.DataFrame) -> pd.DataFrame:
     out["_p0_vol_price"] = _volume_price(_fdf, max_score=10)
     out["_p0_kline_pattern"] = _kline_pattern(_fdf, max_score=10)
     _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-    # P4-Fix: expanding().quantile(0.75) 收敛到全样本 75% 分位数，
     # WFO 训练窗口信号做过拟合。改为 rolling(252) 限制 1 年窗口。
     out["_p0_golden_denom"] = _gs.rolling(252, min_periods=20).quantile(0.75)
     out.attrs["_p0_feat_const"] = _const

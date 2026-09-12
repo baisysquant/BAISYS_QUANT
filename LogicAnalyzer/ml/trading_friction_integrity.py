@@ -203,7 +203,6 @@ def check_sell_side_completeness(
     violations: list[str] = []
     for t in trade_log:
         if str(t.get("action", "")).startswith("sell"):
-            # P3 审计修复：成交额 = value（毛额），cost 已含于 value 内；
             # 旧实现 value + cost 当成交额口径错位（cost 占比小未误报，现已修正）
             amount = float(t.get("value", 0.0))
             if amount <= 0:

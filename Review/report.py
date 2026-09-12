@@ -385,7 +385,6 @@ class ReportService:
         engine = get_engine(self.config)
         trade_date_iso = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
-        # P1-6：仅取交易日当日的复权因子（无历史窗口，无未来信息）
         placeholders = ",".join([f":code{i}" for i in range(len(stock_codes))])
         params = {f"code{i}": code for i, code in enumerate(stock_codes)}
         params["trade_date"] = trade_date_iso
@@ -434,7 +433,6 @@ class ReportService:
                 if col not in df_copy.columns:
                     continue
 
-                # P1-6：不复权价 = 后复权价 / 当日 adj_factor（无前视）
                 def _convert_price(row):
                     code = str(row[ColumnNames.STOCK_CODE]) if ColumnNames.STOCK_CODE in row else None
                     if code in adj_map:

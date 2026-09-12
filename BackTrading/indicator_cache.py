@@ -307,6 +307,9 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
     if symbol in _IN_MEMORY:
         return "skipped"
 
+    if _load_from_disk(symbol):
+        return "cached"
+
     df_raw = pd.read_parquet(f)
     _fp = _data_fingerprint(df_raw)
     if _load_from_disk(symbol, expected_fp=_fp):
@@ -320,8 +323,6 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
         _SYMBOL_FPS[symbol] = _fp
         return "empty"
 
-    # ── 窗口预检（指标计算前）：SKIP → 跳过并写快照；NEED_FILL → 限界填充 ──
-    # Task F: 日历口径停牌统计（停牌占比超阈值 → SKIP），无统计时回退启发式
     from BackTrading.precheck import apply_precheck as _apply_precheck
     from BackTrading.prepare import _compute_indicators_snapshotted
 
@@ -339,7 +340,6 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
     df_ind = _compute_indicators_snapshotted(
         df_raw, symbol=symbol, context="precompute_all_indicators"
     )
-    # 参数无关特征（评分层跨试次复用）：一次性计算并随指标缓存落盘
     df_ind = _p0_features(df_ind)
 
     _IN_MEMORY[symbol] = df_ind
@@ -491,6 +491,10 @@ def precompute_all_indicators(stock_dir: str, fingerprint: str | None = None,
     if mode != "off" and report.skipped:
         _log_msg += f" 断点跳过 {report.skipped} 片"
     logger.info(_log_msg)
+
+    # Flush 预检聚合日志（避免残留）
+    from BackTrading.precheck import flush_precheck_aggregation
+    flush_precheck_aggregation()
 
 
 def get_precomputed(

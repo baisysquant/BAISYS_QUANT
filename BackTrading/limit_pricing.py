@@ -234,7 +234,6 @@ def limit_prices_for(
     Returns:
         LimitPriceInfo：exempt=True 时 limit_up/down 用 ±100% 近似无限制。
     """
-    # P1 审计修复 + P1.10 精确前缀匹配：非主板代码进入时直接拦截（fail-fast）
     # 使用精确前缀集合替代 startswith，避免 8/4 单字符前缀误匹配其他代码段。
     _MAIN_BOARD_PREFIXES = {"600", "601", "603", "605", "000", "001", "002", "003"}
     _GEM_PREFIXES = {"300", "301"}
@@ -246,7 +245,6 @@ def limit_prices_for(
         _code = _digits.group(1)
         _prefix = _code[:3]
 
-        # P1.10：精确前缀集合拦截，不依赖单字符 startswith
         if _prefix in _GEM_PREFIXES:
             raise ValueError(
                 f"[涨跌停] {symbol} 为创业板（{_prefix}），不适用主板涨跌停规则。"
@@ -268,7 +266,6 @@ def limit_prices_for(
         exempt = listing_days <= listing_exempt_days(trade_date)
 
     if exempt:
-        # P1.9 修复：新股豁免期返回 inf 涨跌停价，确保判定逻辑自动放行。
         # 原实现 ratio=1.0 导致所有价位均触发涨跌停守卫，误杀正常买入/卖出。
         return LimitPriceInfo(
             ratio_up=float("inf"),
@@ -279,7 +276,6 @@ def limit_prices_for(
             is_st=False,
         )
     elif is_delisting:
-        # P0.5 修复：退市整理期涨跌幅 ±10%，独立于 ST ±5% 规则
         ratio_up = ratio_down = MAIN_BOARD_LIMIT_RATIO
     elif (
         listing_days == 1
@@ -402,7 +398,6 @@ def auction_fill_ratio_for(
     decay = seal_decay ** max(0, board_streak - 1)
 
     if touched_up:
-        # P0.4：按方向拆分成交率
         if side == "buy":
             # 涨停开盘买入极难——买方排队深，仅少量成交
             _ratio = 0.05

@@ -128,13 +128,11 @@ def run_bayesian_walk_forward(
     Returns:
         DataFrame, 每行一个 WFO 窗口，与旧 walk_forward 返回格式兼容。
     """
-    # P0 审计修复：OOS 窗口硬约束 ≥ 60 天
     if test_period < 60:
         raise ValueError(
             f"OOS 验证窗口 {test_period} 天 < 60 天最小要求，统计效力不足（Sharpe 标准误 ≈ 1.96/√{test_period-1}）"
             " — 请缩短 IS 窗口或增加数据跨度以提供至少 60 天 OOS。"
         )
-    # P1 审计修复：路径数 ≥ 5 以降低路径间相关性
     if num_paths < 5:
         logger.warning(
             f"路径数 {num_paths} < 5，WFO 中位数聚合统计效力不足，建议 ≥ 5 且路径起始偏移 ≥ 40 天"
@@ -297,7 +295,6 @@ def apply_calibration_to_config(config: object) -> None:
             sc.GOLDEN_CROSS_BONUS = int(val)
         elif key == "divergence_penalty":
             sc.DIVERGENCE_PENALTY = int(val)
-        # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
         # 现覆写到 backtest 配置（与 ConfigParser [BACKTEST_CALIBRATED] 覆写同目标）
         elif key == "buy_threshold":
             cfg.app_config.backtest.BUY_THRESHOLD = int(val)
@@ -351,7 +348,6 @@ def write_calibration_to_ini(params: dict) -> dict | None:
     if not params:
         logger.info("无校准参数，跳过写入")
         return None
-    # P0-1 修复：整数参数统一取整 —— WFO 回退参数 = 参数空间中点，会产生
     # 31.5/17.5/11.5 等非整值；旧实现在此 fail-fast 抛 ValueError 后被调用方
     # except 吞掉，导致 config.ini 实际未写但日志谎报"已写入"。现在仅对
     # 无法转换为数值的值 fail-fast，非整数值 round 后落盘。

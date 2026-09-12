@@ -159,10 +159,8 @@ def _oos_validate(
         if st_history:
             engine_params["_st_history"] = st_history
             engine_params["_exclude_st"] = exclude_st
-        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if listing_days:
             engine_params["_listing_days"] = listing_days
-        # P1-4 行业映射：注入 db_engine_url 至引擎（FIX：用 URL 字符串替代 Engine 对象）
         if db_engine is not None:
             engine_params["_db_engine_url"] = str(db_engine.url)
         _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
@@ -265,7 +263,6 @@ def bayesian_walk_forward_multi(
         point_in_time=kwargs.get("point_in_time", True),
         execution_model=kwargs.get("execution_model", "next_open"),
         cost_model=_wfo_cost,
-        # P1-5 max_order_pct 分档注入
         max_order_pct=kwargs.get("max_order_pct", 0.30),
         max_order_pct_high=kwargs.get("max_order_pct_high", 0.20),
         max_order_pct_low=kwargs.get("max_order_pct_low", 0.10),
@@ -356,10 +353,8 @@ def bayesian_walk_forward_multi(
     # ST/退市逐日状态（runner 注入；回测阶段默认不排除 ST，防止 train/serve skew）
     st_history = kwargs.get("st_history")
     exclude_st = bool(kwargs.get("exclude_st", False))  # FIX(P0): 回测默认不排除 ST
-    # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
     listing_days = kwargs.get("listing_days")
 
-    # P1.17 修复：WFO 窗口起始日期需动态延迟，避免新股数据不足导致指标预热失败。
     # 策略：基于 listing_days 计算有效起始日期 — 取 90% 分位上市日 + _SIGNAL_WARMUP_DAYS，
     # 确保绝大多数新股在进入第一个训练窗口前已有足够预热数据。
     # 若 listing_days 缺失或上市日数据不足，回退至原有固定偏移。
@@ -384,16 +379,14 @@ def bayesian_walk_forward_multi(
     else:
         logger.debug("  P1.17: listing_days 缺失，使用固定窗口起始偏移")
 
-    # P1-4 行业映射：透传 db_engine 至引擎
     db_engine = kwargs.get("db_engine")
 
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
-    _K_FOR_OOS = 10  # P1-6 OOS验证top-K参数数提升至≥10，供PBO计算（原3组合随机1/3违反概率）
+    _K_FOR_OOS = 10
 
     for path_idx in range(num_paths):
         # 确定性偏移：各路径互不重叠，避免 IS/OOS 数据泄露
-        # P1.17 修复：路径 offset 叠加上市日动态偏移，跳过早期新股不足窗口
         offset = path_idx * test_period + _listing_offset
         _span = train_period + test_period + embargo_days  # purge 仅缩训练尾部，不占额外天数
         # WFO 寻参上界受 holdout 限制（末段禁触）；无 holdout 时回退 n_dates
@@ -633,7 +626,7 @@ def bayesian_walk_forward_multi(
                         logger.warning(
                             f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(OVERFITTED) | "
                             f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
-                            f"衰减率={_decay_report.decay_rate:.1%}，"
+                            f"衰减率={_decay_report.sharpe_decay:.1%}，"
                             f"训练期内拟合出的参数组合泛化能力不足，窗口结果废弃"
                         )
                         logger.warning("=" * 64)
@@ -787,6 +780,9 @@ def bayesian_walk_forward_multi(
     agg_rows: list[dict[str, Any]] = []
     for win_id in sorted(all_path_results.keys()):
         entries = all_path_results[win_id]
+        if not entries:
+            logger.warning(f"  窗口 {win_id} 无有效路径结果，跳过聚合")
+            continue
         # 取第一个作为基础（结构相同）
         base = dict(entries[0])
         # 对 params 取中位数

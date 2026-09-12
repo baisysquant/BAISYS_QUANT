@@ -51,7 +51,6 @@ def compute_risk_metrics(
     sharpe = excess_mu / sigma if sigma > 0 else 0.0
 
     downside = returns[returns < 0]
-    # P1 审计修复：无亏损日时 Sortino 截断为有限大值（100.0），避免优化器崩溃 / 数值不稳定
     # 原逻辑：float("inf") → DSR/PBO 污染 / scipy 优化器 NaN
     _SORTINO_CEILING = 100.0
     if len(downside) == 0:

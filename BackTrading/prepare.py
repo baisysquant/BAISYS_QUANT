@@ -31,7 +31,6 @@ from LogicAnalyzer.ml.signal_model import apply_ml_signal
 # ML 只按数据版本重训一次（该版本的"首帧"，优化器路径下即默认参数帧），
 # 后续任意参数变体直接注入冻结预测，不再重训 XGBoost（~800s → 秒级）。
 # 未预测日期（预热期/模型不显著回退）保持原生评分，语义与 apply_ml_signal 一致。
-# P2 审计修复：使用 OrderedDict 实现 LRU 上限，防止内存泄漏
 _ML_PRED_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 _ML_PRED_CACHE_MAX = 10  # 最多缓存 10 个 (config_hash, data_fp) 组合
 _ML_PRED_LOCK = threading.Lock()
@@ -54,7 +53,6 @@ from BackTrading.indicator_cache import get_precomputed, get_divergence, precomp
 from BackTrading import output_store as _os
 from BackTrading import calendar_align as _ca
 
-# P1#5 / P1.4 重构：指标最大窗口 — 不再硬编码 120
 # 改为启动时自动扫描 vectorized_signal.py、Indicators.py 等指标管线中所有
 # rolling(window=N) / ewm(span=N) 窗口，取 max() 作为最小缓存缓冲要求。
 # 当新增更长窗口指标时，此处自动生效，无需手动更新。
@@ -170,7 +168,6 @@ def _trade_day_str() -> str:
 
 # ── 增量缓存（日期后缀 + 每只股票独立写入，支持中断续算） ──
 
-# P3 审计修复：自动管线版本管理 — 基于关键 Python 文件 mtime 生成哈希
 # 替代手动 _SIGNAL_PIPELINE_VERSION，代码变更即自动失效旧缓存
 def _pipeline_version_hash() -> str:
     """对信号管线涉及的源文件计算 mtime 哈希，代码变更时自动使旧缓存失效。"""
@@ -405,12 +402,10 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             files.extend(sorted(bucket_dir.glob("*.parquet")))
     if not files:
         return None
-    # P2.4 内存碎片治理：分块 concat 降低峰值 + 显式 gc.collect() 释放。
     # 一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
     #（parts 列表 + 合并结果），容易在 Windows 上触发 OOM/原生崩溃。
     # 这里按块合并、逐块释放，同时提前丢弃 exit_strategy 字典列（每行一个 dict，
     # 是内存大头，提取出止损价后不再需要）。
-    # P1.12 动态 chunk 计算：根据文件总数自适应，避免硬编码
     # 小数据集用大 chunk 减少 GC 开销；大数据集缩小 chunk 控制峰值。
     _total_files = len(files)
     _CHUNK = max(50, min(1000, round(40000 / max(_total_files, 1))))
@@ -438,7 +433,6 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             merged = pd.concat(parts, ignore_index=True)
             del parts[:]
             parts.append(merged)
-            # P2.4：每次 chunk 合并后触发 GC，释放已被 del 的 parquet 中间对象
             gc.collect()
 
             if (idx + 1) % 800 == 0:
@@ -448,7 +442,6 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
         return None
     df = pd.concat(parts, ignore_index=True)
     del parts[:]
-    # P2.4：终态 concat 后也触发一次 GC
     gc.collect()
     # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
@@ -508,7 +501,6 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     for col in ["进场评分", "退出评分", "综合评分"]:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
-    # P1-9 修复：止损价信号缺失日用 ffill 沿前值延续，而非填0。
     # 填0 → core.py 的 >0 守卫跳过 _prev_stop 更新 → 旧止损线残留 → 止损静默失效
     if "止损价" in result.columns:
         result["止损价"] = pd.to_numeric(result["止损价"], errors="coerce")
@@ -645,7 +637,6 @@ def prepare_backtest_data(
             merged = apply_ml_signal(merged)
             ml_pred = merged[["symbol", "trade_date", "进场评分"]].copy()
             with _ML_PRED_LOCK:
-                # P2 审计修复：LRU 淘汰 — 缓存超限则删除最久未使用的条目
                 if len(_ML_PRED_CACHE) >= _ML_PRED_CACHE_MAX:
                     _evict_key = next(iter(_ML_PRED_CACHE))
                     del _ML_PRED_CACHE[_evict_key]
@@ -662,8 +653,6 @@ def prepare_backtest_data(
             merged = merged.drop(columns=["ML进场评分"])
             logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
         if "ATR" in merged.columns:
-            # P2-3：止损价统一使用后复权口径，避免除权日 close 跳跌而 ATR 连续导致量纲不一致
-            # P2-5 修复：_saved_atr_stop 为 None（params 非 flat）时退化为默认 1.5，
             # 确保缓存中的旧版不复权止损价在 merge 后被无条件重建
             _atr_stop_mult = _saved_atr_stop if _saved_atr_stop is not None else 1.5
             close_for_stop = merged["close_normal"] if "close_normal" in merged.columns else merged["close"]
@@ -760,7 +749,6 @@ def prepare_backtest_data(
                     logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
                     return _finalize(kline_df, signal_df)
             else:
-                # P0-1 补充修复：缓存文件存在但整体不可读/为空（损坏缓存）时，之前会静默
                 # 返回原始 K 线（无止损价/信号列）→ 引擎在无止损保护下运行。改为降级重算。
                 logger.warning(
                     f"[信号缓存] {len(done)} 只股票的缓存文件存在但无法读取或为空"
@@ -827,13 +815,25 @@ def prepare_backtest_data(
                 os.path.join(stock_dir, f"{sym}.parquet"), index=False
             )
 
-        # Phase 0: 预计算所有股票的技术指标 + peak/trough（仅一次，后续评估复用）
         # fingerprint=data_fp：跨数据批次（WFO 窗口/路径切片）切换时清空指标内存缓存，
         # 防止 worker 复用旧切片的指标导致信号日期错位（2026-08-07 OOS 0 交易根因）。
-        # P0-10 ②：循环兜底路径已删除，统一向量化路径（vectorized 参数仅保留兼容性）
         if not vectorized:
             logger.warning("vectorized=False 已弃用：循环兜底路径已删除，统一走向量化路径")
+
+        _orig_handlers = dict(logger._core.handlers)
+        logger.remove()
+        logger.add(sys.stderr, level="ERROR", format="{message}", colorize=False)
         precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
+        logger.remove()
+        for _id, _cfg in _orig_handlers.items():
+            logger.add(
+                _cfg["handler"],
+                level=_cfg["level"],
+                format=_cfg["format"],
+                colorize=_cfg["colorize"],
+                serialize=_cfg["serialize"],
+                enqueue=_cfg.get("enqueue", False),
+            )
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES
@@ -867,7 +867,6 @@ def prepare_backtest_data(
                 _use_process = False
 
             try:
-                # P2-11: 标记进程池是否已崩溃，避免重复告警
                 _process_pool_crashed = False
 
                 def _run_batch(syms_batch: list[str], *, progress: bool = False) -> set[str]:
@@ -1004,7 +1003,6 @@ def _stock_worker_vectorized(
     import sys as _sys
     try:
         stock_df, _peaks, _troughs = get_precomputed(symbol, stock_dir)
-        # P1-14 文档化：次新股 <60 个交易日整票无信号。
         # 取舍原因：
         #   1) 上市前5日A股无涨跌幅限制（2018年起），价格剧烈波动，MA/ATR等指标统计无意义；
         #   2) 60根bar可覆盖MA60窗口（P1-10已设min_periods=60），指标预热充分；
@@ -1033,7 +1031,6 @@ def _stock_worker_vectorized(
                 precomputed_divergence=_div,
             )
         except Exception as e:
-            # P0-10 ②：循环兜底路径已删除。向量化失败即整票失败（不降级到
             # O(n²) 逐 bar 重算的另一套实现），由外层 D1 分片重跑机制处理。
             import traceback
             logger.error(f"  [{symbol}] 向量化信号计算失败，整票失败: {e}\n{traceback.format_exc()}")
@@ -1171,7 +1168,6 @@ def _compute_indicators(
     )
 
     df = df_raw.copy()
-    # P2-3/P0-2：技术指标统一使用后复权口径，除权日连续无跳跌。
     # 上游（DB）提供 open_normal/high_normal/low_normal/close_normal 后复权列；
     # 合成/测试帧缺失 *_normal 时回退原始列。
     close = df["close_normal"] if "close_normal" in df.columns else df["close"]
@@ -1273,7 +1269,6 @@ def _compute_indicators(
     else:
         df["AMOUNT"] = close * df["volume"]
     df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean().shift(1)
-    # P0-11：AMOUNT_MA20 用于次日开盘成交时点的流动性分档（冲击成本/滑点档位）。
     # 原实现 rolling(20).mean() 含当日全天成交额——开盘撮合时当日成交额不可知，
     # 属确定性前视（利好回测）。shift(1) 使其仅用 T 日及之前数据，与引擎
     # _update_adv（收盘后更新、不含当日）口径一致（PIT 合规）。

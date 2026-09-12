@@ -470,7 +470,6 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
         logger.info("[ML] 缺少 close 列，跳过 ML 信号模型")
         return merged
 
-    # P0-9 ③：必需列强校验（替换旧的"只查 ≥3 个 CN 列"弱校验）。
     # 弱校验下缺列不报错，但 _emit_prediction / 训练路径用
     # df.loc[day_mask, _FEATURE_ALL] 取列时会抛 KeyError 崩溃
     # （_FEATURE_CN 中文列不参与计算，缺失时 _FEATURE_ALL 子集缺列）；
@@ -508,7 +507,7 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
     folds: list[tuple[list[str], list[str]]] = []   # 1.3 多折 Walk-Forward 折叠（周期末自检）
     model_anchor_idx: int | None = None            # 1.6 当前生效模型的训练锚点索引
     anchor_audits: list[dict[str, Any]] = []       # 1.6 锚点审计：{anchor_idx, first_idx}
-    label_window_violations: list[str] = []        # P0-4 标签价格窗口越锚折叠记录（门禁）
+    label_window_violations: list[str] = []
 
     def _emit_prediction(i_day: int) -> None:
         """用当前生效模型输出第 i_day 个交易日的信号并覆写当日进场评分。
@@ -561,7 +560,6 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
                 _emit_prediction(i)
 
             cut_idx = max(0, i - _TRAIN_WINDOW)
-            # P0-4 前视泄漏修复：训练窗口尾部 purge _PURGE_DAYS（= 标签持有期）。
             # 窗口最后 5 行（t = T-5…T-1）的标签 fwd_5d = C_{t+5}/C_{t+1}−1
             # 引用 anchor+4 前的价格，且落入验证集，驱动 XGBoost 早停、Rank-IC
             # 与显著性门控（决定 ML 是否覆写评分）——模型选择被未来价格影响。
@@ -580,7 +578,6 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
             except Exception as e:
                 logger.warning(f"[锚定检查] 截止线自检执行失败: {e}")
 
-            # P0-4 标签价格窗口锚定自检（关键，门禁）：窗口内样本标签最远引用
             # 价格必须 ≤ 锚点 T——尾部标签引用锚点当日及以后价格即前视泄漏。
             try:
                 label_report = check_label_window_within_anchor(
@@ -740,7 +737,6 @@ def apply_ml_signal(merged: pd.DataFrame) -> pd.DataFrame:
             _integrity_pass = False
             logger.warning(f"[锚定检查] 信号时序自检执行异常: {e} — 门禁触发，ML 信号作废")
 
-    # P0-4 标签价格窗口锚定自检（多轮累计）：任一折叠窗口尾部标签引用锚点
     # 当日及以后价格 → 门禁触发，ML 信号作废 【关键】
     if label_window_violations:
         _integrity_pass = False

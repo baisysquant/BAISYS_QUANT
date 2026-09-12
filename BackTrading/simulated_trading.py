@@ -158,7 +158,7 @@ def validate_params(
     config: Any | None = None,
     engine_cfg: EngineConfig | None = None,
     oos_sortino: float = 0.0,  # 审计新增：样本外 Sortino
-    validation_dates: set[str] | None = None,  # P0-10 ④：独立验证集（与选参区间无交集）
+    validation_dates: set[str] | None = None,
     oos_sample_days: int = 60,  # 审计增强：OOS 样本量（用于统计检验 SE 估算）
     oos_returns: np.ndarray | None = None,  # 审计增强：OOS 日收益序列（HAC 修正 SE）
 ) -> SimTradeVerdict:
@@ -249,7 +249,6 @@ def validate_params(
         _prep["trade_date"] = _prep["trade_date"].dt.strftime("%Y-%m-%d")
     _date_range = _prep["trade_date"].astype(str)
     _unique_dates = sorted(_date_range.unique())
-    # P0-10 ④：验证段按 sim_dates_sorted 定位（独立验证集可能不在数据末尾），
     # 回退模式下即末尾 sim_days 日
     _sim_n = min(len(sim_dates_sorted), len(_unique_dates))
     _sim_dates_str = {d for d in sim_dates_sorted if d in _unique_dates}
@@ -273,7 +272,6 @@ def validate_params(
     # 按 best_params 的 atr_stop_mult 计算止损价
     stop_mult = best_params.get("atr_stop_mult")
     if stop_mult is not None and "ATR" in ext_data.columns:
-        # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
         _stop_close = ext_data["close_normal"] if "close_normal" in ext_data.columns else ext_data["close"]
         ext_data["止损价"] = _stop_close - ext_data["ATR"] * stop_mult
     elif "止损价" not in ext_data.columns:

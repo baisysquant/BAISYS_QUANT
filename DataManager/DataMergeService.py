@@ -109,7 +109,6 @@ class DataMergeService:
             pool = sync.get_stock_pool_from_db()
             industry = pool[["ts_code", "name", "industry"]].copy()
             industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
-            # P0-7 ①：附加申万一级行业列（独立映射表 stock_basic_info_sw_l1；
             # 宏观 tilt 按一级行业 key 映射，二级语义 行业 列保持不变供行业信号使用）。
             # 失败记录 error 日志（不静默吞异常），一级列缺失时宏观 tilt 降级为 0。
             try:

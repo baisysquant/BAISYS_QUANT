@@ -167,7 +167,6 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        # P2.11: Pandera 数据契约校验（非阻塞，仅WARN）
                         is_schema_valid, schema_errors = SchemaValidator.validate_strategic_ranking(df)
                         if is_schema_valid:
                             logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
@@ -223,7 +222,6 @@ class DataAcquisitionService:
                     is_valid, missing = self.data_validator.validate_required_columns(df, required_cols, desc)
 
                     if is_valid:
-                        # P2.11: Pandera 数据契约校验（非阻塞，仅WARN）
                         is_schema_valid, schema_errors = SchemaValidator.validate_strategic_ranking(df)
                         if is_schema_valid:
                             logger.info(f"  - [OK] {desc}: {len(df)} 条记录")
@@ -326,5 +324,4 @@ class DataAcquisitionService:
             logger.warning(f"[P2.2] 交叉校验异常（不影响主流程）: {e}")
 
         return data
-
 

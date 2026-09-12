@@ -337,7 +337,6 @@ class ExecutionEngine:
 
             if shares < lot:
                 # 现金不足 → 缩减
-                # P1.1 简化处理
                 remaining_buys.append(p)
                 continue
 

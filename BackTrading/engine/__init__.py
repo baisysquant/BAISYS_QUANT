@@ -137,8 +137,8 @@ class EngineConfig:
     portfolio_method: str = "score_weighted"
     point_in_time: bool = True
     atr_stop_mult: float = 2.5
-    take_profit_pct: float = 15.0        # P2: 跟踪止盈目标浮盈百分比（默认 15%）
-    trail_profit_ratio: float = 50.0     # P2: 止盈回撤比例（从最高点回撤 50% 触发）
+    take_profit_pct: float = 15.0
+    trail_profit_ratio: float = 50.0
     kelly_fraction: float = 0.25
     position_a: float = 0.3
     boll_narrow_ratio: float = 0.8
@@ -164,11 +164,9 @@ class EngineConfig:
     # ── 涨跌停撮合约束（simulate_limit_up_down=true 开启可成交量模型） ──
     simulate_limit_up_down: bool = True  # false=回退简化撮合（触板一律禁买/禁卖）
     limit_seal_ratio: float = 0.05  # [deprecated] 保留兼容
-    # P1-2 修复：一字板封死方向流动性不对称——
     # 涨停板卖出相对容易（排队少，提供流动性），跌停板买入极难（恐慌情绪，逆势挂单）。
     limit_seal_sell_ratio: float = 0.05  # 一字涨停/跌停封板时卖出可成交量比例（提供流动性，相对容易）
     limit_seal_buy_ratio: float = 0.02   # 一字涨停/跌停封板时买入可成交量比例（逆势排队，极难）
-    # P1-2 修复：涨跌停方向流动性不对称——涨停开盘买方排队深，买方成交难；
     # 跌停开盘恐慌抛压，卖方成交困难但炸板后流动性通常好于涨停封板。
     limit_tradable_up_ratio: float = 0.30   # 涨停开盘触板可成交量比例（买方保守）
     limit_tradable_down_ratio: float = 0.30  # 跌停开盘触板可成交量比例

@@ -187,7 +187,6 @@ def optimize_window(
     """
     import pandas as pd  # type: ignore[import]
 
-    # P4-Fix: 注入被固定的低敏感参数（space.py 已排除出搜索空间，
     # 但 backtest 引擎仍需要这些字段）
     _fixed_params = _get_fixed_params()
 
@@ -234,7 +233,6 @@ def optimize_window(
         return tuple(sorted((k, round(float(v), 8)) for k, v in p.items()))
 
     def _eval_once(params: dict[str, float], fidelity: int) -> dict[str, Any]:
-        # P4-Fix: 注入被固定的低敏感参数（space.py 已排除出搜索空间，
         # 但 backtest 引擎仍需要这些字段）。固定参数优先级低于搜索参数。
         merged = {**_fixed_params, **params}
         key = _params_key(merged)
@@ -263,7 +261,6 @@ def optimize_window(
             best_equity_local = list(equity) if equity else None
 
     # ═══════════════════════════════════════════════════════════
-    # Phase 1: Sobol + 预热缓存（组合空间 × Level2，信号用默认参数）
     # ═══════════════════════════════════════════════════════════
     n_init = n_init_signal if n_total > 0 else 3
     n_portfolio = len(portfolio_sp)
@@ -302,7 +299,6 @@ def optimize_window(
             logger.debug(f"  Sobol[{i}] sharpe={sharpe:.4f}")
 
     # ═══════════════════════════════════════════════════════════
-    # Phase 2: 贝叶斯 Level 1（全空间 GP + 组合参数冻结，仅优化信号维度）
     # ═══════════════════════════════════════════════════════════
     if n_signal > 0 and n_iter_signal > 0:
         logger.info(f"[Phase 2/4] Bayes signal: {n_iter_signal} 轮 (全空间GP)")
@@ -386,7 +382,6 @@ def optimize_window(
     logger.info(f"[Phase 1+2] 完成: best={best_sharpe_local:.4f}, 耗时={_p2_end-_opt_t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════
-    # Phase 3: 固定信号最优值，优化组合参数
     # ═══════════════════════════════════════════════════════════
     # 取出最优的信号参数
     if n_signal > 0:
@@ -476,7 +471,6 @@ def optimize_window(
     logger.info(f"[Phase 3] 完成: best={best_sharpe_local:.4f}, 耗时={_p3_end-_opt_t0:.1f}s")
 
     # ═══════════════════════════════════════════════════════════
-    # Phase 4: 局部精细化（代理模型上爬山，然后真实评估 top-3）
     # ═══════════════════════════════════════════════════════════
     if n_signal > 0 and len(X_hist) >= 3:
         logger.info(f"[Phase 4/4] Local refinement: top-{n_refine_top}")
