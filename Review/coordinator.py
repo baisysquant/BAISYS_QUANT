@@ -264,6 +264,27 @@ class StockAnalysisCoordinator:
             filtered_pure_codes = self.incremental_sync_engine.sync_stock_pool_and_kline(
                 target_date=self.today_str
             )
+
+            # ── 降级保护：当 sync 返回空集（如回测锁拦截），从数据库已有数据加载股票池 ──
+            if not filtered_pure_codes:
+                self.logger.warning(
+                    "同步未返回股票池，尝试从数据库已有 stock_daily_kline 加载股票池"
+                )
+                try:
+                    pool_df = self.incremental_sync_engine.get_stock_pool_from_db()
+                    if not pool_df.empty and "股票代码" in pool_df.columns:
+                        # 复用同步引擎的过滤链（ST + 主板 + 研报）
+                        pool_df = self.incremental_sync_engine.filter_st_stocks(pool_df)
+                        pool_df = self.incremental_sync_engine.filter_main_board(pool_df)
+                        codes = set(pool_df["股票代码"].unique())
+                        if codes:
+                            filtered_pure_codes = codes
+                            self.logger.info(
+                                f"[降级] 从已有数据加载股票池: {len(codes)} 只"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"降级加载股票池失败: {e}")
+
             if not filtered_pure_codes:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return False

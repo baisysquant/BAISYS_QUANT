@@ -158,6 +158,49 @@ def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
 _clean_stale_tempdirs()
 
 
+# AUDIT_FIX Step 11: 信号缓存目录 TTL 自动清理
+def _clean_signal_cache(ttl_days: int = 7) -> int:
+    """清理 signal_cache 下超过 TTL 天数的旧缓存目录。
+
+    持久化缓存 ``signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/``
+    在 WFO 多窗口运行时会累积至数百 GB，需自动驱逐过期目录。
+
+    Args:
+        ttl_days: 缓存保留天数，默认 7 天。
+
+    Returns:
+        清理掉的目录数量。
+    """
+    if not CACHE_DIR.exists():
+        return 0
+
+    removed = 0
+    now = time.time()
+    ttl_seconds = ttl_days * 86400
+
+    try:
+        for entry in CACHE_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            if entry.name.startswith("signal_cache_"):
+                try:
+                    age_seconds = now - entry.stat().st_mtime
+                    if age_seconds > ttl_seconds:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    if removed:
+        logger.info(f"[AUDIT_FIX Step 11] 清理了 {removed} 个过期信号缓存目录（TTL={ttl_days}天）")
+    return removed
+
+
+_clean_signal_cache()
+
+
 
 def _trade_day_str() -> str:
     try:
@@ -645,13 +688,29 @@ def prepare_backtest_data(
             logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s（预测已冻结，后续参数变体不再重训）")
         else:
             merged = merged.merge(
-                ml_pred.rename(columns={"进场评分": "ML进场评分"}),
+                ml_pred.rename(columns={"进场评分": "ML评分"}),
                 on=["symbol", "trade_date"], how="left",
             )
-            _ml_fill = merged["ML进场评分"].notna()
-            merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML进场评分"]
-            merged = merged.drop(columns=["ML进场评分"])
-            logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
+            # AUDIT_FIX Step 6: ML 信号修正因子混合模式
+            # 最终进场评分 = ml_blend_weight × 原生 + (1 - ml_blend_weight) × ML
+            # ml_blend_weight=0 时退化为旧行为（完全 ML 覆写）
+            _ml_fill = merged["ML评分"].notna()
+            _blend_w = float(params.get("ml_blend_weight", 0.4))
+            if _blend_w == 0:
+                # 完全覆写（旧行为）
+                merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML评分"]
+            elif _blend_w >= 1.0:
+                # 完全忽略 ML，不做处理
+                pass
+            else:
+                # 混合模式：加权融合
+                merged.loc[_ml_fill, "进场评分"] = (
+                    _blend_w * merged.loc[_ml_fill, "进场评分"]
+                    + (1.0 - _blend_w) * merged.loc[_ml_fill, "ML评分"]
+                )
+            if "ML评分" in merged.columns:
+                merged = merged.drop(columns=["ML评分"])
+            logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行，混合权重 {_blend_w:.1f}），耗时 {time.time()-_t_ml:.1f}s")
         if "ATR" in merged.columns:
             # 确保缓存中的旧版不复权止损价在 merge 后被无条件重建
             _atr_stop_mult = _saved_atr_stop if _saved_atr_stop is not None else 1.5
@@ -820,20 +879,14 @@ def prepare_backtest_data(
         if not vectorized:
             logger.warning("vectorized=False 已弃用：循环兜底路径已删除，统一走向量化路径")
 
-        _orig_handlers = dict(logger._core.handlers)
-        logger.remove()
-        logger.add(sys.stderr, level="ERROR", format="{message}", colorize=False)
-        precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
-        logger.remove()
-        for _id, _cfg in _orig_handlers.items():
-            logger.add(
-                _cfg["handler"],
-                level=_cfg["level"],
-                format=_cfg["format"],
-                colorize=_cfg["colorize"],
-                serialize=_cfg["serialize"],
-                enqueue=_cfg.get("enqueue", False),
-            )
+        # ── 指标计算阶段 ──
+        # 不再 logger.remove() 清除所有 handler（会导致回测日志文件断写）。
+        # 多进程场景下子进程有自己的 logger 实例，不影响父进程 handler。
+        logger.info("指标预计算: 开始")
+        precompute_all_indicators(
+            stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats
+        )
+        logger.info("指标预计算: 完成")
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES

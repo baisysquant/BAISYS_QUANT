@@ -66,6 +66,9 @@ MIN_SLIPPAGE_FLOOR: float = 0.0005
 #   缺失早期分段将导致千九十年代回测交易费用被系统性低估。
 #   建议在 config.ini [BACKTEST] 段覆盖 stamp_tax_segments 或扩展本常量。
 #
+# [AUDIT_FIX Step 1, 2026-09-17] 拆分 2000-2001 历史段：2000-01-01 ~ 2001-11-16
+# 期间实际税率为千三(0.003)，此前兜底段千二(0.002)系统性低估了该时段成本约 50%。
+#
 # 单值 stamp_tax_rate 为"卖出侧费率"；双边区间内买入侧按 STAMP_TAX_UNILATERAL_DATE
 # 判定补收（buy_cost_breakdown）。
 DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
@@ -74,7 +77,8 @@ DEFAULT_STAMP_TAX_SEGMENTS: tuple[tuple[str, float], ...] = (
     ("2008-04-24", 0.001),
     ("2007-05-30", 0.003),
     ("2005-01-24", 0.001),
-    ("2000-01-01", 0.002),
+    ("2001-11-17", 0.002),
+    ("2000-01-01", 0.003),
 )
 # 此前为双边征收（买入卖出均按 stamp_tax_segments 当期税率收取）。
 STAMP_TAX_UNILATERAL_DATE: str = "2008-09-19"
@@ -149,7 +153,11 @@ class CostModel:
         liquidity_tier_cap: 各档冲击成本上限
     """
 
-    commission_rate: float = 0.0003
+    commission_rate: float = 0.0003  # 保守回测佣金费率（万分之三，A 股传统上限口径）
+    # AUDIT_FIX Step 2: 实测佣金参数（模拟盘/实盘校准用；回测模式仍以 commission_rate 为准）
+    # 2024+ 券商实际佣金普遍降至万分之 0.85~1.5，机构通道可达万分之 0.5。
+    # 使用场景：simulated_trading 中读取此值，backtest 场景忽略此值
+    commission_rate_actual: float = 0.00015  # 实测佣金费率（万分之一点五，可覆写）
     stamp_tax_rate: float = 0.0005
     market_slippage: float = 0.001
     limit_slippage: float = 0.0005
@@ -201,6 +209,7 @@ class CostModel:
             sorted(self.csrc_fee_segments, key=lambda x: str(x[0]))
         )
         # 否则 commission_includes_fees=False 时历史成本被低估 ~30%（0.00487%→0.00341%）
+        # 自动对齐：单值费率与分段表兜底不一致时，修正为兜底值而非仅告警
         for _name, _rate, _segs in (
             ("handling_fee_rate", self.handling_fee_rate, self.handling_fee_segments),
             ("csrc_fee_rate", self.csrc_fee_rate, self.csrc_fee_segments),
@@ -208,25 +217,14 @@ class CostModel:
             if _segs:
                 _fallback_date, _fallback_rate = _segs[0]  # 最早日期 = 兜底
                 if abs(_rate - _fallback_rate) > 1e-9:
-                    import warnings
-                    warnings.warn(
-                        f"CostModel.{_name}={_rate} 与分段表兜底段 "
-                        f"({_fallback_date}: {_fallback_rate}) 不一致！"
-                        f"回退路径（无命中时）将使用 {_rate}，"
-                        f"可能导致历史经手费/证管费被低估。建议将 {_name} 设置为 {_fallback_rate}。"
-                    )
+                    setattr(self, _name, _fallback_rate)
 
         # 否则 2023-08-28 前交易按错误税率收取，历史成本被低估
+        # 自动对齐：stamp_tax_rate 与分段表兜底不一致时，修正为兜底值
         if self.stamp_tax_segments:
             _fallback_date, _fallback_rate = self.stamp_tax_segments[0]  # 最早日期 = 兜底
             if abs(self.stamp_tax_rate - _fallback_rate) > 1e-9:
-                import warnings
-                warnings.warn(
-                    f"CostModel.stamp_tax_rate={self.stamp_tax_rate} 与分段表兜底段 "
-                    f"({_fallback_date}: {_fallback_rate}) 不一致！"
-                    f"回退路径（无命中时）将使用 stamp_tax_rate={self.stamp_tax_rate}，"
-                    f"可能导致 2023-08-28 前印花税被低估。建议将 stamp_tax_rate 设置为 {_fallback_rate}。"
-                )
+                self.stamp_tax_rate = _fallback_rate
 
     # ── 流动性分档 ────────────────────────────────────────────
 
@@ -633,8 +631,9 @@ class CostModel:
             return DEFAULT_STAMP_TAX_SEGMENTS
         segs = sorted(segs, key=lambda x: x[0])
         # #2 修复：若无兜底段（最早日期 > 2005），注入 DEFAULT 兜底（最老段）
+        # AUDIT_FIX Step 8: 兜底注入值从 0.001 改为 0.003（千三，2000-2001 期间实际税率）
         if segs[0][0] > "2005-01-01":
-            _fallback = DEFAULT_STAMP_TAX_SEGMENTS[-1] if DEFAULT_STAMP_TAX_SEGMENTS else ("2000-01-01", 0.001)
+            _fallback = DEFAULT_STAMP_TAX_SEGMENTS[-1] if DEFAULT_STAMP_TAX_SEGMENTS else ("2000-01-01", 0.003)
             segs.insert(0, _fallback)
         return tuple(segs)
 

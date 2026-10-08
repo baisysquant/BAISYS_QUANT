@@ -9,6 +9,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
+
+# ── 日志落盘：按日期轮转，保留 7 天 ──
+import os as _os
+_os.makedirs("logs", exist_ok=True)
+logger.remove()  # 清除默认 console sink
+logger.add(
+    "logs/backtest_{time:YYYY-MM-DD}.log",
+    rotation="00:00",
+    retention="7 days",
+    level="INFO",
+    encoding="utf-8",
+    enqueue=True,
+)
+logger.add(sys.stderr, level="WARNING")  # 控制台保留警告以上
 from scipy.stats import spearmanr
 from sqlalchemy import text
 
@@ -62,11 +76,18 @@ def _acquire_lock(engine: Any) -> None:
         if held:
             logger.info("  获取会话级数据隔离锁成功（外部数据同步将让路）")
         else:
-            logger.warning("  会话级数据隔离锁被占用，仍继续执行")
+            # AUDIT_FIX Step 7: 会话级锁获取失败应终止（而非降级为 warning）
+            # 旧逻辑仅 warning 继续 → xact_lock 在事务结束后已释放，会话级锁未持有
+            # 时存在竞争窗口，外部同步可能在此期间写入导致数据漂移
+            _RUN_LOCK_CONN.close()
+            _RUN_LOCK_CONN = None
+            logger.error("  会话级数据隔离锁被占用，终止执行（数据一致性风险）")
+            sys.exit(1)
     except Exception as exc:
-        logger.warning(f"  会话级数据隔离锁获取失败: {exc}")
         _RUN_LOCK_CONN.close()
         _RUN_LOCK_CONN = None
+        logger.error(f"  会话级数据隔离锁获取失败: {exc}，终止执行")
+        sys.exit(1)
 
 
 def _release_run_lock() -> None:

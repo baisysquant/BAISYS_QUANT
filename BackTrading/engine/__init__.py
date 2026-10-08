@@ -126,7 +126,9 @@ class EngineConfig:
     """回测引擎配置 - 纯数据容器，无业务逻辑"""
 
     initial_cash: float = 1_000_000.0
-    commission_rate: float = 0.0003
+    commission_rate: float = 0.0003  # 保守回测佣金费率（万分之三）
+    # AUDIT_FIX Step 2: 实测佣金参数（模拟盘/实盘校准用；回测模式仍以 commission_rate 为准）
+    commission_rate_actual: float = 0.00015  # 实测佣金费率（万分之一点五）
     stamp_tax_rate: float = 0.0005
     slippage: float = 0.001
     transfer_fee_rate: float = 0.00001  # 过户费 0.001% 双边
@@ -139,11 +141,11 @@ class EngineConfig:
     atr_stop_mult: float = 2.5
     take_profit_pct: float = 15.0
     trail_profit_ratio: float = 50.0
-    kelly_fraction: float = 0.25
-    position_a: float = 0.3
+    kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费
+    position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费
     boll_narrow_ratio: float = 0.8
     cross_decay_days: int = 30
-    risk_none_multiplier: float = 1.0
+    risk_none_multiplier: float = 1.0  # [DEAD KEY] 未在任何代码路径中被消费
     max_holdings: int = 0  # 0=不限制
     buy_threshold: int = 15  # 买入评分阈值
     min_commission_per_trade: float = 5.0  # A股每笔最低佣金 5 元
@@ -155,6 +157,10 @@ class EngineConfig:
     
     # ── ATR 风险驱动仓位控制（A4） ──
     risk_per_trade: float = 0.02  # 单笔风险占总资金比例（默认2%）
+    # AUDIT_FIX Step 6: ML 信号混合模式 — 原生评分与 ML 评分加权融合
+    # ml_blend_weight ∈ [0, 1]；最终进场评分 = weight × 原生 + (1-weight) × ML
+    # 0=完全 ML 覆写（旧行为），1=完全忽略 ML，默认 0.4（ML 占 60%）
+    ml_blend_weight: float = 0.4
     # ── 成交时点模型（0.1 执行时序合规） ──
     # next_open=信号次日开盘价成交（默认，符合A股T+1）
     # vwap=信号次日VWAP（成交额/成交量，后复权）成交。next_open/vwap 下单挂至次日开盘撮合，

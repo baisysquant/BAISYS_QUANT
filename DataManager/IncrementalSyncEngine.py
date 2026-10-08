@@ -370,7 +370,18 @@ class IncrementalSyncEngine:
             )
             return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
 
-        # 腾讯API 失败时直接返回 None，由批处理器标记为失败股票，下次重试
+        # ── 股票级整体重试：raw_rows 与 hfq_rows 均为空，可能是瞬时网络问题 ──
+        # 等 1 秒后重试一次，仍失败则标记为失败
+        logger.warning(f"腾讯API {symbol} 首次拉取返回空，1s 后重试...")
+        time.sleep(1)
+        raw_rows = _tx_raw("")
+        hfq_rows = _tx_raw("hfq")
+        if raw_rows and hfq_rows:
+            return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
+        if raw_rows:
+            return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
+
+        # 重试后仍失败，标记为失败，将在下次同步时重试
         logger.warning(f"腾讯API {symbol} 返回空,标记为失败，将在下次同步时重试")
         return None
 
@@ -819,7 +830,10 @@ class IncrementalSyncEngine:
 
     def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
         from UtilsManager.CodeNormalizer import CodeNormalizer
-        from UtilsManager.IDataProvider import backtest_lock_held
+        from UtilsManager.IDataProvider import (
+            BACKTEST_ADVISORY_LOCK_KEY,
+            backtest_lock_held,
+        )
 
         # ── 回测数据隔离（P3.3 制度化）：回测进程持有会话级 advisory lock 时禁止写入 ──
         # 运行中改写 stock_daily_kline 会导致回测窗口数据漂移、信号缓存静默失效，

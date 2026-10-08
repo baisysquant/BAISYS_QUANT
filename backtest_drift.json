@@ -80,5 +80,73 @@
         "drift_pct": 120.0
       }
     ]
+  },
+  {
+    "type": "failure",
+    "error": "'OOSDecayReport' object has no attribute 'decay_rate'",
+    "time": "2026-09-09T04:20:51.382600",
+    "snapshot_id": "466cf05bb3a56d25",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-12T17:11:05.142409",
+    "snapshot_id": "bf56f6eae05379c9",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-12T18:49:36.794364",
+    "snapshot_id": "aad56ae93edfdb99",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-14T13:41:02.623649",
+    "snapshot_id": "ab5bee29e6deb803",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-15T08:15:35.496796",
+    "snapshot_id": "67531bc7c1daf845",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-15T10:04:25.725026",
+    "snapshot_id": "2612f03567b79f9b",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-15T13:50:46.613395",
+    "snapshot_id": "5af3d3722cd1dac9",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "name 'sys' is not defined",
+    "time": "2026-09-16T05:52:51.097234",
+    "snapshot_id": "316c0b418f2159b2",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "drift",
+    "time": "2026-09-18T05:59:33.186812",
+    "drifts": [
+      {
+        "param": "atr_stop_mult",
+        "old": 2.5,
+        "new": 4.0,
+        "drift_pct": 60.0
+      }
+    ]
   }
 ]

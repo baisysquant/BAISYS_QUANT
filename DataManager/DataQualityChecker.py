@@ -30,6 +30,15 @@ class DataQualityChecker:
         "综合分析评分", "建议仓位比例",
     ]
 
+    # AUDIT_FIX Step 12: 复权口径校验 — 日线表必须满足的契约
+    # 原始价列（不复权）：open/close/high/low — 用涨跌停/成交/估值
+    # 后复权价列：*_normal — 用信号/指标/止损
+    # 复权因子：adj_factor = close_normal / close
+    KLINE_SCHEMA_COLUMNS = ["open", "close", "high", "low",
+                            "open_normal", "close_normal", "high_normal", "low_normal",
+                            "adj_factor"]
+    KLINE_REQUIRED_MIN = 6  # 至少要有 close, close_normal, adj_factor 等核心列
+
     def __init__(self, db_engine: Any = None) -> None:
         self._engine = db_engine
 
@@ -141,7 +150,40 @@ class DataQualityChecker:
             logger.warning(f"[数据质量] 评分异常: 全部相同 ({detail})")
         else:
             logger.info(f"[数据质量] {detail}")
-        return not all_same
+        return n
+
+    # AUDIT_FIX Step 12: 复权口径校验
+    def check_kline_adj_schema(self, df: pd.DataFrame, trade_date: str) -> bool:
+        """校验日线表的复权口径是否符合契约。
+
+        契约：open/close/high/low = 不复权原始价；*_normal = 后复权价；adj_factor = close_normal/close。
+        """
+        missing = [c for c in self.KLINE_SCHEMA_COLUMNS if c not in df.columns]
+        if len(missing) > (len(self.KLINE_SCHEMA_COLUMNS) - self.KLINE_REQUIRED_MIN):
+            detail = f"缺失列（超过容许阈值）: {missing}"
+            self._log(trade_date, "数据质量", "复权口径", "warn",
+                      len(missing), self.KLINE_REQUIRED_MIN, detail)
+            logger.warning(f"[数据质量][AUDIT_FIX] {detail}")
+            return False
+
+        # 校验 adj_factor 一致性：adj_factor ≈ close_normal / close
+        if "adj_factor" in df.columns and "close_normal" in df.columns and "close" in df.columns:
+            close = df["close"].astype(float)
+            close_n = df["close_normal"].astype(float)
+            adj = df["adj_factor"].astype(float)
+            expected = close_n / close.replace(0, np.nan)
+            diff = (adj - expected).abs()
+            bad = (diff > 0.01).sum()
+            total = len(df)
+            if bad > total * 0.05:  # 容许 5% 偏差
+                detail = f"adj_factor 校验失败: {bad}/{total} 行偏差 >1%"
+                self._log(trade_date, "数据质量", "复权因子一致性", "warn",
+                          float(bad), float(total), detail)
+                logger.warning(f"[数据质量][AUDIT_FIX] {detail}")
+                return False
+
+        self._log(trade_date, "数据质量", "复权口径", "pass", 0, 0, "复权合约通过")
+        return True
 
     def check_trade_date_freshness(self, trade_date: str,
                                    df: pd.DataFrame | None = None,
@@ -188,6 +230,39 @@ class DataQualityChecker:
                          float(r.get("ratio", 0.0)), 0.0, detail):
                 n += 1
         return n
+
+    # AUDIT_FIX Step 12: 复权口径校验
+    def check_kline_adj_schema(self, df: pd.DataFrame, trade_date: str) -> bool:
+        """校验日线表的复权口径是否符合契约。
+
+        契约：open/close/high/low = 不复权原始价；*_normal = 后复权价；adj_factor = close_normal/close。
+        """
+        missing = [c for c in self.KLINE_SCHEMA_COLUMNS if c not in df.columns]
+        if len(missing) > (len(self.KLINE_SCHEMA_COLUMNS) - self.KLINE_REQUIRED_MIN):
+            detail = f"缺失列（超过容许阈值）: {missing}"
+            self._log(trade_date, "数据质量", "复权口径", "warn",
+                      len(missing), self.KLINE_REQUIRED_MIN, detail)
+            logger.warning(f"[数据质量][AUDIT_FIX] {detail}")
+            return False
+
+        # 校验 adj_factor 一致性：adj_factor ≈ close_normal / close
+        if "adj_factor" in df.columns and "close_normal" in df.columns and "close" in df.columns:
+            close = df["close"].astype(float)
+            close_n = df["close_normal"].astype(float)
+            adj = df["adj_factor"].astype(float)
+            expected = close_n / close.replace(0, np.nan)
+            diff = (adj - expected).abs()
+            bad = (diff > 0.01).sum()
+            total = len(df)
+            if bad > total * 0.05:  # 容许 5% 偏差
+                detail = f"adj_factor 校验失败: {bad}/{total} 行偏差 >1%"
+                self._log(trade_date, "数据质量", "复权因子一致性", "warn",
+                          float(bad), float(total), detail)
+                logger.warning(f"[数据质量][AUDIT_FIX] {detail}")
+                return False
+
+        self._log(trade_date, "数据质量", "复权口径", "pass", 0, 0, "复权合约通过")
+        return True
 
     # ── 批量运行 ───────────────────────────────────────────
 

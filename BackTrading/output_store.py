@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 import time
@@ -26,7 +25,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 OUTPUT_WRITE_UPSERT = "upsert"
 OUTPUT_WRITE_REPLACE = "replace"

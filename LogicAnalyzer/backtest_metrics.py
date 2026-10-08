@@ -42,7 +42,14 @@ def compute_risk_metrics(
         return {}
 
     total_ret = vals[-1] / vals[0] - 1
-    ann_factor = 244  # A股实际年化交易日数均值（非美股 252）
+    # AUDIT_FIX Step 4: 短周期动态年化因子
+    # 固定 244 在观测期 < 半年时失真；此时按观测日比例折算年化因子
+    ann_factor_base = 244  # A股实际年化交易日数均值
+    years_est = n / ann_factor_base
+    if years_est < 0.5:
+        ann_factor = 365 * n / max(n + 30, 1)  # 近似按观测日历天数比例折算
+    else:
+        ann_factor = ann_factor_base
     mu = returns.mean() * ann_factor
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
 
@@ -53,8 +60,17 @@ def compute_risk_metrics(
     downside = returns[returns < 0]
     # 原逻辑：float("inf") → DSR/PBO 污染 / scipy 优化器 NaN
     _SORTINO_CEILING = 100.0
+    sortino_reliable = True  # AUDIT_FIX Step 10: Sortino 可靠性标志
     if len(downside) == 0:
         sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
+        sortino_reliable = False
+        logger.warning(f"Sortino 下行样本为 0（总 {n} 个交易日无亏损），截断为 {_SORTINO_CEILING}，统计不可靠")
+    elif len(downside) < 30:
+        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
+        raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)
+        sortino = min(raw_sortino, _SORTINO_CEILING)
+        sortino_reliable = False
+        logger.warning(f"Sortino 下行样本不足 ({len(downside)} < 30)，统计不可靠（sortino={sortino:.2f}）")
     else:
         downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
         raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)

@@ -50,7 +50,10 @@ def _compute_sharpe_from_equity(
     if len(returns) < 2:
         return 0.0
 
-    ann_factor = ANN_FACTOR
+    # AUDIT_FIX Step 4: 短周期动态年化因子，同 backtest_metrics.py 保持一致
+    n_obs = len(returns)
+    years_est = n_obs / ANN_FACTOR
+    ann_factor = 365 * n_obs / max(n_obs + 30, 1) if years_est < 0.5 else ANN_FACTOR
     mu = returns.mean() * ann_factor
     excess_mu = mu - risk_free_rate
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
@@ -174,11 +177,17 @@ def compute_pbo(
     window_results: list[dict[Any, Any]],
     top_m: int = 5,
 ) -> float:
+    """计算 PBO（Probabilistic Backtest Overfitting）。
+
+    Returns:
+        PBO 值（0~1）；0.5 表示无法判定。
+    """
     if not window_results:
         return 0.5
 
     violations = 0
     total_windows = 0
+    min_oos_in_window = float("inf")
 
     for w in window_results:
         ocs = w.get("oos_combos", [])
@@ -193,6 +202,9 @@ def compute_pbo(
         if len(oos_sharpes) < 2:
             continue
 
+        # AUDIT_FIX Step 5: 记录窗口内最小 OOS 组合数，用于可靠性判定
+        min_oos_in_window = min(min_oos_in_window, len(oos_sharpes))
+
         median_oos = float(np.median(oos_sharpes))
         rank1 = next((c for c in ocs if c.get("is_rank") == 1), None)
         if rank1 is not None:
@@ -204,7 +216,16 @@ def compute_pbo(
 
     if total_windows == 0:
         return 0.5
-    return violations / total_windows
+
+    pbo_val = violations / total_windows
+
+    # AUDIT_FIX Step 5: 小样本可靠性警告
+    if min_oos_in_window < 30:
+        logger.warning(
+            f"PBO 计算的小样本 OOS 组合数 ({min_oos_in_window} < 30)，"
+            f"统计不可靠，建议结合 DSR 评估（pbo={pbo_val:.3f}）"
+        )
+    return pbo_val
 
 
 def compute_dsr_from_equity_curve(
