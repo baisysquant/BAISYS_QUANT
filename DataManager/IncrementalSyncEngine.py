@@ -353,37 +353,362 @@ class IncrementalSyncEngine:
         if raw_rows and hfq_rows:
             return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
 
-        # 腾讯对部分股票(次新股/新上市)不提供后复权数据,响应中只有 day 无 hfqday。
-        # 优先用 asharehub 复权因子重建后复权价(raw × factor)；
-        # 因子不可用或全为 1.0(从未除权,后复权=不复权)时降级为不复权写入。
-        if raw_rows:
-            factor_map = self._fetch_ah_factor_map(symbol, start, end)
-            if factor_map:
-                non_one = [d for d, f in factor_map.items() if abs(f - 1.0) > 1e-9]
-                if non_one:
-                    logger.warning(
-                        f"腾讯API {symbol} 无后复权数据,使用 asharehub 复权因子重建({len(non_one)} 个除权因子)"
-                    )
-                    return self._build_qq_df_from_factor(symbol, start, end, raw_rows, factor_map)
-            logger.warning(
-                f"腾讯API {symbol} 无后复权数据,降级为不复权写入(adj_factor=1.0,asharehub 因子全为1或不可用)"
-            )
-            return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
-
-        # ── 股票级整体重试：raw_rows 与 hfq_rows 均为空，可能是瞬时网络问题 ──
-        # 等 1 秒后重试一次，仍失败则标记为失败
-        logger.warning(f"腾讯API {symbol} 首次拉取返回空，1s 后重试...")
+        # ── 腾讯接口未同时获取到不复权+后复权数据，1s 后重试一次 ──
+        logger.warning(f"腾讯API {symbol} 首次拉取数据不完整，1s 后重试...")
         time.sleep(1)
         raw_rows = _tx_raw("")
         hfq_rows = _tx_raw("hfq")
         if raw_rows and hfq_rows:
             return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
-        if raw_rows:
-            return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
 
-        # 重试后仍失败，标记为失败，将在下次同步时重试
-        logger.warning(f"腾讯API {symbol} 返回空,标记为失败，将在下次同步时重试")
+        # ── 腾讯接口重试后仍无完整后复权数据，走备用接口（ak.stock_zh_a_daily） ──
+        logger.info(f"腾讯API {symbol} 无法获取完整后复权数据，切换备用接口（ak.stock_zh_a_daily）...")
+        backup_df = self._fetch_sina_backup(symbol, start, end)
+        if backup_df is None:
+            # 备用接口本身报错（网络问题等），标记为失败下次重试
+            logger.warning(f"腾讯API + 备用接口 {symbol} 均失败，标记为失败，将在下次同步时重试")
+        elif backup_df.empty:
+            # 备用接口确认无数据（JSONDecodeError: No value to decode → 股票可能已 ST/退市）
+            logger.info(f"备用接口确认 {symbol} 无数据可获取（可能已ST/退市），不再重试")
+        else:
+            logger.info(f"备用接口 {symbol} 成功获取 {len(backup_df)} 条记录")
+            return backup_df
+
         return None
+
+    def _fetch_sina_backup(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
+        """备用数据源：通过 ak.stock_zh_a_daily 获取后复权K线数据。
+
+        仅在腾讯接口完全失败时调用。使用 hfq（后复权）参数以匹配主数据源语义。
+
+        Args:
+            symbol: 股票代码，如 sh600006 或 sz000001（必须带市场前缀）
+            start: 起始日期 YYYYMMDD
+            end: 结束日期 YYYYMMDD
+
+        Returns:
+            格式统一的 DataFrame，与 _build_qq_df 输出结构一致；失败时返回 None。
+        """
+        try:
+            import akshare as ak
+
+            # 确保 symbol 带市场前缀
+            sym = self._ensure_market_prefix(symbol)
+            logger.info(f"  备用接口请求 {sym}: {start} ~ {end} (hfq)")
+
+            df = ak.stock_zh_a_daily(
+                symbol=sym,
+                start_date=start,
+                end_date=end,
+                adjust="hfq",
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"  备用接口 {sym} 返回空数据")
+                return None
+
+            return self._build_sina_df(sym, start, end, df)
+
+        except json.JSONDecodeError:
+            # "No value to decode" → 新浪确认无数据（股票可能已 ST/退市）
+            logger.info(f"  备用接口确认 {symbol} 无数据（JSONDecodeError，可能已ST/退市），不再重试")
+            return pd.DataFrame()
+        except Exception as e:
+            logger.warning(f"  备用接口 {symbol} 获取失败: {type(e).__name__}: {e}")
+            return None
+
+    @staticmethod
+    def _ensure_market_prefix(symbol: str) -> str:
+        """确保股票代码带 sh/sz 前缀。
+
+        ak.stock_zh_a_daily 需要带前缀的 symbol（如 sh600001）。
+        """
+        if symbol.lower().startswith(("sh", "sz", "bj")):
+            return symbol.lower()
+        # 无前缀时根据代码推断：6 开头为沪市，0/3 开头为深市
+        code = symbol[:2]
+        if code.startswith("6"):
+            return f"sh{symbol}"
+        elif code.startswith(("0", "3")):
+            return f"sz{symbol}"
+        return symbol
+
+    @staticmethod
+    def _resolve_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        """从候选列名中找到第一个存在的列（大小写不敏感）。
+
+        akshare 不同版本返回的列名可能为英文或中文。
+        """
+        df_cols_lower = {col.lower(): col for col in df.columns}
+        for col in candidates:
+            if col.lower() in df_cols_lower:
+                return df_cols_lower[col.lower()]
+        return None
+
+    @staticmethod
+    def _compact_date(d_str: str) -> str | None:
+        """将日期字符串统一归一化为 YYYYMMDD 紧凑格式，失败返回 None。"""
+        s = str(d_str).strip()
+        if len(s) >= 10 and s[4] == "-":
+            key = s[:10].replace("-", "")
+        else:
+            key = s.replace("-", "").replace("/", "")
+        if len(key) == 8 and key.isdigit():
+            return key
+        return None
+
+    def _build_sina_df(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        raw_df: pd.DataFrame,
+    ) -> pd.DataFrame | None:
+        """将 ak.stock_zh_a_daily 返回的 DataFrame 转换为统一格式。
+
+        ak.stock_zh_a_daily(adjust='hfq') 返回的是后复权价格：
+          open/close/high/low 已经是后复权价；
+          volume 单位=股；amount 单位=元。
+
+        需要同时输出原始价和复权价：
+          - open/close/high/low = 原始价（原始价 = 复权价 / adj_factor）
+          - open_normal/close_normal/high_normal/low_normal = 后复权价（即 API 返回值）
+          - adj_factor = 后复权收盘价 / 原始收盘价
+
+        注意：ak.stock_zh_a_daily 不直接返回 adj_factor，
+        可通过 hfq 接口获取 adj_factor 列来精确计算原始价。
+        此处先用 hfq-factor 重拉一次获取因子；若因子接口不可用则降级。
+        """
+        try:
+            import akshare as ak
+
+            # 确保 symbol 带前缀
+            sym = self._ensure_market_prefix(symbol)
+
+            # 尝试获取后复权因子（用于精确还原原始价）
+            factor_map: dict[str, float] | None = None
+            try:
+                factor_df = ak.stock_zh_a_daily(
+                    symbol=sym,
+                    start_date=start,
+                    end_date=end,
+                    adjust="hfq",
+                )
+
+                # 再拉一次不复权数据来反算因子
+                raw_df = ak.stock_zh_a_daily(
+                    symbol=sym,
+                    start_date=start,
+                    end_date=end,
+                    adjust="",
+                )
+
+                # 兼容 akshare 不同版本的列名
+                date_col = self._resolve_column(factor_df, ["date", "日期"]) if factor_df is not None and not factor_df.empty else None
+                close_hfq_col = self._resolve_column(factor_df, ["close", "收盘"]) if factor_df is not None and not factor_df.empty else None
+                close_raw_col = self._resolve_column(raw_df, ["close", "收盘"]) if raw_df is not None and not raw_df.empty else None
+
+                if (factor_df is not None and not factor_df.empty and raw_df is not None
+                        and not raw_df.empty and date_col and close_hfq_col and close_raw_col):
+                    # 构建因子映射：adj_factor = close_hfq / close_raw
+                    factor_map = {}
+                    raw_by_date = {}
+                    for _, row in raw_df.iterrows():
+                        d_str = str(row[date_col])
+                        key = self._compact_date(d_str)
+                        if key:
+                            raw_by_date[key] = float(row[close_raw_col]) if row[close_raw_col] else 0
+
+                    for _, row in factor_df.iterrows():
+                        d_str = str(row[date_col])
+                        key = self._compact_date(d_str)
+                        if key and key in raw_by_date:
+                            raw_close = raw_by_date[key]
+                            hfq_close = float(row[close_hfq_col]) if row[close_hfq_col] else 0
+                            if raw_close > 0:
+                                factor_map[key] = hfq_close / raw_close
+            except Exception as e:
+                # 因子获取失败不阻断流程，降级到简化路径
+                logger.warning(f"  备用接口 {symbol} 因子获取失败({type(e).__name__})，降级为简化模式")
+
+            if factor_map:
+                return self._build_sina_df_with_factor(symbol, start, end, raw_df, factor_map)
+
+            # 降级：无因子数据时，假设所有复权价 = 原始价 × 1.0（即无除权）
+            logger.warning(f"  备用接口 {symbol} 无复权因子，降级为原始价≈复权价写入")
+            return self._build_sina_df_simple(symbol, start, end, raw_df)
+
+        except Exception as e:
+            logger.warning(f"  备用接口构建DataFrame失败 {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    def _build_sina_df_with_factor(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        hfq_df: pd.DataFrame,
+        factor_map: dict[str, float],
+    ) -> pd.DataFrame | None:
+        """用后复权行情 + 复权因子精确重建 DataFrame。
+
+        原始价 = 后复权价 / adj_factor；后复权价 = API 返回的 hfq 价格。
+        """
+        # 解析列名（兼容中英文）
+        date_col = self._resolve_column(hfq_df, ["date", "日期"])
+        if date_col is None:
+            logger.warning(f"  备用接口 {symbol} 无法找到日期列: {hfq_df.columns.tolist()}")
+            return None
+
+        col_open = self._resolve_column(hfq_df, ["open", "开盘"])
+        col_close = self._resolve_column(hfq_df, ["close", "收盘"])
+        col_high = self._resolve_column(hfq_df, ["high", "最高"])
+        col_low = self._resolve_column(hfq_df, ["low", "最低"])
+        col_volume = self._resolve_column(hfq_df, ["volume", "成交量"])
+        col_amount = self._resolve_column(hfq_df, ["amount", "成交额"])
+
+        hfq_df = hfq_df.copy()
+        hfq_df[date_col] = hfq_df[date_col].astype(str)
+
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
+        }
+        skipped = 0
+
+        for _, row in hfq_df.iterrows():
+            d_str = str(row[date_col])
+            d_compact = self._compact_date(d_str)
+            d_iso = d_str[:10] if len(d_str) >= 10 and d_str[4] == "-" else None
+
+            if d_compact is None or d_iso is None:
+                skipped += 1
+                continue
+
+            if not (start <= d_compact <= end):
+                continue
+
+            factor = factor_map.get(d_compact)
+            if factor is None or not (math.isfinite(factor) and factor > 0):
+                skipped += 1
+                continue
+
+            # 从 hfq DataFrame 取后复权价格
+            close_hfq = self._safe_num(row.get(col_close) if col_close else None)
+            if close_hfq is None or close_hfq <= 0:
+                skipped += 1
+                continue
+
+            open_hfq = self._safe_num(row.get(col_open) if col_open else None, default=close_hfq)
+            high_hfq = self._safe_num(row.get(col_high) if col_high else None, default=close_hfq)
+            low_hfq = self._safe_num(row.get(col_low) if col_low else None, default=close_hfq)
+
+            # 原始价 = 后复权价 / adj_factor
+            open_raw = open_hfq / factor
+            close_raw = close_hfq / factor
+            high_raw = high_hfq / factor
+            low_raw = low_hfq / factor
+
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d_iso)
+            out["open"].append(open_raw)
+            out["close"].append(close_raw)
+            out["high"].append(high_raw)
+            out["low"].append(low_raw)
+            out["open_normal"].append(open_hfq)
+            out["close_normal"].append(close_hfq)
+            out["high_normal"].append(high_hfq)
+            out["low_normal"].append(low_hfq)
+
+            vol = self._safe_num(row.get(col_volume) if col_volume else None)
+            if vol is None or vol < 0:
+                vol = 0.0
+            out["volume"].append(int(vol))
+
+            amt = self._safe_num(row.get(col_amount) if col_amount else None)
+            out["amount"].append(amt if amt is not None else 0.0)
+            out["adj_factor"].append(factor)
+
+        if skipped:
+            logger.warning(f"  备用接口 {symbol} 跳过 {skipped} 行(因子缺失或格式异常)")
+
+        if not out["symbol"]:
+            return None
+
+        return pd.DataFrame(out)
+
+    def _build_sina_df_simple(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        hfq_df: pd.DataFrame,
+    ) -> pd.DataFrame | None:
+        """无因子时的简化版：假设原始价 ≈ 后复权价，adj_factor = 1.0。"""
+        date_col = self._resolve_column(hfq_df, ["date", "日期"])
+        if date_col is None:
+            logger.warning(f"  备用接口 {symbol} 无法找到日期列: {hfq_df.columns.tolist()}")
+            return None
+
+        col_open = self._resolve_column(hfq_df, ["open", "开盘"])
+        col_close = self._resolve_column(hfq_df, ["close", "收盘"])
+        col_high = self._resolve_column(hfq_df, ["high", "最高"])
+        col_low = self._resolve_column(hfq_df, ["low", "最低"])
+        col_volume = self._resolve_column(hfq_df, ["volume", "成交量"])
+        col_amount = self._resolve_column(hfq_df, ["amount", "成交额"])
+
+        hfq_df = hfq_df.copy()
+        hfq_df[date_col] = hfq_df[date_col].astype(str)
+
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
+        }
+
+        for _, row in hfq_df.iterrows():
+            d_str = str(row[date_col])
+            d_compact = self._compact_date(d_str)
+            d_iso = d_str[:10] if len(d_str) >= 10 and d_str[4] == "-" else None
+
+            if d_compact is None or d_iso is None:
+                continue
+            if not (start <= d_compact <= end):
+                continue
+
+            close_val = self._safe_num(row.get(col_close) if col_close else None)
+            if close_val is None or close_val <= 0:
+                continue
+
+            open_val = self._safe_num(row.get(col_open) if col_open else None, default=close_val)
+            high_val = self._safe_num(row.get(col_high) if col_high else None, default=close_val)
+            low_val = self._safe_num(row.get(col_low) if col_low else None, default=close_val)
+
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d_iso)
+            out["open"].append(open_val)
+            out["close"].append(close_val)
+            out["high"].append(high_val)
+            out["low"].append(low_val)
+            out["open_normal"].append(open_val)
+            out["close_normal"].append(close_val)
+            out["high_normal"].append(high_val)
+            out["low_normal"].append(low_val)
+
+            vol = self._safe_num(row.get(col_volume) if col_volume else None)
+            out["volume"].append(int(vol) if vol is not None else 0)
+
+            amt = self._safe_num(row.get(col_amount) if col_amount else None)
+            out["amount"].append(amt if amt is not None else 0.0)
+            out["adj_factor"].append(1.0)
+
+        if not out["symbol"]:
+            return None
+
+        return pd.DataFrame(out)
 
     def _fetch_ah_factor_map(self, symbol: str, start: str, end: str) -> dict[str, float] | None:
         """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。

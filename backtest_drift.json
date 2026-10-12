@@ -148,5 +148,17 @@
         "drift_pct": 60.0
       }
     ]
+  },
+  {
+    "type": "drift",
+    "time": "2026-10-12T00:22:54.575342",
+    "drifts": [
+      {
+        "param": "atr_stop_mult",
+        "old": 2.5,
+        "new": 4.0,
+        "drift_pct": 60.0
+      }
+    ]
   }
 ]
