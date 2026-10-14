@@ -156,23 +156,23 @@ class ValidationReport:
             logger.info(f"\n发现 {len(errors)} 个错误（将自动修复）：")
             for i, iss in enumerate(errors, 1):
                 if iss.field:
-                    print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
                     if iss.actual_value is not None:
-                        print(f"       当前值: {iss.actual_value}")
+                        logger.info(f"       当前值: {iss.actual_value}")
                 else:
-                    print(f"  [{i}] [{iss.section}]: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}]: {iss.message}")
 
         if warnings:
             logger.info(f"\n发现 {len(warnings)} 个警告（不影响运行，建议修正）：")
             for i, iss in enumerate(warnings, 1):
                 if iss.field:
-                    print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
                 else:
-                    print(f"  [{i}] [{iss.section}]: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}]: {iss.message}")
                 if iss.actual_value is not None:
-                    print(f"       当前值: {iss.actual_value}")
+                    logger.info(f"       当前值: {iss.actual_value}")
                 if iss.expected:
-                    print(f"       推荐: {iss.expected}")
+                    logger.info(f"       推荐: {iss.expected}")
 
         logger.info("")
 
@@ -715,7 +715,7 @@ def auto_repair(config_path: str = "config.ini") -> int:
 
     logger.info(f"已备份原文件至 {bak_path}")
     for op in ops:
-        print(f"  + {op}")
+        logger.info(f"  + {op}")
     logger.info(f"共修复 {len(ops)} 项\n")
     return len(ops)
 

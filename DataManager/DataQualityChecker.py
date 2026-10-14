@@ -150,7 +150,7 @@ class DataQualityChecker:
             logger.warning(f"[数据质量] 评分异常: 全部相同 ({detail})")
         else:
             logger.info(f"[数据质量] {detail}")
-        return n
+        return not all_same
 
     # AUDIT_FIX Step 12: 复权口径校验
     def check_kline_adj_schema(self, df: pd.DataFrame, trade_date: str) -> bool:
