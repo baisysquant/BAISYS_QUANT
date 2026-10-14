@@ -160,5 +160,24 @@
         "drift_pct": 60.0
       }
     ]
+  },
+  {
+    "type": "failure",
+    "error": "only 0-dimensional arrays can be converted to Python scalars",
+    "time": "2026-10-13T06:48:20.055862",
+    "snapshot_id": "a263603c501abc36",
+    "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "drift",
+    "time": "2026-10-14T10:41:50.207899",
+    "drifts": [
+      {
+        "param": "atr_stop_mult",
+        "old": 2.5,
+        "new": 3.5,
+        "drift_pct": 40.0
+      }
+    ]
   }
 ]

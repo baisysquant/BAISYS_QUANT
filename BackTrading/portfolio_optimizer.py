@@ -27,17 +27,16 @@ import pandas as pd
 from loguru import logger
 
 # ── CVXPY 求解器（DCP 凸优化，自动选择最优求解器） ──
-# Windows 下 cvxpy DLL 加载可能直接崩溃进程（非 ImportError），用子进程隔离检测
+# AUDIT_FIX P2-10: 优化检测策略——先用 importlib.util.find_spec 快速检查存在性，
+# 仅在存在时尝试导入。Windows DLL 崩溃风险用 try-except 隔离，不再每次 fork 子进程。
 def _check_cvxpy() -> bool:
-    """在子进程中检测 cvxpy 可用性，避免 DLL 崩溃影响主进程"""
-    import subprocess
-    import sys
+    """检测 cvxpy 可用性。优先 find_spec（无 DLL 加载），存在时尝试导入。"""
+    import importlib.util
+    if not importlib.util.find_spec("cvxpy"):
+        return False
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", "import cvxpy; print('OK')"],
-            capture_output=True, text=True, timeout=10,
-        )
-        return result.returncode == 0 and "OK" in result.stdout
+        import cvxpy  # noqa: F401 — 仅测试导入
+        return True
     except Exception:
         return False
 
@@ -47,9 +46,9 @@ cp = None
 if HAVE_CVXPY:
     try:
         import cvxpy as cp
-    except Exception:  # 子进程检测通过但主进程加载失败
+    except Exception:  # find_spec 通过但导入失败（如 DLL 问题）
         logger.warning(
-            "[PortfolioOptimizer] cvxpy 主进程导入失败，将回退至 scipy SLSQP。"
+            "[PortfolioOptimizer] cvxpy find_spec 通过但主进程导入失败，将回退至 scipy SLSQP。"
         )
         HAVE_CVXPY = False
         cp = None

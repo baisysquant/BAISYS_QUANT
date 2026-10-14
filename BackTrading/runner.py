@@ -10,19 +10,27 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-# ── 日志落盘：按日期轮转，保留 7 天 ──
+# AUDIT_FIX P2-11: 日志配置从模块级移至 _configure_logging()，避免 import 即修改全局 logger。
+# 旧行为：import runner 即 logger.remove() 清除所有 handler → 其他模块日志配置被覆盖。
+# 新行为：仅在 main() 或显式调用 _configure_logging() 时配置。
+
 import os as _os
-_os.makedirs("logs", exist_ok=True)
-logger.remove()  # 清除默认 console sink
-logger.add(
-    "logs/backtest_{time:YYYY-MM-DD}.log",
-    rotation="00:00",
-    retention="7 days",
-    level="INFO",
-    encoding="utf-8",
-    enqueue=True,
-)
-logger.add(sys.stderr, level="WARNING")  # 控制台保留警告以上
+
+def _configure_logging() -> None:
+    """配置回测日志（按日期轮转，保留 7 天）。仅在入口函数中调用。"""
+    _os.makedirs("logs", exist_ok=True)
+    # 仅移除 loguru 默认的 console sink，避免重复输出；其他模块的 sink 保留。
+    logger.remove()
+    logger.add(
+        "logs/backtest_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="7 days",
+        level="INFO",
+        encoding="utf-8",
+        enqueue=True,
+    )
+    logger.add(sys.stderr, level="WARNING")
+
 from scipy.stats import spearmanr
 from sqlalchemy import text
 
@@ -1198,6 +1206,23 @@ def run_backtest_pipeline(
             )
             logger.warning("=" * 50)
 
+        # ── 回测完整性自检（AUDIT_FIX P0-4 替代方案） ──
+        try:
+            from BackTrading.backtest_integrity import BacktestIntegrityChecker
+            checker = BacktestIntegrityChecker()
+            integrity_report = checker.check_all(
+                trade_log=trade_log,
+                equity_curve=equity_curve,
+                engine_cfg=ecfg,
+            )
+            if not integrity_report.passed:
+                logger.warning(
+                    f"[回测完整性] 未通过检查: {'; '.join(integrity_report.failures)}。"
+                    f"建议查看 trade_log 确认 T+1 合规性和前视偏差。"
+                )
+        except Exception as _e:
+            logger.warning(f"回测完整性检查异常（非致命）: {_e}")
+
         # ── 多策略组合回测 ──
         _enable_ms = getattr(bt, "MULTI_STRATEGY_ENABLED", False)
         if _enable_ms:
@@ -1778,30 +1803,50 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
     如果提取失败（数据不足、Sharpe 全为 NaN/负值、params 列缺失等），
     返回配置中的默认参数中位数作为兜底，并记录警告。
     """
-    # 默认兜底参数（从配置区间取中位数）
+    # 兜底参数（三层优先级，合并而非替代）：
+    # 1) 先算出 config 区间中位数（或硬编码默认值）作为完整参数底
+    # 2) 如果 calibration_result.json 存在，用校准参数覆盖同名键
+    # 3) 这样即使校准文件只有部分参数，其余参数也有合理值
     def _fallback_params(cfg: Config | None) -> dict[str, float]:
+        # ── 底层参数：config 区间中位数 或 硬编码默认值 ──
         if cfg is None:
-            return {
+            # 硬编码默认值（隐患 2 修复：buy_threshold 12→45 对齐搜索范围 30~60 中位数）
+            _base: dict[str, float] = {
                 "atr_stop_mult": 2.5,
                 "boll_narrow_ratio": 0.9,
                 "cross_decay_days": 37,
                 "conclusion_full_bull": 80,
                 "golden_cross_bonus": 10,
                 "divergence_penalty": 20,
-                "buy_threshold": 12,
-                "max_holdings": 5,
+                "buy_threshold": 45,
+                "max_holdings": 8,
             }
-        bt = cfg.app_config.backtest
-        return {
-            "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
-            "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
-            "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
-            "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
-            "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
-            "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
-            "buy_threshold": bt.BUY_THRESHOLD,
-            "max_holdings": bt.MAX_HOLDINGS,
-        }
+        else:
+            bt = cfg.app_config.backtest
+            _base = {
+                "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
+                "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
+                "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
+                "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
+                "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
+                "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
+                "buy_threshold": bt.BUY_THRESHOLD,
+                "max_holdings": bt.MAX_HOLDINGS,
+            }
+
+        # ── 覆盖层：上次成功校准参数（只覆盖同名键，不破坏完整参数集） ──
+        try:
+            from BackTrading.calibration import load_calibration as _load_cal
+            _cal = _load_cal()
+            if _cal is not None and _cal.params:
+                _overridden = {k: v for k, v in _cal.params.items() if k in _base}
+                if _overridden:
+                    _base.update(_overridden)
+                    logger.info(f"[兜底参数] 合并 calibration_result.json 校准参数覆盖: {_overridden}")
+        except Exception:
+            pass
+
+        return _base
 
     if wf_result.empty or "params" not in wf_result.columns:
         logger.warning("Walk-Forward 结果为空或缺少 params 列，使用配置中位数作为兜底参数")
@@ -1923,6 +1968,7 @@ def main() -> None:
         python -m BackTrading.runner --force     # 强制重新回测
         python -m BackTrading.runner --schedule  # 启动常驻调度器
     """
+    _configure_logging()  # AUDIT_FIX P2-11: 延迟配置，避免 import 副作用
     args = sys.argv[1:]
     config = Config()
 

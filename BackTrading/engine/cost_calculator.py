@@ -6,6 +6,11 @@
   - 买入成本计算（佣金、印花税、过户费、经手费、证管费、滑点、冲击）
   - 卖出成本计算（含印花税分段 + 最低佣金守卫）
   - 成本累计器（回退聚合）
+
+AUDIT_FIX P0-3 状态标记：
+  CostCalculator 和 CostAccum 为重构目标（消除 core.py 中的 _cost_accum dict），
+  当前 core.py 使用 _cost_accum dict 作为成本累计唯一来源。
+  集成时需废弃 _cost_accum 并统一使用 CostCalculator.accumulator。
 """
 
 from __future__ import annotations

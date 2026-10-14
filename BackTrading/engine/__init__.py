@@ -140,12 +140,13 @@ class EngineConfig:
     point_in_time: bool = True
     atr_stop_mult: float = 2.5
     take_profit_pct: float = 15.0
-    trail_profit_ratio: float = 50.0
-    kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费
-    position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费
+    trail_profit_ratio: float = 10.0  # 移动止盈回撤阈值：从最高点回撤 10% 触发止盈；AUDIT_FIX P0-1 修复双重除法（50.0→10.0，代码中仅除 100 一次）
+    # kelly_fraction / position_a / risk_none_multiplier — DEAD KEY，引擎未消费；保留向后兼容但标记废弃
+    kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
+    position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
     boll_narrow_ratio: float = 0.8
     cross_decay_days: int = 30
-    risk_none_multiplier: float = 1.0  # [DEAD KEY] 未在任何代码路径中被消费
+    risk_none_multiplier: float = 1.0  # [DEAD KEY] 未在任何代码路径中被消费；建议移除
     max_holdings: int = 0  # 0=不限制
     buy_threshold: int = 15  # 买入评分阈值
     min_commission_per_trade: float = 5.0  # A股每笔最低佣金 5 元
@@ -184,6 +185,9 @@ class EngineConfig:
     # 当日成交量 × min(触板档比例, auction_fill_ratio)。假设文档化：
     # 成交价=开盘价（集合竞价价），开盘后向限价收敛的盘中成交不单独建模。
     auction_fill_ratio: float = 0.12
+    # AUDIT_FIX P3-16: 退市整理期可成交量比例（远低于正常日，买方稀缺+恐慌抛售）
+    # 强平单逐日重挂至成交，不会导致持仓滞留；此比例控制非强平场景的成交速度。
+    delisting_fill_ratio: float = 0.01
     # 替代固定比例常量（技术债：固定比例缺经验依据）。分钟/tick/盘口数据
     # 不在数据源内，经验分位是可行的统计替代：
     #   fixed            = 旧行为（固定比例常量）
@@ -191,7 +195,9 @@ class EngineConfig:
     #   empirical_p10    = 经验 10% 分位（worst-case 保守口径，暴露流动性枯竭）
     # 单元格样本不足 limit_calib_min_samples → 回退 fixed 档；校准表全样本静态
     # 统计（静态参数选择，应用时不带前视——竞价可成交量 = 前日量 × 校准分位）。
-    limit_ratio_mode: str = "fixed"
+    # AUDIT_FIX P2-12: 默认启用 empirical_median（数据驱动替代固定比例），
+    # 校准失败自动回退 fixed 档，无 crash 风险。
+    limit_ratio_mode: str = "empirical_median"
     limit_calib_min_samples: int = 20
     resume_gap_up: float = 0.05  # 复牌高开≥该比例（相对停牌前收盘）→ 开盘兑现卖出 + 当日禁买
     resume_gap_down: float = 0.05  # 复牌低开≤-该比例 → 日志标记（风控卖出照常）

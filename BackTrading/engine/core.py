@@ -37,8 +37,9 @@ EquityCurve: TypeAlias = list[dict[str, Any]]
 # 20 日均量（行业口径：不含当日的滚动均值，避免用当日成交量前视）
 _ADV_WINDOW = 20
 # 当日量开盘时不可知（前视）；前日无数据时（停牌复牌/新股首日）
-# 使用 500手×100 = 50,000 股作为保守成交代理。
-_DEFAULT_VOLUME_FALLBACK: float = 50_000.0
+# AUDIT_FIX P2-9: 使用更保守的回退策略——按个股最近 AMOUNT_MA20 的 10% 估算成交额，
+# 再除当前价格估算股数；若完全无数据则返回 0 强制拒绝涨跌停日成交。
+_DEFAULT_VOLUME_FALLBACK: float = 0.0  # 无历史成交量时返回 0，由调用方决定保守处理
 
 
 # 固定滑点强制下限（1.8 交易摩擦合规：A股隐性成本不低于单边 0.05%，
@@ -534,6 +535,9 @@ def _run_single_backtest(
     _seal_decay = float(getattr(engine_cfg, "limit_seal_decay", 0.5))
     # 集合竞价可成交量 = 当日成交量 × min(触板档比例, auction_fill_ratio)
     _auction_ratio = float(getattr(engine_cfg, "auction_fill_ratio", 0.12))
+    # AUDIT_FIX P3-16: 退市整理期可成交量比例（远低于正常日，买方稀缺+恐慌抛售）
+    _delist_fill_ratio = float(getattr(engine_cfg, "delisting_fill_ratio", 0.01))
+    # 退市整理期股票集合的闭包引用（_delist_period_syms_by_day）
     # ── 经验填充模型（技术债修复）：limit_ratio_mode=empirical_median/p10 时，
     # 用历史日线 V_t/V_prev 分位数替代固定比例常量（limit_calibration.py）。
     # 校准表全样本静态统计（等价静态参数选择，应用无前视）；构建失败告警回退 fixed。
@@ -630,6 +634,9 @@ def _run_single_backtest(
         )
     # 成本拆解累计（佣金/印花税/过户费/经手费/证管费/滑点/冲击 + 买卖成交额），
     # 回测结束输出 [成本拆解] 报告（各项占总成本百分比）
+    # AUDIT_FIX P0-3: 声明为回测成本累计唯一来源。
+    # CostCalculator.accumulator (engine/cost_calculator.py) 为重构目标，当前路径未使用；
+    # 未来集成时需废弃本 dict 并统一入口，避免双重记账。
     _cost_accum: dict[str, float] = {
         "commission": 0.0, "stamp": 0.0, "transfer": 0.0,
         "handling": 0.0, "csrc": 0.0, "slippage": 0.0, "impact": 0.0,
@@ -663,7 +670,7 @@ def _run_single_backtest(
 
     _atr_stop = engine_cfg.atr_stop_mult
     _take_profit_pct = float(getattr(engine_cfg, "take_profit_pct", 15.0)) / 100.0
-    _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 50.0)) / 100.0
+    _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 10.0)) / 100.0
     _max_order_pct_default = engine_cfg.max_order_pct
     _max_order_pct_high = engine_cfg.max_order_pct_high
     _max_order_pct_low = engine_cfg.max_order_pct_low
@@ -933,13 +940,8 @@ def _run_single_backtest(
                     "cost": _round_half_up(cst),
                     # 1.9 流动性拟真字段：实际成交数量（A股最小交易单位整数倍）
                     "qty": int(sell_shares),
-                    # 1.7 执行滞后自检字段：close 模型下为成交日真实收盘（=price）；
-                    # next_open/vwap 下为信号日复权收盘价锚点（成交锚点在 exec_open）
-                    "close_adj": (
-                        float(s_close[j])
-                        if _exec_model == "close"
-                        else _exec_anchor
-                    ),
+                    # 1.7 执行滞后自检字段：next_open/vwap 下为信号日复权收盘价锚点
+                    "close_adj": _exec_anchor,
                     # #5 审计修复：碎股状态标记（持仓不足一手）
                     "has_fractional": bool(0 < pos_shares[si] < lot),
                     # 0.1 成交参考价（成交日开盘/VWAP/收盘）——成交时序自检锚点
@@ -1015,6 +1017,11 @@ def _run_single_backtest(
                 return _round_half_up(v)
             return v
         if _exec_model == "vwap":
+            # AUDIT_FIX P1-5: VWAP 前视偏差标注。
+            # VWAP=amount/volume 使用全天成交分布，而 VWAP 在收盘后才确定。
+            # 实盘中无法保证按全天 VWAP 成交（除非 TWAP 执行且假设 VWAP≈TWAP）。
+            # 当前实现：VWAP 仅用于"评估"路径（非回测主路径），main 路径统一用 next_open。
+            # 若用 VWAP 做回测，结果不可直接实盘化——需增加随机扰动模拟执行偏差。
             _c = float(close_local[j])  # 真实收盘
             if "open" in day_data_ld.columns:
                 _o = float(day_data_ld["open"].values[j])
@@ -1095,7 +1102,7 @@ def _run_single_backtest(
         _u_buy, _u_sell = 0.0, 0.0  # 当日未成交金额（stats_sink worst-case 用）
         sym_row = {s: j for j, s in enumerate(syms_str_ld)}
 
-        def _auction_fill_for(sym: str, j: int, side: str = "sell") -> float:
+        def _auction_fill_for(sym: str, j: int, side: str = "sell", force: bool = False) -> float:
             """开盘触板日集合竞价可成交量比例（PIT：仅用 9:25 已知 open/限价）。
 
             P1-2 修复：一字板场景拆分买卖方向成交率——
@@ -1105,7 +1112,17 @@ def _run_single_backtest(
             fixed 档：min(auction_fill_ratio_for, auction_fill_ratio)（原行为）；
             经验档（limit_ratio_mode=empirical_median/p10）：校准表分位数，
             单元格样本不足回退 fixed 档（limit_calibration.py）。
+            AUDIT_FIX P3-16: 退市整理期股票使用极低成交率（_delist_fill_ratio）。
             """
+            # AUDIT_FIX P3-16: 退市整理期股票 — 买方稀缺，成交率极低（强平单逐日重挂不受限）
+            _dt_str = str(dt)
+            if sym in _delist_period_syms_by_day.get(_dt_str, set()) and not force:
+                logger.info(
+                    f"[退市整理成交率] {_dt_str} {sym} 非强平单 "
+                    f"可成交量比例 {_delist_fill_ratio:.0%}（低于正常日）"
+                )
+                return _delist_fill_ratio
+
             _o = float(open_arr_ld[j]) if open_arr_ld is not None else None
             _is_seal = False
             if side == "sell" and at_limit_down_ld[j] and open_arr_ld is not None and abs(open_arr_ld[j] - close_raw_ld[j]) <= 1e-9:
@@ -1184,10 +1201,16 @@ def _run_single_backtest(
                 continue
             if _is_seal_down(jj):
                 # （恐慌抛压时仍有少量成交，卖出相对容易因提供流动性）
-                _auction_ratio_sell = _auction_fill_for(p["sym"], jj, side="sell")
+                _auction_ratio_sell = _auction_fill_for(p["sym"], jj, side="sell", force=p.get("force", False))
                 _sink_inc("seal_sell_partial", 1)
                 _pv_sell = _prev_volume.get(p["sym"], 0.0)
                 _vol_ref_sell = _pv_sell if _pv_sell > 0 else _DEFAULT_VOLUME_FALLBACK
+                # AUDIT_FIX P2-9: 无历史成交量时 ADV=0 → 可成交量=0 → 未成交
+                if _vol_ref_sell == 0:
+                    logger.info(f"[ADV_FALLBACK] {dt} {p['sym']} 无历史成交量 → 跌停卖出未成交")
+                    _sink_inc("seal_sell_rejected", 1)
+                    remaining_sells.append(p)
+                    continue
                 sell_val += _process_sell(
                     dt,
                     np.array([p["sym"]], dtype=object),
@@ -1222,7 +1245,7 @@ def _run_single_backtest(
             # 假设文档化：成交价 = 开盘价（集合竞价价）；开盘后向限价收敛的盘中成交
             # 不单独建模（对卖出保守：跌停开盘成交价=跌停价，且成交率受竞价档上限约束）
             _auction_ratio_sell = (
-                _auction_fill_for(p["sym"], jj, side="sell")
+                _auction_fill_for(p["sym"], jj, side="sell", force=p.get("force", False))
                 if (_sim_limits and _open_at_limit_down)
                 else None
             )
@@ -1307,7 +1330,7 @@ def _run_single_backtest(
                 if not (np.isfinite(px_seal) and px_seal > 0):
                     remaining_buys.append(p)
                     continue
-                _auction_ratio_buy_seal = _auction_fill_for(p["sym"], jj, side="buy")
+                _auction_ratio_buy_seal = _auction_fill_for(p["sym"], jj, side="buy", force=p.get("force", False))
                 _sink_inc("seal_buy_partial", 1)
                 _pv_seal = _prev_volume.get(p["sym"], 0.0)
                 _vol_ref_seal = _pv_seal if _pv_seal > 0 else _DEFAULT_VOLUME_FALLBACK
@@ -1407,7 +1430,7 @@ def _run_single_backtest(
             # 假设文档化：成交价 = 开盘价（集合竞价价）；开盘后向限价收敛的盘中成交
             # 不单独建模（对买入保守：涨停开盘成交价=涨停价，且成交率受竞价档上限约束）
             _auction_ratio_buy = (
-                _auction_fill_for(p["sym"], jj, side="buy")
+                _auction_fill_for(p["sym"], jj, side="buy", force=p.get("force", False))
                 if (_sim_limits and _open_at_limit_up)
                 else None
             )
@@ -1526,13 +1549,8 @@ def _run_single_backtest(
                     "value": _round_half_up(tv),
                     "cost": _round_half_up(cst),
                     "qty": int(shares),
-                    # 1.7 执行滞后自检字段：close 模型下为成交日真实收盘（=price）；
-                    # next_open/vwap 下为信号日复权收盘价锚点（成交锚点在 exec_open）
-                    "close_adj": (
-                        float(px)
-                        if _exec_model == "close"
-                        else float(p["sig_close"])
-                    ),
+                    # 1.7 执行滞后自检字段：next_open/vwap 下为信号日复权收盘价锚点
+                    "close_adj": float(p["sig_close"]),
                     "exec_open": float(px),
                     **_extra_buy,
                 }
@@ -2057,7 +2075,7 @@ def _run_single_backtest(
                 _drawdown_from_max = (_max_close_arr - close_adj) / _max_close_arr
                 exit_take_profit = (
                     (_pnl_pct >= _take_profit_pct) &
-                    (_drawdown_from_max >= _trail_profit_ratio / 100.0) &
+                    (_drawdown_from_max >= _trail_profit_ratio) &
                     adj_ok
                 )
             
@@ -2482,10 +2500,12 @@ def _run_single_backtest(
                     
                     # ── A4 风险驱动仓位控制 ──
                     # 用 ATR 止损距离反推仓位，确保单笔破位亏损 = 总资金 × risk_per_trade
+                    # AUDIT_FIX P0-2: 基数改为 total_value（总净值）而非 cash（残余现金），
+                    # 避免等权分配时先买的票仓位大、后买的票仓位小；min(cash) 上限确保不超可用资金。
                     _sig_close = float(b_close[j])
                     _atr_val = _atr_arr[j] if (_atr_arr is not None and j < len(_atr_arr)) else 0.0
                     _risk_distance = _atr_val * _atr_stop if np.isfinite(_atr_val) and _atr_val > 0 else (_sig_close * 0.05)  # ATR缺失回退5%
-                    _atr_tv = (cash * engine_cfg.risk_per_trade) / _risk_distance * _sig_close if _risk_distance > 0 else 0
+                    _atr_tv = min((total_value * engine_cfg.risk_per_trade) / _risk_distance * _sig_close, cash) if _risk_distance > 0 else 0
                     
                     # 最终头寸 = min(等权/原限额, ATR风险仓位)
                     _base_tv = min(cash * equal_weight, total_value * max_pos_pct * _market_multiplier)

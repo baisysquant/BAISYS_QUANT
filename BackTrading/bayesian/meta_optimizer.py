@@ -381,6 +381,27 @@ def bayesian_walk_forward_multi(
 
     db_engine = kwargs.get("db_engine")
 
+    # ── 窗口预检：加载上次成功校准参数（优先于空间中位数） ──
+    # 预检用"上次实际跑出过的参数"比"空间中位数"更接近真实策略表现，
+    # 避免中位数恰好落在差区导致好窗口被误杀。
+    _last_calib_params: dict[str, float] | None = None
+    try:
+        from BackTrading.calibration import load_calibration as _load_cal
+        _cal = _load_cal()
+        if _cal is not None and _cal.params:
+            _last_calib_params = _cal.params
+            logger.info(f"  窗口预检：已加载上次成功校准参数 ({len(_last_calib_params)} 个) 作为预检基准")
+    except Exception:
+        pass  # 加载失败不影响主流程，回退到空间中位数
+
+    # ── 从 config 读取预检阈值（隐患 1 修复：不再硬编码 -0.5） ──
+    _skip_threshold = -0.5
+    try:
+        _skip_threshold = float(getattr(_Config().app_config.backtest, "WFO_PRECHECK_THRESHOLD", -0.5))
+    except Exception:
+        pass
+    logger.info(f"  窗口预检阈值: IS Sharpe < {_skip_threshold} 的窗口将跳过 BO 寻优")
+
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
     _K_FOR_OOS = 10
@@ -465,36 +486,47 @@ def bayesian_walk_forward_multi(
                            f"{_to_date_str(train_dates[0])}~{_to_date_str(train_dates[-1])}")
             logger.info(f"  [{path_idx + 1}-{win_idx}] 训练数据: {len(train_data)}行, {train_data['symbol'].nunique()}只股票")
 
-            # ── 窗口质量预检：默认参数轻量回测（P4-Fix） ──
-            # 在 BO 前先用参数空间中点值快速跑一次回测。默认参数都没超额收益的窗口，
+            # ── 窗口质量预检：上次成功参数 / 空间中位数轻量回测（P4-Fix + 隐患1修复） ──
+            # 优先用上次成功校准参数做预检（更接近真实策略表现）；
+            # 无校准历史时回退到参数空间中位数。默认参数都没超额收益的窗口，
             # 后续 BO 也基本不可能找到好参数——直接跳过，节省 2~3 小时算力。
-            _skip_threshold = -0.5
+            # 校准参数可能只含部分键（如仅 atr_stop_mult），以空间中位数为底，
+            # 校准参数覆盖同名键，确保所有搜索参数都有值。
             _precheck_sharpe = None
             try:
                 from BackTrading.bayesian.cost_model import FidelityController as _FC
                 from BackTrading.bayesian.space import _get_fixed_params as _space_fixed
                 _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                _all_params = {**_space_fixed(), **_mid_params}
+                _precheck_params = {**_space_fixed(), **_mid_params}
+                if _last_calib_params:
+                    _precheck_params.update(_last_calib_params)
+                    _precheck_source = "上次成功校准参数(合并空间中位数)"
+                else:
+                    _precheck_source = "参数空间中位数"
                 _pre_ctrl = _FC(train_data, base_cfg, compute_exit_strategy=True,
                                 vectorized=True, eval_start_date=train_eval_start,
                                 st_history=st_history, exclude_st=exclude_st,
                                 data_version=data_version, listing_days=listing_days,
                                 db_engine=db_engine)
-                _pre_res = _pre_ctrl.evaluate(_all_params, fidelity=1)
+                _pre_res = _pre_ctrl.evaluate(_precheck_params, fidelity=1)
                 _precheck_sharpe = _pre_res.get("sharpe", float("-inf"))
                 if _precheck_sharpe < _skip_threshold:
                     logger.warning(
                         f"  [{path_idx + 1}-{win_idx}] 窗口质量预检未通过: "
-                        f"默认参数 IS Sharpe={_precheck_sharpe:.4f} < {_skip_threshold}，"
+                        f"{_precheck_source} IS Sharpe={_precheck_sharpe:.4f} < {_skip_threshold}，"
                         f"跳过该窗口的全部 BO 寻优"
                     )
                     continue
             except Exception as _pre_e:
-                logger.debug(f"  [{path_idx + 1}-{win_idx}] 窗口预检异常({_pre_e})，继续正常优化")
+                # 隐患 4 修复：预检异常从 debug 提升到 warning，确保运维可见
+                logger.warning(
+                    f"  [{path_idx + 1}-{win_idx}] 窗口预检异常({_pre_e})，"
+                    f"继续正常 BO 寻优（预检失败不阻塞主流程）"
+                )
             if show_progress and _precheck_sharpe is not None:
                 logger.info(
                     f"  [{path_idx + 1}-{win_idx}] 窗口预检通过: "
-                    f"默认参数 IS Sharpe={_precheck_sharpe:.4f}，开始 BO 寻优"
+                    f"{_precheck_source} IS Sharpe={_precheck_sharpe:.4f}，开始 BO 寻优"
                 )
 
             # ── 贝叶斯优化 IS ──

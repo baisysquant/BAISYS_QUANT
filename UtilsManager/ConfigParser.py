@@ -453,6 +453,9 @@ class BacktestConfig(BaseModel):
                                           description="CPCV 净化天数：训练窗口尾部剔除（前向收益标签视界）")
     BAYESIAN_CPCV_EMBARGO_DAYS: int = Field(default=3, ge=0, le=30,
                                             description="CPCV 禁运天数：训练结束与 OOS 开始之间的缓冲间隔")
+    # ── 窗口质量预检：IS Sharpe 阈值，低于此值的窗口跳过 BO 寻优 ──
+    WFO_PRECHECK_THRESHOLD: float = Field(default=-0.5, ge=-5.0, le=5.0,
+                                          description="窗口预检 IS Sharpe 阈值，低于此值跳过该窗口全部 BO 寻优")
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"

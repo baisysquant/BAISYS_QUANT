@@ -50,10 +50,9 @@ def _compute_sharpe_from_equity(
     if len(returns) < 2:
         return 0.0
 
-    # AUDIT_FIX Step 4: 短周期动态年化因子，同 backtest_metrics.py 保持一致
+    # AUDIT_FIX P1-7: 统一使用 ANN_FACTOR=244，短周期样本量不足时由调用方过滤
     n_obs = len(returns)
-    years_est = n_obs / ANN_FACTOR
-    ann_factor = 365 * n_obs / max(n_obs + 30, 1) if years_est < 0.5 else ANN_FACTOR
+    ann_factor = ANN_FACTOR
     mu = returns.mean() * ann_factor
     excess_mu = mu - risk_free_rate
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
@@ -82,9 +81,18 @@ def probabilistic_sharpe_ratio(
     skew: float = 0.0,
     kurt: float = 3.0,
     target_sr: float = 0.0,
+    returns: np.ndarray | None = None,  # AUDIT_FIX P2-14: 可选收益序列，自动计算 skew/kurt
 ) -> float:
     if n_obs <= 1:
         return 0.5
+
+    # AUDIT_FIX P2-14: A股收益分布具负偏尖峰厚尾，从实际序列计算 skew/kurt 替代正态假设
+    if returns is not None and len(returns) >= 30:
+        _s, _ = stats.skew(returns, nan_policy='omit')
+        _k, _ = stats.kurtosis(returns, fisher=False, nan_policy='omit')  # Fisher=False 返回 excess+3
+        if np.isfinite(_s) and np.isfinite(_k):
+            skew = float(_s)
+            kurt = float(_k)
 
     sd = sharpe / math.sqrt(ANN_FACTOR)
     td = target_sr / math.sqrt(ANN_FACTOR)
