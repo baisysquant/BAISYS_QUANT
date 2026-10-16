@@ -107,6 +107,36 @@ def get_last_run(engine: Any) -> dict[str, Any] | None:
     return result
 
 
+def get_last_successful_run(engine: Any) -> dict[str, Any] | None:
+    """获取最近一次 status=success 的回测记录（含 params）。
+
+    用于审计类消费方（漂移检测、成本审计等）在 calibration_result.json
+    为空壳（门控拦截导致 save_calibration 未执行）时，仍能从数据库获取
+    上次回测参数进行比对。
+
+    与 get_last_run 的区别：仅返回 status='success' 的记录，排除 failed
+    等异常状态。注意：数据库记录不区分是否通过采纳门控，调用方需自行
+    判断是否用于生产写入（本函数仅供审计/监控类场景使用）。
+    """
+    sql = text(f"""
+        SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
+               initial_cash, params, sharpe, total_return, max_drawdown, status,
+               config_hash, data_version, git_commit, pbo, dsr, num_trials
+        FROM {TABLE}
+        WHERE status = 'success'
+        ORDER BY run_time DESC
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql).mappings().fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if isinstance(result.get("params"), str):
+        result["params"] = json.loads(result["params"])
+    return result
+
+
 def should_rerun(
     last_run: dict[str, Any] | None,
     frequency: str,

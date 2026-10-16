@@ -1,12 +1,50 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# 运行时注入键：不可序列化，序列化前必须剥离
+_RUNTIME_KEYS = frozenset({"_db_engine", "_st_history", "_listing_days"})
+
+
+def _json_safe(obj: Any) -> Any:
+    """递归将任意对象转为 JSON 可序列化的原生 Python 类型。
+
+    - numpy 标量 → Python float/int
+    - dict/list/tuple → 递归处理
+    - 其他不可序列化对象（Engine、模块等）→ str() 兜底
+    """
+    import numbers
+    # numpy 标量
+    if hasattr(obj, "item") and callable(obj.item):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    # numpy 数组
+    if hasattr(obj, "tolist") and callable(obj.tolist):
+        try:
+            return _json_safe(obj.tolist())
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    if isinstance(obj, numbers.Number):
+        return float(obj)
+    # 兜底：不可序列化对象转字符串
+    return str(obj)
 
 
 def _project_root() -> Path:
@@ -85,6 +123,9 @@ class CalibrationResult:
     pbo: float = 0.0
     dsr: float = 0.0
     num_trials: int = 0
+    # ── 门控状态（区分合格参数与未达标但强制写入的参数）──
+    gate_passed: bool = True
+    gate_reasons: list[str] = field(default_factory=list)
     # ── 成本模型快照（方案C：回测验证假设的持久化记录）──
     cost_model_snapshot: dict[str, Any] = field(default_factory=dict)
 
@@ -170,9 +211,19 @@ def run_bayesian_walk_forward(
 
 
 def save_calibration(result: CalibrationResult) -> None:
+    # 剥离运行时注入的不可序列化对象（Engine / ST 历史等），避免 asdict deepcopy 崩溃
+    safe_params = {k: v for k, v in result.params.items() if k not in _RUNTIME_KEYS}
+    _orig_params = result.params
+    result.params = safe_params
+    try:
+        raw = asdict(result)
+    finally:
+        result.params = _orig_params
+    # 递归清洗 numpy 标量等非 JSON 原生类型
+    safe_data = _json_safe(raw)
     tmp_path = CALIBRATION_FILE.with_name(CALIBRATION_FILE.name + ".tmp")
     tmp_path.write_text(
-        json.dumps(asdict(result), ensure_ascii=False, indent=2),
+        json.dumps(safe_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     os.replace(tmp_path, CALIBRATION_FILE)
@@ -202,12 +253,12 @@ def audit_cost_model_vs_calibration() -> list[str]:
 
     cal = load_calibration()
     if cal is None:
-        warnings_list.append("[成本审计] calibration_result.json 不存在，跳过比对")
+        logger.info("[成本审计] calibration_result.json 不存在（首次运行或从未通过门控），跳过成本比对")
         return warnings_list
 
     snapshot = cal.cost_model_snapshot
     if not snapshot:
-        warnings_list.append("[成本审计] calibration_result.json 中无 cost_model_snapshot，跳过比对")
+        logger.info("[成本审计] 无通过门控的校准快照（门控正常拦截，非异常），跳过成本比对")
         return warnings_list
 
     # 获取当前 CostModel 默认值用于比对
@@ -275,6 +326,14 @@ def apply_calibration_to_config(config: object) -> None:
     overrides = result.params.copy()
     if not overrides:
         return
+
+    # 门控状态告警：未通过门控的参数仍会应用，但提示用户关注过拟合风险
+    if not result.gate_passed:
+        logger.warning(
+            f"[参数应用] 当前 calibration_result.json 中的参数未通过采纳门控"
+            f"（gate_passed=false，原因: {'；'.join(result.gate_reasons) or '未知'}），"
+            f"参数仍将应用到生产配置，请人工复核过拟合风险"
+        )
 
     rd = cfg.app_config.regime_detection
     sc = cfg.app_config.scoring_params
@@ -347,6 +406,11 @@ def write_calibration_to_ini(params: dict) -> dict | None:
     """
     if not params:
         logger.info("无校准参数，跳过写入")
+        return None
+    # 过滤运行时注入键，防止 Engine/ST历史等对象被 str() 后写入 config.ini
+    params = {k: v for k, v in params.items() if k not in _RUNTIME_KEYS}
+    if not params:
+        logger.info("过滤运行时键后无校准参数，跳过写入")
         return None
     # 31.5/17.5/11.5 等非整值；旧实现在此 fail-fast 抛 ValueError 后被调用方
     # except 吞掉，导致 config.ini 实际未写但日志谎报"已写入"。现在仅对

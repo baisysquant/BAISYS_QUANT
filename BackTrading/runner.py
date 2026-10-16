@@ -265,9 +265,9 @@ def _acceptance_gate(
 ) -> tuple[bool, list[str]]:
     """P0-5：统一参数采纳门控（save_calibration 与 write_calibration_to_ini 共用）。
 
-    修复门控不一致：write_calibration_to_ini 曾未应用 PBO/DSR 门控（save_calibration
-    有），PBO 过拟合参数集仍可落盘进生产 config.ini。两处采纳决策必须走同一
-    门控——任一关键项不通过，calibration_result.json 与 config.ini 均不写入。
+    门控结果用于标记参数质量并输出告警。门控不通过时，参数仍会写入
+    calibration_result.json（gate_passed=false）和 config.ini，但会输出
+    WARNING 告警提示过拟合风险，供人工复核。
 
     Returns:
         (是否全部通过, 未通过原因列表)。
@@ -1109,7 +1109,7 @@ def run_backtest_pipeline(
 
         if not _oos_decay_pass:
             logger.warning("=" * 50)
-            logger.warning("[OOS衰减校验] 未通过 —— 参数组不予写入 config.ini，结果已废弃")
+            logger.warning("[OOS衰减校验] 未通过 —— 参数组将标记 gate_passed=false 并输出告警，参数仍会写入")
             logger.warning("=" * 50)
 
         # ── 序列化当前成本模型快照（方案C：持久化回测验证假设）──
@@ -1196,12 +1196,19 @@ def run_backtest_pipeline(
             pbo_gate=_pbo_gate,
             dsr_gate=_dsr_gate,
         )
+        # 标记门控状态到校准结果，供下游消费方区分合格/未达标参数
+        cal_result.gate_passed = _gate_pass
+        cal_result.gate_reasons = _gate_reasons
+
+        # 始终写入 calibration_result.json（门控不通过时也写入，但标记 gate_passed=false）
+        save_calibration(cal_result)
         if _gate_pass:
-            save_calibration(cal_result)
+            logger.info("[采纳门控] 参数组通过统一采纳门控，calibration_result.json 已保存")
         else:
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] 参数组未通过统一采纳门控，calibration_result.json 不予保存: "
+                "[采纳门控] 参数组未通过统一采纳门控，calibration_result.json 已保存"
+                "（gate_passed=false，请关注过拟合风险）: "
                 + "；".join(_gate_reasons)
             )
             logger.warning("=" * 50)
@@ -1258,31 +1265,31 @@ def run_backtest_pipeline(
         except Exception as e:
             logger.warning(f"  涨跌停压力测试异常: {e}")
 
+        # ── VAEO：波动率自适应退出参数学习（始终执行） ──
+        try:
+            from BackTrading.replay_optimizer import optimize_vol_exits
+            learned_t1, learned_t2 = optimize_vol_exits(
+                trade_log, final_prepared,
+                sl_mult=best_params.get("atr_stop_mult", 1.5)
+            )
+            best_params["learned_t1_mult"] = round(learned_t1, 2)
+            best_params["learned_t2_mult"] = round(learned_t2, 2)
+            logger.info(f"[VAEO] 学习完成: T1={learned_t1:.2f}, T2={learned_t2:.2f}，将写入配置闭环")
+        except Exception as e:
+            logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
+
+        # 始终写入 config.ini 并应用到内存配置（门控不通过时也写入，但输出告警）
+        write_calibration_to_ini(best_params)
+        apply_calibration_to_config(config)
         if _gate_pass:
-            # ── VAEO：波动率自适应退出参数学习 ──
-            try:
-                from BackTrading.replay_optimizer import optimize_vol_exits
-                learned_t1, learned_t2 = optimize_vol_exits(
-                    trade_log, final_prepared, 
-                    sl_mult=best_params.get("atr_stop_mult", 1.5)
-                )
-                best_params["learned_t1_mult"] = round(learned_t1, 2)
-                best_params["learned_t2_mult"] = round(learned_t2, 2)
-                logger.info(f"[VAEO] 学习完成: T1={learned_t1:.2f}, T2={learned_t2:.2f}，将写入配置闭环")
-            except Exception as e:
-                logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
-                
-            write_calibration_to_ini(best_params)
-            apply_calibration_to_config(config)
-            logger.info("模拟验证通过，参数已写入 config.ini 并生效")
+            logger.info("参数已写入 config.ini 并生效（门控通过）")
         else:
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] config.ini 参数保持不变（结果可作回测报告参考，已记录数据库）: "
+                "[采纳门控] 参数已写入 config.ini 并生效（门控未通过 — 存在过拟合风险，请人工复核）: "
                 + "；".join(_gate_reasons)
             )
             logger.warning("=" * 50)
-            # 仍将结果写入数据库用于历史追踪
 
         # 防止不可序列化类型进入 json.dumps。_pyval 兜底已能处理，但源头清理更优。
         _runtime_keys = {"_db_engine", "_st_history", "_listing_days"}
@@ -1311,7 +1318,7 @@ def run_backtest_pipeline(
         if _gate_pass:
             logger.info(f"  寻优结果已采纳并写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]")
         else:
-            logger.info("  寻优结果未通过统一采纳门控，calibration_result.json / config.ini 未写入")
+            logger.info(f"  寻优结果未通过门控但已写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]（gate_passed=false，请人工复核）")
         alert.on_success(cal_result)
         return cal_result
 

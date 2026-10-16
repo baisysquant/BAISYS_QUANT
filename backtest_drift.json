@@ -179,5 +179,12 @@
         "drift_pct": 40.0
       }
     ]
+  },
+  {
+    "type": "failure",
+    "error": "cannot pickle 'module' object",
+    "time": "2026-10-16T14:45:23.578912",
+    "snapshot_id": "e1c33a64e4cf306d",
+    "error_code": "PIPELINE_FAILED"
   }
 ]
