@@ -386,12 +386,13 @@ def check_market_cycle_coverage(
     report.details.append(f"回测跨度: {span_years:.1f} 年（{len(dates)} 个交易日）")
 
     # ── 2. 构建大盘代理（等权平均日收益率） ──
+    # 使用复权价计算收益率，避免除权日机械跳降污染回报序列
     price_col = "close"
-    if "close" in kline_df.columns:
+    if "close_normal" in kline_df.columns:
+        price_col = "close_normal"
+        market_df = kline_df.groupby("trade_date")["close_normal"].mean().to_frame()
+    elif "close" in kline_df.columns:
         market_df = kline_df.groupby("trade_date")["close"].mean().to_frame()
-    elif "close_adj" in kline_df.columns:
-        price_col = "close_adj"
-        market_df = kline_df.groupby("trade_date")["close_adj"].mean().to_frame()
     else:
         # fallback: 取含 price 的列
         price_col = next((c for c in kline_df.columns if "close" in c.lower() or "price" in c.lower()), None)

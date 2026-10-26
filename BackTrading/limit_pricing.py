@@ -100,6 +100,42 @@ def _round_half_up_vec(x: np.ndarray) -> np.ndarray:
     return np.floor(y + 0.5) / 100.0
 
 
+def exright_reference_price(
+    prev_close_raw: float,
+    adj_factor_today: float,
+    adj_factor_yesterday: float,
+) -> float:
+    """计算交易所"除权除息参考价"用作涨跌停基准。
+
+    涨跌停价以交易所除权除息参考价为基准，而非原始前收盘。
+    除权日若直接用原始前收计算涨跌停价，偏差 = 每股分红 / 前收，
+    一字板判定随之失真（close ≥ limit_up 误判 / 漏判）。
+
+    原理：adj_factor 为不复权→后复权的累积乘数，
+    adj_factor_today / adj_factor_yesterday = 1（普通日）
+    adj_factor_today / adj_factor_yesterday < 1（除权日：比值 = 除权系数）
+
+    ref_price = prev_close_raw × (adj_factor_today / adj_factor_yesterday)
+
+    等价于交易所公式：(前收 − 每股现金红利) / (1 + 送转比例)
+
+    Args:
+        prev_close_raw: 前收盘价（不复权原始价）
+        adj_factor_today: 当日 adj_factor（后复权因子）
+        adj_factor_yesterday: 前日 adj_factor
+
+    Returns:
+        涨跌停基准参考价；无法计算时退化为 prev_close_raw。
+    """
+    if (np.isfinite(adj_factor_today) and np.isfinite(adj_factor_yesterday)
+            and adj_factor_yesterday > 0 and adj_factor_today > 0):
+        ratio = adj_factor_today / adj_factor_yesterday
+        # 除权系数应在合理范围内（防止脏数据导致极端偏差）
+        if 0.1 < ratio < 5.0:
+            return prev_close_raw * ratio
+    return prev_close_raw
+
+
 def calc_limit_prices(
     prev_close: float,
     ratio_up: float,
@@ -111,9 +147,18 @@ def calc_limit_prices(
     P0-11 审计修复：以交易所 ROUND_HALF_UP（四舍五入）替代 Python round 的
     银行家舍入（round-half-even）——第三位小数恰为 5 时 round 会舍向偶数，
     与交易所规则系统性偏差 0.01 元，影响封板/一字板/可成交量判定。
+
+    P2.1 修复：中间计算使用 Decimal 精确十进制算术，避免高价位股票（如茅台 1800+）
+    浮点乘法误差导致 10.505 → 10.50499999... → 低位舍入偏差。
     """
-    up = _round_half_up_scalar(prev_close * (1 + ratio_up))
-    down = _round_half_up_scalar(prev_close * (1 - ratio_down))
+    # Decimal 精确计算替代 float 乘法
+    pc_d = Decimal(str(prev_close))
+    up = float((pc_d * (1 + Decimal(str(ratio_up)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    ))
+    down = float((pc_d * (1 - Decimal(str(ratio_down)))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    ))
     return up, down
 
 
@@ -128,9 +173,9 @@ def calc_limit_prices_batch(
     不再使用 np.round（银行家舍入）。
 
     Args:
-        prev_close: 前收盘价数组 (n,)
-        ratio_up: 涨停比例数组 (n,)
-        ratio_down: 跌停比例数组 (n,)
+        prev_close: 前收盘价数组（n,）。除权日应为"除权除息参考价"。
+        ratio_up: 涨停比例数组（n,）
+        ratio_down: 跌停比例数组（n,）
 
     Returns:
         (limit_up, limit_down) 各 (n,)
@@ -171,6 +216,7 @@ def limit_prices_for(
     symbol: str,
     *,
     is_st: bool = False,
+    is_delisting: bool = False,
     listing_days: Optional[int] = None,
     trade_date: Optional[str] = None,
 ) -> LimitPriceInfo:
@@ -181,29 +227,37 @@ def limit_prices_for(
         symbol: 股票代码（sh600000 / 600000.SH / 600000）— 保留参数兼容签名，
                  系统仅覆盖沪深主板，不再按代码分派板块规则。
         is_st: 当日是否为 ST/*ST（涨跌幅 5%）。
+        is_delisting: 当日是否处于退市整理期（涨跌幅 10%，独立于 ST 规则）。
         listing_days: 上市第 N 个交易日（1=首日）；None 视为已上市多日（无豁免）。
         trade_date: "YYYY-MM-DD"，主板注册制前后规则切换用。
 
     Returns:
         LimitPriceInfo：exempt=True 时 limit_up/down 用 ±100% 近似无限制。
     """
-    # P1 审计修复：非主板代码进入时发出 warning，防止 silently 使用错误涨跌幅
+    # 使用精确前缀集合替代 startswith，避免 8/4 单字符前缀误匹配其他代码段。
+    _MAIN_BOARD_PREFIXES = {"600", "601", "603", "605", "000", "001", "002", "003"}
+    _GEM_PREFIXES = {"300", "301"}
+    _STAR_PREFIXES = {"688"}
+    _BSE_PREFIXES = {"83", "87", "43", "89"}
+
     _digits = _CODE_RE.search(symbol)
     if _digits is not None:
         _code = _digits.group(1)
-        if _code.startswith("300"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为创业板（300），应使用 ±20% 规则而非主板 ±10%。"
+        _prefix = _code[:3]
+
+        if _prefix in _GEM_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为创业板（{_prefix}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
-        elif _code.startswith("688"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为科创板（688），应使用 ±20% 规则而非主板 ±10%。"
+        elif _prefix in _STAR_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为科创板（{_prefix}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
-        elif _code.startswith("8") or _code.startswith("4"):
-            logger.warning(
-                f"[涨跌停] {symbol} 为北交所（{ _code[0] }xxx），应使用 ±30% 规则而非主板 ±10%。"
+        elif _code[:2] in _BSE_PREFIXES:
+            raise ValueError(
+                f"[涨跌停] {symbol} 为北交所（{_code[:2]}），不适用主板涨跌停规则。"
                 f"请确认 stock_basic_info 过滤正确或关闭 main_board_only。"
             )
 
@@ -212,7 +266,17 @@ def limit_prices_for(
         exempt = listing_days <= listing_exempt_days(trade_date)
 
     if exempt:
-        ratio_up = ratio_down = 1.0
+        # 原实现 ratio=1.0 导致所有价位均触发涨跌停守卫，误杀正常买入/卖出。
+        return LimitPriceInfo(
+            ratio_up=float("inf"),
+            ratio_down=float("inf"),
+            limit_up=float("inf"),
+            limit_down=float("-inf"),
+            exempt=True,
+            is_st=False,
+        )
+    elif is_delisting:
+        ratio_up = ratio_down = MAIN_BOARD_LIMIT_RATIO
     elif (
         listing_days == 1
         and (trade_date is None or str(trade_date)[:10] < MAIN_BOARD_REFORM_DATE)
@@ -244,22 +308,27 @@ def fill_ratio_for(
     board_streak: int = 1,
     *,
     seal_ratio: float = 0.05,
-    tradable_ratio: float = 0.30,
+    tradable_up_ratio: float = 0.30,
+    tradable_down_ratio: float = 0.30,
+    tradable_ratio: float = 0.30,  # [deprecated] 保留兼容，默认与 up 一致
     intraday_ratio: float = 0.10,
     seal_decay: float = 0.5,
 ) -> float:
     """可成交量比例（撮合层消费）——三档触板口径。
+
+    注意：此函数依赖当日 close/high/low（未来信息），P2 审计已将其从引擎
+    核心路径移除。保留仅供校准参考 / 离线分析使用。
 
     触板判定（日线近似，无需分钟数据）：
         - 涨停方向：high >= limit_up 或 open >= limit_up（一字/高开触及涨停价）
         - 跌停方向：low <= limit_down 或 open <= limit_down
     三档口径（按触板方式区分，全天量 × 比例 = 可成交量）：
         1. 一字板（开=收=限价）：seal_ratio（默认 5%）—— 全天封死，流动性最差
-        2. 开盘触板后炸板（open≥限价 但 close<限价）：tradable_ratio（默认 30%）
-           —— 开盘即封板、随后打开，早盘限价附近有大量挂单，30% 合理
+        2. 开盘触板后炸板（open≥限价 但 close<限价）：
+           涨停方向用 tradable_up_ratio（默认 30%），跌停方向用 tradable_down_ratio
+           —— 开盘即封板、随后打开，早盘限价附近有大量挂单
         3. 盘中冲板（open<限价, high≥限价）：intraday_ratio（默认 10%）
-           —— 盘中才触板，全天大部分成交量不在限价附近，30%×全天量严重高估，
-              用更低比例折算
+           —— 盘中才触板，全天大部分成交量不在限价附近
     - 非触板日：1.0（不限制）
     - 连续板数 n 板 → 比例 × seal_decay^(n-1)
     """
@@ -276,7 +345,7 @@ def fill_ratio_for(
             r = seal_ratio
         elif open_price is not None and open_price >= limit_up - _LIMIT_EPS:
             # 开盘涨停后炸板：open≥limit 但 close<limit
-            r = tradable_ratio
+            r = tradable_up_ratio
         else:
             # 盘中冲板：open<limit, high≥limit
             r = intraday_ratio
@@ -295,10 +364,53 @@ def fill_ratio_for(
             r = seal_ratio
         elif open_price is not None and open_price <= limit_down + _LIMIT_EPS:
             # 开盘跌停后炸板：open≤limit 但 close>limit
-            r = tradable_ratio
+            r = tradable_down_ratio
         else:
             # 盘中触跌停：open>limit, low≤limit
             r = intraday_ratio
         return r * (seal_decay ** max(0, board_streak - 1))
 
+    return 1.0
+
+
+def auction_fill_ratio_for(
+    open_price: Optional[float],
+    limit_up: float,
+    limit_down: float,
+    *,
+    side: str = "sell",
+    tradable_up_ratio: float = 0.30,
+    tradable_down_ratio: float = 0.30,
+    board_streak: int = 1,
+    seal_decay: float = 0.5,
+) -> float:
+    """开盘集合竞价时点（9:25）的可成交量比例 — P1-2 前视修复 + P0.4 方向区分。
+
+    P0.4 修复：涨停开盘买卖方向成交率区分——
+        - 涨停开盘时买方排队深，买入成交极难（~5%）
+        - 涨停开盘时卖方提供流动性，卖出相对容易（~60%）
+        - 跌停开盘反之，卖出极难（~5%），买方相对容易接盘（~60%）
+    side="buy" 时买入方向取保守比，"sell" 时取宽松比。
+    """
+    touched_up = open_price is not None and open_price >= limit_up - _LIMIT_EPS
+    touched_down = open_price is not None and open_price <= limit_down + _LIMIT_EPS
+
+    decay = seal_decay ** max(0, board_streak - 1)
+
+    if touched_up:
+        if side == "buy":
+            # 涨停开盘买入极难——买方排队深，仅少量成交
+            _ratio = 0.05
+        else:
+            # 涨停开盘卖出相对容易——卖方向市场提供流动性
+            _ratio = tradable_up_ratio
+        return _ratio * decay
+    if touched_down:
+        if side == "sell":
+            # 跌停开盘卖出极难——卖方恐慌抛压
+            _ratio = 0.05
+        else:
+            # 跌停开盘买入相对容易——逆势抄底有流动性
+            _ratio = tradable_down_ratio
+        return _ratio * decay
     return 1.0

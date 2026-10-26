@@ -28,7 +28,6 @@ from DataManager.ColumnNames import ColumnNames
 from UtilsManager.CodeNormalizer import CodeNormalizer
 from loguru import logger
 
-# P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
@@ -160,7 +159,7 @@ def scan_all_symbols() -> list[dict]:
                 SELECT trade_date, symbol, open, close, high, low, volume
                 FROM stock_daily_kline
                 WHERE symbol = :symbol
-                ORDER BY trade_date
+                ORDER BY trade_date asc
                 """)
                 df = pd.read_sql(sql, conn, params={"symbol": symbol}, parse_dates=["trade_date"])
                 df.set_index("trade_date", inplace=True)

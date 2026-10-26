@@ -23,6 +23,10 @@ import pandas as pd
 from loguru import logger
 
 from BackTrading import output_store as _os
+from BackTrading.vectorized_signal import (
+    compute_param_independent_features as _p0_features,
+    _p0_feature_constants as _p0_constants,
+)
 
 _IN_MEMORY: dict[str, pd.DataFrame] = {}
 _PEAKS: dict[str, np.ndarray] = {}
@@ -52,19 +56,32 @@ def _reset_memory_caches() -> None:
 
 
 def _data_fingerprint(df: pd.DataFrame) -> str:
-    """快速指纹：只依赖原始 OHLCV，不依赖参数。"""
-    key_cols = ["close", "high", "low", "open", "volume"]
-    present = [c for c in key_cols if c in df.columns]
-    if not present:
+    """P1-2 修复：内容级强哈希（全列采样 sha256），替代首/中/尾3行+sum弱指纹。
+
+    弱指纹问题：复权改写/因子修正只改中间行数据，首/中/尾3行+sum不敏感→
+    静默复用脏指标缓存，信号全错但无告警。
+
+    新方案：均匀步长采样所有 OHLCV 字节级 sha256 + 行数 + 日期范围 + adj_factor，
+    内容变化即整库失效（宁可全废，不可错用）。与 prepare._data_fingerprint 口径对齐。
+    """
+    try:
+        key_cols = ["close", "high", "low", "open", "volume"]
+        present = [c for c in key_cols if c in df.columns]
+        if not present:
+            return "unknown"
+        # 均匀采样（避免全量哈希性能问题），步长按总行数动态
+        step = max(1, len(df) // 20000)
+        sampled = df.iloc[::step][present].values.tobytes()
+        content_hash = hashlib.sha256(sampled).hexdigest()[:12]
+        # 纳入 adj_factor（复权因子变化必须使缓存失效）
+        af_part = ""
+        if "adj_factor" in df.columns:
+            af_bytes = df[["adj_factor"]].iloc[::step].values.tobytes()
+            af_part = hashlib.sha256(af_bytes).hexdigest()[:8]
+        raw = f"{len(df)}|{df.index.min() if hasattr(df.index, 'min') else 0}|{df.index.max() if hasattr(df.index, 'max') else 0}|{content_hash}|{af_part}"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    except Exception:
         return "unknown"
-    raw = "{}_{}_{}_{}_{}".format(
-        len(df),
-        df[present].iloc[0].values.tolist(),
-        df[present].iloc[-1].values.tolist(),
-        df[present].iloc[min(len(df) // 2, len(df) - 1)].values.tolist(),
-        df["close"].sum(),
-    )
-    return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
 def _cache_root() -> Path:
@@ -227,8 +244,13 @@ def _load_from_disk(symbol: str, expected_fp: str | None = None) -> bool:
         return False
     if meta.get("version") != _pipeline_version():
         return False
+    # 参数无关特征列依赖的配置常量（slope_window）变化时同样失效，
+    # 否则会静默复用旧窗口的斜率分（指标缓存 key 不含 config_hash）。
+    if meta.get("feat_const") != _p0_constants():
+        return False
     try:
         _IN_MEMORY[symbol] = pd.read_parquet(ipath)
+        _IN_MEMORY[symbol].attrs["_p0_feat_const"] = meta.get("feat_const") or {}
         _PEAKS[symbol] = np.load(ppath)
         _TROUGHS[symbol] = np.load(tpath)
         return True
@@ -242,6 +264,8 @@ def _save_to_disk(symbol: str, df: pd.DataFrame, peaks: np.ndarray, troughs: np.
         "fingerprint": _data_fingerprint(df),
         "n_rows": len(df),
         "version": _pipeline_version(),
+        # 参数无关特征列的计算常量（slope_window），加载时校验一致性
+        "feat_const": _p0_constants(),
     }
     if precheck_reasons:
         meta["precheck"] = precheck_reasons
@@ -283,6 +307,9 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
     if symbol in _IN_MEMORY:
         return "skipped"
 
+    if _load_from_disk(symbol):
+        return "cached"
+
     df_raw = pd.read_parquet(f)
     _fp = _data_fingerprint(df_raw)
     if _load_from_disk(symbol, expected_fp=_fp):
@@ -296,8 +323,6 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
         _SYMBOL_FPS[symbol] = _fp
         return "empty"
 
-    # ── 窗口预检（指标计算前）：SKIP → 跳过并写快照；NEED_FILL → 限界填充 ──
-    # Task F: 日历口径停牌统计（停牌占比超阈值 → SKIP），无统计时回退启发式
     from BackTrading.precheck import apply_precheck as _apply_precheck
     from BackTrading.prepare import _compute_indicators_snapshotted
 
@@ -315,6 +340,7 @@ def _precompute_one_symbol(f: Path, symbol: str, suspension_stats: dict[str, Any
     df_ind = _compute_indicators_snapshotted(
         df_raw, symbol=symbol, context="precompute_all_indicators"
     )
+    df_ind = _p0_features(df_ind)
 
     _IN_MEMORY[symbol] = df_ind
     _PEAKS[symbol] = np.array([], dtype=int)
@@ -350,7 +376,7 @@ def precompute_all_indicators(stock_dir: str, fingerprint: str | None = None,
     在指标计算前 SKIP（precheck 日历口径硬拒）。
     """
     global _ACTIVE_FINGERPRINT
-    if fingerprint is not None and fingerprint != _ACTIVE_FINGERPRINT:
+    if fingerprint is None or fingerprint != _ACTIVE_FINGERPRINT:
         _reset_memory_caches()
         _ACTIVE_FINGERPRINT = fingerprint
 
@@ -466,6 +492,10 @@ def precompute_all_indicators(stock_dir: str, fingerprint: str | None = None,
         _log_msg += f" 断点跳过 {report.skipped} 片"
     logger.info(_log_msg)
 
+    # Flush 预检聚合日志（避免残留）
+    from BackTrading.precheck import flush_precheck_aggregation
+    flush_precheck_aggregation()
+
 
 def get_precomputed(
     symbol: str,
@@ -480,10 +510,13 @@ def get_precomputed(
         若股票不足 60 根 K 线，返回 (空 DataFrame, [], [])。
     """
     # 1. 内存缓存（校验所属批次指纹，防止跨窗口切片污染）
-    if symbol in _IN_MEMORY and _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT:
-        return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
-    elif symbol in _IN_MEMORY and _ACTIVE_FINGERPRINT is None:
-        return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+    if symbol in _IN_MEMORY:
+        # 空结果（precheck SKIP/数据不足）无过期风险，始终返回，
+        # 无需校验指纹——避免指纹不匹配时 fallback 重新计算已跳过的股票
+        if _IN_MEMORY[symbol].empty:
+            return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
+        if _SYMBOL_FPS.get(symbol) == _ACTIVE_FINGERPRINT or _ACTIVE_FINGERPRINT is None:
+            return _IN_MEMORY[symbol], _PEAKS[symbol], _TROUGHS[symbol]
 
     # 2. 磁盘缓存（校验指纹：数据范围/内容变化时缓存失效，防止 WFO 窗口切片污染）
     if stock_dir is not None:
@@ -525,6 +558,7 @@ def get_precomputed(
     _pre_reasons = _pre_res.reasons if _pre_res.status.value != "OK" else None
 
     df_ind = _compute_indicators_snapshotted(df_raw, symbol=symbol, context="get_precomputed")
+    df_ind = _p0_features(df_ind)
 
     _IN_MEMORY[symbol] = df_ind
     _PEAKS[symbol] = np.array([], dtype=int)

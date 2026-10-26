@@ -99,7 +99,6 @@ DEFAULT_SECTION_TEMPLATES: dict[str, list[str]] = {
     "ASHAREHUB": [
         "[ASHAREHUB]",
         "api_key = (请设置 AShareHub API 密钥)",
-        "enable_chip_distribution = false",
     ],
     "MACRO_FILTER": [
         "[MACRO_FILTER]",
@@ -157,23 +156,23 @@ class ValidationReport:
             logger.info(f"\n发现 {len(errors)} 个错误（将自动修复）：")
             for i, iss in enumerate(errors, 1):
                 if iss.field:
-                    print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
                     if iss.actual_value is not None:
-                        print(f"       当前值: {iss.actual_value}")
+                        logger.info(f"       当前值: {iss.actual_value}")
                 else:
-                    print(f"  [{i}] [{iss.section}]: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}]: {iss.message}")
 
         if warnings:
             logger.info(f"\n发现 {len(warnings)} 个警告（不影响运行，建议修正）：")
             for i, iss in enumerate(warnings, 1):
                 if iss.field:
-                    print(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}] {iss.field}: {iss.message}")
                 else:
-                    print(f"  [{i}] [{iss.section}]: {iss.message}")
+                    logger.info(f"  [{i}] [{iss.section}]: {iss.message}")
                 if iss.actual_value is not None:
-                    print(f"       当前值: {iss.actual_value}")
+                    logger.info(f"       当前值: {iss.actual_value}")
                 if iss.expected:
-                    print(f"       推荐: {iss.expected}")
+                    logger.info(f"       推荐: {iss.expected}")
 
         logger.info("")
 
@@ -322,9 +321,17 @@ SECTION_RULES: list[SectionRule] = [
     SectionRule(name="USER_FOCUS_STOCKS", description="用户关注股池配置", optional=True, fields=[
         FieldRule("user_focus_stocks", "str", required=False, default=""),
     ]),
+    SectionRule(name="API", description="REST API 服务配置", optional=True, fields=[
+        FieldRule("enabled", "bool", required=False, default="0"),
+        FieldRule("host", "str", required=False, default="127.0.0.1"),
+        FieldRule("port", "int", required=False, default="8000", min_value=0, max_value=65535),
+        FieldRule("alert_webhook_url", "str", required=False, default=""),
+        FieldRule("alert_channel", "str", required=False, default="generic"),
+        FieldRule("alert_on_failure", "bool", required=False, default="1"),
+        FieldRule("alert_on_success", "bool", required=False, default="0"),
+    ]),
     SectionRule(name="ASHAREHUB", description="AShareHub筹码分布数据配置", optional=True, fields=[
         FieldRule("api_key", "str"),
-        FieldRule("enable_chip_distribution", "bool", required=False, default="false"),
         FieldRule("chip_limit", "int", required=False, default="1", min_value=1, max_value=200),
     ]),
     SectionRule(name="FULL_BULL_SCORING", description="MACD完全多头评分配置", optional=True, fields=[
@@ -364,8 +371,6 @@ SECTION_RULES: list[SectionRule] = [
     ]),
     SectionRule(name="SCORING_PARAMS", description="评分计算参数", optional=True, fields=[
         FieldRule("atr_stop_mult", "float", required=False, default="1.5", min_value=0.5, max_value=5.0),
-        FieldRule("atr_t1_mult", "float", required=False, default="2.0", min_value=0.5, max_value=5.0),
-        FieldRule("atr_t2_mult", "float", required=False, default="5.0", min_value=2.0, max_value=20.0),
         FieldRule("cross_decay_days", "int", required=False, default="30", min_value=5, max_value=120),
         FieldRule("cross_decay_min", "float", required=False, default="0.3", min_value=0.1, max_value=1.0),
         FieldRule("kline_decay_days", "int", required=False, default="10", min_value=2, max_value=60),
@@ -415,8 +420,10 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("liquidity_tier_impact_base", "str", required=False, default="0.008,0.003,0.0015,0.001"),
         FieldRule("liquidity_tier_threshold", "str", required=False, default="0.005,0.01,0.01,0.02"),
         FieldRule("liquidity_tier_cap", "str", required=False, default="0.10,0.05,0.05,0.03"),
-        FieldRule("exclude_st", "bool", required=False, default="true"),
         FieldRule("max_position_pct", "float", required=False, default="0.1", min_value=0.01, max_value=1.0),
+        FieldRule("max_order_pct", "float", required=False, default="0.30", min_value=0.01, max_value=1.0),
+        FieldRule("max_order_pct_high", "float", required=False, default="0.20", min_value=0.01, max_value=1.0),
+        FieldRule("max_order_pct_low", "float", required=False, default="0.10", min_value=0.01, max_value=1.0),
         FieldRule("portfolio_method", "str", required=False, default="score_weighted",
                    allowed_values=["score_weighted", "risk_parity", "min_variance", "mean_variance"]),
         FieldRule("point_in_time", "bool", required=False, default="true"),
@@ -426,9 +433,12 @@ SECTION_RULES: list[SectionRule] = [
         FieldRule("limit_seal_ratio", "float", required=False, default="0.05", min_value=0, max_value=1),
         FieldRule("limit_tradable_ratio", "float", required=False, default="0.30", min_value=0, max_value=1),
         FieldRule("limit_seal_decay", "float", required=False, default="0.5", min_value=0, max_value=1),
-        # P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理）
         FieldRule("auction_fill_ratio", "float", required=False, default="0.12", min_value=0, max_value=1),
-        # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
+        # 经验填充模型（技术债修复）：历史日线分位数替代固定比例常量
+        FieldRule("limit_ratio_mode", "str", required=False, default="fixed",
+                  allowed_values=["fixed", "empirical_median", "empirical_p10"]),
+        FieldRule("limit_calib_min_samples", "int", required=False, default="20", min_value=1, max_value=1000000),
+        FieldRule("limit_stress_enabled", "bool", required=False, default="true"),
         FieldRule("regime_ret20_full", "float", required=False, default="0.02", min_value=-1, max_value=1),
         FieldRule("regime_ret20_half", "float", required=False, default="-0.02", min_value=-1, max_value=1),
         FieldRule("regime_vol_pct_max", "float", required=False, default="0.8", min_value=0, max_value=1),
@@ -440,15 +450,14 @@ SECTION_RULES: list[SectionRule] = [
                    default="2023-08-28:0.0005;2000-01-01:0.001"),
     ]),
     SectionRule(name="BACKTEST_CALIBRATED", description="回测校准参数", optional=True, fields=[
-        # P0-7 ②：整数参数必须整值落盘（float "17.0" 会在加载端 int() 解析崩溃）
         FieldRule("buy_threshold", "int", required=False, default="17", min_value=1, max_value=100),
         FieldRule("max_holdings", "int", required=False, default="11", min_value=0, max_value=100),
     ]),
     SectionRule(name="MULTI_FACTOR_ALPHA", description="多因子Alpha评分配置", optional=True, fields=[
         FieldRule("enabled", "bool", required=False, default="true"),
         FieldRule("financial_quality_cache_days", "int", required=False, default="90", min_value=1, max_value=365),
-        FieldRule("financial_quality_batch_size", "int", required=False, default="500", min_value=1, max_value=5000),
-        FieldRule("financial_quality_batch_sleep", "int", required=False, default="20", min_value=0, max_value=600),
+        FieldRule("financial_quality_batch_size", "int", required=False, default="100", min_value=1, max_value=5000),
+        FieldRule("financial_quality_batch_sleep", "int", required=False, default="10", min_value=0, max_value=600),
         FieldRule("financial_quality_file_cache_days", "int", required=False, default="30", min_value=1, max_value=365),
         FieldRule("fundamentals_retry", "int", required=False, default="3", min_value=1, max_value=10),
     ]),
@@ -706,7 +715,7 @@ def auto_repair(config_path: str = "config.ini") -> int:
 
     logger.info(f"已备份原文件至 {bak_path}")
     for op in ops:
-        print(f"  + {op}")
+        logger.info(f"  + {op}")
     logger.info(f"共修复 {len(ops)} 项\n")
     return len(ops)
 

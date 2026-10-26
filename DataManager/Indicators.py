@@ -2,8 +2,18 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 from DataManager.ColumnNames import ColumnNames
+
+
+# 新增长周期（如 MA200/MA250）时在此追加并同步更新 MAX_ROLLING_WINDOW。
+DEFAULT_MA_PERIODS = [5, 10, 20, 30, 60, 90, 120]
+
+# 供 prepare.py 的 MAX_INDICATOR_WINDOW 自动聚合。
+MAX_ROLLING_WINDOW = max(DEFAULT_MA_PERIODS)  # 120
+# 确保 MA120 等长周期指标有足够预热窗口，避免前 30 天指标统计无效。
+MIN_DATA_LENGTH = MAX_ROLLING_WINDOW + 20  # 140
 
 
 class TrendLevels:
@@ -31,27 +41,40 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
     df["trade_date"] = df["trade_date"].astype(str).str[:10]
     df = df.sort_values("trade_date").copy()
 
-    if len(df) < 30:
-        return _generate_empty_result("数据不足30个交易日")
+    # 30 天时 MA60/MA90/MA120 均为 NaN，趋势评分静默失效。
+    if len(df) < MIN_DATA_LENGTH:
+        return _generate_empty_result(f"数据不足 {MIN_DATA_LENGTH} 个交易日（warm-up 期不足）")
 
-    for _period in [5, 10, 20, 30, 60, 90, 120]:
+    _price_col = ColumnNames.CLOSE_NORMAL if ColumnNames.CLOSE_NORMAL in df.columns else "close"
+    if ColumnNames.CLOSE_NORMAL not in df.columns and _price_col == "close":
+        # 不复权 close 在除权日跳变导致 MA/趋势评分严重失真，不可接受。
+        logger.warning(
+            f"[P1.3] Indicators calculate_full_bull_score: 标的缺失 close_normal 列，"
+            f"不复权 close 降级将导致除权日指标跳变 → 强制阻断返回空结果"
+        )
+        return _generate_empty_result("P1.3 审计：缺失复权价格(close_normal)，拒绝使用不复权价格")
+
+    for _period in DEFAULT_MA_PERIODS:
         _col = f"MA{_period}"
         if _col not in df.columns:
-            df[_col] = df["close"].rolling(window=_period, min_periods=1).mean()
-    if "MA_Volume_5" not in df.columns:
-        df["MA_Volume_5"] = df["volume"].rolling(window=5, min_periods=1).mean()
+            df[_col] = df[_price_col].rolling(window=_period, min_periods=_period).mean()
+    if ColumnNames.MA_VOLUME_5 not in df.columns:
+        df[ColumnNames.MA_VOLUME_5] = df[ColumnNames.VOLUME_DATA].rolling(window=5, min_periods=5).mean()
 
     latest = df.iloc[-1]
-    close_price = latest["close"]
+    close_price = latest[_price_col]
 
     def _trend_skeleton_score() -> tuple[int, str]:
         ma30, ma60, ma90 = latest["MA30"], latest["MA60"], latest["MA90"]
         base_mid = (ma30 > ma60 * 0.98) and (ma60 > ma90 * 0.98)
-        slope_30 = (ma30 - df["MA30"].iloc[-6]) / df["MA30"].iloc[-6]
-        slope_60 = (ma60 - df["MA60"].iloc[-11]) / df["MA60"].iloc[-11]
+        _ma30_prev = df["MA30"].iloc[-6]
+        _ma60_prev = df["MA60"].iloc[-11]
+        slope_30 = (ma30 - _ma30_prev) / _ma30_prev if abs(_ma30_prev) > 1e-6 else 0.0
+        slope_60 = (ma60 - _ma60_prev) / _ma60_prev if abs(_ma60_prev) > 1e-6 else 0.0
         slope_benefit = 10 if (slope_30 > 0 and slope_60 > 0) else 0
         ma120 = latest["MA120"]
-        long_up = 10 if ma120 > df["MA120"].iloc[-21] else 0
+        long_up_prev = df["MA120"].iloc[-22] if len(df) >= 22 else df["MA120"].iloc[-21]
+        long_up = 10 if ma120 > long_up_prev else 0
         price_pos = 10 if close_price > latest["MA20"] else 0
         total = (20 if base_mid else 0) + slope_benefit + long_up + price_pos
         desc = f"骨架得分: {total}/40 (中期:{'是' if base_mid else '否'}, 长期:{'上行' if long_up else '横盘'}, 位置:{'上方' if price_pos else '下方'})"
@@ -86,7 +109,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
 
     def _oscillation_forgive_score() -> tuple[int, str]:
         ma5, ma10 = latest["MA5"], latest["MA10"]
-        vol, vol_ma5 = latest["volume"], latest["MA_Volume_5"]
+        vol, vol_ma5 = latest[ColumnNames.VOLUME_DATA], latest["MA_Volume_5"]
         convergence = 0
         if max(ma5, ma10) > 0:
             convergence_ratio = abs(ma5 - ma10) / max(ma5, ma10)
@@ -102,9 +125,9 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
         historical_vol_window = 120
         if len(df) < historical_vol_window:
             historical_vol_window = min(len(df), 60)
-        historical_volumes = df["volume"].iloc[-historical_vol_window:]
+        historical_volumes = df[ColumnNames.VOLUME_DATA].iloc[-historical_vol_window:]
         mean_vol = historical_volumes.mean()
-        current_vol = latest["volume"]
+        current_vol = latest[ColumnNames.VOLUME_DATA]
         vol_ratio_to_mean = current_vol / mean_vol if mean_vol > 0 else float("inf")
         liquidity_ratio_threshold = 0.2
         if vol_ratio_to_mean < liquidity_ratio_threshold:
@@ -114,7 +137,7 @@ def calculate_full_bull_score(df: pd.DataFrame, thresholds: dict[str, int] = Non
             )
         if latest["MA30"] < latest["MA60"]:
             return False, "中期骨架塌陷"
-        stock_name = str(latest.get("name", ""))
+        stock_name = str(latest.get(ColumnNames.NAME_COL, ""))
         if "ST" in stock_name or "*" in stock_name:
             return False, "ST风险"
         return True, "通过"

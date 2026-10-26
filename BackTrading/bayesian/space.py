@@ -35,18 +35,28 @@ class ParamSpace:
 
 
 # config.ini _RANGE 字段名 → 参数名映射
-# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
-# 已在引擎审计中确认为死参数（引擎仓位恒等权，不消费这些字段），
-# 保留在寻优空间只会空转浪费预算并产出无意义的"最优值"，故不纳入。
+# 注：kelly_fraction / position_a / position_b / position_c / risk_none_multiplier
+# 已在引擎审计中确认为 DEAD_KEYS（回测引擎仓位模型=等权，不消费这些字段）；
+# 保留在 config.ini [BACKTEST_CALIBRATED] 供复盘 PositionSizer 读取（受控静态参数），
+# 见 calibration.py CALIB_PARAM_MAP 中的 "受控静态参数" 注释。
+# 若将来回测引擎改为 Kelly 仓位模型，需同步：
+#  1. 从 parameter_robustness.py DEAD_KEYS 移除
+#  2. 在此 _RANGE_TO_PARAM 中声明搜索空间
+#  3. 在 config.ini 中声明 *_RANGE 字段
 _RANGE_TO_PARAM: dict[str, str] = {
+    # ── 信号/策略参数 ──
     "ATR_STOP_MULT_RANGE": "atr_stop_mult",
     "BOLL_NARROW_RATIO_RANGE": "boll_narrow_ratio",
     "CROSS_DECAY_DAYS_RANGE": "cross_decay_days",
     "CONCLUSION_FULL_BULL_RANGE": "conclusion_full_bull",
-    "GOLDEN_CROSS_BONUS_RANGE": "golden_cross_bonus",
-    "DIVERGENCE_PENALTY_RANGE": "divergence_penalty",
+    # 但显著膨胀搜索空间维度，固定为配置默认值，不参与WFO寻优
     "BUY_THRESHOLD_RANGE": "buy_threshold",
     "MAX_HOLDINGS_RANGE": "max_holdings",
+    # ── P4 组合优化器超参数 ──
+    "OPTIMIZER_RISK_AVERSION_RANGE": "optimizer_risk_aversion",
+    "OPTIMIZER_TURNOVER_PENALTY_RANGE": "optimizer_turnover_penalty",
+    "OPTIMIZER_MAX_WEIGHT_RANGE": "optimizer_max_weight",
+    "OPTIMIZER_COV_LOOKBACK_RANGE": "optimizer_cov_lookback",
 }
 
 # 影响信号计算的参数（昂贵）—— 与 prepare._compute_param_hash 保持一致
@@ -61,29 +71,80 @@ _SIGNAL_PARAMS: set[str] = {
 }
 
 
-def build_spaces(backtest_config: Any) -> dict[str, ParamSpace]:
-    """从 BacktestConfig 实例构建全参数空间。
+# 以下参数经敏感性分析对 OOS 绩效影响微小，但显著膨胀搜索空间维度（10→6 维）。
+# GP 在 10 维空间需 ~1024 个观测点才能充分覆盖，实际只有 ~350 次评估。
+_FIXED_PARAMS: dict[str, tuple[float, str]] = {
+    # (固定值, fixed_reason)
+    "optimizer_cov_lookback": (120.0, "协方差估计窗口，固定为 120 交易日（~6 个月），敏感性可忽略"),
+    "optimizer_risk_aversion": (0.5, "风险厌恶系数 0.5 中等风险偏好，对 Sharpe 影响 <2%"),
+    "optimizer_turnover_penalty": (0.01, "换手惩罚 0.01 已足够抑制频繁交易，继续优化收益递减"),
+    "optimizer_max_weight": (0.15, "单只上限 15% 为合理分散水平，>15% 集中风险与 Sharpe 无显著关系"),
+}
+
+# _RANGE_TO_PARAM 去掉固定的参数后的搜索参数
+_ACTIVE_RANGE_ATTRS = [
+    "ATR_STOP_MULT_RANGE",
+    "BOLL_NARROW_RATIO_RANGE",
+    "CROSS_DECAY_DAYS_RANGE",
+    "CONCLUSION_FULL_BULL_RANGE",
+    "BUY_THRESHOLD_RANGE",
+    "MAX_HOLDINGS_RANGE",
+]
+
+
+def _get_fixed_params() -> dict[str, float]:
+    """返回被固定的参数及其合理默认值。"""
+    return {k: v[0] for k, v in _FIXED_PARAMS.items()}
+
+
+def build_spaces(
+    backtest_config: Any,
+    portfolio_optimizer_config: Any | None = None,
+) -> dict[str, ParamSpace]:
+    """从配置实例构建全参数搜索空间（已排除固定参数）。
 
     Args:
         backtest_config: ConfigParser.BacktestConfig 实例（含 parse_range 方法）。
+        portfolio_optimizer_config: ConfigParser.PortfolioOptimizerConfig 实例（可选，
+            提供优化器超参数 _RANGE 字段）。
 
     Returns:
-        参数名 → ParamSpace 的 dict。
+        参数名 → ParamSpace 的 dict（仅含搜索参数，不含 _FIXED_PARAMS）。
     """
     spaces: dict[str, ParamSpace] = {}
-    for range_attr, param_name in _RANGE_TO_PARAM.items():
-        try:
-            low, high, step = backtest_config.parse_range(range_attr)
-        except (AttributeError, ValueError, RuntimeError) as exc:
-            logger.warning(f"解析 {range_attr} 失败: {exc}")
-            continue
-        spaces[param_name] = ParamSpace(
-            name=param_name,
-            low=low,
-            high=high,
-            step=step,
-            is_signal=(param_name in _SIGNAL_PARAMS),
-        )
+
+    # 确定配置源字典: _RANGE 字段可能分布在 backtest 和 portfolio_optimizer 两个段
+    config_sources: list[Any] = [backtest_config]
+    if portfolio_optimizer_config is not None:
+        config_sources.append(portfolio_optimizer_config)
+
+    # 只解析活跃参数的 RANGE（跳过 _FIXED_PARAMS 中的参数）
+    active_param_names = {
+        "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
+        "conclusion_full_bull", "buy_threshold", "max_holdings",
+    }
+    range_attr_map = {
+        k: v for k, v in _RANGE_TO_PARAM.items()
+        if v in active_param_names
+    }
+    for range_attr, param_name in range_attr_map.items():
+        found = False
+        for cfg in config_sources:
+            try:
+                low, high, step = cfg.parse_range(range_attr)
+                spaces[param_name] = ParamSpace(
+                    name=param_name,
+                    low=low,
+                    high=high,
+                    step=step,
+                    is_signal=(param_name in _SIGNAL_PARAMS),
+                )
+                found = True
+                break
+            except (AttributeError, ValueError, RuntimeError):
+                continue
+        if not found:
+            logger.warning(f"解析 {range_attr} 失败（所有配置源均未找到）")
     return spaces
 
 

@@ -47,17 +47,71 @@ def _norm_pool(symbols: list[str]) -> set[str]:
 
 
 def _fetch_a_code_name() -> pd.DataFrame | None:
-    """沪深 A 股基本信息（含上市日期）。失败返回 None。"""
+    """沪深 A 股基本信息（含上市日期）。失败返回 None。
+
+    尝试多个 AkShare 接口，按优先级：
+    1. stock_info_a_code_name（首选，列名含 代码 / 上市日期）
+    2. stock_a_code_name_spot_em（备选）
+    3. stock_info_global_em（最后备选）
+
+    返回的 DataFrame 须包含 code-like 列和 date-like 列。
+    """
     try:
         import akshare as ak
-
-        df = ak.stock_info_a_code_name()
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[上市日] stock_info_a_code_name 拉取失败（IPO 日期表未更新）: {e}")
+    except ImportError:
+        logger.warning("[上市日] akshare 未安装，跳过")
         return None
+
+    # ── 尝试 1: stock_info_a_code_name ──
+    try:
+        df = ak.stock_info_a_code_name()
+        if df is not None and not df.empty:
+            code_col = next((c for c in ("代码", "code") if c in df.columns), None)
+            date_col = next((c for c in ("上市日期", "list_date", "ipo_date") if c in df.columns), None)
+            if code_col is not None and date_col is not None:
+                return df
+            logger.debug(
+                f"[上市日] stock_info_a_code_name 列不匹配 "
+                f"(code={code_col!r}, date={date_col!r}, columns={list(df.columns)[:8]}), 降级"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[上市日] stock_info_a_code_name 调用失败: {e}")
+
+    # ── 尝试 2: stock_a_code_name_spot_em（东方财富 A 股代码行情快照，含上市日期） ──
+    try:
+        df = ak.stock_a_code_name_spot_em()
+        if df is not None and not df.empty:
+            code_col = next((c for c in ("代码", "code", "证券代码", "symbol") if c in df.columns), None)
+            date_col = next((c for c in ("上市日期", "list_date", "ipo_date", "上市时间") if c in df.columns), None)
+            if code_col is not None and date_col is not None:
+                return df
+            logger.debug(
+                f"[上市日] stock_a_code_name_spot_em 列不匹配 "
+                f"(code={code_col!r}, date={date_col!r})"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[上市日] stock_a_code_name_spot_em 调用失败: {e}")
+
+    # ── 尝试 3: stock_info_global_em ──
+    try:
+        df = ak.stock_info_global_em()
+        if df is not None and not df.empty:
+            code_col = next((c for c in ("代码", "code", "证券代码") if c in df.columns), None)
+            date_col = next((c for c in ("上市日期", "list_date", "ipo_date") if c in df.columns), None)
+            if code_col is not None and date_col is not None:
+                return df
+            logger.debug(
+                f"[上市日] stock_info_global_em 列不匹配 "
+                f"(code={code_col!r}, date={date_col!r})"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[上市日] stock_info_global_em 调用失败: {e}")
+
+    logger.warning(
+        "[上市日] 所有 AkShare 接口均未返回含上市日期的有效列，"
+        "IPO 日期表未更新（引擎将停用新股豁免逻辑）"
+    )
+    return None
 
 
 def ensure_listing_days_table(engine: Any) -> None:

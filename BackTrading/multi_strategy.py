@@ -52,8 +52,7 @@ def run_multi_strategy_backtest(
     # 止损价
     stop_mult = params.get("atr_stop_mult", 2.0)
     if "ATR" in prepared.columns:
-        # P0-1：止损价与引擎比较基准统一到后复权空间（指标 ATR 亦为后复权）
-        _stop_close = prepared["close_adj"] if "close_adj" in prepared.columns else prepared["close"]
+        _stop_close = prepared["close_normal"] if "close_normal" in prepared.columns else prepared["close"]
         prepared["止损价"] = _stop_close - prepared["ATR"] * stop_mult
     else:
         prepared["止损价"] = 0.0
@@ -130,7 +129,7 @@ def _allocate_strategy_capital(
             vols[name] = 0.20
             continue
         returns = pd.Series([e["portfolio_value"] for e in ec]).pct_change().dropna()
-        vols[name] = max(returns.std() * np.sqrt(252), 0.01)
+        vols[name] = max(returns.std() * np.sqrt(244), 0.01)  # A股年化交易日244
 
     inv_vol = {k: 1.0 / v for k, v in vols.items()}
     total = sum(inv_vol.values()) or 1.0

@@ -20,8 +20,6 @@ def _make_service(
     cfg_path.write_text(
         "[SYSTEM]\nHOME_DIRECTORY = ~/test_baisys\n\n"
         "[LOGGING]\nLOG_LEVEL = DEBUG\n\n"
-        "[SCORING_PARAMS]\natr_t1_mult = 3.0\natr_t2_mult = 5.0\n\n"
-        "[BACKTEST_CALIBRATED]\natr_t1_mult = 4\n\n"
         "[TRADING_COST]\ncommission_rate = 0.0\nstamp_tax_rate = 0.0\ntransfer_fee_rate = 0.0\n\n"
         f"{config_overrides}"
         "[POSITION_BACKTEST]\npool_file_path = 证券交割单.xlsx\n",
@@ -36,7 +34,7 @@ def _make_service(
     cfg = MagicMock()
     cfg.POOL_FILE_PATH = str(xlsx_path)
     cfg.config_file = str(cfg_path)
-    cfg.SCORING_PARAMS = {"atr_t1_mult": 4.0, "atr_t2_mult": 5.0}
+    cfg.SCORING_PARAMS = {}
     cfg.TRADING_COST_PARAMS = {"commission_rate": 0.0, "stamp_tax_rate": 0.0, "transfer_fee_rate": 0.0}
 
     logger = MagicMock()

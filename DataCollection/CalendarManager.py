@@ -149,15 +149,27 @@ class TradingCalendarAnalyzer:
     def get_last_trading_day(self, input_date: datetime = None) -> str:
         official_dates = self.get_official_trading_dates()
 
-        check_date = input_date or datetime.now()
-        if check_date.tzinfo is None:
-            check_date = self.beijing_tz.localize(check_date)
+        if input_date is not None:
+            check_date = input_date
+            if check_date.tzinfo is None:
+                check_date = self.beijing_tz.localize(check_date)
+            else:
+                check_date = check_date.astimezone(self.beijing_tz)
         else:
-            check_date = check_date.astimezone(self.beijing_tz)
+            # 北京时间判定（不依赖本机时区）：本机挂钟 → 本机实际 UTC 偏移 →
+            # UTC → Asia/Shanghai。旧实现把本地时间直接当北京时间，本机时区
+            # 非北京时间时会全天判错（如 UTC-7 机器，本地 06:00 = 北京 21:00）。
+            _local = datetime.now().astimezone()
+            check_date = _local.astimezone(self.beijing_tz)
 
         current_str = check_date.strftime("%Y-%m-%d")
 
-        if current_str in official_dates and check_date.hour >= 6:
+        # 当日日线行情收盘后（北京时间 15:30）才完整：15:30 前"今天"的数据
+        # 尚未产生，只应返回前一个交易日（回测/复盘共表的新鲜度基准）。
+        # 旧阈值 06:00 过早——白天任意运行都会误判"今天"，触发全市场重复下载。
+        if current_str in official_dates and (
+            check_date.hour > 15 or (check_date.hour == 15 and check_date.minute >= 30)
+        ):
             return current_str
 
         for i in range(1, 60):

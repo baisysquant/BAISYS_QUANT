@@ -94,6 +94,35 @@ def get_last_run(engine: Any) -> dict[str, Any] | None:
                initial_cash, params, sharpe, total_return, max_drawdown, status,
                config_hash, data_version, git_commit
         FROM {TABLE}
+        ORDER BY run_time DESC
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql).mappings().fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if isinstance(result.get("params"), str):
+        result["params"] = json.loads(result["params"])
+    return result
+
+
+def get_last_successful_run(engine: Any) -> dict[str, Any] | None:
+    """获取最近一次 status=success 的回测记录（含 params）。
+
+    用于审计类消费方（漂移检测、成本审计等）在 calibration_result.json
+    为空壳（门控拦截导致 save_calibration 未执行）时，仍能从数据库获取
+    上次回测参数进行比对。
+
+    与 get_last_run 的区别：仅返回 status='success' 的记录，排除 failed
+    等异常状态。注意：数据库记录不区分是否通过采纳门控，调用方需自行
+    判断是否用于生产写入（本函数仅供审计/监控类场景使用）。
+    """
+    sql = text(f"""
+        SELECT run_time, frequency, backtest_start_date, out_of_sample_days,
+               initial_cash, params, sharpe, total_return, max_drawdown, status,
+               config_hash, data_version, git_commit, pbo, dsr, num_trials
+        FROM {TABLE}
         WHERE status = 'success'
         ORDER BY run_time DESC
         LIMIT 1
@@ -144,6 +173,15 @@ def should_rerun(
         if _last_ch and _last_ch != config_hash:
             return True, f"配置哈希变化（{_last_ch} → {config_hash}），需重新回测"
 
+    # ── 上次失败保护：data/config 未变且上次失败，不再重复浪费算力 ──
+    _last_status = last_run.get("status", "success")
+    if _last_status == "failed":
+        logger.warning(
+            f"上次回测失败（于 {last_date}），数据/配置未发生变化，跳过重复执行。"
+            f"如需强制重跑请调用 run_backtest_pipeline(force=True)"
+        )
+        return False, f"上次回测于 {last_date} 失败（data/config 未变），跳过重复执行"
+
     if frequency == "initial":
         return False, f"频率=initial，上次执行于 {last_date}，不再自动重跑"
 
@@ -163,7 +201,11 @@ def should_rerun(
 
 
 def _pyval(v: Any) -> Any:
-    """numpy → 原生 Python 类型，避免 psycopg2 序列化成 np.float64(...) 导致 SQL 报错。"""
+    """numpy → 原生 Python 类型，避免 psycopg2 序列化成 np.float64(...) 导致 SQL 报错。
+
+    P2 修复：兜底逻辑改用 str() 替代 try/except json.dumps，覆盖更多不可序列化类型
+    （如 SQLAlchemy Engine、pandas DataFrame、自定义类等）。
+    """
     if isinstance(v, np.floating):
         return float(v)
     if isinstance(v, np.integer):
@@ -171,9 +213,15 @@ def _pyval(v: Any) -> Any:
     if isinstance(v, np.bool_):
         return bool(v)
     if isinstance(v, dict):
-        return {k: _pyval(v) for k, v in v.items()}
+        return {k: _pyval(val) for k, val in v.items()}
     if isinstance(v, (list, tuple)):
-        return type(v)(_pyval(x) for x in v)
+        return type(v)(_pyval(item) for item in v)
+    # FIX(P2) 兜底：json 不支持的类型 → 用 repr 而非 json.dumps 探测 + 直接 str(v) 转换
+    # 旧逻辑：try/except json.dumps(v) 在某些 C 扩展类型（如 SQLAlchemy Engine）
+    #   上可能抛出非 TypeError 异常（如 RuntimeError），导致未捕获崩溃。
+    # 新逻辑：对一切非标量/非容器直接 str(v) 降级。
+    if not isinstance(v, (str, int, float, bool, type(None))):
+        return f"<{type(v).__module__}.{type(v).__qualname__}: {str(v)[:120]}>"
     return v
 
 

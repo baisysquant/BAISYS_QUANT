@@ -208,6 +208,7 @@ class QuantDBSyncTask:
             "综合级别": "comprehensive_level",
             "风险等级": "risk_level",
             "MACD趋势分类": "macd_trend_type",
+            "MACD趋势数值分": "macd_trend_value",
             # 独立技术指标（水平多因子交叉验证）
             "KDJ_Signal": "kdj_signal",
             "CCI_Signal": "cci_signal",

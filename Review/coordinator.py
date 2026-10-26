@@ -152,8 +152,16 @@ class StockAnalysisCoordinator:
         self.quality_checker = DataQualityChecker(db_engine=db_engine)
         self.force_rerun = False
         self.start_time = time.time()
-        # P0-7 ①：申万一级行业映射缓存（None=未加载；{} = 加载失败/为空）
         self._sw_l1_map: dict[str, str] | None = None
+
+        # ── 方案C：回测成本模型审计（复盘启动时验证认知对齐）──
+        try:
+            from BackTrading.calibration import audit_cost_model_vs_calibration
+            _cost_warnings = audit_cost_model_vs_calibration()
+            for _w in _cost_warnings:
+                self.logger.warning(_w)
+        except Exception:
+            pass  # 审计失败不阻断复盘启动
 
     # ──────────────────────────────────────────────
     # Pipeline 定义
@@ -256,10 +264,37 @@ class StockAnalysisCoordinator:
             filtered_pure_codes = self.incremental_sync_engine.sync_stock_pool_and_kline(
                 target_date=self.today_str
             )
+
+            # ── 降级保护：当 sync 返回空集（如回测锁拦截），从数据库已有数据加载股票池 ──
+            if not filtered_pure_codes:
+                self.logger.warning(
+                    "同步未返回股票池，尝试从数据库已有 stock_daily_kline 加载股票池"
+                )
+                try:
+                    pool_df = self.incremental_sync_engine.get_stock_pool_from_db()
+                    if not pool_df.empty and "股票代码" in pool_df.columns:
+                        # 复用同步引擎的过滤链（ST + 主板 + 研报）
+                        pool_df = self.incremental_sync_engine.filter_st_stocks(pool_df)
+                        pool_df = self.incremental_sync_engine.filter_main_board(pool_df)
+                        codes = set(pool_df["股票代码"].unique())
+                        if codes:
+                            filtered_pure_codes = codes
+                            self.logger.info(
+                                f"[降级] 从已有数据加载股票池: {len(codes)} 只"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"降级加载股票池失败: {e}")
+
             if not filtered_pure_codes:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")
                 return False
+
+            # 业务上不能推荐 ST 标的给投资者（合规风险/5%涨跌幅限制），
+            # 不复归 config 配置项控制，从源头杜绝误配风险。
+            filtered_pure_codes = self._filter_st_stocks(filtered_pure_codes)
+
             ctx.set("filtered_pure_codes", filtered_pure_codes)
+            self.logger.info(f"[复盘ST过滤] 过滤后剩余 {len(filtered_pure_codes)} 只股票参与复盘")
 
             # 同步因子数据
             if self.config.MULTI_FACTOR_ALPHA_ENABLED:
@@ -269,6 +304,60 @@ class StockAnalysisCoordinator:
         except Exception as e:
             self.logger.error(f"同步失败: {e}")
             return False
+
+    def _filter_st_stocks(self, stock_codes: set[str]) -> set[str]:
+        """从复盘股票池中硬编码排除今日处于 ST/退市状态的股票。
+
+        合规要求：不复归 config 控制，强制过滤。
+        数据源：stock_st_history PIT 表（按 today_str 查询 is_st 或 is_delisting 为真者）。
+        """
+        from sqlalchemy import text
+
+        if not stock_codes:
+            return stock_codes
+
+        try:
+            # 带市场前缀的 symbol 列表
+            prefixed = [CodeNormalizer.add_market_prefix(c) for c in stock_codes]
+
+            with self.db_engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT DISTINCT symbol
+                    FROM stock_st_history
+                    WHERE symbol = ANY(:syms)
+                      AND trade_date = :trade_date
+                      AND (is_st = TRUE OR is_delisting = TRUE)
+                """), {
+                    "syms": prefixed,
+                    "trade_date": self.today_str,
+                }).fetchall()
+
+            st_today = {str(r[0]) for r in rows}
+            if st_today:
+                # 归一化回 6 位纯数字做差集
+                st_pure = set()
+                for s in st_today:
+                    digits = s.replace("sh", "").replace("sz", "").replace("bj", "")
+                    if len(digits) == 6:
+                        st_pure.add(digits)
+                before = len(stock_codes)
+                stock_codes = stock_codes - st_pure
+                removed = before - len(stock_codes)
+                if removed:
+                    self.logger.info(
+                        f"[复盘ST过滤] 排除 {removed} 只 ST/退市标的"
+                        f"（{before} → {len(stock_codes)} 只）"
+                    )
+            else:
+                self.logger.debug(f"[复盘ST过滤] 今日无 ST 股票需要排除")
+
+        except Exception as e:
+            # PIT 表缺失不影响复盘流程，仅告警不阻断（保守放行）
+            self.logger.warning(
+                f"[复盘ST过滤] stock_st_history 查询失败，跳过 ST 过滤（可能向投资者包含 ST 标的）: {e}"
+            )
+
+        return stock_codes
 
     def _sync_factor_fetchers(self, stock_codes: set[str]) -> None:
         """同步估值/质量因子数据采集器。"""
@@ -302,7 +391,6 @@ class StockAnalysisCoordinator:
         except Exception as e:
             self.logger.warning(f"[因子数据] 质量因子同步失败: {e}")
 
-        # P0-7 ①：申万一级行业映射表（行业一级中性化 / 宏观 tilt 依赖，独立于
         # stock_basic_info_sw 的二级语义；失败时响亮报错，不吞异常）
         try:
             from DataManager.SwIndustrySync import sync_sw_l1_industries
@@ -358,19 +446,19 @@ class StockAnalysisCoordinator:
         if hist_df_all.empty:
             self.logger.warning("[WARN] 由于历史数据为空，将跳过所有技术指标计算。")
 
-        # 从 hist_df_all 获取每只股票最新的 close_normal 作为 spot_data
+        # 从 hist_df_all 获取每只股票最新的 close（不复权原始价）作为 spot_data
         try:
-            cn = hist_df_all[hist_df_all["close_normal"].notna()]
+            cn = hist_df_all[hist_df_all["close"].notna()]
             if not cn.empty:
                 last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
                 last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
-                latest_prices_df = last_cn[["股票代码", "close_normal"]].rename(
-                    columns={"close_normal": "最新价"}
+                latest_prices_df = last_cn[["股票代码", "close"]].rename(
+                    columns={"close": "最新价"}
                 )
                 self.logger.info(f"[INFO] 从 DB 获取 {len(latest_prices_df)} 只股票的最新收盘价")
             else:
                 latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
-                self.logger.warning("[WARN] 数据库 close_normal 为空，最新价留空")
+                self.logger.warning("[WARN] 数据库 close 为空，最新价留空")
         except Exception as e:
             self.logger.warning(f"[WARN] 构建最新价失败: {e}")
             latest_prices_df = pd.DataFrame(columns=["股票代码", "最新价"])
@@ -419,12 +507,12 @@ class StockAnalysisCoordinator:
             hist = ctx.get("hist_df", pd.DataFrame())
             if not hist.empty:
                 try:
-                    cn = hist[hist["close_normal"].notna()]
+                    cn = hist[hist["close"].notna()]
                     if not cn.empty:
                         last_cn = cn.sort_values("trade_date").groupby("symbol").last().reset_index()
                         last_cn["股票代码"] = CodeNormalizer.normalize_series(last_cn["symbol"])
-                        spot_data = last_cn[["股票代码", "close_normal"]].rename(
-                            columns={"close_normal": "最新价"}
+                        spot_data = last_cn[["股票代码", "close"]].rename(
+                            columns={"close": "最新价"}
                         )
                         ctx.set("spot_data", spot_data)
                         self.logger.info(f"[spot_data] 从 hist_df 重建，{len(spot_data)} 条")
@@ -741,7 +829,6 @@ class StockAnalysisCoordinator:
 
         symbols = list(consolidated_report["股票代码"].unique())
 
-        # P0-8① PIT：质量/估值按本交易日 as-of 加载（历史复盘时 today_str 为回放日）
         quality_df = self.factor_calculator.load_quality_from_db(symbols, as_of=self.today_str)
         valuation_df = self.factor_calculator.load_valuation_from_db(symbols, trade_date=self.today_str)
 
@@ -1194,7 +1281,6 @@ class StockAnalysisCoordinatorFactory:
         calendar_mgr = TradingCalendarAnalyzer()
         today_str = calendar_mgr.get_last_trading_day()
 
-        # P0-10 ⑤：LoggerManager 已删除，改用 loguru 文件 sink（原 get_logger 语义）
         _log_path = os.path.join(config.LOG_DIR, f"Corenews_Main_{today_str}.log")
         os.makedirs(config.LOG_DIR, exist_ok=True)
         logger.add(
@@ -1220,7 +1306,6 @@ class StockAnalysisCoordinatorFactory:
                 research_report_min_count=config.RESEARCH_REPORT_MIN_COUNT,
             )
 
-            # P0-10 ⑤：GetStockBasicinfo.py 已删除（申万行业同步由
             # DataManager.SwIndustrySync 承担），此处不再调用；异常捕获面
             # 扩大到 ImportError，防止残留引用导致日频管线启动即崩。
 

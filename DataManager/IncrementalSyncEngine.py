@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
@@ -24,7 +25,7 @@ BATCH_SIZE = 300          # 每批次处理 300 只
 BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
 FETCH_WORKERS = 2         # 每管道并发取数线程数
-_STOCK_FETCH_LOCK = threading.Semaphore(2)  # Windows SSL 限制并发数，允许 2 路避免完全串行化
+_STOCK_FETCH_LOCK = threading.Semaphore(4)  # 两管道共 4 worker，各需 1 permit；原 Semaphore(2) 导致 B 管道饿死
 
 
 class IncrementalSyncEngine:
@@ -52,17 +53,47 @@ class IncrementalSyncEngine:
         os.makedirs(self._cache_dir, exist_ok=True)
         try:
             _cal = TradingCalendarAnalyzer()
-            _today_str = _cal.get_last_trading_day()
-            self._trade_date = datetime.strptime(_today_str, "%Y-%m-%d").date()
+            # 北京时间：本机挂钟 → 本机实际 UTC 偏移 → UTC → UTC+8。
+            # 本机时区非北京时间时，直接用本地时间会偏移数小时（如 UTC-7 机器）。
+            _bj_now = datetime.now().astimezone().astimezone(timezone(timedelta(hours=8)))
+            self._trade_date = self._expected_kline_date(_cal, _bj_now) or date.today()
         except Exception:
-            self._trade_date = date.today()
+            # 兜底仍严格使用北京时间,避免非北京时区机器基准日错一天
+            self._trade_date = datetime.now().astimezone().astimezone(timezone(timedelta(hours=8))).date()
         self._trade_date_str = self._trade_date.isoformat().replace("-", "")
-        # 全局共享 Session，限制并发连接数防 Windows SSL 崩溃
+        # 全局共享 Session，提升连接池匹配两管道各 2 worker（共 4 路并发）
         self._session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
         self._cleanup_old_cache()
+
+    @staticmethod
+    def _expected_kline_date(cal: Any, now_bj: datetime) -> date | None:
+        """K 线新鲜度基准日（回测/复盘共表去重下载的核心）。
+
+        now_bj 须为北京时间（aware/naive 均可，仅用 date/hour/minute）。
+        兜底逻辑：若日历在收盘前仍返回"今天"（旧版行为），回退到上一交易日；
+        当前 TradingCalendarAnalyzer 已按北京时间 15:30 收盘阈值修正，该回退
+        通常不再触发，仅作防御。
+        """
+        try:
+            last_str = cal.get_last_trading_day()
+            last = datetime.strptime(last_str, "%Y-%m-%d").date()
+            if (
+                last == now_bj.date()
+                and (now_bj.hour < 15 or (now_bj.hour == 15 and now_bj.minute < 30))
+            ):
+                dates = sorted(cal.get_official_trading_dates())
+                try:
+                    idx = dates.index(last_str)
+                except ValueError:
+                    idx = -1
+                if idx > 0:
+                    last = datetime.strptime(dates[idx - 1], "%Y-%m-%d").date()
+            return last
+        except Exception:
+            return None
 
     # ── public API ──────────────────────────────────────────────
 
@@ -108,7 +139,8 @@ class IncrementalSyncEngine:
                 return 0
 
             start_iso = force_start_iso or self._calc_start_iso(remaining)
-            end_iso = self._trade_date.isoformat()
+            _today = date.today().isoformat()
+            end_iso = min(self._trade_date.isoformat(), _today)
             logger.info(f"同步 {len(remaining)} 只, {start_iso} ~ {end_iso}" + ("（强制回填）" if force_start_iso else ""))
 
             mid = len(remaining) // 2
@@ -154,7 +186,7 @@ class IncrementalSyncEngine:
                 datetime.strptime(self._default_start, "%Y%m%d").strftime("%Y-%m-%d")
                 if self._default_start else "2000-01-01"
             )
-        return (min_latest - timedelta(days=OVERLAP_DAYS)).isoformat()
+        return (min_latest - timedelta(days=OVERLAP_DAYS + 1)).isoformat()
 
     # ── Dual Pipeline ───────────────────────────────────────────
 
@@ -179,8 +211,35 @@ class IncrementalSyncEngine:
         logger.info(f"管道{label} 完成,写入 {inserted} 行(失败 {len(all_failures)} 只)")
         return inserted, all_failures
 
-    def _batch_get_latest_date(self, symbols: list[str]) -> dict[str, date | None]:
-        """批量获取每只股票的最新日期, 一次 DB 查询."""
+    def _batch_get_overlap_history(self, symbols: list[str], start: str) -> dict[str, dict[str, tuple[float | None, float | None]]]:
+        """批量获取每只股票重叠区 [start, ∞) 的 DB 历史,一次查询。
+
+        返回 {symbol: {trade_date_iso: (close_normal, adj_factor)}}，
+        供增量判定对同一天做新旧对比（旧值=DB 已存值，新值=本次拉取值）。
+        """
+        if not symbols:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT symbol, trade_date::date AS d, close_normal, adj_factor
+                    FROM {TABLE}
+                    WHERE symbol = ANY(:symbols) AND trade_date::date >= :start
+                """),
+                {"symbols": symbols, "start": datetime.strptime(start, "%Y%m%d").date()},
+            ).fetchall()
+        out: dict[str, dict[str, tuple[float | None, float | None]]] = {}
+        for sym, d, cn, adj in rows:
+            out.setdefault(sym, {})[d.isoformat()] = (
+                float(cn) if cn is not None else None,
+                float(adj) if adj is not None else None,
+            )
+        return out
+
+    def _batch_get_last_date(self, symbols: list[str]) -> dict[str, date | None]:
+        """批量获取每股 DB 内最新交易日(全区间),一次查询,用于停牌/缺口预分类."""
+        if not symbols:
+            return {}
         with self._engine.connect() as conn:
             rows = conn.execute(
                 text(f"""
@@ -193,32 +252,14 @@ class IncrementalSyncEngine:
             ).fetchall()
         return {row[0]: row[1] for row in rows}
 
-    def _batch_get_latest_adj(self, symbols: list[str]) -> dict[str, float | None]:
-        """批量获取每只股票的最新 adj_factor,一次 DB 查询."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"""
-                    SELECT DISTINCT ON (symbol) symbol, adj_factor
-                    FROM {TABLE}
-                    WHERE symbol = ANY(:symbols) AND adj_factor IS NOT NULL
-                    ORDER BY symbol, trade_date DESC
-                """),
-                {"symbols": symbols},
-            ).fetchall()
-        return {row[0]: row[1] for row in rows}
-
-    def _batch_has_close_normal(self, symbols: list[str]) -> set[str]:
-        """批量查询哪些股票已有 close_normal,一次 DB 查询."""
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                text(f"""
-                    SELECT DISTINCT symbol
-                    FROM {TABLE}
-                    WHERE symbol = ANY(:symbols) AND close_normal IS NOT NULL
-                """),
-                {"symbols": symbols},
-            ).fetchall()
-        return {row[0] for row in rows}
+    @staticmethod
+    def _safe_num(v: Any, default: float | None = None) -> float | None:
+        """尽可能将腾讯返回字段转为有限浮点数;格式异常返回 default."""
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else default
+        except (TypeError, ValueError):
+            return default
 
     TX_URL = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
 
@@ -231,20 +272,32 @@ class IncrementalSyncEngine:
     def _do_fetch_one_stock(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
         start_year = int(start[:4])
         end_year = int(end[:4])
+        _current_year = date.today().year
+        if start_year > _current_year:
+            logger.warning(f"腾讯API {symbol} 同步起始年份 {start_year} 超过当前年份 {_current_year}，跳过")
+            return None
+        end_year = min(end_year, _current_year)
+
+        # SSL 降级标志：本股票首次遇到 SSL 失败后，后续请求降级 verify=False
+        _ssl_degraded = [False]
 
         def _tx_raw(adjust: str) -> list[list]:
             rows: list[list] = []
             for year in range(start_year, end_year + 1):
+                # 再次确认：不请求未来年份
+                if year > _current_year:
+                    continue
                 key = "hfqday" if adjust == "hfq" else "day"
                 param = f"{symbol},day,{year}-01-01,{year+1}-12-31,640,{adjust}"
                 var = f"kline_day{adjust}{year}"
-                # P2 审计修复：指数退避重试 — 所有异常统一退避，重试次数 5，per-symbol 速率限制
                 for attempt in range(5):
                     try:
+                        _verify = True if not _ssl_degraded[0] else False
                         r = self._session.get(
                             self.TX_URL,
                             params={"_var": var, "param": param, "r": "0.8205"},
                             timeout=15,
+                            verify=_verify,
                         )
                         if r.status_code == 429:
                             # 速率限制：指数退避 + 抖动
@@ -255,14 +308,33 @@ class IncrementalSyncEngine:
                             time.sleep(_backoff)
                             continue
                         r.raise_for_status()
+                        if "={" not in r.text:
+                            # 结构异常（无 JSON 载荷）：视为该年无数据，不消耗重试
+                            time.sleep(0.5)
+                            break
                         data = json.loads(r.text[r.text.find("={") + 1:])
-                        rows.extend(data["data"][symbol].get(key, []))
-                        # P2 速率限制：每只股票请求间隔 ≥ 0.5s
+                        # 按 data["data"][symbol] 取数会抛 TypeError 并烧掉 5 次指数退避重试；
+                        # 结构异常按"该年无数据"优雅跳过（继续下一年的正常年份数据）。
+                        node = data.get("data") if isinstance(data, dict) else None
+                        if not isinstance(node, dict):
+                            time.sleep(0.5)
+                            break
+                        sub = node.get(symbol)
+                        if not isinstance(sub, dict):
+                            # 该股该年无 K 线（如退市早于该年），跳过本年份
+                            time.sleep(0.5)
+                            break
+                        rows.extend(sub.get(key, []))
                         time.sleep(0.5)
                         break
                     except Exception as e:
+                        if "SSL" in type(e).__name__ and not _ssl_degraded[0]:
+                            _ssl_degraded[0] = True
+                            logger.warning(
+                                f"腾讯API {symbol} SSL 验证失败（自签名证书），降级为 verify=False 重试"
+                            )
+                            continue  # 立即重试，不消耗 attempt 计时
                         if attempt < 4:
-                            # P2 指数退避：base_delay=2s, max=30s, 加 0~1s 抖动防雷群效应
                             _backoff = min(2 ** attempt + random.uniform(0, 1), 30)
                             logger.warning(
                                 f"腾讯API {symbol} {adjust} {year} 异常: {type(e).__name__}，"
@@ -281,32 +353,375 @@ class IncrementalSyncEngine:
         if raw_rows and hfq_rows:
             return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
 
-        # 腾讯对部分股票(次新股/新上市)不提供后复权数据,响应中只有 day 无 hfqday。
-        # 优先用 asharehub 复权因子重建后复权价(raw × factor)；
-        # 因子不可用或全为 1.0(从未除权,后复权=不复权)时降级为不复权写入。
-        if raw_rows:
-            factor_map = self._fetch_ah_factor_map(symbol, start, end)
-            if factor_map:
-                non_one = [d for d, f in factor_map.items() if abs(f - 1.0) > 1e-9]
-                if non_one:
-                    logger.warning(
-                        f"腾讯API {symbol} 无后复权数据,使用 asharehub 复权因子重建({len(non_one)} 个除权因子)"
-                    )
-                    return self._build_qq_df_from_factor(symbol, start, end, raw_rows, factor_map)
-            logger.warning(
-                f"腾讯API {symbol} 无后复权数据,降级为不复权写入(adj_factor=1.0,asharehub 因子全为1或不可用)"
-            )
-            return self._build_qq_df(symbol, start, end, raw_rows, raw_rows)
+        # ── 腾讯接口未同时获取到不复权+后复权数据，1s 后重试一次 ──
+        logger.warning(f"腾讯API {symbol} 首次拉取数据不完整，1s 后重试...")
+        time.sleep(1)
+        raw_rows = _tx_raw("")
+        hfq_rows = _tx_raw("hfq")
+        if raw_rows and hfq_rows:
+            return self._build_qq_df(symbol, start, end, raw_rows, hfq_rows)
 
-        # 腾讯API 失败时直接返回 None，由批处理器标记为失败股票，下次重试
-        logger.warning(f"腾讯API {symbol} 返回空,标记为失败，将在下次同步时重试")
+        # ── 腾讯接口重试后仍无完整后复权数据，走备用接口（ak.stock_zh_a_daily） ──
+        logger.info(f"腾讯API {symbol} 无法获取完整后复权数据，切换备用接口（ak.stock_zh_a_daily）...")
+        backup_df = self._fetch_sina_backup(symbol, start, end)
+        if backup_df is None:
+            # 备用接口本身报错（网络问题等），标记为失败下次重试
+            logger.warning(f"腾讯API + 备用接口 {symbol} 均失败，标记为失败，将在下次同步时重试")
+        elif backup_df.empty:
+            # 备用接口确认无数据（JSONDecodeError: No value to decode → 股票可能已 ST/退市）
+            logger.info(f"备用接口确认 {symbol} 无数据可获取（可能已ST/退市），不再重试")
+        else:
+            logger.info(f"备用接口 {symbol} 成功获取 {len(backup_df)} 条记录")
+            return backup_df
+
         return None
 
+    def _fetch_sina_backup(self, symbol: str, start: str, end: str) -> pd.DataFrame | None:
+        """备用数据源：通过 ak.stock_zh_a_daily 获取后复权K线数据。
+
+        仅在腾讯接口完全失败时调用。使用 hfq（后复权）参数以匹配主数据源语义。
+
+        Args:
+            symbol: 股票代码，如 sh600006 或 sz000001（必须带市场前缀）
+            start: 起始日期 YYYYMMDD
+            end: 结束日期 YYYYMMDD
+
+        Returns:
+            格式统一的 DataFrame，与 _build_qq_df 输出结构一致；失败时返回 None。
+        """
+        try:
+            import akshare as ak
+
+            # 确保 symbol 带市场前缀
+            sym = self._ensure_market_prefix(symbol)
+            logger.info(f"  备用接口请求 {sym}: {start} ~ {end} (hfq)")
+
+            df = ak.stock_zh_a_daily(
+                symbol=sym,
+                start_date=start,
+                end_date=end,
+                adjust="hfq",
+            )
+
+            if df is None or df.empty:
+                logger.warning(f"  备用接口 {sym} 返回空数据")
+                return None
+
+            return self._build_sina_df(sym, start, end, df)
+
+        except json.JSONDecodeError:
+            # "No value to decode" → 新浪确认无数据（股票可能已 ST/退市）
+            logger.info(f"  备用接口确认 {symbol} 无数据（JSONDecodeError，可能已ST/退市），不再重试")
+            return pd.DataFrame()
+        except Exception as e:
+            logger.warning(f"  备用接口 {symbol} 获取失败: {type(e).__name__}: {e}")
+            return None
+
+    @staticmethod
+    def _ensure_market_prefix(symbol: str) -> str:
+        """确保股票代码带 sh/sz 前缀。
+
+        ak.stock_zh_a_daily 需要带前缀的 symbol（如 sh600001）。
+        """
+        if symbol.lower().startswith(("sh", "sz", "bj")):
+            return symbol.lower()
+        # 无前缀时根据代码推断：6 开头为沪市，0/3 开头为深市
+        code = symbol[:2]
+        if code.startswith("6"):
+            return f"sh{symbol}"
+        elif code.startswith(("0", "3")):
+            return f"sz{symbol}"
+        return symbol
+
+    @staticmethod
+    def _resolve_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+        """从候选列名中找到第一个存在的列（大小写不敏感）。
+
+        akshare 不同版本返回的列名可能为英文或中文。
+        """
+        df_cols_lower = {col.lower(): col for col in df.columns}
+        for col in candidates:
+            if col.lower() in df_cols_lower:
+                return df_cols_lower[col.lower()]
+        return None
+
+    @staticmethod
+    def _compact_date(d_str: str) -> str | None:
+        """将日期字符串统一归一化为 YYYYMMDD 紧凑格式，失败返回 None。"""
+        s = str(d_str).strip()
+        if len(s) >= 10 and s[4] == "-":
+            key = s[:10].replace("-", "")
+        else:
+            key = s.replace("-", "").replace("/", "")
+        if len(key) == 8 and key.isdigit():
+            return key
+        return None
+
+    def _build_sina_df(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        raw_df: pd.DataFrame,
+    ) -> pd.DataFrame | None:
+        """将 ak.stock_zh_a_daily 返回的 DataFrame 转换为统一格式。
+
+        ak.stock_zh_a_daily(adjust='hfq') 返回的是后复权价格：
+          open/close/high/low 已经是后复权价；
+          volume 单位=股；amount 单位=元。
+
+        需要同时输出原始价和复权价：
+          - open/close/high/low = 原始价（原始价 = 复权价 / adj_factor）
+          - open_normal/close_normal/high_normal/low_normal = 后复权价（即 API 返回值）
+          - adj_factor = 后复权收盘价 / 原始收盘价
+
+        注意：ak.stock_zh_a_daily 不直接返回 adj_factor，
+        可通过 hfq 接口获取 adj_factor 列来精确计算原始价。
+        此处先用 hfq-factor 重拉一次获取因子；若因子接口不可用则降级。
+        """
+        try:
+            import akshare as ak
+
+            # 确保 symbol 带前缀
+            sym = self._ensure_market_prefix(symbol)
+
+            # 尝试获取后复权因子（用于精确还原原始价）
+            factor_map: dict[str, float] | None = None
+            try:
+                factor_df = ak.stock_zh_a_daily(
+                    symbol=sym,
+                    start_date=start,
+                    end_date=end,
+                    adjust="hfq",
+                )
+
+                # 再拉一次不复权数据来反算因子
+                raw_df = ak.stock_zh_a_daily(
+                    symbol=sym,
+                    start_date=start,
+                    end_date=end,
+                    adjust="",
+                )
+
+                # 兼容 akshare 不同版本的列名
+                date_col = self._resolve_column(factor_df, ["date", "日期"]) if factor_df is not None and not factor_df.empty else None
+                close_hfq_col = self._resolve_column(factor_df, ["close", "收盘"]) if factor_df is not None and not factor_df.empty else None
+                close_raw_col = self._resolve_column(raw_df, ["close", "收盘"]) if raw_df is not None and not raw_df.empty else None
+
+                if (factor_df is not None and not factor_df.empty and raw_df is not None
+                        and not raw_df.empty and date_col and close_hfq_col and close_raw_col):
+                    # 构建因子映射：adj_factor = close_hfq / close_raw
+                    factor_map = {}
+                    raw_by_date = {}
+                    for _, row in raw_df.iterrows():
+                        d_str = str(row[date_col])
+                        key = self._compact_date(d_str)
+                        if key:
+                            raw_by_date[key] = float(row[close_raw_col]) if row[close_raw_col] else 0
+
+                    for _, row in factor_df.iterrows():
+                        d_str = str(row[date_col])
+                        key = self._compact_date(d_str)
+                        if key and key in raw_by_date:
+                            raw_close = raw_by_date[key]
+                            hfq_close = float(row[close_hfq_col]) if row[close_hfq_col] else 0
+                            if raw_close > 0:
+                                factor_map[key] = hfq_close / raw_close
+            except Exception as e:
+                # 因子获取失败不阻断流程，降级到简化路径
+                logger.warning(f"  备用接口 {symbol} 因子获取失败({type(e).__name__})，降级为简化模式")
+
+            if factor_map:
+                return self._build_sina_df_with_factor(symbol, start, end, raw_df, factor_map)
+
+            # 降级：无因子数据时，假设所有复权价 = 原始价 × 1.0（即无除权）
+            logger.warning(f"  备用接口 {symbol} 无复权因子，降级为原始价≈复权价写入")
+            return self._build_sina_df_simple(symbol, start, end, raw_df)
+
+        except Exception as e:
+            logger.warning(f"  备用接口构建DataFrame失败 {symbol}: {type(e).__name__}: {e}")
+            return None
+
+    def _build_sina_df_with_factor(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        hfq_df: pd.DataFrame,
+        factor_map: dict[str, float],
+    ) -> pd.DataFrame | None:
+        """用后复权行情 + 复权因子精确重建 DataFrame。
+
+        原始价 = 后复权价 / adj_factor；后复权价 = API 返回的 hfq 价格。
+        """
+        # 解析列名（兼容中英文）
+        date_col = self._resolve_column(hfq_df, ["date", "日期"])
+        if date_col is None:
+            logger.warning(f"  备用接口 {symbol} 无法找到日期列: {hfq_df.columns.tolist()}")
+            return None
+
+        col_open = self._resolve_column(hfq_df, ["open", "开盘"])
+        col_close = self._resolve_column(hfq_df, ["close", "收盘"])
+        col_high = self._resolve_column(hfq_df, ["high", "最高"])
+        col_low = self._resolve_column(hfq_df, ["low", "最低"])
+        col_volume = self._resolve_column(hfq_df, ["volume", "成交量"])
+        col_amount = self._resolve_column(hfq_df, ["amount", "成交额"])
+
+        hfq_df = hfq_df.copy()
+        hfq_df[date_col] = hfq_df[date_col].astype(str)
+
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
+        }
+        skipped = 0
+
+        for _, row in hfq_df.iterrows():
+            d_str = str(row[date_col])
+            d_compact = self._compact_date(d_str)
+            d_iso = d_str[:10] if len(d_str) >= 10 and d_str[4] == "-" else None
+
+            if d_compact is None or d_iso is None:
+                skipped += 1
+                continue
+
+            if not (start <= d_compact <= end):
+                continue
+
+            factor = factor_map.get(d_compact)
+            if factor is None or not (math.isfinite(factor) and factor > 0):
+                skipped += 1
+                continue
+
+            # 从 hfq DataFrame 取后复权价格
+            close_hfq = self._safe_num(row.get(col_close) if col_close else None)
+            if close_hfq is None or close_hfq <= 0:
+                skipped += 1
+                continue
+
+            open_hfq = self._safe_num(row.get(col_open) if col_open else None, default=close_hfq)
+            high_hfq = self._safe_num(row.get(col_high) if col_high else None, default=close_hfq)
+            low_hfq = self._safe_num(row.get(col_low) if col_low else None, default=close_hfq)
+
+            # 原始价 = 后复权价 / adj_factor
+            open_raw = open_hfq / factor
+            close_raw = close_hfq / factor
+            high_raw = high_hfq / factor
+            low_raw = low_hfq / factor
+
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d_iso)
+            out["open"].append(open_raw)
+            out["close"].append(close_raw)
+            out["high"].append(high_raw)
+            out["low"].append(low_raw)
+            out["open_normal"].append(open_hfq)
+            out["close_normal"].append(close_hfq)
+            out["high_normal"].append(high_hfq)
+            out["low_normal"].append(low_hfq)
+
+            vol = self._safe_num(row.get(col_volume) if col_volume else None)
+            if vol is None or vol < 0:
+                vol = 0.0
+            out["volume"].append(int(vol))
+
+            amt = self._safe_num(row.get(col_amount) if col_amount else None)
+            out["amount"].append(amt if amt is not None else 0.0)
+            out["adj_factor"].append(factor)
+
+        if skipped:
+            logger.warning(f"  备用接口 {symbol} 跳过 {skipped} 行(因子缺失或格式异常)")
+
+        if not out["symbol"]:
+            return None
+
+        return pd.DataFrame(out)
+
+    def _build_sina_df_simple(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        hfq_df: pd.DataFrame,
+    ) -> pd.DataFrame | None:
+        """无因子时的简化版：假设原始价 ≈ 后复权价，adj_factor = 1.0。"""
+        date_col = self._resolve_column(hfq_df, ["date", "日期"])
+        if date_col is None:
+            logger.warning(f"  备用接口 {symbol} 无法找到日期列: {hfq_df.columns.tolist()}")
+            return None
+
+        col_open = self._resolve_column(hfq_df, ["open", "开盘"])
+        col_close = self._resolve_column(hfq_df, ["close", "收盘"])
+        col_high = self._resolve_column(hfq_df, ["high", "最高"])
+        col_low = self._resolve_column(hfq_df, ["low", "最低"])
+        col_volume = self._resolve_column(hfq_df, ["volume", "成交量"])
+        col_amount = self._resolve_column(hfq_df, ["amount", "成交额"])
+
+        hfq_df = hfq_df.copy()
+        hfq_df[date_col] = hfq_df[date_col].astype(str)
+
+        out: dict[str, list] = {
+            "symbol": [], "trade_date": [], "open": [], "close": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
+        }
+
+        for _, row in hfq_df.iterrows():
+            d_str = str(row[date_col])
+            d_compact = self._compact_date(d_str)
+            d_iso = d_str[:10] if len(d_str) >= 10 and d_str[4] == "-" else None
+
+            if d_compact is None or d_iso is None:
+                continue
+            if not (start <= d_compact <= end):
+                continue
+
+            close_val = self._safe_num(row.get(col_close) if col_close else None)
+            if close_val is None or close_val <= 0:
+                continue
+
+            open_val = self._safe_num(row.get(col_open) if col_open else None, default=close_val)
+            high_val = self._safe_num(row.get(col_high) if col_high else None, default=close_val)
+            low_val = self._safe_num(row.get(col_low) if col_low else None, default=close_val)
+
+            out["symbol"].append(symbol)
+            out["trade_date"].append(d_iso)
+            out["open"].append(open_val)
+            out["close"].append(close_val)
+            out["high"].append(high_val)
+            out["low"].append(low_val)
+            out["open_normal"].append(open_val)
+            out["close_normal"].append(close_val)
+            out["high_normal"].append(high_val)
+            out["low_normal"].append(low_val)
+
+            vol = self._safe_num(row.get(col_volume) if col_volume else None)
+            out["volume"].append(int(vol) if vol is not None else 0)
+
+            amt = self._safe_num(row.get(col_amount) if col_amount else None)
+            out["amount"].append(amt if amt is not None else 0.0)
+            out["adj_factor"].append(1.0)
+
+        if not out["symbol"]:
+            return None
+
+        return pd.DataFrame(out)
+
     def _fetch_ah_factor_map(self, symbol: str, start: str, end: str) -> dict[str, float] | None:
-        """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。"""
+        """从 asharehub 拉取复权因子 {YYYYMMDD: factor}（累计因子,后复权价=未复权价×因子）。
+
+        P2（审计）：trade_date 键统一归一化为 YYYYMMDD——API 可能返回
+        YYYY-MM-DD 字符串 / date / datetime（含 pandas Timestamp）对象；旧实现
+        直接 str() 作 key，回退路径（_build_qq_df_from_factor 用 d_compact=YYYYMMDD
+        查表）全部 miss → 每股被静默跳过（仅"跳过 N 天"告警）。格式探测：
+        无法解析为 YYYYMMDD 的行告警并跳过。
+        """
         try:
             from UtilsManager.ConfigParser import Config
-            from asharehub import AShareHub
+            from UtilsManager.AShareHubClient import make_asharehub_client
             cfg = Config()
             key = getattr(cfg, "ASHAREHUB_API_KEY", "") or ""
             if not key:
@@ -314,7 +729,7 @@ class IncrementalSyncEngine:
             code = symbol[2:]
             market = symbol[:2]
             suffix = {"sh": "SH", "sz": "SZ", "bj": "BJ"}.get(market, "SH")
-            client = AShareHub(api_key=key)
+            client = make_asharehub_client(api_key=key)
             df = client.adj_factor(
                 symbol=f"{code}.{suffix}",
                 start_date=start.replace("-", ""),
@@ -322,22 +737,47 @@ class IncrementalSyncEngine:
             )
             if df is None or df.empty:
                 return None
-            return {str(r["trade_date"]): float(r["adj_factor"]) for _, r in df.iterrows()}
+            out: dict[str, float] = {}
+            bad = 0
+            for _, r in df.iterrows():
+                td = r["trade_date"]
+                if isinstance(td, (datetime, date)):
+                    key_n = td.strftime("%Y%m%d")
+                else:
+                    s = str(td).strip()
+                    key_n = s[:10].replace("-", "") if len(s) >= 10 and s[4] == "-" else s.replace("-", "").replace("/", "")
+                if len(key_n) != 8 or not key_n.isdigit():
+                    bad += 1
+                    continue
+                out[key_n] = float(r["adj_factor"])
+            if bad:
+                logger.warning(
+                    f"asharehub 复权因子 {symbol} 跳过 {bad}/{len(df)} 行："
+                    f"trade_date 格式异常（期望 YYYYMMDD/YYYY-MM-DD/date 对象）"
+                )
+            return out or None
         except Exception as e:
             logger.warning(f"asharehub 复权因子获取失败 {symbol}: {type(e).__name__}: {e}")
             return None
 
     def _build_qq_df_from_factor(self, symbol: str, start: str, end: str,
                                  raw_rows: list[list], factor_map: dict[str, float]) -> pd.DataFrame | None:
-        """用不复权行情 × asharehub 复权因子重建后复权 DataFrame（含除权日连续价格）。"""
+        """用不复权行情 × asharehub 复权因子重建 DataFrame（含除权日连续价格）。
+
+        P0-12 审计修复（复权语义统一）：
+        open/close/high/low = 不复权原始价（交易所真实成交价，涨跌停/成交/估值用）；
+        open_normal/close_normal/high_normal/low_normal = 后复权价（原始价 × 累计因子，
+        信号/止损/指标用）；adj_factor = 累计复权因子（后复权价 ÷ 原始价）。
+        """
         raw_map = {str(r[0]): r for r in raw_rows}
         filtered = [d for d in sorted(raw_map) if start <= d.replace("-", "") <= end]
         if not filtered:
             return None
         out: dict[str, list] = {
             "symbol": [], "trade_date": [], "open": [], "close": [],
-            "high": [], "low": [], "volume": [], "amount": [],
-            "adj_factor": [], "close_normal": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
         }
         skipped = 0
         for d in filtered:
@@ -353,20 +793,35 @@ class IncrementalSyncEngine:
                 continue
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
-            out["open"].append(float(raw[1]) * factor)
-            out["close"].append(close_raw * factor)
-            out["high"].append(float(raw[3]) * factor)
-            out["low"].append(float(raw[4]) * factor)
-            out["volume"].append(int(float(raw[5]) * 100))
-            out["amount"].append(float(raw[8]) * 10000)
+            out["open"].append(float(raw[1]))
+            out["close"].append(close_raw)
+            out["high"].append(float(raw[3]))
+            out["low"].append(float(raw[4]))
+            out["open_normal"].append(float(raw[1]) * factor)
+            out["close_normal"].append(close_raw * factor)
+            out["high_normal"].append(float(raw[3]) * factor)
+            out["low_normal"].append(float(raw[4]) * factor)
+            vol = self._safe_num(raw[5] if len(raw) > 5 else None)
+            if vol is None or vol < 0:
+                skipped += 1
+                logger.warning(f"asharehub 因子重建 {symbol} 丢弃交易日 {d}: 成交量异常(vol={raw[5] if len(raw) > 5 else None})")
+                continue
+            out["volume"].append(int(vol * 100))
+            amt = self._safe_num(raw[8] if len(raw) > 8 else None)
+            out["amount"].append((amt * 10000) if amt is not None else 0.0)
             out["adj_factor"].append(factor)
-            out["close_normal"].append(close_raw)
         if skipped:
             logger.warning(f"asharehub 因子重建 {symbol} 跳过 {skipped}/{len(filtered)} 天(因子缺失)")
         return pd.DataFrame(out)
 
     def _build_qq_df(self, symbol: str, start: str, end: str,
                      raw_rows: list[list], hfq_rows: list[list]) -> pd.DataFrame | None:
+        """原始价 + 后复权价合并重建 DataFrame。
+
+        P0-12 审计修复（复权语义统一）：open/close/high/low = 不复权原始价；
+        open_normal/close_normal/high_normal/low_normal = 后复权价；
+        adj_factor = 后复权收盘 ÷ 原始收盘（累计因子）。
+        """
         raw_map = {str(r[0]): r for r in raw_rows}
         hfq_map = {str(h[0]): h for h in hfq_rows}
         common = sorted(set(raw_map) & set(hfq_map))
@@ -375,8 +830,9 @@ class IncrementalSyncEngine:
             return None
         out: dict[str, list] = {
             "symbol": [], "trade_date": [], "open": [], "close": [],
-            "high": [], "low": [], "volume": [], "amount": [],
-            "adj_factor": [], "close_normal": [],
+            "high": [], "low": [], "open_normal": [], "close_normal": [],
+            "high_normal": [], "low_normal": [],
+            "volume": [], "amount": [], "adj_factor": [],
         }
         skipped = 0
         for d in filtered:
@@ -384,25 +840,95 @@ class IncrementalSyncEngine:
             hfq = hfq_map[d]
             close_raw = float(raw[2])
             close_hfq = float(hfq[2])
-            if not (math.isfinite(close_raw) and close_raw > 0
-                    and math.isfinite(close_hfq) and close_hfq > 0):
-                # 上游价格异常（负值/NaN/零，如 sh600076 2024-06-24 负后复权价）：
-                # 丢弃该交易日，防止负复权价写入 DB 导致回测负市值污染
+            if not (math.isfinite(close_raw) and close_raw > 0):
+                # 原始价异常：无法重建，丢弃
                 skipped += 1
+                logger.warning(f"腾讯API {symbol} 丢弃交易日 {d}：原始收盘价异常(close_raw={close_raw})")
                 continue
+            # 使用上一个有效交易日的 adj_factor 进行降级重建
+            adj_factor = 1.0
+            use_hfq = math.isfinite(close_hfq) and close_hfq > 0
+            if use_hfq:
+                adj_factor = close_hfq / close_raw
+            else:
+                # hfq 异常：向前查找上一个有效的 adj_factor
+                use_hfq = False
+                # 从已构建的行中取最后一个有效 adj_factor
+                _prev_factor = out["adj_factor"][-1] if out["adj_factor"] else 1.0
+                if math.isfinite(_prev_factor) and _prev_factor > 0:
+                    adj_factor = _prev_factor
+                else:
+                    # 极端情况：第一条记录就异常，使用 1.0
+                    adj_factor = 1.0
+                logger.warning(
+                    f"腾讯API {symbol} {d} hfq收盘价异常(close_hfq={close_hfq})，"
+                    f"使用上一交易日adj_factor={adj_factor:.6f}降级重建"
+                )
+
             out["symbol"].append(symbol)
             out["trade_date"].append(d)
-            out["open"].append(float(hfq[1]))
-            out["close"].append(close_hfq)
-            out["high"].append(float(hfq[3]))
-            out["low"].append(float(hfq[4]))
-            out["volume"].append(int(float(raw[5]) * 100))
-            out["amount"].append(float(raw[8]) * 10000)
-            out["adj_factor"].append(close_hfq / close_raw if close_raw else 1.0)
-            out["close_normal"].append(close_raw)
+            out["open"].append(float(raw[1]))
+            out["close"].append(close_raw)
+            out["high"].append(float(raw[3]))
+            out["low"].append(float(raw[4]))
+            if use_hfq:
+                out["open_normal"].append(float(hfq[1]))
+                out["close_normal"].append(close_hfq)
+                out["high_normal"].append(float(hfq[3]))
+                out["low_normal"].append(float(hfq[4]))
+            else:
+                out["open_normal"].append(float(raw[1]) * adj_factor)
+                out["close_normal"].append(close_raw * adj_factor)
+                out["high_normal"].append(float(raw[3]) * adj_factor)
+                out["low_normal"].append(float(raw[4]) * adj_factor)
+            vol = self._safe_num(raw[5] if len(raw) > 5 else None)
+            if vol is None or vol < 0:
+                # 成交量缺失/异常:无法重建,丢弃该日
+                skipped += 1
+                logger.warning(f"腾讯API {symbol} 丢弃交易日 {d}: 成交量异常(vol={raw[5] if len(raw) > 5 else None})")
+                continue
+            out["volume"].append(int(vol * 100))
+            amt = self._safe_num(raw[8] if len(raw) > 8 else None)
+            out["amount"].append((amt * 10000) if amt is not None else 0.0)
+            out["adj_factor"].append(adj_factor)
         if skipped:
             logger.warning(f"腾讯API {symbol} 丢弃 {skipped}/{len(filtered)} 个非法价格交易日(close<=0 或 NaN)")
         return pd.DataFrame(out)
+
+    def _detect_overlap_correction(self, db_rows: dict[str, tuple[float | None, float | None]],
+                                   grp: pd.DataFrame) -> tuple[bool, str, str]:
+        """重叠区同日期新旧对比，判断是否触发全量重拉（P0-13）。
+
+        逐日对齐 DB 与本次拉取的同一天值，统一 0.1% 容差判定：
+          - adj_factor 同日期 ratio ∉ [0.999, 1.001] → 除权/因子修正
+          - close_normal 同日期相对偏差 > 0.001      → 数据源修正历史
+        加滞回：需 ≥2 个不同交易日均不一致才判定重拉，过滤数据源瞬时抖动/单日修正。
+        返回 (是否重拉, 原因, DB 最新交易日 ISO)。
+        """
+        latest_iso = max(db_rows)
+        grp_by_date = grp.set_index("trade_date")
+        _TOL = 0.001  # 0.1% 统一容差
+        adj_bad: set[str] = set()
+        cn_bad: set[str] = set()
+        for d, (db_cn, db_adj) in db_rows.items():
+            if d not in grp_by_date.index:
+                continue
+            row = grp_by_date.loc[d]
+            new_adj = row.get("adj_factor")
+            if new_adj is not None and db_adj is not None and db_adj != 0:
+                ratio = new_adj / db_adj
+                if ratio > 1.0 + _TOL or ratio < 1.0 - _TOL:
+                    adj_bad.add(d)
+            new_cn = row.get("close_normal")
+            if new_cn is not None and db_cn is not None and db_cn != 0:
+                dev = abs(new_cn / db_cn - 1.0)
+                if dev > _TOL:
+                    cn_bad.add(d)
+        bad_dates = adj_bad | cn_bad
+        if len(bad_dates) >= 2:
+            return True, (f"重叠区 {len(bad_dates)} 天不一致"
+                          f"(adj_factor {len(adj_bad)} 天, close_normal {len(cn_bad)} 天)"), latest_iso
+        return False, "overlap stable", latest_iso
 
     def _process_batch(self, symbols: list[str], start: str, end: str, desc: str = "", force: bool = False) -> tuple[int, list[str]]:
         """并发取窗口数据 → 批量 DB 查询 → 内存判断 → 一次写入.
@@ -411,12 +937,33 @@ class IncrementalSyncEngine:
         （幂等 upsert,用于指标预热历史回填;否则已有数据只写增量,
         早期历史会被丢弃导致回填永不生效）。
         """
-        # Step 1: concurrent fetch
+        # Step 1: 预分类 + 并发取窗口数据
+        # 1a. 预查每股 DB 最新交易日,识别窗口内无成交的疑似停牌/长空窗股：
+        #     统一窗口对它们没有可拉数据,不该进并发拉取池(浪费请求/污染失败缓存);
+        #     改为按缺口区间 [last+1, end] 单独补拉,复牌或漏采恢复时自动补全。
+        if force:
+            fetch_syms: list[str] = list(symbols)
+            fill_candidates: dict[str, tuple[date, date]] = {}
+        else:
+            start_date = datetime.strptime(start, "%Y%m%d").date()
+            end_date = datetime.strptime(end, "%Y%m%d").date()
+            last_map = self._batch_get_last_date(symbols)
+            fill_candidates = {}
+            fetch_syms = []
+            for sym in symbols:
+                ld = last_map.get(sym)
+                if ld is not None and ld < start_date and (end_date - ld).days > OVERLAP_DAYS:
+                    fill_candidates[sym] = (ld + timedelta(days=1), end_date)
+                else:
+                    fetch_syms.append(sym)
+
         all_data: dict[str, pd.DataFrame] = {}
         failed: list[str] = []
-        with tqdm(total=len(symbols), desc=desc, unit="stk", leave=False) as pbar:
+        # position 区分管道: A=0, B=1, 防止 tqdm 互相覆盖
+        _pos = 0 if 'A' in desc else (1 if 'B' in desc else None)
+        with tqdm(total=len(fetch_syms), desc=desc, unit="stk", leave=False, position=_pos) as pbar:
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
-                futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in symbols}
+                futures = {ex.submit(self._fetch_one_stock, sym, start, end): sym for sym in fetch_syms}
                 for future in as_completed(futures):
                     sym = futures[future]
                     try:
@@ -430,17 +977,47 @@ class IncrementalSyncEngine:
                         failed.append(sym)
                     pbar.update(1)
 
+        # 1b. 疑似停牌/长空窗股缺口补拉 [last+1, end];成功即与 DB 无重叠,可直接写
+        if fill_candidates:
+            with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
+                futures = {
+                    ex.submit(self._fetch_one_stock, sym, s.strftime("%Y%m%d"), e.strftime("%Y%m%d")): sym
+                    for sym, (s, e) in fill_candidates.items()
+                }
+                for future in as_completed(futures):
+                    sym = futures[future]
+                    try:
+                        df = future.result()
+                        if df is not None and not df.empty:
+                            all_data[sym] = df
+                            logger.info(f"  [{sym}] 缺口补拉 {fill_candidates[sym][0]} ~ {end} 成功,恢复 {len(df)} 行")
+                        else:
+                            logger.info(f"  [{sym}] 窗口内无成交(最近交易 {last_map.get(sym)}),判定停牌跳过")
+                    except Exception as e:
+                        logger.error(f"  [{sym}] 缺口补拉异常: {type(e).__name__}: {e}")
+
+        if not force:
+            # 1c. 区分真失败与"窗口内无成交"(停牌)：
+            #     窗口内应有数据却拉取失败,或 DB 无历史且拉不到 → 真失败,留待下次重试;
+            #     最近交易日早在窗口 start 之前 → 停牌,不标记失败,避免失败缓存被停牌股污染。
+            final_failed: list[str] = []
+            for sym in failed:
+                ld = last_map.get(sym)
+                if ld is None or ld >= start_date:
+                    final_failed.append(sym)
+                else:
+                    logger.info(f"  [{sym}] 窗口内无成交(最近交易 {ld}),跳过(不标记失败)")
+            failed = final_failed
+
         if not all_data:
             logger.info(f"  {desc} 完成: 成功 0 只, 失败 {len(failed)} 只")
             return 0, failed
 
         # Step 2: bulk DB reads (force 模式全量覆盖,无需读取已有状态)
         syms = list(all_data.keys())
-        latest_map = self._batch_get_latest_date(syms) if not force else {}
-        adj_map = self._batch_get_latest_adj(syms) if not force else {}
-        has_cn_set = self._batch_has_close_normal(syms) if not force else set()
+        db_map = self._batch_get_overlap_history(syms, start) if not force else {}
 
-        # Step 3: identify split stocks
+        # Step 3: identify split stocks（P0-13 同日期新旧对比判定）
         to_write: list[pd.DataFrame] = []
         written_symbols: set[str] = set()
         split_syms: list[str] = []
@@ -452,24 +1029,20 @@ class IncrementalSyncEngine:
                 to_write.append(grp)
                 written_symbols.add(sym)
                 continue
-            latest = latest_map.get(sym)
-            has_cn = sym in has_cn_set
-
-            if latest is None or not has_cn:
+            db_rows = db_map.get(sym)
+            if not db_rows or not any(cn is not None for cn, _ in db_rows.values()):
+                # 首次拉取或 DB 缺少 close_normal:全量写入
                 to_write.append(grp)
                 written_symbols.add(sym)
                 continue
 
-            old_adj = adj_map.get(sym)
-            if old_adj is not None:
-                match = grp.loc[grp["trade_date"] == latest.isoformat(), "adj_factor"]
-                if not match.empty:
-                    ratio = match.iloc[0] / old_adj
-                    if ratio > 1.01 or ratio < 0.99:
-                        split_syms.append(sym)
-                        continue
+            should_repull, reason, latest_iso = self._detect_overlap_correction(db_rows, grp)
+            if should_repull:
+                logger.warning(f"  [{sym}] {reason}, 触发全量重拉")
+                split_syms.append(sym)
+                continue
 
-            new = grp[grp["trade_date"] > latest.isoformat()]
+            new = grp[grp["trade_date"] > latest_iso]
             if not new.empty:
                 to_write.append(new)
                 written_symbols.add(sym)
@@ -478,7 +1051,7 @@ class IncrementalSyncEngine:
         if split_syms:
             full_start = self._default_start.replace("-", "") if self._default_start else "20190101"
             full_end = self._trade_date.strftime("%Y%m%d")
-            logger.info(f"  {len(split_syms)} 只除权除息,并发拉取全量历史")
+            logger.info(f"  {len(split_syms)} 只触发重拉(除权/数据源修正),并发拉取全量历史")
             with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
                 futures = {ex.submit(self._fetch_one_stock, sym, full_start, full_end): sym for sym in split_syms}
                 for future in as_completed(futures):
@@ -582,7 +1155,10 @@ class IncrementalSyncEngine:
 
     def sync_stock_pool_and_kline(self, target_date: str | None = None) -> set[str]:
         from UtilsManager.CodeNormalizer import CodeNormalizer
-        from UtilsManager.IDataProvider import backtest_lock_held
+        from UtilsManager.IDataProvider import (
+            BACKTEST_ADVISORY_LOCK_KEY,
+            backtest_lock_held,
+        )
 
         # ── 回测数据隔离（P3.3 制度化）：回测进程持有会话级 advisory lock 时禁止写入 ──
         # 运行中改写 stock_daily_kline 会导致回测窗口数据漂移、信号缓存静默失效，
@@ -688,7 +1264,9 @@ class IncrementalSyncEngine:
         if df.empty:
             return
         records = df.rename(columns={}).to_dict("records")
-        columns = ["symbol", "trade_date", "open", "close", "high", "low", "volume", "amount", "adj_factor", "close_normal"]
+        columns = ["symbol", "trade_date", "open", "close", "high", "low",
+                   "open_normal", "close_normal", "high_normal", "low_normal",
+                   "volume", "amount", "adj_factor"]
         placeholders = ", ".join(f":{c}" for c in columns)
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns if c not in ("symbol", "trade_date"))
         with self._engine.begin() as conn:
@@ -707,7 +1285,11 @@ class IncrementalSyncEngine:
         return os.path.join(self._cache_dir, f"failed_symbols_{self._trade_date_str}.txt")
 
     def _drop_dead_symbols(self, symbols: set[str]) -> set[str]:
-        """剔除永不上市/已退市的股票(名称含 IPO终止/退市),避免每次同步都无效重试."""
+        """剔除永不上市的股票(名称含 IPO终止),避免每次同步都无效重试。
+        
+        P3-5 审计修复(P0): 不再拦截"退市"类股票——已退市标的的历史K线对回测至关重要，
+        需要在退市前区间内正常拉取数据。仅保留 IPO终止的过滤(这些标的从未产生过交易数据)。
+        """
         if not symbols:
             return symbols
         try:
@@ -717,11 +1299,11 @@ class IncrementalSyncEngine:
                     {"codes": sorted(symbols)},
                 ).fetchall()
                 known = {str(r[0]) for r in rows}
-                # 保留:仍在池中且名称不含 IPO终止/退市 的;池外代码保留原逻辑(可能是新上市未入库)
+                # 仅剔除 IPO终止(从未上市); 退市股票允许同步(需保留其退市前K线)
                 if known:
                     name_rows = conn.execute(
                         text("SELECT stock_code FROM stock_basic_info_sw "
-                             "WHERE stock_code = ANY(:codes) AND (stock_name LIKE '%IPO终止%' OR stock_name LIKE '%退市%')"),
+                             "WHERE stock_code = ANY(:codes) AND stock_name LIKE '%IPO终止%'"),
                         {"codes": sorted(known)},
                     ).fetchall()
                     dead = {str(r[0]) for r in name_rows}
@@ -729,7 +1311,7 @@ class IncrementalSyncEngine:
                     dead = set()
             kept = set(symbols) - dead
             if dead:
-                logger.info(f"跳过 {len(dead)} 只 IPO终止/退市 股票,不再重试")
+                logger.info(f"跳过 {len(dead)} 只 IPO终止 股票,不再重试")
             return kept
         except Exception as e:
             logger.warning(f"剔除失效股票异常: {e},按原名单重试")

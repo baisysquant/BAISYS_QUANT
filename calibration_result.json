@@ -1,6 +1,7 @@
 {
   "params": {
-    "atr_stop_mult": 1.0
+    "boll_narrow_ratio": 0.6,
+    "cross_decay_days": 30.0
   },
   "score": 0.0,
   "sharpe": 0.0,
@@ -21,5 +22,10 @@
   "config_hash": "",
   "pbo": 0.0,
   "dsr": 0.0,
-  "num_trials": 0
+  "num_trials": 0,
+  "gate_passed": false,
+  "gate_reasons": [
+    "test"
+  ],
+  "cost_model_snapshot": {}
 }

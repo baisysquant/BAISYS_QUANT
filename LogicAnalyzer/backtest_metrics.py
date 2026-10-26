@@ -42,7 +42,27 @@ def compute_risk_metrics(
         return {}
 
     total_ret = vals[-1] / vals[0] - 1
-    ann_factor = 252
+    # AUDIT_FIX P1-7: 统一使用 ann_factor=244（A股年化交易日数），不分长短周期。
+    # 短周期 Sharpe 本身统计不可靠（样本量不足），通过 min_observations 阈值拒绝输出。
+    ann_factor = 244
+    # OOS 窗口默认 60 天，信号预热截断可能吃掉 1~2 天导致实际权益 58~59 天。
+    # 阈值留 5 天余量（55），避免边界条件落入"样本不足"分支触发降级输出。
+    _MIN_OBSERVATIONS = 55  # 少于 55 个交易日（约 2.5 个月）拒绝输出 Sharpe
+    if n < _MIN_OBSERVATIONS:
+        logger.warning(
+            f"样本量不足 ({n} < {_MIN_OBSERVATIONS} 个交易日)，Sharpe/Sortino 统计不可靠；"
+            f"返回 total_return 和 max_drawdown 供参考。"
+        )
+        return {
+            "total_return": round(total_ret, 6),
+            "annual_return": None,
+            "annual_vol": None,
+            "sharpe_ratio": None,
+            "sortino_ratio": None,
+            "max_drawdown": round(float(((vals - np.maximum.accumulate(vals)) / vals).min()), 6),
+            "n_observations": n,
+            "warning": "样本不足",
+        }
     mu = returns.mean() * ann_factor
     sigma = returns.std(ddof=1) * math.sqrt(ann_factor)
 
@@ -51,11 +71,19 @@ def compute_risk_metrics(
     sharpe = excess_mu / sigma if sigma > 0 else 0.0
 
     downside = returns[returns < 0]
-    # P1 审计修复：无亏损日时 Sortino 截断为有限大值（100.0），避免优化器崩溃 / 数值不稳定
     # 原逻辑：float("inf") → DSR/PBO 污染 / scipy 优化器 NaN
     _SORTINO_CEILING = 100.0
+    sortino_reliable = True  # AUDIT_FIX Step 10: Sortino 可靠性标志
     if len(downside) == 0:
         sortino = _SORTINO_CEILING if excess_mu > 0 else 0.0
+        sortino_reliable = False
+        logger.warning(f"Sortino 下行样本为 0（总 {n} 个交易日无亏损），截断为 {_SORTINO_CEILING}，统计不可靠")
+    elif len(downside) < 30:
+        downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
+        raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)
+        sortino = min(raw_sortino, _SORTINO_CEILING)
+        sortino_reliable = False
+        logger.warning(f"Sortino 下行样本不足 ({len(downside)} < 30)，统计不可靠（sortino={sortino:.2f}）")
     else:
         downside_std = downside.std(ddof=1) * math.sqrt(ann_factor)
         raw_sortino = excess_mu / downside_std if downside_std > 0 else (float("inf") if excess_mu > 0 else 0.0)

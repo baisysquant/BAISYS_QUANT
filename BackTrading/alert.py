@@ -43,13 +43,36 @@ class BacktestAlert:
         self._write_alert("failure", data)
 
     def _check_drift(self, new_params: dict[str, float]) -> None:
+        # 优先使用 calibration_result.json（通过门控的合格参数快照）
         old = load_calibration()
-        if old is None:
+        old_params = old.params if (old is not None and old.params) else None
+
+        # 审计类降级：JSON 为空壳（门控拦截导致 save_calibration 未执行）时，
+        # 从数据库读取最近一次成功回测的 params 作为比对基准。
+        # 注意：漂移检测是审计/监控功能，使用未通过门控的数据做比对是安全的，
+        # 不会将参数写入生产配置。
+        if old_params is None:
+            try:
+                from DataManager.DbEngine import get_engine
+                from BackTrading.calibration_log import get_last_successful_run
+                engine = get_engine(self.config)
+                last_run = get_last_successful_run(engine)
+                if last_run and last_run.get("params"):
+                    old_params = last_run["params"]
+                    logger.info(
+                        "[漂移检测] calibration_result.json 为空壳（门控拦截），"
+                        "改用数据库最近成功回测参数作为比对基准"
+                    )
+            except Exception:
+                pass  # 数据库读取失败不影响主流程
+
+        if old_params is None:
+            logger.info("[漂移检测] 无历史参数可供比对（首次运行或数据库无成功记录），跳过漂移检测")
             return
 
         drifts: list[dict[str, Any]] = []
         for key, new_val in new_params.items():
-            old_val = old.params.get(key)
+            old_val = old_params.get(key)
             if old_val is None or old_val == 0:
                 continue
             ratio = abs(new_val - old_val) / abs(old_val)

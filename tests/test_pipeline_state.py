@@ -61,6 +61,5 @@ def test_calc_exit_strategy_no_atr() -> None:
 
 def test_calc_exit_strategy_with_params(sample_ohlcv_with_indicators: pd.DataFrame) -> None:
     result = _calc_exit_strategy(sample_ohlcv_with_indicators,
-                                 params={"atr_stop_mult": 2.0, "atr_t1_mult": 4.0})
+                                 params={"atr_stop_mult": 2.0})
     assert result["stop_loss"] is not None
-    assert result["t1_target"] is not None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -8,6 +9,28 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from loguru import logger
+
+# AUDIT_FIX P2-11: 日志配置从模块级移至 _configure_logging()，避免 import 即修改全局 logger。
+# 旧行为：import runner 即 logger.remove() 清除所有 handler → 其他模块日志配置被覆盖。
+# 新行为：仅在 main() 或显式调用 _configure_logging() 时配置。
+
+import os as _os
+
+def _configure_logging() -> None:
+    """配置回测日志（按日期轮转，保留 7 天）。仅在入口函数中调用。"""
+    _os.makedirs("logs", exist_ok=True)
+    # 仅移除 loguru 默认的 console sink，避免重复输出；其他模块的 sink 保留。
+    logger.remove()
+    logger.add(
+        "logs/backtest_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="7 days",
+        level="INFO",
+        encoding="utf-8",
+        enqueue=True,
+    )
+    logger.add(sys.stderr, level="WARNING")
+
 from scipy.stats import spearmanr
 from sqlalchemy import text
 
@@ -24,7 +47,7 @@ from BackTrading.calibration import (
 )
 from BackTrading.calibration_log import ensure_table, get_last_run, record_run, should_rerun
 from UtilsManager.IDataProvider import BacktestDataProvider
-from BackTrading.prepare import _build_params, prepare_backtest_data
+from BackTrading.prepare import _build_params, merge_best_params_into_structured, prepare_backtest_data
 from UtilsManager.ConfigParser import Config
 from DataManager.DbEngine import get_engine
 
@@ -46,8 +69,8 @@ def _acquire_lock(engine: Any) -> None:
         if locked:
             logger.info("  获取回测分布式锁成功")
         else:
-            logger.warning("回测分布式锁被占用，跳过本次执行（可能有另一个进程正在运行）")
-            sys.exit(0)
+            logger.error("回测分布式锁被占用，终止执行（可能有另一个进程正在运行）")
+            sys.exit(1)
 
     # 会话级锁：在专用连接上持有整个回测期间（session-level，跨事务存活）。
     # 同一会话重复获取返回 True（回测自身的启动同步不受影响），
@@ -61,11 +84,18 @@ def _acquire_lock(engine: Any) -> None:
         if held:
             logger.info("  获取会话级数据隔离锁成功（外部数据同步将让路）")
         else:
-            logger.warning("  会话级数据隔离锁被占用，仍继续执行")
+            # AUDIT_FIX Step 7: 会话级锁获取失败应终止（而非降级为 warning）
+            # 旧逻辑仅 warning 继续 → xact_lock 在事务结束后已释放，会话级锁未持有
+            # 时存在竞争窗口，外部同步可能在此期间写入导致数据漂移
+            _RUN_LOCK_CONN.close()
+            _RUN_LOCK_CONN = None
+            logger.error("  会话级数据隔离锁被占用，终止执行（数据一致性风险）")
+            sys.exit(1)
     except Exception as exc:
-        logger.warning(f"  会话级数据隔离锁获取失败: {exc}")
         _RUN_LOCK_CONN.close()
         _RUN_LOCK_CONN = None
+        logger.error(f"  会话级数据隔离锁获取失败: {exc}，终止执行")
+        sys.exit(1)
 
 
 def _release_run_lock() -> None:
@@ -79,18 +109,38 @@ def _release_run_lock() -> None:
         _RUN_LOCK_CONN = None
 
 
+def _to_date(v: Any) -> date | None:
+    """统一日期归一化：任意时间类型 → datetime.date。
+
+    支持 str / pd.Timestamp / datetime.datetime / numpy.datetime64 / int 等。
+    解析失败返回 None（调用方负责处理）。
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return pd.Timestamp(v).date()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def _holdout_equity_slice(
     equity_curve: list[dict[str, Any]] | pd.DataFrame | None,
     final_prepared: pd.DataFrame,
     holdout_days: int,
 ) -> tuple[list[dict[str, Any]] | pd.DataFrame | None, str | None]:
-    """P0-3：按交易日索引切出末段 holdout 净值曲线。
+    """P0-3 / P1.5：按交易日索引切出末段 holdout 净值曲线。
 
-    弃用 len(equity_curve)×ratio 的日历轴切分——净值曲线按日历轴生成（含补全日），
-    长度口径与 WFO 交易日口径漂移导致边界错位。这里以 final_prepared 的交易日
-    集合定位边界（末 holdout_days 个交易日），再按 time 过滤净值曲线。
-    equity_curve 兼容 list 与 DataFrame（旧实现假设 DataFrame，list 上 .empty
-    直接 AttributeError 导致整条校准管线 FAILED）。
+    P1.5 修复：PIT 过滤后个股交易日集不同步（新股上市/停牌复牌 → 末段样本量不足）。
+    旧实现用 ``pd.unique(final_prepared["trade_date"])`` 取"并集" —— 任何股票
+    出现在的日期都算交易日。新股在 holdout 期中途上市时，该标的 holdout 样本量
+    被拉长，导致净值曲线权重失真。
+
+    新逻辑：取有效交易日集合 = 至少有 ``min_coverage_pct × 总标的数`` 行数据的日期
+    （默认 50%），排除"稀疏日"。日志输出 holdout 期有效标的分布与缺失天数。
 
     Returns:
         (切片后的净值曲线, holdout 起始交易日字符串)；数据不足/类型不支持时
@@ -100,23 +150,107 @@ def _holdout_equity_slice(
         return None, None
     if not isinstance(equity_curve, (list, pd.DataFrame)):
         return None, None
-    _fp_dates = sorted(pd.unique(final_prepared["trade_date"]))
-    if len(_fp_dates) < holdout_days:
+
+    EQUITY_REQUIRED_COLS = {"time", "portfolio_value"}
+    if isinstance(equity_curve, pd.DataFrame):
+        actual_cols = set(equity_curve.columns)
+        missing = EQUITY_REQUIRED_COLS - actual_cols
+        if missing:
+            logger.warning(
+                f"[P2.4] 净值曲线缺少必需列 {missing}（实际列: {sorted(actual_cols)}），"
+                f"holdout 切片跳过"
+            )
+            return None, None
+    elif isinstance(equity_curve, list) and equity_curve:
+        # list[dict] 分支检查首个 dict 的 keys
+        actual_keys = set(equity_curve[0].keys())
+        missing = EQUITY_REQUIRED_COLS - actual_keys
+        if missing:
+            logger.warning(
+                f"[P2.4] 净值曲线 dict 缺少必需键 {missing}（实际键: {sorted(actual_keys)}），"
+                f"holdout 切片跳过"
+            )
+            return None, None
+
+    # ── P1.5 PIT 对齐：取有效交易日交集（≥50% 标的覆盖率） ──
+    _all_dates = sorted(pd.unique(final_prepared["trade_date"]))
+    if "symbol" in final_prepared.columns:
+        _total_symbols = int(final_prepared["symbol"].nunique())
+    else:
+        _total_symbols = 0
+
+    if _total_symbols < 3:
+        logger.warning(
+            f"[Holdout] 仅{_total_symbols}只标的参与窗口，覆盖率极低——"
+            f"holdout 评估结果可能不可信。"
+        )
+
+    _min_rows = max(1, int(_total_symbols * 0.50)) if _total_symbols > 0 else 1
+
+    # 按日期 groupby 计数，取行数 ≥ min_rows 的日期为有效交易日
+    _date_counts = None
+    if "trade_date" in final_prepared.columns:
+        _date_counts = final_prepared.groupby("trade_date").size()
+    if _date_counts is not None:
+        _dense_dates = sorted(
+            str(d)[:10] for d in _date_counts[_date_counts >= _min_rows].index
+        )
+        if len(_dense_dates) < holdout_days:
+            logger.warning(
+                f"[Holdout] PIT有效交易日仅{len(_dense_dates)}天<holdout_demand{holdout_days}，"
+                f"回退到并集日期（覆盖率容差放宽）"
+            )
+            _dense_dates = None
+
+    _fp_dates_str = [str(d)[:10] for d in _all_dates if d is not None]
+    _fp_dates_obj = [
+        d for d in map(_to_date, _fp_dates_str) if d is not None
+    ]
+    _fp_dates_obj.sort()
+
+    # 优先取 dense_dates（覆盖率达标），否则 fallback 到原始并集
+    if _dense_dates and len(_dense_dates) >= holdout_days:
+        _dense_obj = sorted([d for d in map(_to_date, _dense_dates) if d is not None])
+        if len(_dense_obj) >= holdout_days:
+            _fp_dates_obj = _dense_obj
+
+    if len(_fp_dates_obj) < holdout_days:
         return None, None
-    _start_date = str(_fp_dates[-holdout_days])[:10]
+    _start_date = _fp_dates_obj[-holdout_days]  # datetime.date
+
     if isinstance(equity_curve, pd.DataFrame):
         if equity_curve.empty:
             return None, None
-        _ts = (
-            equity_curve["time"].astype(str).str[:10]
-            if "time" in equity_curve.columns
-            else equity_curve.index.astype(str).str[:10]
-        )
-        return equity_curve[_ts >= _start_date], _start_date
-    return [
+        if "time" in equity_curve.columns:
+            _dates = equity_curve["time"].apply(_to_date)
+        else:
+            _dates = equity_curve.index.to_series().apply(_to_date)
+        mask = _dates >= _start_date
+        result = equity_curve[mask]
+
+        _ec_dates = set(_dates[mask].dropna().astype(str).str[:10])
+        if _total_symbols > 0:
+            _holdout_counts = None
+            if "trade_date" in final_prepared.columns and "symbol" in final_prepared.columns:
+                _ht_mask = final_prepared["trade_date"].astype(str).str[:10].isin(_ec_dates)
+                _holdout_counts = final_prepared.loc[_ht_mask].groupby("trade_date")["symbol"].nunique()
+            if _holdout_counts is not None:
+                _min_coverage = _holdout_counts.min()
+                _avg_coverage = _holdout_counts.mean()
+                _missing_days = (_holdout_counts < _total_symbols * 0.5).sum()
+                logger.info(
+                    f"[Holdout] 有效交易日{len(_ec_dates)}天 | "
+                    f"标的覆盖率 min={_min_coverage} / avg={_avg_coverage:.0f} / 总数{_total_symbols} | "
+                    f"稀疏日{_missing_days}天"
+                )
+        return result, _start_date.isoformat()
+
+    # list[dict] 分支
+    result = [
         e for e in equity_curve
-        if str(e.get("time", ""))[:10] >= _start_date
-    ], _start_date
+        if _to_date(e.get("time")) is not None and _to_date(e.get("time")) >= _start_date
+    ]
+    return result, _start_date.isoformat()
 
 
 def _acceptance_gate(
@@ -131,9 +265,9 @@ def _acceptance_gate(
 ) -> tuple[bool, list[str]]:
     """P0-5：统一参数采纳门控（save_calibration 与 write_calibration_to_ini 共用）。
 
-    修复门控不一致：write_calibration_to_ini 曾未应用 PBO/DSR 门控（save_calibration
-    有），PBO 过拟合参数集仍可落盘进生产 config.ini。两处采纳决策必须走同一
-    门控——任一关键项不通过，calibration_result.json 与 config.ini 均不写入。
+    门控结果用于标记参数质量并输出告警。门控不通过时，参数仍会写入
+    calibration_result.json（gate_passed=false）和 config.ini，但会输出
+    WARNING 告警提示过拟合风险，供人工复核。
 
     Returns:
         (是否全部通过, 未通过原因列表)。
@@ -199,7 +333,6 @@ def run_backtest_pipeline(
     )
 
     if not should_run and not force:
-        # P0-11：移除阻塞式 input() 交互（生产调度/每日 02:00 DAG 中无终端会挂起）。
         # 默认跳过并提示；需强制重跑时显式传 force=True（或在调度侧传参）。
         logger.info(f"{reason} → 跳过（如需强制重跑请调用 run_backtest_pipeline(force=True)）")
         return load_calibration()
@@ -233,18 +366,27 @@ def run_backtest_pipeline(
         logger.info(f"  股票数量: {len(symbols)}")
         _log_step("resolve_symbols")
 
-        kline_df = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
+        kline_df, _delisted_synced = _fetch_kline(engine, symbols, bt.BACKTEST_START_DATE)
         if kline_df.empty:
             logger.warning("K 线数据为空，跳过回测")
             return None
 
+        _available_syms = set(kline_df["symbol"].astype(str).unique())
+        _original_count = len(symbols)
+        symbols = [s for s in symbols if s in _available_syms]
+        _filtered = _original_count - len(symbols)
+        if _filtered:
+            logger.info(f"  剔除无 K 线数据股票 {_filtered} 只，有效股票 {len(symbols)} 只")
+
+        # （_sync_delisted_stocks 仅接收 engine 与起始日期，且返回退市股集合，
+        # 同步结果已并入本次查询）——此处不再重复调用，避免签名不匹配/覆盖 DataFrame。
+        _log_step("sync_delisted_stocks")
+
         logger.info(f"  K 线行数: {len(kline_df)}")
 
-        # P3.1: fetch 可能已增量同步新行，重算数据版本以匹配实际使用的数据
-        _data_version = _compute_kline_data_version(engine)
+        _data_version = _compute_kline_data_version(engine, kline_df=kline_df)
 
         # ── ST/退市历史早加载（供 WFO / 模拟验证 / 最终回测全链路使用） ──
-        # P0-5: 查询起点覆盖 K 线预热缓冲（_fetch_kline 用 360 日历日缓冲），
         # 否则缓冲期内 ST 涨跌幅 5% 判定缺失。
         _bt_start_iso = datetime.strptime(bt.BACKTEST_START_DATE, "%Y%m%d").date().isoformat()
         _st_query_start = (
@@ -253,7 +395,6 @@ def run_backtest_pipeline(
         _end_date = kline_df["trade_date"].max()
         if pd.api.types.is_datetime64_any_dtype(kline_df["trade_date"]):
             _end_date = _end_date.strftime("%Y-%m-%d")
-        # P0-5: ST/退市 PIT 同步（全历史逐日状态回填；网络失败优雅降级，仅告警不阻断）
         try:
             from DataManager.StPitSync import ensure_st_history_table, sync_st_pit
             ensure_st_history_table(engine)
@@ -276,16 +417,28 @@ def run_backtest_pipeline(
         listing_days = _load_listing_days(engine, symbols, _st_query_start)
         _log_step("load_listing_days")
 
-        # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）
-        _delisted_syms = {
-            s for s, recs in st_history.items()
-            if any(_is_del for _is_st, _is_del in recs.values())
-        }
+        # 生存偏差实测评估：池内退市股的历史 K 线是否真实纳入（其退市前负收益才会计入）。
+        # stock_st_history PIT 表解耦——PIT 同步失败不应导致"生存偏差受控"误报。
+        # 独立源拉取失败 → 降级到 PIT 退市标记口径并注明降级（行为与旧版一致）。
         _kline_syms = set(kline_df["symbol"].astype(str))
+        _survival_source = "AkShare 退市列表（独立数据源）"
+        try:
+            from DataManager.StPitSync import fetch_delisted_symbols
+            _delisted_syms = fetch_delisted_symbols() or set()
+        except Exception as e:  # noqa: BLE001
+            _delisted_syms = set()
+            _survival_source = f"PIT 退市标记（独立源拉取失败降级: {e}）"
+        if not _delisted_syms:
+            _delisted_syms = {
+                s for s, recs in st_history.items()
+                if any(_is_del for _is_st, _is_del in recs.values())
+            }
+            if _survival_source.startswith("AkShare"):
+                _survival_source = "PIT 退市标记（独立源为空降级）"
         _missing_delisted = sorted(_delisted_syms - _kline_syms)
         if _delisted_syms:
             logger.info(
-                f"  股票池含 {len(_delisted_syms)} 只有退市/ST 历史标记的股票，"
+                f"  独立退市列表（{_survival_source}）识别 {len(_delisted_syms)} 只退市股，"
                 f"其中 {len(_delisted_syms & _kline_syms)} 只已纳入 K 线"
             )
             if _missing_delisted:
@@ -296,21 +449,54 @@ def run_backtest_pipeline(
                 )
             else:
                 logger.info(
-                    "生存偏差受控: 退市/ST 股历史 K 线已纳入股票池，"
+                    "生存偏差受控: 退市股历史 K 线已纳入股票池，"
                     "退市前负收益计入回测；ST/退市日的逐日剔除由引擎按 stock_st_history 执行"
                 )
         else:
             logger.warning(
-                "生存偏差: stock_st_history 无退市标记记录，股票池可能仅含当前存活股票，"
-                "已退市/ST 股票的历史负收益未被计入"
+                "生存偏差: 独立退市列表与 stock_st_history 均无退市记录，"
+                "股票池可能仅含当前存活股票，已退市/ST 股票的历史负收益未被计入"
             )
         _log_step("load_st_history")
 
+        # ── FIX(P0) Subtask-4：退市股覆盖率门禁 ──
+        # 如果股票池中几乎没有退市股（覆盖率<5%），可能存在严重数据偏差：
+        # 回测只基于存活股票，忽略已退市公司带来的尾部风险。
+        # 覆盖率 < 5% 时中断回测（RuntimeError）；独立源为空时仅告警不断。
+        # kline中无退市股（_covered==0）时降级为警告，不中断回测——
+        # 这是腾讯API无老退市股历史K线数据的已知限制，不应阻断回测。
+        _pool_size = len(symbols)
+        _delist_coverage = len(_delisted_syms & _kline_syms) / max(_pool_size, 1)
+        if _delist_coverage < 0.05 and _delisted_syms:
+            _covered = len(_delisted_syms & _kline_syms)
+            if _covered == 0:
+                logger.warning(
+                    f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
+                    f"（{_covered} / {_pool_size} < 5%），"
+                    f"腾讯API无老退市股历史K线数据（已知限制），"
+                    f"门禁降级为警告（回测继续，可能存在生存偏差）"
+                )
+            else:
+                raise RuntimeError(
+                    f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
+                    f"（{_covered} / {_pool_size} < 5%），"
+                    f"回测结果可能因生存偏差而系统性高估。"
+                    f"请扩展数据同步范围以包含退市标的历史 K 线。"
+                )
+        elif not _delisted_syms and _pool_size > 0:
+            logger.warning(
+                f"退市股覆盖率门禁: 独立退市列表与 stock_st_history 均无退市记录，"
+                f"数据源可能未覆盖退市标的；回测结果可能存在生存偏差（仅告警，不中断）"
+            )
+
         # 窗口坐标轴以正式回测起点为准（起点前为信号预热历史，不参与 WFO 交易）
-        def _ds(d) -> str:
-            return d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
-        _bt_cut = f"{bt.BACKTEST_START_DATE[:4]}-{bt.BACKTEST_START_DATE[4:6]}-{bt.BACKTEST_START_DATE[6:8]}"
-        total_trading_days = sum(1 for d in kline_df["trade_date"].unique() if _ds(d) >= _bt_cut)
+        # 统一使用 _to_date 归一化，消除 str[:10] 时区/格式脆弱性
+        _bt_start = _to_date(bt.BACKTEST_START_DATE)
+        assert _bt_start is not None, f"无效的 BACKTEST_START_DATE: {bt.BACKTEST_START_DATE!r}"
+        total_trading_days = sum(
+            1 for d in kline_df["trade_date"].unique()
+            if _to_date(d) is not None and _to_date(d) >= _bt_start
+        )
         _oos = bt.OUT_OF_SAMPLE_DAYS
         # ── 末段独立 holdout：终验只在该段进行，WFO 全程禁触 ──
         # holdout_days = round(total * ratio)；钳制 ≥OOS 且 WFO 寻参域须留足 120+OOS，
@@ -331,12 +517,28 @@ def run_backtest_pipeline(
                 )
                 _holdout_days = 0
         _wfo_total = total_trading_days - _holdout_days
-        # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS <= n，
+        # 数据自适应 WFO 配置：路径 p 的 offset = p*OOS，需满足 offset + IS + OOS + embargo <= n，
         # 否则路径 2/3 必然越界跳过（如 IS=805+OOS=60 在 865 天数据上只有 1 条路径有效）。
+        # ⚠️ 公式必须扣减 embargo：否则 max_offset 恒 = (num_paths-1)*OOS - embargo < 末路径 offset，
+        # 末条路径在任何数据长度下都被跳过（train = n - num_paths*OOS 时 span 恰好越界 embargo 天）。
+        _embargo_days = max(0, int(bt.BAYESIAN_CPCV_EMBARGO_DAYS))
         _np_cfg = max(1, int(bt.WFO_NUM_PATHS))
-        _max_np = max(1, (_wfo_total - 120) // _oos) if _wfo_total > _oos + 120 else 1
+        if _np_cfg < 5:
+            logger.error(
+                f"WFO 多路径数 wfo_num_paths={_np_cfg} 低于审计最低要求(≥5)，"
+                f"回测终止。请修改 config.ini [BACKTEST] wfo_num_paths ≥ 5"
+            )
+            sys.exit(2)
+        _is_min = 180
+        _max_np = max(1, (_wfo_total - _is_min - _embargo_days) // _oos) if _wfo_total > _oos + _is_min + _embargo_days else 1
         _num_paths = min(_np_cfg, _max_np)
-        train_period = max(120, min(_wfo_total - _oos, _wfo_total - _oos * _num_paths))
+        train_period = max(
+            _is_min,
+            min(
+                _wfo_total - _oos - _embargo_days,
+                _wfo_total - _oos * _num_paths - _embargo_days,
+            ),
+        )
         _holdout_label = (
             f" | Holdout: {_holdout_days}天(占比{_holdout_days/total_trading_days:.0%},独立终验)"
             if _holdout_active else " | Holdout: 禁用(自引用回退)"
@@ -347,37 +549,94 @@ def run_backtest_pipeline(
             f"{_holdout_label}"
         )
         _log_step("fetch_kline")
-        wf_result = run_walk_forward(
-            kline_df=kline_df,
-            num_paths=_num_paths,
-            train_period=train_period,
-            test_period=bt.OUT_OF_SAMPLE_DAYS,
-            initial_cash=bt.INITIAL_CASH,
-            commission=bt.COMMISSION_RATE,
-            stamp_tax=bt.STAMP_TAX_RATE,
-            slippage=bt.SLIPPAGE,
-            max_position_pct=bt.MAX_POSITION_PCT,
-            portfolio_method=bt.PORTFOLIO_METHOD,
-            point_in_time=bt.POINT_IN_TIME,
-            show_progress=True,
-            backtest_start_date=_bt_cut,
-            st_history=st_history,
-            exclude_st=bool(bt.EXCLUDE_ST),
-            listing_days=listing_days,
-            # P2.1 CPCV 净化+禁运
-            purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
-            embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
-            # P2.4 预算制
-            time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
-            max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
-            # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
-            holdout_days=_holdout_days,
-            # P3.1 数据版本入缓存 key
-            data_version=_data_version,
-            # A2 失败快照上下文
-            run_id=_run_id,
-            task_id="backtest_pipeline",
-        )
+        # ── WFO 系统性失败拦截：捕获 WFOSystematicFailure，记录失败并中断流水线 ──
+        from BackTrading.bayesian.meta_optimizer import WFOSystematicFailure
+
+        try:
+            wf_result = run_walk_forward(
+                kline_df=kline_df,
+                num_paths=_num_paths,
+                train_period=train_period,
+                test_period=bt.OUT_OF_SAMPLE_DAYS,
+                initial_cash=bt.INITIAL_CASH,
+                commission=bt.COMMISSION_RATE,
+                stamp_tax=bt.STAMP_TAX_RATE,
+                slippage=bt.SLIPPAGE,
+                max_position_pct=bt.MAX_POSITION_PCT,
+                portfolio_method=bt.PORTFOLIO_METHOD,
+                point_in_time=bt.POINT_IN_TIME,
+                show_progress=True,
+                backtest_start_date=_bt_start_iso,
+                st_history=st_history,
+                exclude_st=False,  # FIX(P0): 回测不排除 ST，防止 train/serve skew
+                # 复盘单元的 ST 过滤已在 Review/coordinator.py 硬编码执行（不复归 config 控制），
+                # 回测时排除 ST 会导致模型在"干净"样本池训练 → OOS 失效。
+                listing_days=listing_days,
+                purge_days=int(bt.BAYESIAN_CPCV_PURGE_DAYS),
+                embargo_days=int(bt.BAYESIAN_CPCV_EMBARGO_DAYS),
+                time_budget_seconds=float(bt.BAYESIAN_TIME_BUDGET_SECONDS),
+                max_no_improve_windows=int(bt.BAYESIAN_MAX_NO_IMPROVE_WINDOWS),
+                # 末段独立 holdout：WFO 寻参上界切除末段，供终验独立使用
+                holdout_days=_holdout_days,
+                data_version=_data_version,
+                # A2 失败快照上下文
+                run_id=_run_id,
+                task_id="backtest_pipeline",
+                db_engine=engine,
+                max_order_pct=float(getattr(bt, "MAX_ORDER_PCT", 0.30)),
+                max_order_pct_high=float(getattr(bt, "MAX_ORDER_PCT_HIGH", 0.20)),
+                max_order_pct_low=float(getattr(bt, "MAX_ORDER_PCT_LOW", 0.10)),
+            )
+        except WFOSystematicFailure as wfo_err:
+            # WFO 系统性失败：策略在当前数据区间无泛化能力，中断流水线
+            logger.critical("=" * 60)
+            logger.critical(f"[WFO系统性失败] {wfo_err.reason}")
+            logger.critical(
+                "策略在当前数据区间不具备泛化能力，建议检查：\n"
+                "  1. 特征工程是否存在隐性数据泄露\n"
+                "  2. 信号逻辑是否适应当前市场 regime\n"
+                "  3. 回看区间是否过短/过长导致过拟合\n"
+                "本次回测已标记为失败；回退参数（参数空间中位）仍会写入 config.ini，"
+                "下次调度将跳过（需手动 force=True 或数据/配置变化后重跑）"
+            )
+            logger.critical("=" * 60)
+
+            # 记录失败状态，避免下次调度重复执行
+            record_run(
+                engine=engine,
+                frequency=bt.OPTIMIZE_FREQUENCY,
+                backtest_start_date=bt.BACKTEST_START_DATE,
+                out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
+                initial_cash=bt.INITIAL_CASH,
+                params=wfo_err.fallback_params,
+                sharpe=0,
+                total_return=0,
+                max_drawdown=0,
+                status="failed",
+                config_hash=_cur_config_hash,
+                data_version=_data_version,
+            )
+
+            # 即使 WFO 系统性失败，本次回测实际评估过的参数（回退参数 =
+            # 参数空间中位）仍直接写入 config.ini [BACKTEST_CALIBRATED]，
+            # 与成功路径写回闭环同口径，保证下次加载沿用本次结果。
+            try:
+                written = write_calibration_to_ini(wfo_err.fallback_params)
+                if written:
+                    logger.warning(
+                        f"[WFO系统性失败] 回退参数已写入 config.ini "
+                        f"[BACKTEST_CALIBRATED]: {written}"
+                    )
+                else:
+                    logger.warning("[WFO系统性失败] 回退参数为空，未写入 config.ini")
+            except Exception as _wfo_write_err:
+                logger.opt(exception=True).warning(
+                    f"[WFO系统性失败] 回退参数写入 config.ini 被拒"
+                    f"（config 保持原值，下次运行将重新评估）: {_wfo_write_err}"
+                )
+
+            alert.on_failure(wfo_err)
+            return None
         _log_step("walk_forward")
         logger.info(f"  Walk-Forward 片段数: {len(wf_result)}")
 
@@ -387,21 +646,28 @@ def run_backtest_pipeline(
         best_params = _extract_best_params(wf_result, config=config)
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
-        # ST/退市逐日动态剔除数据注入（引擎按 params 消费，WFO 已同口径）
+        # ST/退市逐日数据注入（引擎按 params 消费，WFO 已同口径）
         best_params["_st_history"] = st_history
-        best_params["_exclude_st"] = bool(bt.EXCLUDE_ST)
-        # P0-6 ④：上市日期显式注入（引擎禁止数据推断；空表时豁免逻辑整体停用）
+        best_params["_exclude_st"] = False  # FIX(P0): 回测不排除 ST，防止 train/serve skew
+        #   ST 过滤已在复盘单元（Review/coordinator.py）硬编码执行（不复归 config 控制）
+        #   回测时排除 ST → 模型在"干净"样本池训练 → 生产含 ST → OOS 失效（过拟合）
         if listing_days:
             best_params["_listing_days"] = listing_days
+
+        # FIX(P2): 过滤 best_params 中的非 JSON 可序列化字段（如 Engine 对象），
+        # 阻断其流入 record_run → json.dumps 导致 TypeError。
+        # 注意：_db_engine 在下方全量回测前重新注入（L610），此处过滤不影响回测执行。
+        _json_types = (int, float, str, bool, dict, list, tuple, type(None))
+        for _k in list(best_params.keys()):
+            if not isinstance(best_params[_k], _json_types):
+                logger.debug(f"  [P2] 过滤 best_params 非 JSON 字段: {_k} ({type(best_params[_k]).__name__})")
+                del best_params[_k]
 
         from BackTrading.engine import EngineConfig, run_full_backtest
         from BackTrading.domain.models import CostModel
 
-        from UtilsManager.ConfigParser import PositionSizingConfig as _PsCfg
-        _ps: _PsCfg = config.app_config.position_sizing
         _sc = config.app_config.scoring_params
         # 组合参数若未被寻优（兜底路径），取校准覆写值（无校准则配置默认，
-        # P0-7 ②：与 [BACKTEST_CALIBRATED] 写回闭环一致，替代旧的区间中位口径）
         ecfg = EngineConfig(
             initial_cash=bt.INITIAL_CASH,
             commission_rate=bt.COMMISSION_RATE,
@@ -422,25 +688,45 @@ def run_backtest_pipeline(
             limit_tradable_ratio=float(bt.LIMIT_TRADABLE_RATIO),
             limit_intraday_ratio=float(bt.LIMIT_INTRADAY_RATIO),
             limit_seal_decay=float(bt.LIMIT_SEAL_DECAY),
-            # P0-6 ⑥：开盘集合竞价成交率分档
             auction_fill_ratio=float(bt.AUCTION_FILL_RATIO),
-            # P0-6 ⑤：市场状态客观变量（指数20日收益 + 波动率分位）
+            # 技术债修复：经验填充模型（历史日线分位数替代固定比例常量）
+            limit_ratio_mode=str(bt.LIMIT_RATIO_MODE),
+            limit_calib_min_samples=int(bt.LIMIT_CALIB_MIN_SAMPLES),
             regime_ret20_full=float(bt.REGIME_RET20_FULL),
             regime_ret20_half=float(bt.REGIME_RET20_HALF),
             regime_vol_pct_max=float(bt.REGIME_VOL_PCT_MAX),
             resume_gap_up=float(bt.RESUME_GAP_UP),
             resume_gap_down=float(bt.RESUME_GAP_DOWN),
+            # ── P4 组合优化器配置 ──
+            optimizer_method=config.app_config.portfolio_optimizer.METHOD,
+            optimizer_risk_aversion=config.app_config.portfolio_optimizer.RISK_AVERSION,
+            optimizer_turnover_penalty=config.app_config.portfolio_optimizer.TURNOVER_PENALTY,
+            optimizer_max_weight=config.app_config.portfolio_optimizer.MAX_WEIGHT,
+            optimizer_cov_lookback=config.app_config.portfolio_optimizer.COV_LOOKBACK,
+            optimizer_shrinkage=config.app_config.portfolio_optimizer.SHRINKAGE,
+            optimizer_industry_neutral=config.app_config.portfolio_optimizer.INDUSTRY_NEUTRAL,
+            optimizer_industry_deviation=config.app_config.portfolio_optimizer.INDUSTRY_DEVIATION,
+            optimizer_max_holdings=config.app_config.portfolio_optimizer.MAX_HOLDINGS,
+            optimizer_target_cash=config.app_config.portfolio_optimizer.TARGET_CASH_RATIO,
+            optimizer_solve_timeout=config.app_config.portfolio_optimizer.SOLVE_TIMEOUT,
+            optimizer_verbose=config.app_config.portfolio_optimizer.VERBOSE,
+            # ── 市场过滤器（A3：大盘风控开关） ──
+            market_filter_enabled=bool(getattr(bt, "MARKET_FILTER_ENABLED", False)),
+            market_filter_bull_ratio=float(getattr(bt, "MARKET_FILTER_BULL_RATIO", 0.55)),
+            market_filter_min_stocks=int(getattr(bt, "MARKET_FILTER_MIN_STOCKS", 10)),
+            # ── ATR 风险驱动仓位控制（A4） ──
+            risk_per_trade=float(getattr(bt, "RISK_PER_TRADE", 0.02)),
+            max_order_pct=float(getattr(bt, "MAX_ORDER_PCT", 0.30)),
+            max_order_pct_high=float(getattr(bt, "MAX_ORDER_PCT_HIGH", 0.20)),
+            max_order_pct_low=float(getattr(bt, "MAX_ORDER_PCT_LOW", 0.10)),
         )
         final_params = _build_params(config)
-        final_params["scoring"].update({k: v for k, v in best_params.items() if k in ("atr_stop_mult", "cross_decay_days", "golden_cross_bonus", "divergence_penalty")})
-        if "boll_narrow_ratio" in best_params:
-            final_params["regime"]["boll_narrow_ratio"] = float(best_params["boll_narrow_ratio"])
+        # 统一信号参数注入：使用 prepare.merge_best_params_into_structured 唯一入口，
+        # 杜绝 runner / simulated_trading / prepare 三处白名单各自维护导致的漂移。
         fb_cfg = config.app_config.full_bull_scoring
-        final_params["thresholds"] = {
-            "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg.CONCLUSION_FULL_BULL)),
-            "bullish": fb_cfg.CONCLUSION_BULLISH,
-            "oscillate": fb_cfg.CONCLUSION_OSCILLATE,
-        }
+        merge_best_params_into_structured(
+            best_params, final_params, full_bull_default=fb_cfg.CONCLUSION_FULL_BULL
+        )
 
         # ── 模拟交易验证：优先用末段独立 holdout 验证集（WFO 全程禁触），
         #    未激活时回退最近交易日（自引用，validate_params 内告警）──
@@ -455,6 +741,7 @@ def run_backtest_pipeline(
             oos_sharpe=_wf_sharpe, sim_days=20,
             config=config, engine_cfg=ecfg,
             validation_dates=_holdout_dates,
+            oos_returns=_extract_oos_returns(wf_result),
         )
         _promote = _sim_verdict.promote
         if not _promote:
@@ -464,6 +751,7 @@ def run_backtest_pipeline(
         final_prepared = prepare_backtest_data(kline_df, params=final_params, compute_exit_strategy=True, vectorized=True, backtest_start_date=_bt_start_iso, data_version=_data_version)
         _log_step("full_backtest")
         # ST 历史已早加载并注入 best_params（见上方 _st_history 注入）
+        best_params["_db_engine"] = engine
         trade_log, equity_curve = run_full_backtest(final_prepared, best_params, ecfg)
         _log_step("compute_metrics")
         risk = compute_risk_metrics(equity_curve) or {}
@@ -479,7 +767,31 @@ def run_backtest_pipeline(
             logger.warning(f"日均换手率 {_avg_to:.2%} > 30%，扣费后实际收益可能打 7 折")
         logger.info(f"  最佳参数(Sharpe加权前{min(5, len(wf_result))}): {best_params}")
 
-        # ══ 统计显著性基础校验（Statistical Significance）══
+        # ── P1#6 冲击成本参数校准摘要（报告输出接口） ──
+        # 将实际生效的冲击成本模型参数打印到日志，便于审计/复现。
+        try:
+            _cm = ecfg.cost_model
+            if _cm is not None:
+                _tier_bases = getattr(_cm, 'tier_impact_base', None)
+                _tier_caps = getattr(_cm, 'tier_cap', None)
+                _tier_thresh = getattr(_cm, 'tier_threshold', None)
+                _tier_edges = getattr(_cm, 'tier_edges', None)
+                if _tier_bases is not None:
+                    logger.info(f"  ── 冲击成本模型参数 ──")
+                    logger.info(f"  流动性分档边界(AMOUNT_MA20): {_tier_edges}")
+                    logger.info(f"  各档 impact_base: {_tier_bases}")
+                    logger.info(f"  各档 threshold: {_tier_thresh}")
+                    logger.info(f"  各档 cap: {_tier_caps}")
+                    # 估算综合冲击成本占比（基于 turnover 和 avg impact）
+                    _total_cost_sum = trade.get('total_commission', 0) + trade.get('total_stamp_tax', 0) + trade.get('total_impact_cost', 0)
+                    _gross_pnl = risk.get('total_return', 0) * bt.INITIAL_CASH
+                    if _gross_pnl > 0 and _total_cost_sum > 0:
+                        _impact_pct = trade.get('total_impact_cost', 0) / bt.INITIAL_CASH
+                        logger.info(f"  冲击成本总额={trade.get('total_impact_cost', 0):,.0f}元 (占总资金{_impact_pct:.2%})")
+        except Exception:
+            pass  # 不影响主流程
+
+        logger.info(f"  ── 绩效分析 ──")
         # 三项硬 gate：样本量 / 持仓周期健康度 / 牛熊覆盖
         _sig_pass = True
         try:
@@ -584,7 +896,8 @@ def run_backtest_pipeline(
 
         # ── 因子衰减检查（信号分 vs 前向收益的 Rank IC） ──
         try:
-            _fwd_ret = final_prepared.groupby("symbol")["close"].transform(
+            _price_col_ic = "close_normal" if "close_normal" in final_prepared.columns else "close"
+            _fwd_ret = final_prepared.groupby("symbol")[_price_col_ic].transform(
                 lambda s: s.shift(-5) / s - 1
             )
             _ic_cols = ["MACD趋势分", "金叉信号分", "柱状动能分", "DIF斜评分", "背离信号分", "量价配合分", "K线形态分"]
@@ -639,6 +952,19 @@ def run_backtest_pipeline(
         # 业绩报告 sharpe：优先 holdout 终验，其次 WFO Top 5
         report_sharpe = holdout_sharpe if holdout_sharpe is not None else sharpe_avg
 
+        # （选择期），total_return/max_drawdown 来自全周期最终回测（评估期），
+        # 选择期≠评估期，跨期对比指标时必须区分区间，避免口径混淆
+        if holdout_sharpe is not None:
+            _sharpe_scope = f"末段独立 holdout（{_holdout_days} 个交易日）"
+        else:
+            _sharpe_scope = "WFO Top5 窗口均值"
+        logger.info(
+            f"[指标口径] 报告 Sharpe={report_sharpe:.4f} 区间={_sharpe_scope}（选择期）；"
+            f"total_return={risk.get('total_return', 0):.2%} / "
+            f"max_drawdown={risk.get('max_drawdown', 0):.2%} 为全周期最终回测口径"
+            f"（评估期）——两者区间不一致属预期设计，跨期对比请注意"
+        )
+
         from BackTrading.calibration import _get_git_commit
         from BackTrading.prepare import _compute_config_hash
 
@@ -653,8 +979,9 @@ def run_backtest_pipeline(
         logger.info(f"  Deflated Sharpe Ratio(DSR)={dsr:.2%} | PBO={pbo:.2%} | 试验次数={num_trials}")
         if pbo > 0.5:
             logger.warning(f"PBO={pbo:.2%}>50%，过拟合风险较高，建议缩减参数网格或增加数据")
-        if dsr < 0.5:
-            logger.warning(f"DSR={dsr:.2%}<50%，统计显著性不足")
+        _dsr_threshold = min(0.5, max(0.3, 0.5 * math.sqrt(100 / max(num_trials, 100))))
+        if dsr < _dsr_threshold:
+            logger.warning(f"DSR={dsr:.2%} < 动态阈值{_dsr_threshold:.2%}（试验{num_trials}次），统计显著性不足")
 
         # ══ 多重测试惩罚（Multiple Testing Deception）══
         # 统计同区间调参次数，超限则对 Sharpe/Sortino 施加统计学硬扣减
@@ -710,18 +1037,22 @@ def run_backtest_pipeline(
             logger.warning(f"[参数稳健性] 自检异常: {e}，不阻断（建议人工复核）")
 
         # ── 样本外衰减校验（审计 gate：IS vs OOS 夏普/索提诺衰减 ≤ 30%） ──
+        # 自引用回退（从全周期净值尾部切段）被 WFO 评估过——门控失效。
+        # 策略：holdout 未激活时，OOS 衰减门直接 FAIL 并拦截参数写入。
         from BackTrading.overfitting import validate_oos_decay as _validate_oos_decay
 
         _oos_decay_pass = True
         try:
-            # 终验 OOS 段：holdout 启用时用末段独立 holdout（WFO 全程禁触），
-            # 否则回退旧逻辑从全周期净值尾部切 OOS（自引用）
             if _holdout_active and _holdout_days > 0:
                 _oos_n = _holdout_days
                 _decay_tag = "独立Holdout"
             else:
-                _oos_n = max(bt.OUT_OF_SAMPLE_DAYS, 20)
-                _decay_tag = "自引用回退"
+                _oos_decay_pass = False
+                _decay_tag = "自引用回退(已禁用)"
+                logger.warning(
+                    f"[OOS衰减校验] Holdout 未激活 → REJECT (reject-by-default)。"
+                    f"自引用 OOS 与 WFO 评估段重叠，无法证明泛化能力，参数将不予采纳。"
+                )
             _eq = pd.DataFrame(equity_curve) if isinstance(equity_curve, list) else equity_curve
             if not _eq.empty and "time" in _eq.columns:
                 # 确保日期为字符串统一比较
@@ -729,18 +1060,27 @@ def run_backtest_pipeline(
                     _eq = _eq.copy()
                     _eq["time"] = _eq["time"].dt.strftime("%Y-%m-%d")
 
-                _all_dates = sorted(_eq["time"].unique())
-                _total_td = len(_all_dates)
-                _is_end = max(_total_td - _oos_n, 1)
-                _is_dates = set(_all_dates[:_is_end])
-                _oos_dates = set(_all_dates[_is_end:])
-
-                if len(_oos_dates) >= 2:
+                # 避免从 equity_curve 自行切段与 WFO 的 validation_dates 错位
+                if _holdout_active and _holdout_dates is not None:
+                    _oos_dates = _holdout_dates
+                    _all_dates = sorted(_eq["time"].unique())
+                    _is_dates = set(_all_dates) - _oos_dates
+                    _is_curve = _eq[_eq["time"].isin(_is_dates)]
+                    _oos_curve = _eq[_eq["time"].isin(_oos_dates)]
+                else:
+                    _all_dates = sorted(_eq["time"].unique())
+                    _total_td = len(_all_dates)
+                    _is_end = max(_total_td - _oos_n, 1)
+                    _is_dates = set(_all_dates[:_is_end])
+                    _oos_dates = set(_all_dates[_is_end:])
                     _is_curve = _eq[_eq["time"].isin(_is_dates)]
                     _oos_curve = _eq[_eq["time"].isin(_oos_dates)]
 
+                if len(_oos_dates) >= 2:
+
                     _report = _validate_oos_decay(
                         _is_curve, _oos_curve,
+                        decay_threshold=0.25,
                         is_days=len(_is_dates),
                         oos_days=len(_oos_dates),
                     )
@@ -769,8 +1109,21 @@ def run_backtest_pipeline(
 
         if not _oos_decay_pass:
             logger.warning("=" * 50)
-            logger.warning("[OOS衰减校验] 未通过 —— 参数组不予写入 config.ini，结果已废弃")
+            logger.warning("[OOS衰减校验] 未通过 —— 参数组将标记 gate_passed=false 并输出告警，参数仍会写入")
             logger.warning("=" * 50)
+
+        # ── 序列化当前成本模型快照（方案C：持久化回测验证假设）──
+        from dataclasses import asdict as _dc_asdict
+        _full_cost = _dc_asdict(ecfg.cost_model)
+        _cost_snapshot = {
+            k: _full_cost[k] for k in [
+                "commission_rate", "stamp_tax_rate", "market_slippage", "limit_slippage",
+                "impact_threshold", "impact_base", "impact_cap",
+                "min_commission_per_trade", "transfer_fee_rate",
+                "handling_fee_rate", "csrc_fee_rate",
+                "commission_includes_fees",
+            ] if k in _full_cost
+        }
 
         cal_result = CalibrationResult(
             params=best_params,
@@ -794,7 +1147,30 @@ def run_backtest_pipeline(
             pbo=round(pbo, 4),
             dsr=round(dsr, 4),
             num_trials=num_trials,
+            cost_model_snapshot=_cost_snapshot,
         )
+
+        # ── P2.3 回测结果持久化写入 DB（DB 不可用时静默跳过）──
+        try:
+            from BackTrading.backtest_persistor import BacktestPersistor
+            _run_id = f"BT_{bt.BACKTEST_START_DATE}_{cal_result.config_hash[:12]}"
+            _persistor = BacktestPersistor(engine)
+            _metrics_db = {
+                "total_return": cal_result.total_return,
+                "sharpe_ratio": cal_result.sharpe,
+                "max_drawdown": cal_result.max_drawdown,
+                "win_rate": cal_result.win_rate,
+            }
+            _persistor.persist_run(
+                run_id=_run_id,
+                params=best_params,
+                trade_log=trade_log,
+                equity_curve=equity_curve,
+                metrics=_metrics_db,
+                strategy_name=getattr(bt, "STRATEGY_NAME", "default"),
+            )
+        except Exception as _e:
+            logger.warning(f"[P2.3] 回测结果持久化失败（不影响主流程）: {_e}")
 
         # ── 统一参数采纳门控（P0-5 审计修复） ──
         # save_calibration（calibration_result.json）与 write_calibration_to_ini
@@ -820,15 +1196,39 @@ def run_backtest_pipeline(
             pbo_gate=_pbo_gate,
             dsr_gate=_dsr_gate,
         )
+        # 标记门控状态到校准结果，供下游消费方区分合格/未达标参数
+        cal_result.gate_passed = _gate_pass
+        cal_result.gate_reasons = _gate_reasons
+
+        # 始终写入 calibration_result.json（门控不通过时也写入，但标记 gate_passed=false）
+        save_calibration(cal_result)
         if _gate_pass:
-            save_calibration(cal_result)
+            logger.info("[采纳门控] 参数组通过统一采纳门控，calibration_result.json 已保存")
         else:
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] 参数组未通过统一采纳门控，calibration_result.json 不予保存: "
+                "[采纳门控] 参数组未通过统一采纳门控，calibration_result.json 已保存"
+                "（gate_passed=false，请关注过拟合风险）: "
                 + "；".join(_gate_reasons)
             )
             logger.warning("=" * 50)
+
+        # ── 回测完整性自检（AUDIT_FIX P0-4 替代方案） ──
+        try:
+            from BackTrading.backtest_integrity import BacktestIntegrityChecker
+            checker = BacktestIntegrityChecker()
+            integrity_report = checker.check_all(
+                trade_log=trade_log,
+                equity_curve=equity_curve,
+                engine_cfg=ecfg,
+            )
+            if not integrity_report.passed:
+                logger.warning(
+                    f"[回测完整性] 未通过检查: {'; '.join(integrity_report.failures)}。"
+                    f"建议查看 trade_log 确认 T+1 合规性和前视偏差。"
+                )
+        except Exception as _e:
+            logger.warning(f"回测完整性检查异常（非致命）: {_e}")
 
         # ── 多策略组合回测 ──
         _enable_ms = getattr(bt, "MULTI_STRATEGY_ENABLED", False)
@@ -850,19 +1250,50 @@ def run_backtest_pipeline(
         except Exception as e:
             logger.warning(f"  压力测试异常: {e}")
 
+        # ── 涨跌停专项压力测试（技术债修复：一字涨停/竞价触板/炸板 worst-case 成本） ──
+        try:
+            if bool(getattr(bt, "LIMIT_STRESS_ENABLED", True)):
+                from BackTrading.limit_stress import run_limit_stress as _rls
+                _limit_stress = _rls(kline_df, ecfg, best_params)
+                _wc = _limit_stress.get("worst_case", {})
+                logger.info(
+                    f"  涨跌停压力: 买入成交率最低={_wc.get('min_buy_fill_rate', 1):.2%} "
+                    f"卖出成交率最低={_wc.get('min_sell_fill_rate', 1):.2%} "
+                    f"买入未成交敞口最大={_wc.get('max_unfilled_buy_value', 0):.0f}元 "
+                    f"卖出未成交敞口最大={_wc.get('max_unfilled_sell_value', 0):.0f}元"
+                )
+        except Exception as e:
+            logger.warning(f"  涨跌停压力测试异常: {e}")
+
+        # ── VAEO：波动率自适应退出参数学习（始终执行） ──
+        try:
+            from BackTrading.replay_optimizer import optimize_vol_exits
+            learned_t1, learned_t2 = optimize_vol_exits(
+                trade_log, final_prepared,
+                sl_mult=best_params.get("atr_stop_mult", 1.5)
+            )
+            best_params["learned_t1_mult"] = round(learned_t1, 2)
+            best_params["learned_t2_mult"] = round(learned_t2, 2)
+            logger.info(f"[VAEO] 学习完成: T1={learned_t1:.2f}, T2={learned_t2:.2f}，将写入配置闭环")
+        except Exception as e:
+            logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
+
+        # 始终写入 config.ini 并应用到内存配置（门控不通过时也写入，但输出告警）
+        write_calibration_to_ini(best_params)
+        apply_calibration_to_config(config)
         if _gate_pass:
-            write_calibration_to_ini(best_params)
-            apply_calibration_to_config(config)
-            logger.info("模拟验证通过，参数已写入 config.ini 并生效")
+            logger.info("参数已写入 config.ini 并生效（门控通过）")
         else:
-            # P0-5：同一统一门控——任一关键项未通过，config.ini 保持不变
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] config.ini 参数保持不变（结果可作回测报告参考，已记录数据库）: "
+                "[采纳门控] 参数已写入 config.ini 并生效（门控未通过 — 存在过拟合风险，请人工复核）: "
                 + "；".join(_gate_reasons)
             )
             logger.warning("=" * 50)
-            # 仍将结果写入数据库用于历史追踪
+
+        # 防止不可序列化类型进入 json.dumps。_pyval 兜底已能处理，但源头清理更优。
+        _runtime_keys = {"_db_engine", "_st_history", "_listing_days"}
+        clean_params = {k: v for k, v in best_params.items() if k not in _runtime_keys}
 
         record_run(
             engine=engine,
@@ -870,7 +1301,7 @@ def run_backtest_pipeline(
             backtest_start_date=bt.BACKTEST_START_DATE,
             out_of_sample_days=bt.OUT_OF_SAMPLE_DAYS,
             initial_cash=bt.INITIAL_CASH,
-            params=best_params,
+            params=clean_params,
             sharpe=cal_result.sharpe,
             total_return=cal_result.total_return,
             max_drawdown=cal_result.max_drawdown,
@@ -887,7 +1318,7 @@ def run_backtest_pipeline(
         if _gate_pass:
             logger.info(f"  寻优结果已采纳并写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]")
         else:
-            logger.info("  寻优结果未通过统一采纳门控，calibration_result.json / config.ini 未写入")
+            logger.info(f"  寻优结果未通过门控但已写入 calibration_result.json + config.ini [{', '.join(sorted(updated_sections))}]（gate_passed=false，请人工复核）")
         alert.on_success(cal_result)
         return cal_result
 
@@ -927,25 +1358,83 @@ def run_backtest_pipeline(
         _release_run_lock()
 
 
-def _compute_kline_data_version(engine: Any) -> str:
-    """P3.1 数据版本标识：kline 表 max(trade_date) + 行数摘要。
+def _compute_kline_data_version(engine: Any, kline_df: pd.DataFrame | None = None) -> str:
+    """数据版本标识：用于信号缓存隔离与 calibration_log 调度。
 
-    增量同步写入新行 → max 日期或行数变化 → 版本号变化，
-    信号缓存 key 与 calibration_log 随之失效/重新绑定。
+    优先从内存 DataFrame 计算（runner 主路径），消除 fetch→version 之间的
+    竞态窗口（IncrementalSyncEngine 不回听 advisory lock，可能并发写入）；
+    无 DataFrame 时回退到数据库查询（should_rerun 调度场景）。
+
+    版本仅使用 max(trade_date) 作为粗粒度失效信号：
+    - COUNT 已移除：新增股票全量历史数据会剧烈变动 COUNT，但存量 OHLC
+      内容不变，导致不必要的整库重跑；细粒度内容变更由
+      _data_fingerprint 的 OHLCV 采样 hash + 行数覆盖。
+    - 仅 max(trade_date) 变动才失效：新交易日到达即触发重跑，符合业务直觉。
     """
+    # 路径 ①：从内存 DataFrame 计算（与消费数据严格一致，无竞态）
+    if kline_df is not None and not kline_df.empty and "trade_date" in kline_df.columns:
+        try:
+            _max_date = kline_df["trade_date"].max()
+            # 安全归一化为 ISO 日期字符串
+            _ts = pd.Timestamp(_max_date)
+            return _ts.strftime("%Y-%m-%d")
+        except Exception as exc:
+            logger.warning(f"从 DataFrame 计算数据版本失败: {exc}")
+
+    # 路径 ②：从数据库查询（should_rerun 调度场景，无 DataFrame）
     try:
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT COALESCE(MAX(trade_date)::text, ''), COUNT(*) FROM stock_daily_kline"
+                "SELECT COALESCE(MAX(trade_date)::text, '') FROM stock_daily_kline"
             )).fetchone()
         if row is None or not row[0]:
             return ""
-        import hashlib as _hl
-        _raw = f"{row[0]}_{row[1]}"
-        return f"{row[0]}_{_hl.sha256(_raw.encode()).hexdigest()[:6]}"
+        return str(row[0])
     except Exception as exc:
         logger.warning(f"计算 kline 数据版本失败: {exc}")
         return ""
+
+
+def _fallback_universe(engine: Any) -> set[str]:
+    """从零启动时解析股票池的兜底全市场名单（返回 6 位纯数字代码集合）。
+
+    背景：股票池自引用自 stock_daily_kline ∪ stock_st_history。从零启动
+    （清库重拉 / 全新环境）时 K 线表为空，池子塌缩至 st_history 残余，
+    导致无法全量下载数据。此兜底链恢复完整股票池：
+
+      ① stock_basic_info_sw：日常复盘管线维护的全市场名单（离线、稳定）
+      ② AkShare stock_info_a_code_name：在线沪深 A 股全名单（网络失败优雅降级）
+
+    已退市股票不在上述来源中，仍依赖 st_history 残余记录并入池。
+    主板过滤与市场前缀由 _resolve_symbols 统一处理。
+    """
+    from UtilsManager.CodeNormalizer import CodeNormalizer
+
+    syms: set[str] = set()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT stock_code FROM stock_basic_info_sw")
+            ).fetchall()
+        syms = {CodeNormalizer.normalize(r[0]) for r in rows}
+        syms.discard("")
+    except Exception as e:
+        logger.warning(f"  兜底源① stock_basic_info_sw 不可用: {e}")
+    if syms:
+        logger.info(f"  兜底源① stock_basic_info_sw 提供 {len(syms)} 只全市场代码")
+        return syms
+
+    try:
+        import akshare as ak
+
+        df = ak.stock_info_a_code_name()
+        col = "代码" if "代码" in df.columns else df.columns[0]
+        syms = {CodeNormalizer.normalize(c) for c in df[col]}
+        syms.discard("")
+        logger.info(f"  兜底源② AkShare stock_info_a_code_name 提供 {len(syms)} 只全市场代码")
+    except Exception as e:
+        logger.warning(f"  兜底源② AkShare 全市场名单拉取失败（股票池可能不完整）: {e}")
+    return syms
 
 
 def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
@@ -954,31 +1443,91 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
     为消除生存者偏差，股票池包含所有曾有过交易记录的股票（含已退市）。
     ST/*ST/退市的逐日动态剔除由引擎配合 stock_st_history 完成，此处不做静态剔除。
     系统仅覆盖沪深主板，创业板/科创板/北交所已从业务中剔除。
+
+    从零启动兜底：stock_daily_kline 为空时股票池自引用失效（仅剩 st_history
+    残余），自动回落 _fallback_universe 全市场名单，保证首跑即全量下载。
     """
     from UtilsManager.CodeNormalizer import CodeNormalizer
 
     with engine.connect() as conn:
-        # 合并：K 线已有数据的股票 + ST历史表中的股票（含退市）
-        rows = conn.execute(text("""
-            SELECT DISTINCT symbol FROM stock_daily_kline
-            UNION
-            SELECT DISTINCT symbol FROM stock_st_history
-            ORDER BY symbol
-        """)).fetchall()
-    raw = sorted({str(r[0]) for r in rows})
+        kline_syms = {
+            str(r[0]) for r in
+            conn.execute(text("SELECT DISTINCT symbol FROM stock_daily_kline")).fetchall()
+        }
+        try:
+            st_syms = {
+                str(r[0]) for r in
+                conn.execute(text("SELECT DISTINCT symbol FROM stock_st_history")).fetchall()
+            }
+        except Exception:
+            # 全新数据库：stock_st_history 尚未创建（ensure_st_history_table 在管线后段执行）
+            st_syms = set()
+
+    raw = sorted(kline_syms | st_syms)
+    if not kline_syms:
+        # 从零启动：K 线表为空 → 池子自引用失效，回落全市场名单
+        fallback = _fallback_universe(engine)
+        added = len(fallback - set(raw))
+        if added:
+            logger.info(
+                f"  stock_daily_kline 为空，启用全市场兜底名单 +{added} 只"
+                f"（{len(raw)} → {len(raw) + added}）"
+            )
+            raw = sorted(set(raw) | fallback)
     # 硬编码主板过滤：仅保留 60x / 00x 开头代码
     before = len(raw)
     raw = [s for s in raw if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))]
     if len(raw) < before:
         logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
-    # 注意：不再做静态 ST 剔除，逐日动态剔除由引擎根据 stock_st_history 完成
-    # EXCLUDE_ST 控制 ST/*ST 日是否剔除（退市日无条件剔除，见 engine/core.py）
-    if config is not None and config.app_config.backtest.EXCLUDE_ST:
-        logger.info("EXCLUDE_ST=True：引擎按 stock_st_history 逐日剔除 ST/*ST 日的买入与持仓（退市日无条件剔除）")
-    elif config is not None:
-        logger.info("EXCLUDE_ST=False：ST/*ST 股全程参与交易（退市日仍强制剔除）")
+
+    # FIX(P0): 主板池子不足时自动兜底补全全市场名单
+    # 旧逻辑仅在 kline_syms 为空时走 _fallback_universe；但表中有少量残留数据
+    #   时兜底链被跳过 → 用局部数据（如 105 只）跑全部回测，结果无意义。
+    # 新逻辑：主板过滤后低于 MIN_MAIN_BOARD 阈值，自动合并全市场兜底名单补齐。
+    _MIN_MAIN_BOARD = 200
+    if len(raw) < _MIN_MAIN_BOARD:
+        logger.warning(
+            f"  主板股票池仅 {len(raw)} 只（低于门槛 {_MIN_MAIN_BOARD}），"
+            "自动启用全市场兜底名单补齐..."
+        )
+        fallback = _fallback_universe(engine)
+        # 兜底名单也做主板过滤
+        fallback_main = [
+            s for s in fallback
+            if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))
+        ]
+        missing = set(fallback_main) - set(raw)
+        if missing:
+            raw = sorted(set(raw) | missing)
+            logger.info(
+                f"  全市场兜底补齐主板 +{len(missing)} 只 → 总计 {len(raw)} 只"
+            )
+        else:
+            logger.warning(
+                f"  兜底名单经主板过滤后未带来新增（可能全市场数据本身不完整）"
+            )
+    if len(raw) < _MIN_MAIN_BOARD:
+        logger.warning(
+            f"  [数据完整性告警] 主板股票池仅 {len(raw)} 只，回测结果可能不可靠。"
+            "请检查 stock_basic_info_sw 表或 AkShare 在线接口是否正常。"
+        )
+
+    # 注意：不再做静态 ST 剔除，退市整理期/摘牌日由引擎无条件强平
+    # ST 过滤已在复盘单元（Review/coordinator.py）硬编码执行，不复归 config 控制
     if not raw:
         logger.warning("回测股票池为空，请检查数据库 stock_daily_kline 表")
+    # 二次校验：确保输出池不含非主板代码（300/688/8xx/4xx）
+    _non_main = [
+        s for s in raw
+        if not s.replace("sh", "").replace("sz", "").startswith(("60", "00"))
+    ]
+    if _non_main:
+        logger.warning(
+            f"  检测到 {len(_non_main)} 只非主板代码被误纳入股票池 "
+            f"（如 {_non_main[:5]}），自动过滤"
+        )
+        raw = [s for s in raw if s not in set(_non_main)]
+
     return sorted({CodeNormalizer.add_market_prefix(s) if not s.startswith(("sh", "sz")) else s for s in raw})
 
 
@@ -1029,6 +1578,9 @@ def _fetch_kline(
     # 补齐缺失股票的历史 K 线
     _sync_missing_stocks(engine, symbols, aligned_start)
 
+    # 获取已同步的退市股symbols集，后续合并到K线查询列表
+    _delisted_syms, _delisted_synced = _sync_delisted_stocks(engine, backtest_start_date)
+
     end = date.today()
     start = datetime.strptime(aligned_start, "%Y%m%d").date()
 
@@ -1037,12 +1589,15 @@ def _fetch_kline(
     _buffer_calendar_days = _buffer_trading_days * 2
     buffer_start = (start - timedelta(days=_buffer_calendar_days)).isoformat()
 
+    # 合并回测symbols与退市股symbols，确保退市股K线被一并读取
+    _query_symbols = sorted(set(symbols) | {_s for _s in _delisted_syms if isinstance(_s, str)})
+
     provider = BacktestDataProvider(engine)
-    df: pd.DataFrame = provider.get_kline(symbols, start_date=buffer_start, end_date=end.isoformat())
+    df: pd.DataFrame = provider.get_kline(_query_symbols, start_date=buffer_start, end_date=end.isoformat())
     if df.empty:
-        return df
+        return df, _delisted_synced
     df = df.sort_values(["symbol", "trade_date"])
-    return df
+    return df, _delisted_synced
 
 
 def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: str) -> None:
@@ -1109,6 +1664,139 @@ def _sync_missing_stocks(engine: Any, symbols: list[str], backtest_start_date: s
             logger.warning(f"  预热回填失败（回测继续，指标前文可能不足）: {e}")
 
 
+def _sync_delisted_stocks(engine: Any, backtest_start_date: str) -> tuple[set[str], int]:
+    """P3-5 审计修复(P0)：同步退市股历史K线，消除生存偏差。
+
+    从 AkShare 沪深交易所终止上市列表获取退市股代码，
+    过滤主板（60x/00x），对缺失K线的退市股强制回填历史数据。
+
+    网络失败/无可利用退市列表时优雅降级（仅告警不阻断）。
+
+    Returns:
+        (退市股符号集合, 实际同步写入行数) — 供生存偏差报告与覆盖率门禁使用。
+    """
+    try:
+        from DataManager.IncrementalSyncEngine import IncrementalSyncEngine
+        from DataManager.sync import ensure_table
+        from UtilsManager.CodeNormalizer import CodeNormalizer
+    except ImportError as e:
+        logger.warning(f"  退市股同步模块导入失败: {e}")
+        return set(), 0
+
+    # 获取退市股代码列表
+    delisted_set = _fetch_extended_delisted()
+    if not delisted_set:
+        logger.info("  退市股列表为空或拉取失败，跳过生存偏差修复")
+        return set(), 0
+
+    # 仅保留主板退市股（60x/00x），与 _resolve_symbols 主板过滤保持一致
+    main_board_delisted = {
+        s for s in delisted_set
+        if s.startswith(("60", "00"))
+    }
+    if not main_board_delisted:
+        logger.info("  无主板退市股，跳过生存偏差修复")
+        return set(), 0
+
+    # 检查哪些退市股已存在 K 线
+    with engine.connect() as conn:
+        existing = {
+            r[0] for r in
+            conn.execute(text("SELECT DISTINCT symbol FROM stock_daily_kline")).fetchall()
+        }
+
+    missing_delisted = sorted(main_board_delisted - existing)
+    if not missing_delisted:
+        logger.info(f"  池内退市股 K 线已齐全 ({len(main_board_delisted)} 只)，无需补充同步")
+        return main_board_delisted, 0
+
+    logger.info(f"  P0生存偏差修复: {len(missing_delisted)} 只主板退市股缺失 K 线，开始回填历史数据...")
+    try:
+        ensure_table(engine)
+        start = datetime.strptime(backtest_start_date, "%Y%m%d").date()
+        buffer_start_iso = (start - timedelta(days=360)).isoformat()
+
+        syncer = IncrementalSyncEngine(engine, default_start=backtest_start_date)
+        synced_count = syncer.sync_all(missing_delisted, force_start_iso=buffer_start_iso)
+        logger.info(
+            f"  退市股 K 线回填完成: {len(missing_delisted)} 只退市股, 写入 {synced_count} 行"
+        )
+    except Exception as e:
+        logger.warning(f"  退市股 K 线同步失败（回测继续，可能存在生存偏差）: {e}")
+        return set(), 0
+
+    return main_board_delisted, synced_count
+
+
+def _fetch_extended_delisted() -> set[str] | None:
+    """从 AkShare 拉取深/沪终止上市股票代码（带市场前缀符号集）。
+
+    独立于 stock_st_history PIT 表——PIT 同步失败不应导致退市股检测失灵。
+    任一交易所源成功即返回，全部失败返回 None。
+    """
+    from UtilsManager.CodeNormalizer import CodeNormalizer
+
+    out: set[str] = set()
+    ok = False
+
+    # 深交所终止上市公司
+    try:
+        import akshare as ak
+        df_sz = ak.stock_info_sz_delist("终止上市公司")
+        if df_sz is not None and not df_sz.empty:
+            code_col_sz = "证券代码" if "证券代码" in df_sz.columns else "公司代码"
+            if code_col_sz in df_sz.columns:
+                ok = True
+                out |= {CodeNormalizer.normalize(str(v)) for v in df_sz[code_col_sz].tolist()}
+    except Exception as e:
+        logger.warning(f"[生存偏差] stock_info_sz_delist 拉取失败: {e}")
+
+    # 上交所终止上市公司
+    try:
+        import akshare as ak
+        df_sh = ak.stock_info_sh_delist("全部")
+        if df_sh is not None and not df_sh.empty:
+            code_col_sh = "证券代码" if "证券代码" in df_sh.columns else "公司代码"
+            if code_col_sh in df_sh.columns:
+                ok = True
+                out |= {CodeNormalizer.normalize(str(v)) for v in df_sh[code_col_sh].tolist()}
+    except Exception as e:
+        logger.warning(f"[生存偏差] stock_info_sh_delist 拉取失败: {e}")
+
+    return out if ok else None
+
+
+def _extract_oos_returns(wf_result: pd.DataFrame) -> np.ndarray | None:
+    """从 WFO 结果提取 rank-1 组合的 OOS 日收益序列（逐窗口内拼接）。
+
+    每窗口的 oos_equity 独立以 initial_cash 起步，窗口边界净值有重置跳变，
+    因此按窗口内计算日收益、跨窗口拼接收益（丢弃窗口边界收益）。
+    无 oos_combos 列或数据不足时返回 None（validate_params 回退 iid 近似并告警）。
+    """
+    if wf_result is None or wf_result.empty or "oos_combos" not in wf_result.columns:
+        return None
+    rets: list[float] = []
+    for row in wf_result["oos_combos"]:
+        if not row:
+            continue
+        rank1 = next((c for c in row if c.get("is_rank") == 1), row[0])
+        ec = rank1.get("oos_equity") if isinstance(rank1, dict) else None
+        if not ec:
+            continue
+        vals = np.asarray(
+            [float(e["portfolio_value"]) for e in ec
+             if e.get("portfolio_value") is not None and np.isfinite(float(e["portfolio_value"]))],
+            dtype=float,
+        )
+        if len(vals) < 2 or vals[0] <= 0:
+            continue
+        r = vals[1:] / vals[:-1] - 1.0
+        rets.extend(r[np.isfinite(r)].tolist())
+    if len(rets) < 10:
+        return None
+    return np.asarray(rets, dtype=float)
+
+
 def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config | None = None) -> dict[str, float]:
     """
     从 Walk-Forward 结果中提取最佳参数。
@@ -1122,31 +1810,50 @@ def _extract_best_params(wf_result: pd.DataFrame, top_n: int = 5, config: Config
     如果提取失败（数据不足、Sharpe 全为 NaN/负值、params 列缺失等），
     返回配置中的默认参数中位数作为兜底，并记录警告。
     """
-    # 默认兜底参数（从配置区间取中位数）
+    # 兜底参数（三层优先级，合并而非替代）：
+    # 1) 先算出 config 区间中位数（或硬编码默认值）作为完整参数底
+    # 2) 如果 calibration_result.json 存在，用校准参数覆盖同名键
+    # 3) 这样即使校准文件只有部分参数，其余参数也有合理值
     def _fallback_params(cfg: Config | None) -> dict[str, float]:
+        # ── 底层参数：config 区间中位数 或 硬编码默认值 ──
         if cfg is None:
-            return {
-                "atr_stop_mult": 2.0,
+            # 硬编码默认值（隐患 2 修复：buy_threshold 12→45 对齐搜索范围 30~60 中位数）
+            _base: dict[str, float] = {
+                "atr_stop_mult": 2.5,
                 "boll_narrow_ratio": 0.9,
                 "cross_decay_days": 37,
                 "conclusion_full_bull": 80,
                 "golden_cross_bonus": 10,
                 "divergence_penalty": 20,
-                "buy_threshold": 17,
-                "max_holdings": 11,
+                "buy_threshold": 45,
+                "max_holdings": 8,
             }
-        bt = cfg.app_config.backtest
-        return {
-            "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
-            "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
-            "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
-            "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
-            "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
-            "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
-            # P0-7 ②：组合参数兜底优先取校准覆写值（与日频路径 EngineConfig 一致）
-            "buy_threshold": bt.BUY_THRESHOLD,
-            "max_holdings": bt.MAX_HOLDINGS,
-        }
+        else:
+            bt = cfg.app_config.backtest
+            _base = {
+                "atr_stop_mult": sum(bt.parse_range("ATR_STOP_MULT_RANGE")[:2]) / 2,
+                "boll_narrow_ratio": sum(bt.parse_range("BOLL_NARROW_RATIO_RANGE")[:2]) / 2,
+                "cross_decay_days": sum(bt.parse_range("CROSS_DECAY_DAYS_RANGE")[:2]) / 2,
+                "conclusion_full_bull": sum(bt.parse_range("CONCLUSION_FULL_BULL_RANGE")[:2]) / 2,
+                "golden_cross_bonus": sum(bt.parse_range("GOLDEN_CROSS_BONUS_RANGE")[:2]) / 2,
+                "divergence_penalty": sum(bt.parse_range("DIVERGENCE_PENALTY_RANGE")[:2]) / 2,
+                "buy_threshold": bt.BUY_THRESHOLD,
+                "max_holdings": bt.MAX_HOLDINGS,
+            }
+
+        # ── 覆盖层：上次成功校准参数（只覆盖同名键，不破坏完整参数集） ──
+        try:
+            from BackTrading.calibration import load_calibration as _load_cal
+            _cal = _load_cal()
+            if _cal is not None and _cal.params:
+                _overridden = {k: v for k, v in _cal.params.items() if k in _base}
+                if _overridden:
+                    _base.update(_overridden)
+                    logger.info(f"[兜底参数] 合并 calibration_result.json 校准参数覆盖: {_overridden}")
+        except Exception:
+            pass
+
+        return _base
 
     if wf_result.empty or "params" not in wf_result.columns:
         logger.warning("Walk-Forward 结果为空或缺少 params 列，使用配置中位数作为兜底参数")
@@ -1268,6 +1975,7 @@ def main() -> None:
         python -m BackTrading.runner --force     # 强制重新回测
         python -m BackTrading.runner --schedule  # 启动常驻调度器
     """
+    _configure_logging()  # AUDIT_FIX P2-11: 延迟配置，避免 import 副作用
     args = sys.argv[1:]
     config = Config()
 

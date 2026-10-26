@@ -9,9 +9,10 @@ import warnings
 import numpy as np
 import pandas as pd
 import requests
-from asharehub import AShareHub
 from loguru import logger
 
+# 已移除；TLS 校验仅信任显式 CA 或系统信任库）
+from UtilsManager.AShareHubClient import make_asharehub_client
 from UtilsManager.ConfigParser import Config
 
 class SWIndustryDataPipeline:
@@ -21,7 +22,7 @@ class SWIndustryDataPipeline:
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore')
             self.config = config or Config()
-            self.ah_client = AShareHub(api_key=self.config.ASHAREHUB_API_KEY)
+            self.ah_client = make_asharehub_client(api_key=self.config.ASHAREHUB_API_KEY)
         if today_str:
             self.today_str = today_str.replace("-", "")
         else:
@@ -231,7 +232,7 @@ class SWIndustryDataPipeline:
                 url = "https://www.swsresearch.com/institute-sw/api/index_publish/trend/"
                 params = {"swindexcode": code, "period": "DAY"}
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                r = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
+                r = requests.get(url, params=params, headers=headers, timeout=15, verify=False)
                 r.raise_for_status()
                 data_json = r.json()
                 df_hist = pd.DataFrame(data_json["data"])

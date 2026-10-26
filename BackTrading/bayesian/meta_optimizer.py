@@ -54,6 +54,24 @@ _SIGNAL_WARMUP_DAYS = 120
 _MAX_CONSECUTIVE_OOS_FAILURES = 3
 
 
+class WFOSystematicFailure(Exception):
+    """WFO 系统性优化失败异常。
+
+    当所有路径/窗口的 OOS 校验全部不通过时抛出，携带回退参数供
+    runner 记录失败状态并中断流水线，避免静默回退导致反复重跑。
+
+    Attributes:
+        fallback_params: 参数空间中间值兜底参数。
+        reason: 失败原因描述。
+        failed_windows: 连续失败的窗口数。
+    """
+    def __init__(self, fallback_params: dict[str, float], reason: str, failed_windows: int = 0) -> None:
+        self.fallback_params = fallback_params
+        self.reason = reason
+        self.failed_windows = failed_windows
+        super().__init__(f"WFO 系统性失败: {reason}")
+
+
 def _window_dates(
     unique_dates: list,
     train_period: int,
@@ -95,9 +113,10 @@ def _oos_validate(
     top_m: int = 5,
     eval_start_date: str | None = None,
     st_history: dict | None = None,
-    exclude_st: bool = True,
+    exclude_st: bool = False,  # FIX(P0): 回测默认不排除 ST
     data_version: str | None = None,
     listing_days: dict | None = None,
+    db_engine: Any = None,
 ) -> list[dict[str, Any]]:
     """对 top-M 参数组合做 OOS 验证。
 
@@ -140,9 +159,10 @@ def _oos_validate(
         if st_history:
             engine_params["_st_history"] = st_history
             engine_params["_exclude_st"] = exclude_st
-        # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
         if listing_days:
             engine_params["_listing_days"] = listing_days
+        if db_engine is not None:
+            engine_params["_db_engine_url"] = str(db_engine.url)
         _run_single_backtest(_prepared, engine_params, _ec, tl, ec)
         risk = compute_risk_metrics(ec) or {}
         trade = compute_trade_metrics(tl) or {}
@@ -197,8 +217,10 @@ def bayesian_walk_forward_multi(
     from UtilsManager.ConfigParser import Config as _Config
 
     if spaces is None:
-        cfg = _Config().app_config.backtest
-        spaces = build_spaces(cfg)
+        full_cfg = _Config()
+        bt_cfg = full_cfg.app_config.backtest
+        po_cfg = getattr(full_cfg.app_config, "portfolio_optimizer", None)
+        spaces = build_spaces(bt_cfg, portfolio_optimizer_config=po_cfg)
 
     # ── A2 失败快照：开启会话（重置计数 + 过期清理），注入 run/task 上下文 ──
     begin_snapshot_session()
@@ -241,6 +263,9 @@ def bayesian_walk_forward_multi(
         point_in_time=kwargs.get("point_in_time", True),
         execution_model=kwargs.get("execution_model", "next_open"),
         cost_model=_wfo_cost,
+        max_order_pct=kwargs.get("max_order_pct", 0.30),
+        max_order_pct_high=kwargs.get("max_order_pct_high", 0.20),
+        max_order_pct_low=kwargs.get("max_order_pct_low", 0.10),
     )
 
     # 从 config 读取 BO 预算
@@ -325,19 +350,65 @@ def bayesian_walk_forward_multi(
     except Exception as _pce:
         logger.warning(f"  Precheck 摘要计算失败（不影响主流程）: {_pce}")
     show_progress = kwargs.get("show_progress", False)
-    # ST/退市逐日动态剔除（runner 注入，寻优与最终回测口径一致）
+    # ST/退市逐日状态（runner 注入；回测阶段默认不排除 ST，防止 train/serve skew）
     st_history = kwargs.get("st_history")
-    exclude_st = bool(kwargs.get("exclude_st", True))
-    # P0-6 ④：上市日期显式注入（与 runner 最终回测口径一致）
+    exclude_st = bool(kwargs.get("exclude_st", False))  # FIX(P0): 回测默认不排除 ST
     listing_days = kwargs.get("listing_days")
+
+    # 策略：基于 listing_days 计算有效起始日期 — 取 90% 分位上市日 + _SIGNAL_WARMUP_DAYS，
+    # 确保绝大多数新股在进入第一个训练窗口前已有足够预热数据。
+    # 若 listing_days 缺失或上市日数据不足，回退至原有固定偏移。
+    _listing_offset = 0  # 全局偏移 bar 数
+    if listing_days:
+        # 过滤：上市日需在 unique_dates 范围内
+        _ipo_dates = [ld for ld in listing_days.values() if ld in unique_dates]
+        if len(_ipo_dates) >= 5:
+            _ipo_sorted = sorted(_ipo_dates)
+            _pct90_idx = max(0, int(len(_ipo_sorted) * 0.9) - 1)
+            _latest_ipo = _ipo_sorted[_pct90_idx]
+            # 计算延迟：从 latest_ipo + warmup 起算第一个交易日索引
+            _safe_start_str = _latest_ipo + pd.Timedelta(days=_SIGNAL_WARMUP_DAYS + 365).strftime("%Y-%m-%d")[:10]
+            _safe_start_str = _safe_start_str.split("T")[0][:10]
+            matching_idx = [i for i, d in enumerate(unique_dates) if d >= _safe_start_str]
+            if matching_idx:
+                _listing_offset = matching_idx[0]
+                logger.info(
+                    f"  P1.17 窗口起始动态延迟: 基于 90% 分位上市日 {_latest_ipo}，"
+                    f"窗口起始偏移 {_listing_offset} 个交易日（跳过早期新股不足窗口）"
+                )
+    else:
+        logger.debug("  P1.17: listing_days 缺失，使用固定窗口起始偏移")
+
+    db_engine = kwargs.get("db_engine")
+
+    # ── 窗口预检：加载上次成功校准参数（优先于空间中位数） ──
+    # 预检用"上次实际跑出过的参数"比"空间中位数"更接近真实策略表现，
+    # 避免中位数恰好落在差区导致好窗口被误杀。
+    _last_calib_params: dict[str, float] | None = None
+    try:
+        from BackTrading.calibration import load_calibration as _load_cal
+        _cal = _load_cal()
+        if _cal is not None and _cal.params:
+            _last_calib_params = _cal.params
+            logger.info(f"  窗口预检：已加载上次成功校准参数 ({len(_last_calib_params)} 个) 作为预检基准")
+    except Exception:
+        pass  # 加载失败不影响主流程，回退到空间中位数
+
+    # ── 从 config 读取预检阈值（隐患 1 修复：不再硬编码 -0.5） ──
+    _skip_threshold = -0.5
+    try:
+        _skip_threshold = float(getattr(_Config().app_config.backtest, "WFO_PRECHECK_THRESHOLD", -0.5))
+    except Exception:
+        pass
+    logger.info(f"  窗口预检阈值: IS Sharpe < {_skip_threshold} 的窗口将跳过 BO 寻优")
 
     # ── 多路径收集 ──
     all_path_results: dict[int, list[dict[str, Any]]] = {}  # window_id → [path_results]
-    _K_FOR_OOS = 3  # OOS 验证 top-K 参数数，供 PBO 计算
+    _K_FOR_OOS = 10
 
     for path_idx in range(num_paths):
         # 确定性偏移：各路径互不重叠，避免 IS/OOS 数据泄露
-        offset = path_idx * test_period
+        offset = path_idx * test_period + _listing_offset
         _span = train_period + test_period + embargo_days  # purge 仅缩训练尾部，不占额外天数
         # WFO 寻参上界受 holdout 限制（末段禁触）；无 holdout 时回退 n_dates
         _wfo_cap = wfo_max_idx if wfo_max_idx is not None else n_dates
@@ -415,6 +486,49 @@ def bayesian_walk_forward_multi(
                            f"{_to_date_str(train_dates[0])}~{_to_date_str(train_dates[-1])}")
             logger.info(f"  [{path_idx + 1}-{win_idx}] 训练数据: {len(train_data)}行, {train_data['symbol'].nunique()}只股票")
 
+            # ── 窗口质量预检：上次成功参数 / 空间中位数轻量回测（P4-Fix + 隐患1修复） ──
+            # 优先用上次成功校准参数做预检（更接近真实策略表现）；
+            # 无校准历史时回退到参数空间中位数。默认参数都没超额收益的窗口，
+            # 后续 BO 也基本不可能找到好参数——直接跳过，节省 2~3 小时算力。
+            # 校准参数可能只含部分键（如仅 atr_stop_mult），以空间中位数为底，
+            # 校准参数覆盖同名键，确保所有搜索参数都有值。
+            _precheck_sharpe = None
+            try:
+                from BackTrading.bayesian.cost_model import FidelityController as _FC
+                from BackTrading.bayesian.space import _get_fixed_params as _space_fixed
+                _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                _precheck_params = {**_space_fixed(), **_mid_params}
+                if _last_calib_params:
+                    _precheck_params.update(_last_calib_params)
+                    _precheck_source = "上次成功校准参数(合并空间中位数)"
+                else:
+                    _precheck_source = "参数空间中位数"
+                _pre_ctrl = _FC(train_data, base_cfg, compute_exit_strategy=True,
+                                vectorized=True, eval_start_date=train_eval_start,
+                                st_history=st_history, exclude_st=exclude_st,
+                                data_version=data_version, listing_days=listing_days,
+                                db_engine=db_engine)
+                _pre_res = _pre_ctrl.evaluate(_precheck_params, fidelity=1)
+                _precheck_sharpe = _pre_res.get("sharpe", float("-inf"))
+                if _precheck_sharpe < _skip_threshold:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] 窗口质量预检未通过: "
+                        f"{_precheck_source} IS Sharpe={_precheck_sharpe:.4f} < {_skip_threshold}，"
+                        f"跳过该窗口的全部 BO 寻优"
+                    )
+                    continue
+            except Exception as _pre_e:
+                # 隐患 4 修复：预检异常从 debug 提升到 warning，确保运维可见
+                logger.warning(
+                    f"  [{path_idx + 1}-{win_idx}] 窗口预检异常({_pre_e})，"
+                    f"继续正常 BO 寻优（预检失败不阻塞主流程）"
+                )
+            if show_progress and _precheck_sharpe is not None:
+                logger.info(
+                    f"  [{path_idx + 1}-{win_idx}] 窗口预检通过: "
+                    f"{_precheck_source} IS Sharpe={_precheck_sharpe:.4f}，开始 BO 寻优"
+                )
+
             # ── 贝叶斯优化 IS ──
             try:
                 best_params, gp_state, top_k_params, is_sharpe, is_equity = optimize_window(
@@ -432,6 +546,7 @@ def bayesian_walk_forward_multi(
                     exclude_st=exclude_st,
                     data_version=data_version,
                     listing_days=listing_days,
+                    db_engine=db_engine,
                 )
             except Exception as opt_err:
                 _sid = save_failure_snapshot(
@@ -473,6 +588,7 @@ def bayesian_walk_forward_multi(
                     exclude_st=exclude_st,
                     data_version=data_version,
                     listing_days=listing_days,
+                    db_engine=db_engine,
                 )
             except Exception as oos_err:
                 _sid = save_failure_snapshot(
@@ -495,39 +611,128 @@ def bayesian_walk_forward_multi(
             oos = oos_results[0] if oos_results else {}
             oos_sharpe = oos.get("oos_sharpe", 0) or 0
 
-            # ── DM 检验（P2.2）：rank-1 参数 vs 基准中位数参数，OOS 显著性 ──
-            # 若寻优参数相对基准无显著优势（p ≥ 0.05），说明"最优"只是噪声尖峰，
-            # 该窗口不参与最终稳健中位数主路径（由 runner._extract_best_params 过滤）。
+            # ── OOS 衰减 gate（业务规则：IS→OOS 风险调整收益衰减 > 30% 即废弃） ──
+            # IS 净值曲线 = 优化器最优候选在训练集上的回测曲线（严格不含 OOS）；
+            # OOS 净值曲线 = rank-1 参数在独立测试集上的回测曲线。
+            # 注意：OOS 衰减 gate 放在 DM 检验之前——IS_Sharpe ≤ 0 时直接废弃，
+            # 无需再消耗 ~30 分钟做 DM 检验。
+            _decay_pass = True
+            _decay_report = None
+            if is_equity is not None and oos_results:
+                _oos_curve = oos_results[0].get("oos_equity")
+                if _oos_curve:
+                    try:
+                        from BackTrading.overfitting import (
+                            validate_oos_decay as _vd_oos,
+                            OverfitType as _OverfitType,
+                        )
+                        _decay_report = _vd_oos(
+                            is_equity, _oos_curve,
+                            is_days=len(train_dates), oos_days=len(test_dates),
+                        )
+                        _decay_pass = _decay_report.passed
+                    except Exception as _de:
+                        logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验异常: {_de}，窗口照常保留")
+
+            if not _decay_pass:
+                _oos_trades = oos.get("total_trades", 0) or 0
+                if _oos_trades == 0:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] OOS 区间 {len(test_dates)} 天无任何交易，"
+                        f"信号未触发（非过拟合），窗口结果无效"
+                    )
+
+                # 根据 overfit_type 生成区分日志
+                if _decay_report is not None:
+                    _otype = _decay_report.overfit_type
+                    if _otype == _OverfitType.INVALID:
+                        logger.warning("=" * 64)
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] 策略无效 | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} ≤ 0，"
+                            f"训练窗口本身无超额收益信号（非过拟合），该窗口结果直接废弃"
+                        )
+                        logger.warning("=" * 64)
+                    elif _otype == _OverfitType.OVERFITTED:
+                        logger.warning("=" * 64)
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(OVERFITTED) | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+                            f"衰减率={_decay_report.sharpe_decay:.1%}，"
+                            f"训练期内拟合出的参数组合泛化能力不足，窗口结果废弃"
+                        )
+                        logger.warning("=" * 64)
+                    else:  # WEAK
+                        logger.warning(
+                            f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验 FAIL(WEAK) | "
+                            f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}，"
+                            f"策略信号偏弱，结果仅供参考"
+                        )
+                else:
+                    logger.warning(
+                        f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
+                        f"（IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}），"
+                        f"该窗口结果直接废弃"
+                    )
+
+                _consecutive_oos_failures += 1
+                if _consecutive_oos_failures >= _MAX_CONSECUTIVE_OOS_FAILURES:
+                    logger.critical(
+                        f"连续 {_consecutive_oos_failures} 个窗口 OOS 全部失效"
+                        f"（单窗口耗时 ~2-3h），策略在当前数据区间系统性泛化失败，"
+                        f"提前终止 WFO"
+                    )
+                    mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                    raise WFOSystematicFailure(
+                        fallback_params=mid,
+                        reason=f"连续 {_consecutive_oos_failures} 个窗口 OOS 衰减校验全部失败；"
+                               f"IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}；"
+                               f"策略在当前数据区间无泛化能力",
+                        failed_windows=_consecutive_oos_failures,
+                    )
+                continue
+
+            # ── DM 检验（P2.2）：仅在 IS_Sharpe > 0 时执行 ──
+            # 当 IS_Sharpe ≤ 0 时 OOS gate 已拦截，不会到达此处。
+            # DM 检验判定"最优"是否只是噪声尖峰，仅在策略有效时才有意义。
             _dm_stat: float | None = None
             _dm_p_value: float | None = None
             _dm_pass: bool = True
-            try:
-                from BackTrading.overfitting import compute_dm_test as _dm_test
+            _is_positive = float(is_sharpe) > 0 if is_sharpe is not None else False
+            if _is_positive:
+                try:
+                    from BackTrading.overfitting import compute_dm_test as _dm_test
 
-                _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                _base_results = _oos_validate(
-                    test_data, [_mid_params], base_cfg, top_m=1,
-                    eval_start_date=test_eval_start,
-                    st_history=st_history, exclude_st=exclude_st,
-                    data_version=data_version,
-                    listing_days=listing_days,
+                    _mid_params = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
+                    _base_results = _oos_validate(
+                        test_data, [_mid_params], base_cfg, top_m=1,
+                        eval_start_date=test_eval_start,
+                        st_history=st_history, exclude_st=exclude_st,
+                        data_version=data_version,
+                        listing_days=listing_days,
+                        db_engine=db_engine,
+                    )
+                    _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
+                    _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []
+                    if len(_rank1_ec) >= 10 and len(_base_ec) >= 10:
+                        _ra = np.diff(np.array([e.get("portfolio_value", 0) for e in _rank1_ec], dtype=float)) / \
+                              np.maximum(np.array([e.get("portfolio_value", 0) for e in _rank1_ec[:-1]], dtype=float), 1e-9)
+                        _rb = np.diff(np.array([e.get("portfolio_value", 0) for e in _base_ec], dtype=float)) / \
+                              np.maximum(np.array([e.get("portfolio_value", 0) for e in _base_ec[:-1]], dtype=float), 1e-9)
+                        _dm_stat, _dm_p_value = _dm_test(_ra, _rb)
+                        _dm_pass = bool(_dm_p_value < 0.05 and _dm_stat > 0)
+                        if not _dm_pass:
+                            logger.warning(
+                                f"  [{path_idx + 1}-{win_idx}] DM检验: rank-1 相对基准中位数无显著优势"
+                                f"（stat={_dm_stat:.2f}, p={_dm_p_value:.3f}），窗口不参与稳健中位数主路径"
+                            )
+                except Exception as _dme:
+                    logger.warning(f"  [{path_idx + 1}-{win_idx}] DM 检验异常: {_dme}，跳过")
+            else:
+                logger.info(
+                    f"  [{path_idx + 1}-{win_idx}] 跳过 DM 检验（IS_Sharpe={float(is_sharpe):.2f} ≤ 0，"
+                    f"OOS gate 已拦截，无需 DM 对比）"
                 )
-                _rank1_ec = oos_results[0].get("oos_equity", []) if oos_results else []
-                _base_ec = _base_results[0].get("oos_equity", []) if _base_results else []
-                if len(_rank1_ec) >= 10 and len(_base_ec) >= 10:
-                    _ra = np.diff(np.array([e.get("portfolio_value", 0) for e in _rank1_ec], dtype=float)) / \
-                          np.maximum(np.array([e.get("portfolio_value", 0) for e in _rank1_ec[:-1]], dtype=float), 1e-9)
-                    _rb = np.diff(np.array([e.get("portfolio_value", 0) for e in _base_ec], dtype=float)) / \
-                          np.maximum(np.array([e.get("portfolio_value", 0) for e in _base_ec[:-1]], dtype=float), 1e-9)
-                    _dm_stat, _dm_p_value = _dm_test(_ra, _rb)
-                    _dm_pass = bool(_dm_p_value < 0.05 and _dm_stat > 0)
-                    if not _dm_pass:
-                        logger.warning(
-                            f"  [{path_idx + 1}-{win_idx}] DM检验: rank-1 相对基准中位数无显著优势"
-                            f"（stat={_dm_stat:.2f}, p={_dm_p_value:.3f}），窗口不参与稳健中位数主路径"
-                        )
-            except Exception as _dme:
-                logger.warning(f"  [{path_idx + 1}-{win_idx}] DM 检验异常: {_dme}，跳过")
 
             # ── 时间预算（P2.4）：窗口粒度检查，超时提前终止 ──
             if time_budget_seconds > 0 and (time.monotonic() - _t_wfo_start) > time_budget_seconds:
@@ -536,51 +741,6 @@ def bayesian_walk_forward_multi(
                     f"提前终止 WFO（已收集 {len(all_path_results)} 组窗口结果）"
                 )
                 _time_up = True
-
-            # ── OOS 衰减 gate（业务规则：IS→OOS 风险调整收益衰减 > 30% 即废弃） ──
-            # IS 净值曲线 = 优化器最优候选在训练集上的回测曲线（严格不含 OOS）；
-            # OOS 净值曲线 = rank-1 参数在独立测试集上的回测曲线。
-            _decay_pass = True
-            _decay_report = None
-            if is_equity is not None and oos_results:
-                _oos_curve = oos_results[0].get("oos_equity")
-                if _oos_curve:
-                    try:
-                        from BackTrading.overfitting import validate_oos_decay as _vd_oos
-                        _decay_report = _vd_oos(
-                            is_equity, _oos_curve,
-                            is_days=len(train_dates), oos_days=len(test_dates),
-                        )
-                        _decay_pass = _decay_report.passed
-                    except Exception as _de:
-                        logger.warning(f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验异常: {_de}，窗口照常保留")
-            if not _decay_pass:
-                _oos_trades = oos.get("total_trades", 0) or 0
-                if _oos_trades == 0:
-                    logger.warning(
-                        f"  [{path_idx + 1}-{win_idx}] OOS 区间 {len(test_dates)} 天无任何交易，"
-                        f"信号未触发（非过拟合），窗口结果无效"
-                    )
-                logger.warning("=" * 64)
-                logger.warning(
-                    f"  [{path_idx + 1}-{win_idx}] OOS 衰减校验未通过"
-                    f"（IS_Sharpe={float(is_sharpe):.2f} → OOS_Sharpe={oos_sharpe:.2f}），"
-                    f"疑似超参数过度网格搜索或特征工程隐性泄露，该窗口结果直接废弃"
-                )
-                logger.warning("=" * 64)
-                _consecutive_oos_failures += 1
-                if _consecutive_oos_failures >= _MAX_CONSECUTIVE_OOS_FAILURES:
-                    logger.critical(
-                        f"连续 {_consecutive_oos_failures} 个窗口 OOS 全部失效"
-                        f"（单窗口耗时 ~2-3h），策略在当前数据区间系统性泛化失败，"
-                        f"提前终止 WFO，回退配置中位数兜底"
-                    )
-                    mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                    return pd.DataFrame([{
-                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
-                        "num_combos": 1, "num_paths": num_paths,
-                    }])
-                continue
 
             # ── 收集 IS Sharpe（优化器返回的真实样本内绩效） ──
             train_sharpe = float(is_sharpe)
@@ -603,7 +763,7 @@ def bayesian_walk_forward_multi(
                 "win_rate": oos.get("win_rate", 0),
                 "profit_factor": oos.get("profit_factor", 0),
                 "total_trades": oos.get("total_trades", 0),
-                "num_combos": n_init_signal + n_iter_signal + n_init_portfolio + n_iter_portfolio,
+                "num_combos": n_init_signal + n_iter_signal + n_init_portfolio + n_iter_portfolio + 3,  # +3=P1-6 Phase4 refine_top 默认值，纳入 DSR num_trials
                 "oos_combos": oos_results,
             }
             if _dm_stat is not None:
@@ -632,17 +792,29 @@ def bayesian_walk_forward_multi(
 
     # ── 按窗口聚合（多路径取中位数） ──
     if not all_path_results:
-        logger.warning("所有路径均无有效窗口，使用配置中位数兜底")
+        logger.critical("所有路径均无有效窗口通过 OOS 校验，策略系统性泛化失败")
         mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-        return pd.DataFrame([{
-            "window": 0, "params": mid, "sharpe_ratio": 0.0,
-            "total_return": 0.0, "max_drawdown": 0.0,
-            "num_combos": 1, "num_paths": num_paths,
-        }])
+        # 返回兜底行（而非抛异常）：runner.py 仍可通过 runner_result["wfo_rows"] 的空值
+        # 判定失败；直接调用方也能拿到非空 DataFrame
+        logger.warning(
+            f"使用参数空间中间值作为兜底: {mid} — 调用方需检查 Sharpe/交易数决定是否采纳"
+        )
+        _fallback = dict(mid)
+        _fallback["sharpe_ratio"] = 0.0
+        _fallback["train_sharpe"] = 0.0
+        _fallback["win_rate"] = 0.0
+        _fallback["total_trades"] = 0
+        _fallback["num_paths"] = 0
+        result = pd.DataFrame([_fallback])
+        logger.info(f"贝叶斯 WFO 完成: {len(result)} 个窗口, {num_paths} 条路径")
+        return result
 
     agg_rows: list[dict[str, Any]] = []
     for win_id in sorted(all_path_results.keys()):
         entries = all_path_results[win_id]
+        if not entries:
+            logger.warning(f"  窗口 {win_id} 无有效路径结果，跳过聚合")
+            continue
         # 取第一个作为基础（结构相同）
         base = dict(entries[0])
         # 对 params 取中位数
@@ -684,12 +856,14 @@ def bayesian_walk_forward_multi(
                 if _agg_decay > 0.30:
                     logger.critical(
                         f"[OOS衰减校验] 聚合衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
-                        f"OOS均值={_agg_oos:.2f}）> 30%，判定超参数过度网格搜索或特征工程隐性泄露，"
-                        f"本次寻优结果整体废弃，回退配置中位数"
+                        f"OOS均值={_agg_oos:.2f}）> 30%，模型泛化能力不足，"
+                        f"本次寻优结果整体废弃"
                     )
                     mid = {n: (sp.low + sp.high) / 2 for n, sp in spaces.items()}
-                    return pd.DataFrame([{
-                        "window": 0, "params": mid, "sharpe_ratio": 0.0,
-                        "num_combos": 1, "num_paths": num_paths,
-                    }])
+                    raise WFOSystematicFailure(
+                        fallback_params=mid,
+                        reason=f"聚合 IS/OOS 衰减 {_agg_decay:.1%}（IS均值={_agg_is:.2f} → "
+                               f"OOS均值={_agg_oos:.2f}）超过 30% 阈值；模型泛化能力不足",
+                        failed_windows=len(agg_rows),
+                    )
     return result

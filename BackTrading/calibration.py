@@ -1,12 +1,50 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# 运行时注入键：不可序列化，序列化前必须剥离
+_RUNTIME_KEYS = frozenset({"_db_engine", "_st_history", "_listing_days"})
+
+
+def _json_safe(obj: Any) -> Any:
+    """递归将任意对象转为 JSON 可序列化的原生 Python 类型。
+
+    - numpy 标量 → Python float/int
+    - dict/list/tuple → 递归处理
+    - 其他不可序列化对象（Engine、模块等）→ str() 兜底
+    """
+    import numbers
+    # numpy 标量
+    if hasattr(obj, "item") and callable(obj.item):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    # numpy 数组
+    if hasattr(obj, "tolist") and callable(obj.tolist):
+        try:
+            return _json_safe(obj.tolist())
+        except Exception:
+            pass
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return obj
+    if isinstance(obj, numbers.Number):
+        return float(obj)
+    # 兜底：不可序列化对象转字符串
+    return str(obj)
 
 
 def _project_root() -> Path:
@@ -29,9 +67,13 @@ from loguru import logger
 from BackTrading.bayesian.space import build_spaces, split_by_cost, describe
 
 # config.ini 中参数名 → (section, key) 映射
-# 注：kelly_fraction / position_a / liq_veto_ratio / risk_none_multiplier
-# 为引擎死参数（审计确认引擎仓位恒等权），不再寻优亦不再回写。
+# ── 寻优参数（bayesian optimizer 搜索，写回闭环）──
+# ── 受控静态参数（POSITION_SIZING；回测引擎等权不消费，但复盘 PositionSizer 使用）──
+# 受控参数写在 [BACKTEST_CALIBRATED] 同一分区，由 ConfigParser.apply_backtest_calibrated_override() 读取；
+# 此处不加入 bayesian 搜索空间（见 bayesian/space.py DEAD_KEYS），但保留写回路径，
+# 以便 apply_calibration_to_config 和 write_calibration_to_ini 能处理手动写入的校准值。
 CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
+    # 寻优参数
     "atr_stop_mult": ("BACKTEST_CALIBRATED", "atr_stop_mult"),
     "boll_narrow_ratio": ("BACKTEST_CALIBRATED", "boll_narrow_ratio"),
     "cross_decay_days": ("BACKTEST_CALIBRATED", "cross_decay_days"),
@@ -40,6 +82,21 @@ CALIB_PARAM_MAP: dict[str, tuple[str, str]] = {
     "divergence_penalty": ("BACKTEST_CALIBRATED", "divergence_penalty"),
     "buy_threshold": ("BACKTEST_CALIBRATED", "buy_threshold"),
     "max_holdings": ("BACKTEST_CALIBRATED", "max_holdings"),
+    # ── P4 组合优化器超参数 ──
+    "optimizer_risk_aversion": ("BACKTEST_CALIBRATED", "optimizer_risk_aversion"),
+    "optimizer_turnover_penalty": ("BACKTEST_CALIBRATED", "optimizer_turnover_penalty"),
+    "optimizer_max_weight": ("BACKTEST_CALIBRATED", "optimizer_max_weight"),
+    "optimizer_cov_lookback": ("BACKTEST_CALIBRATED", "optimizer_cov_lookback"),
+    # ── 受控静态参数（Position Sizer 消费；回测引擎等权不消费）──
+    # 注：position_d 不在此处 —— PositionSizingConfig 无 POSITION_D 字段（D 级恒为 0 仓位）
+    "kelly_fraction": ("BACKTEST_CALIBRATED", "kelly_fraction"),
+    "position_a": ("BACKTEST_CALIBRATED", "position_a"),
+    "position_b": ("BACKTEST_CALIBRATED", "position_b"),
+    "position_c": ("BACKTEST_CALIBRATED", "position_c"),
+    "risk_none_multiplier": ("BACKTEST_CALIBRATED", "risk_none_multiplier"),
+    # ── 波动率自适应退出参数（VAEO 学习产出；复盘/跟盘单元消费）──
+    "learned_t1_mult": ("BACKTEST_CALIBRATED", "learned_t1_mult"),
+    "learned_t2_mult": ("BACKTEST_CALIBRATED", "learned_t2_mult"),
 }
 
 
@@ -66,6 +123,11 @@ class CalibrationResult:
     pbo: float = 0.0
     dsr: float = 0.0
     num_trials: int = 0
+    # ── 门控状态（区分合格参数与未达标但强制写入的参数）──
+    gate_passed: bool = True
+    gate_reasons: list[str] = field(default_factory=list)
+    # ── 成本模型快照（方案C：回测验证假设的持久化记录）──
+    cost_model_snapshot: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CalibrationResult:
@@ -76,7 +138,6 @@ CALIBRATION_FILE = PROJECT_ROOT / "calibration_result.json"
 CONFIG_INI = PROJECT_ROOT / "config.ini"
 
 # 写入 config.ini 时需取整的整数参数
-# P0-7 ②：补齐 buy_threshold/max_holdings —— 此前缺失导致以 "17.0" 浮点落盘，
 # 一旦加载端 int() 解析即崩溃；现强制整值落盘（写入前另有类型断言）。
 _INT_KEYS = frozenset({
     "cross_decay_days", "conclusion_full_bull",
@@ -108,13 +169,11 @@ def run_bayesian_walk_forward(
     Returns:
         DataFrame, 每行一个 WFO 窗口，与旧 walk_forward 返回格式兼容。
     """
-    # P0 审计修复：OOS 窗口硬约束 ≥ 60 天
     if test_period < 60:
         raise ValueError(
             f"OOS 验证窗口 {test_period} 天 < 60 天最小要求，统计效力不足（Sharpe 标准误 ≈ 1.96/√{test_period-1}）"
             " — 请缩短 IS 窗口或增加数据跨度以提供至少 60 天 OOS。"
         )
-    # P1 审计修复：路径数 ≥ 5 以降低路径间相关性
     if num_paths < 5:
         logger.warning(
             f"路径数 {num_paths} < 5，WFO 中位数聚合统计效力不足，建议 ≥ 5 且路径起始偏移 ≥ 40 天"
@@ -123,8 +182,10 @@ def run_bayesian_walk_forward(
     from UtilsManager.ConfigParser import Config as _Config
 
     if spaces is None:
-        cfg = _Config().app_config.backtest
-        spaces = build_spaces(cfg)
+        full_cfg = _Config()
+        bt_cfg = full_cfg.app_config.backtest
+        po_cfg = getattr(full_cfg.app_config, "portfolio_optimizer", None)
+        spaces = build_spaces(bt_cfg, portfolio_optimizer_config=po_cfg)
 
     signal_sp, portfolio_sp = split_by_cost(spaces)
     logger.info(f"贝叶斯 WFO 参数空间:\n{describe(spaces)}")
@@ -150,9 +211,19 @@ def run_bayesian_walk_forward(
 
 
 def save_calibration(result: CalibrationResult) -> None:
+    # 剥离运行时注入的不可序列化对象（Engine / ST 历史等），避免 asdict deepcopy 崩溃
+    safe_params = {k: v for k, v in result.params.items() if k not in _RUNTIME_KEYS}
+    _orig_params = result.params
+    result.params = safe_params
+    try:
+        raw = asdict(result)
+    finally:
+        result.params = _orig_params
+    # 递归清洗 numpy 标量等非 JSON 原生类型
+    safe_data = _json_safe(raw)
     tmp_path = CALIBRATION_FILE.with_name(CALIBRATION_FILE.name + ".tmp")
     tmp_path.write_text(
-        json.dumps(asdict(result), ensure_ascii=False, indent=2),
+        json.dumps(safe_data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     os.replace(tmp_path, CALIBRATION_FILE)
@@ -168,6 +239,82 @@ def load_calibration() -> CalibrationResult | None:
         return None
 
 
+def audit_cost_model_vs_calibration() -> list[str]:
+    """运行时审计：比对当前成本假设与回测校准快照。
+
+    在复盘/实盘启动时调用，加载 calibration_result.json 中持久化的
+    回测验证假设，与当前 CostModel 默认值（或 config.ini 配置）比对，
+    若发现实盘成本假设低于回测值则返回告警列表。
+
+    Returns:
+        告警信息字符串列表。空列表表示无差异或无校准数据可供比对。
+    """
+    warnings_list: list[str] = []
+
+    cal = load_calibration()
+    if cal is None:
+        logger.info("[成本审计] calibration_result.json 不存在（首次运行或从未通过门控），跳过成本比对")
+        return warnings_list
+
+    snapshot = cal.cost_model_snapshot
+    if not snapshot:
+        logger.info("[成本审计] 无通过门控的校准快照（门控正常拦截，非异常），跳过成本比对")
+        return warnings_list
+
+    # 获取当前 CostModel 默认值用于比对
+    try:
+        from BackTrading.domain.models import CostModel
+    except ImportError:
+        warnings_list.append("[成本审计] 无法导入 CostModel，跳过比对")
+        return warnings_list
+
+    current = CostModel()
+
+    # 关键审计字段：实盘值不得低于回测值（否则收益会被高估）
+    # 即 commission/slippage/impact 等 "成本类" 参数，实盘 >= 回测
+    critical_fields = [
+        "commission_rate", "stamp_tax_rate", "market_slippage",
+        "limit_slippage", "impact_threshold", "impact_base",
+        "min_commission_per_trade", "transfer_fee_rate",
+        "handling_fee_rate", "csrc_fee_rate",
+    ]
+
+    for field in critical_fields:
+        snap_val = snapshot.get(field)
+        curr_val = getattr(current, field, None)
+        if snap_val is None or curr_val is None:
+            continue
+        # 数值化比对（容忍浮点精度差异）
+        try:
+            s = float(snap_val)
+            c = float(curr_val)
+        except (TypeError, ValueError):
+            continue
+
+        tolerance = 1e-10  # 绝对容差
+        if c < s - tolerance:
+            warnings_list.append(
+                f"[成本审计告警] {field}: 当前值({c}) < 回测验证值({s}) — "
+                f"实盘摩擦成本假设过低，策略收益可能不及预期"
+            )
+
+    # 布尔字段检查（commission_includes_fees 变更会导致总佣金跳变）
+    bool_fields = ["commission_includes_fees"]
+    for field in bool_fields:
+        snap_val = snapshot.get(field)
+        curr_val = getattr(current, field, None)
+        if snap_val is not None and curr_val is not None and snap_val != curr_val:
+            warnings_list.append(
+                f"[成本审计告警] {field}: 当前值({curr_val}) != 回测验证值({snap_val})"
+            )
+
+    if not warnings_list:
+        logger.info("[成本审计] 当前成本模型与回测校准快照一致，通过检查")
+
+    return warnings_list
+
+
+
 def apply_calibration_to_config(config: object) -> None:
     from UtilsManager.ConfigParser import Config
 
@@ -179,6 +326,14 @@ def apply_calibration_to_config(config: object) -> None:
     overrides = result.params.copy()
     if not overrides:
         return
+
+    # 门控状态告警：未通过门控的参数仍会应用，但提示用户关注过拟合风险
+    if not result.gate_passed:
+        logger.warning(
+            f"[参数应用] 当前 calibration_result.json 中的参数未通过采纳门控"
+            f"（gate_passed=false，原因: {'；'.join(result.gate_reasons) or '未知'}），"
+            f"参数仍将应用到生产配置，请人工复核过拟合风险"
+        )
 
     rd = cfg.app_config.regime_detection
     sc = cfg.app_config.scoring_params
@@ -199,12 +354,24 @@ def apply_calibration_to_config(config: object) -> None:
             sc.GOLDEN_CROSS_BONUS = int(val)
         elif key == "divergence_penalty":
             sc.DIVERGENCE_PENALTY = int(val)
-        # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
         # 现覆写到 backtest 配置（与 ConfigParser [BACKTEST_CALIBRATED] 覆写同目标）
         elif key == "buy_threshold":
             cfg.app_config.backtest.BUY_THRESHOLD = int(val)
         elif key == "max_holdings":
             cfg.app_config.backtest.MAX_HOLDINGS = int(val)
+        # 受控静态参数（Position Sizer 消费；回测引擎等权不消费）
+        # 若校准结果中出现了这些键（如手动写入 calibration_result.json），
+        # 则写回至 PositionSizingConfig，确保复盘与配置一致。
+        elif key == "kelly_fraction":
+            ps.KELLY_FRACTION = float(val)
+        elif key == "position_a":
+            ps.POSITION_A = float(val)
+        elif key == "position_b":
+            ps.POSITION_B = float(val)
+        elif key == "position_c":
+            ps.POSITION_C = float(val)
+        elif key == "risk_none_multiplier":
+            ps.RISK_NONE_MULTIPLIER = float(val)
 
 
 def _get_git_commit() -> str:
@@ -230,31 +397,38 @@ def _format_val(key: str, val: Any) -> str:
     return s if s not in ("", "-0") else "0"
 
 
-def write_calibration_to_ini(params: dict) -> None:
+def write_calibration_to_ini(params: dict) -> dict | None:
     """将校准参数写入 config.ini 的 [BACKTEST_CALIBRATED]。
 
     已有键原位替换（保留行尾注释），新键追加到 section 末尾；
     整型参数取整写入，避免下次加载时 int() 解析崩溃；原子写防半截文件。
+    返回实际落盘参数（整数参数已取整），未写入时返回 None。
     """
     if not params:
         logger.info("无校准参数，跳过写入")
-        return
-    # P0-7 ②：落盘前类型断言 —— 整数参数必须为整数值，否则以 "17.0" 落盘
-    # 会在加载端 int() 解析崩溃；此处 fail-fast，拒绝污染 config.ini。
-    for k in sorted(_INT_KEYS & set(params)):
-        v = params[k]
+        return None
+    # 过滤运行时注入键，防止 Engine/ST历史等对象被 str() 后写入 config.ini
+    params = {k: v for k, v in params.items() if k not in _RUNTIME_KEYS}
+    if not params:
+        logger.info("过滤运行时键后无校准参数，跳过写入")
+        return None
+    # 31.5/17.5/11.5 等非整值；旧实现在此 fail-fast 抛 ValueError 后被调用方
+    # except 吞掉，导致 config.ini 实际未写但日志谎报"已写入"。现在仅对
+    # 无法转换为数值的值 fail-fast，非整数值 round 后落盘。
+    sanitized = dict(params)
+    for k in sorted(_INT_KEYS & set(sanitized)):
+        v = sanitized[k]
         try:
-            is_integral = isinstance(v, (int, float, str)) and float(v).is_integer()
+            sanitized[k] = int(round(float(v)))
         except (TypeError, ValueError):
-            is_integral = False
-        if not is_integral:
             raise ValueError(
-                f"[校准写回] 整数参数 {k} = {v!r} 必须为整数值，拒绝写入 config.ini（防 int() 解析崩溃）"
-            )
+                f"[校准写回] 整数参数 {k} = {v!r} 无法转换为数值，拒绝写入 config.ini（防 int() 解析崩溃）"
+            ) from None
+    params = sanitized
     ini_path = CONFIG_INI
     if not ini_path.exists():
         logger.warning(f"config.ini 不存在: {ini_path}")
-        return
+        return None
 
     text = ini_path.read_text(encoding="utf-8")
     section_header = "[BACKTEST_CALIBRATED]"
@@ -313,3 +487,4 @@ def write_calibration_to_ini(params: dict) -> None:
     tmp_path.write_text("".join(out), encoding="utf-8")
     os.replace(tmp_path, ini_path)
     logger.info(f"校准参数已写入 {ini_path} [{section_header}]")
+    return params

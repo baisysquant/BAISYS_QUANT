@@ -37,41 +37,26 @@ def main() -> None:
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
     # ── 初始化文件日志（必须先于所有业务代码） ──
-    # P0-10 ⑤：UtilsManager.LoggerManager 已删除，改用 loguru 文件 sink
+
+    # 改为 {PROJECT_ROOT}/logs/，增加 LOG_DIR 环境变量覆盖，确保目录不存在时自动创建。
     import os as _os
-    _log_dir = _os.path.join(_os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
+    from pathlib import Path as _Path
+    PROJECT_ROOT = str(_Path(__file__).resolve().parent)
+    _log_dir = _os.environ.get("LOG_DIR", _os.path.join(PROJECT_ROOT, "logs"))
     _os.makedirs(_log_dir, exist_ok=True)
     logger.add(
         _os.path.join(_log_dir, "Corenews_Main.log"),
         level="INFO", encoding="utf-8", enqueue=True, rotation="1 day",
     )
 
-    # ── 企业代理 SSL 兼容：AShareHub httpx 绕过自签名证书 ──
-    import asharehub.client as _ahc
-    _orig_init = _ahc.AShareHub.__init__
-    def _patched_init(self, api_key, base_url=None, timeout=30.0, version="v2"):
-        import httpx as _httpx
-        if base_url is None:
-            base_url = _ahc.DEFAULT_BASE_URL
-        _orig_init(self, api_key, base_url, timeout, version)
-        self._client = _httpx.Client(
-            base_url=base_url,
-            headers={"X-API-Key": api_key},
-            timeout=timeout,
-            verify=False,
-        )
-    _ahc.AShareHub.__init__ = _patched_init
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    logger.info("AShareHub SSL 验证已禁用（企业代理自签名证书兼容）")
+    # 原实现全局 monkeypatch 第三方 AShareHub.__init__ 并 verify=False 禁用 TLS
+    # 企业代理自签名证书场景：导出代理 CA 为 PEM 并设置 SSL_CERT_FILE 即可。
+    logger.info("AShareHub TLS 校验已启用（仅信任显式 CA 或系统信任库）")
 
     # ── 额外回测专用日志文件（时间后缀，方便定位回测问题） ──
     from datetime import datetime as _dt
     _bt_log_name = f"backtest_{_dt.now().strftime('%Y%m%d_%H%M%S')}.log"
-    import os as _os
-    _bt_dir = _os.path.join(_os.path.expanduser("~"), "Downloads", "CoreNews_Reports", "Logs")
-    _os.makedirs(_bt_dir, exist_ok=True)
-    _bt_log_path = _os.path.join(_bt_dir, _bt_log_name)
+    _bt_log_path = _os.path.join(_log_dir, _bt_log_name)
     logger.add(_bt_log_path, level="DEBUG", encoding="utf-8", enqueue=True,
                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<7} | {name}:{function}:{line} | {message}")
     logger.info(f"回测日志: {_bt_log_path}")

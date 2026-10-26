@@ -53,7 +53,7 @@ def _regime_series(
     """全向量化的市场状态检测，返回逐 bar 的 regime 字符串数组。"""
     if params is None:
         params = {}
-    close = df["close"]
+    close = df["close_normal"] if "close_normal" in df.columns else df["close"]
     ma5 = df["MA_5"]
     ma10 = df["MA_10"]
     ma20 = df["MA_20"]
@@ -68,32 +68,26 @@ def _regime_series(
     ma_bearish = (ma5 < ma10) & (ma10 < ma20) & (ma20 < ma30) & (ma30 < ma60)
     momentum_positive = hist > 0
 
-    # DIF 斜率 — P1 审计修复：纯 numpy 卷积替代 rolling().apply(np.polyfit)
-    # 原实现每窗口调用一次 np.polyfit（Python 级循环），3000 只 × 数百年数据 = 瓶颈
-    # 线性回归斜率 = W*Σ((x-μx)(y-μy)) / Σ((x-μx)²)，可拆解为两个卷积（numerator/denominator）
+
     n = len(df)
-    diff = dif.diff().values.astype(float)  # NaN at index 0
+    dif_arr = dif.values.astype(np.float64)
     slope = np.zeros(n, dtype=float)
     if n >= slope_window:
         x = np.arange(slope_window, dtype=float)
         x_mean = x.mean()
-        w_xx = x - x_mean
-        denom_val = float(np.sum(w_xx ** 2))
-        # 卷积核：slope = Σ w_xx * y / denom_val，翻转 w_xx 供 convolve
-        kernel = w_xx[::-1]
-        num_full = np.convolve(diff, kernel, mode="full")
-        # 对齐卷积输出到原始索引（full mode → len = n + slope_window - 1）
-        offset = slope_window - 1
-        # P3 审计修复：num 形状对齐 — 只取 valid 段再除以 denom_val
-        valid_end = min(n, len(num_full) - offset)
-        slope[offset:valid_end] = num_full[offset:valid_end] / denom_val
+        kernel = x - x_mean
+        denom_val = float(np.sum(kernel ** 2))
+        # slope = kernel · y / denom；correlate(a, b, 'valid') = Σ a[i+k]*b[k]
+        slopes_valid = np.correlate(dif_arr, kernel, mode='valid') / denom_val
+        slope[slope_window - 1 : slope_window - 1 + len(slopes_valid)] = slopes_valid
     slope_positive = slope > 0
 
     # Bollinger 带宽
     is_narrow = pd.Series(False, index=df.index)
     if boll_bw_col and boll_bw_col in df.columns:
         bw = df[boll_bw_col]
-        hist_bw = bw.expanding().mean().shift(1)
+        # 早期 bar 的窄带判定受后期数据影响。改为有限窗口 rolling(252) + history shift。
+        hist_bw = bw.rolling(252, min_periods=10).mean().shift(1)
         narrow_ratio = float(params.get("boll_narrow_ratio", 0.8))
         is_narrow = bw < hist_bw * narrow_ratio
 
@@ -315,22 +309,23 @@ def _momentum(dif: pd.Series, dea: pd.Series, max_score: int = 15) -> np.ndarray
     norm_change = (hist_change / hist_vol).fillna(0).to_numpy()
     is_bull = (hist > 0).to_numpy()
 
-    score = np.zeros(len(hist), dtype=np.int32)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64，保留因子差异
+    score = np.zeros(len(hist), dtype=np.float64)
     bull_mask = is_bull & (norm_change >= 0)
     score[bull_mask] = np.clip(
-        (max_score * (0.5 + 0.5 * norm_change[bull_mask] / (norm_change[bull_mask] + 1))).astype(int),
+        (max_score * (0.5 + 0.5 * norm_change[bull_mask] / (norm_change[bull_mask] + 1))),
         0, max_score,
     )
     bull_dec = is_bull & (norm_change < 0)
     score[bull_dec] = np.clip(
-        (max_score * (0.5 + 0.5 * norm_change[bull_dec] / (norm_change[bull_dec] - 1))).astype(int),
+        (max_score * (0.5 + 0.5 * norm_change[bull_dec] / (norm_change[bull_dec] - 1))),
         0, max_score,
     )
     bear = ~is_bull
     max_bear = max(8, max_score * 2 // 5)
     abs_norm = np.abs(norm_change)
     score[bear] = np.clip(
-        (max_bear * abs_norm[bear] / (abs_norm[bear] + 1)).astype(int),
+        max_bear * abs_norm[bear] / (abs_norm[bear] + 1),
         0, max_bear,
     )
     score[:6] = 0
@@ -344,8 +339,9 @@ def _momentum(dif: pd.Series, dea: pd.Series, max_score: int = 15) -> np.ndarray
 def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarray:
     """逐 bar 的 DIF 斜率得分 — 纯向量化 (np.correlate)。"""
     arr = dif.values.astype(np.float64)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
     n = len(arr)
-    score = np.zeros(n, dtype=np.int32)
+    score = np.zeros(n, dtype=np.float64)
     if n < window:
         return score
 
@@ -369,7 +365,7 @@ def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarr
     mask_pos = (slopes > 0) & (r2 > 0.7)
     mask_mid = (slopes > 0) & (r2 <= 0.7)
     score[bar_idx[mask_pos]] = max_score
-    score[bar_idx[mask_mid]] = int(max_score * 0.55)
+    score[bar_idx[mask_mid]] = max_score * 0.55
     return score
 
 
@@ -379,17 +375,25 @@ def _dif_slope(dif: pd.Series, window: int = 5, max_score: int = 10) -> np.ndarr
 
 def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> np.ndarray:
     """逐 bar 量价配合得分 — 全向量化。"""
-    close = df["close"].values
+    # 强制 .values 转为 numpy 数组：Series 按整数数组索引是label-based，
+    # 与非默认 index 混用时会造成 shape mismatch，必须走位置索引。
+    if "close_normal" in df.columns:
+        close = df["close_normal"].values
+    else:
+        close = df["close"].values
     volume = df["volume"].values
     n = len(df)
     half = max_score // 2
-    score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
+    score = np.zeros(n, dtype=np.float64)
 
     if n <= lookback:
         return score
 
+    # FIX(P1) Subtask-7：评分精度改造 — int32 → float64
+    pct = np.zeros(n, dtype=np.float64)
+
     # 价格涨跌幅 (close[i] - close[i-lookback+1]) / close[i-lookback+1]
-    pct = np.zeros(n)
     pct_idx = np.arange(lookback - 1, n)
     prev = pct_idx - lookback + 1
     pct[pct_idx] = (close[pct_idx] - close[prev]) / np.maximum(close[prev], 1e-9)
@@ -421,13 +425,19 @@ def _volume_price(df: pd.DataFrame, lookback: int = 5, max_score: int = 10) -> n
 
 def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     """逐 bar K 线形态得分 — 全向量化。"""
-    close = df["close"].values
+    # 强制 .values 转 numpy 数组：Series 按整数数组/布尔掩码索引是 label-based，
+    # 与非默认 index 混用时可能错位，必须走位置索引。
+    if "close_normal" in df.columns:
+        close = df["close_normal"].values
+    else:
+        close = df["close"].values
     open_ = df["open"].values
     high = df["high"].values
     low = df["low"].values
+    # FIX(P1) Subtask-7：K线形态评分 float64
     n = len(df)
     if n < 5:
-        return np.zeros(n, dtype=np.int32)
+        return np.zeros(n, dtype=np.float64)
 
     # ── 单 bar 特征 ──
     body = np.abs(close - open_)
@@ -481,9 +491,9 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     prev_body = shift_v(body, 1)
     prev2_bullish = shift_v(bullish, 2).astype(bool)
     _body_ma = pd.Series(body).rolling(20, min_periods=5).mean()
-    # 因果回退：早期不足 20 根的窗口用"截至当日"的滚动均值（expanding），
-    # 不使用全样本 mean（np.nanmean(body)）以免引入未来数据的前视泄漏。
-    body_ma20 = _body_ma.fillna(_body_ma.expanding().mean()).values
+    # 造成前视偏差。改为填充 body 序列自身的 rolling 均值近似（早期样本少的 bar 用 NaN
+    # 填充后统一设为 0，即早期 bar 不参与晨星/夜星判定，保守但因果安全）。
+    body_ma20 = _body_ma.fillna(0.0).values
     mid_body_small = prev_body < (body_ma20 * 0.3)
     # 晨星：长阴 → 小实体（跳空低开） → 长阳（收过第一根中点）
     cond_ms = (~prev2_bullish) & mid_body_small & bullish & (close > (prev2_open + prev2_close) / 2.0)
@@ -497,7 +507,8 @@ def _kline_pattern(df: pd.DataFrame, max_score: int = 10) -> np.ndarray:
     # ── 合并 + 归一化 ──
     raw_total = bar_acc + triple_acc + eng_acc
     norm = np.clip(raw_total / 10.0, -1.0, 1.0)
-    scores = ((norm + 1.0) / 2.0 * max_score).astype(np.int32)
+    # FIX(P1) Subtask-7：K线形态评分 float64
+    scores = ((norm + 1.0) / 2.0 * max_score)
     scores[:5] = 0
     return scores
 
@@ -528,22 +539,43 @@ def golden_cross_score(
     golden_zero_below = detail_str.str.contains("零轴下金叉", na=False)
 
     golden_strength = (dif - dea).abs() / atr.replace(0, np.nan)
+
+    # FIX(P1) Subtask-8：波动率归一化动态化
+    # 旧实现：vol_norm_denom 为标量时，直接用 0.15 全局除以 golden_strength。
+    # 低波动期 golden_strength 远 <0.15 → vol_factor 恒为 1.0（信号无区分度）；
+    # 高波动期 golden_strength >> 0.15 → vol_factor 过度压制。
+    # 新实现：改用 golden_strength 滚动 60 日中位数，不足 60 日回退到参数值。
+    if np.isscalar(vol_norm_denom):
+        gs_values = golden_strength.fillna(0).values
+        gs_series = pd.Series(gs_values)
+        gs_rolling_median = gs_series.rolling(60, min_periods=10).median()
+        vol_norm_arr = gs_rolling_median.fillna(float(vol_norm_denom)).values
+        vol_norm_arr = np.maximum(vol_norm_arr, 1e-9)
+    else:
+        vol_norm_arr = np.asarray(vol_norm_denom, dtype=np.float64)
+        if len(vol_norm_arr) != n:
+            raise ValueError(
+                f"vol_norm_denom length mismatch: "
+                f"expected {n}, got {len(vol_norm_arr)}"
+            )
+
     vol_factor = np.where(
         (~pd.isna(golden_strength)) & (golden_strength > 0),
-        np.minimum(1.0, golden_strength / vol_norm_denom),
+        np.minimum(1.0, golden_strength.values / vol_norm_arr),
         1.0,
     )
 
     # R04 金叉加分：仅作用于金叉触发当日，按信号强度缩放
     bonus = float(golden_cross_bonus) * vol_factor
 
-    score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：金叉评分 float64 精度
+    score = np.zeros(n, dtype=np.float64)
     mask_za = golden_zero_above.values
-    score[mask_za] = (w_cross * vol_factor[mask_za] + bonus[mask_za]).astype(int)
+    score[mask_za] = w_cross * vol_factor[mask_za] + bonus[mask_za]
     mask_zb = golden_zero_below.values
-    score[mask_zb] = (w_cross // 2 * vol_factor[mask_zb] + bonus[mask_zb]).astype(int)
+    score[mask_zb] = (w_cross / 2) * vol_factor[mask_zb] + bonus[mask_zb]
     mask_bull = is_bull.values & ~mask_za & ~mask_zb
-    score[mask_bull] = (w_cross * 0.75 * vol_factor[mask_bull]).astype(int)
+    score[mask_bull] = w_cross * 0.75 * vol_factor[mask_bull]
 
     # 衰减向量化: 覆盖 cross 区间 c ∈ (i - cross_decay_days, i]（含 cross 当日）。
     # 衰减随距离单调递减 → 每 bar 取区间内**最远**（最早）cross 的衰减 = 最严格值，
@@ -566,7 +598,8 @@ def golden_cross_score(
         1.0,
     )
 
-    score = (score.astype(np.float64) * decay_mult).astype(np.int32)
+    # FIX(P1) Subtask-7：衰减后保持 float64
+    score = score.astype(np.float64) * decay_mult
     return score
 
 
@@ -647,11 +680,11 @@ def _composite_score(
     }
     trend_scores = np.vectorize(trend_score_map.get)(macd_trend_arr)
 
-    # divergence 评分
-    div_score = np.zeros(n, dtype=np.int32)
+    # FIX(P1) Subtask-7：背离评分 float64 精度
+    div_score = np.zeros(n, dtype=np.float64)
     bot_div = np.char.find(div_type.astype(str), Divergence.BOTTOM_DIVERGENCE) >= 0
     eff = div_strength * div_decay
-    div_score[bot_div] = (w_div * (0.5 + 0.5 * eff[bot_div])).astype(int)
+    div_score[bot_div] = w_div * (0.5 + 0.5 * eff[bot_div])
 
     # R41 顶背离扣分（按背离强度缩放）
     top_div = np.char.find(div_type.astype(str), Divergence.TOP_DIVERGENCE) >= 0
@@ -731,15 +764,14 @@ def compute_signals(
     if _ws > 0 and _ws != 100:
         weights = {k: max(1, int(round(v * 100.0 / _ws))) for k, v in weights.items()}
 
-    # P0-2：信号引擎输入统一为单一空间（后复权）——指标（DIF/DEA/ATR/MA/BOLL）按
-    # close_adj 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
+    # close_normal 计算，价格特征（市场状态/背离/量价/K线形态/止损/退出）必须同空间，
     # 否则 close_ma20_ratio、_exit_score/stop_loss 出现"不复权价 − 后复权指标"混用。
-    # close_normal 仅供涨跌停/真实价格展示，不进入信号计算。
-    if "close_adj" in stock_df.columns:
+    # close_raw 仅供涨跌停/真实价格展示，不进入信号计算。
+    if "close_normal" in stock_df.columns:
         for _c in ("open", "high", "low", "close"):
-            _adj_c = f"{_c}_adj"
-            if _adj_c in stock_df.columns:
-                stock_df[_c] = stock_df[_adj_c]
+            _norm_c = f"{_c}_normal"
+            if _norm_c in stock_df.columns:
+                stock_df[_c] = stock_df[_norm_c]
 
     close = stock_df["close"]
     dif = stock_df["DIF"]
@@ -753,10 +785,14 @@ def compute_signals(
     slope_window = int(div_p.get("slope_window", 5))
     vol_norm_denom = float(score_p.get("vol_norm_denominator", 0.15))
     try:
-        _gs = (dif - dea).abs() / atr.replace(0, np.nan)
-        # 扩展窗口分位数（因果）：只用截至当日的数据归一化，避免全样本
-        # 75% 分位数引入未来波动率分布的前视偏差。
-        _denom = _gs.expanding(min_periods=20).quantile(0.75)
+        if "_p0_golden_denom" in stock_df.columns:
+            # 扩展窗口分位数（因果）：Phase 0 已缓存，避免每试次 O(n²) 重算
+            _denom = stock_df["_p0_golden_denom"]
+        else:
+            _gs = (dif - dea).abs() / atr.replace(0, np.nan)
+            # WFO 中训练窗口的 expanding 分布受全周期数据影响，信号已对训练窗口做过拟合。
+            # 改为滚动窗口 252 天（1 年），限制最大窗口长度。
+            _denom = _gs.rolling(252, min_periods=20).quantile(0.75)
         _denom = _denom.fillna(vol_norm_denom).clip(lower=1e-9)
         if len(_denom) > 0 and float(_denom.iloc[-1]) > 0:
             vol_norm_denom = _denom.values
@@ -773,8 +809,11 @@ def compute_signals(
         "oscillate": int(th_p.get("oscillate", 40)),
     }
 
-    # ── 1. MACD 趋势 ──
-    trend_arr = macd_trend(dif, dea)
+    # ── 1. MACD 趋势（Phase 0 参数无关特征优先，缺失时内联回退） ──
+    if "_p0_macd_trend" in stock_df.columns:
+        trend_arr = stock_df["_p0_macd_trend"].values
+    else:
+        trend_arr = macd_trend(dif, dea)
 
     # ── 2. Divergence（滚动计算，不使用全局 precomputed peaks/troughs 防未来函数） ──
     if precomputed_divergence is not None:
@@ -792,17 +831,33 @@ def compute_signals(
     boll_bw = "BOLL_BANDWIDTH" if "BOLL_BANDWIDTH" in stock_df.columns else None
     regime = _regime_series(stock_df, boll_bw_col=boll_bw, params=params.get("regime"))
 
-    # ── 4. 动量分 ──
-    mom_score = _momentum(dif, dea, max_score=15)
+    # ── 4. 动量分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_momentum" in stock_df.columns:
+        mom_score = stock_df["_p0_momentum"].values
+    else:
+        mom_score = _momentum(dif, dea, max_score=15)
 
-    # ── 5. 斜率分 ──
-    slope_score = _dif_slope(dif, window=slope_window, max_score=10)
+    # ── 5. 斜率分（Phase 0 缓存优先；slope_window 与缓存常量不一致时重算） ──
+    _p0_feat_const = stock_df.attrs.get("_p0_feat_const") or {}
+    if (
+        "_p0_slope" in stock_df.columns
+        and int(_p0_feat_const.get("slope_window", -1)) == slope_window
+    ):
+        slope_score = stock_df["_p0_slope"].values
+    else:
+        slope_score = _dif_slope(dif, window=slope_window, max_score=10)
 
-    # ── 6. 量价分 ──
-    vol_score = _volume_price(stock_df, max_score=10)
+    # ── 6. 量价分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_vol_price" in stock_df.columns:
+        vol_score = stock_df["_p0_vol_price"].values
+    else:
+        vol_score = _volume_price(stock_df, max_score=10)
 
-    # ── 7. K 线形态分 ──
-    kp_score = _kline_pattern(stock_df, max_score=10)
+    # ── 7. K 线形态分（Phase 0 缓存优先，缺失时内联回退） ──
+    if "_p0_kline_pattern" in stock_df.columns:
+        kp_score = stock_df["_p0_kline_pattern"].values
+    else:
+        kp_score = _kline_pattern(stock_df, max_score=10)
 
     # ── 8. 金叉评分 ──
     w_cross = weights["金叉信号"]
@@ -840,6 +895,15 @@ def compute_signals(
         0.0,
     ).astype(np.float64)
 
+    # ── 趋势分数（复用 trend_arr 计算，避免重复调用 macd_trend） ──
+    _trend_score_map = {
+        MACDTrend.SUPER_STRONG: 20.0,
+        MACDTrend.STRONG: 12.0,
+        MACDTrend.WEAK: 8.0,
+        MACDTrend.SUPER_WEAK: 0.0,
+    }
+    trend_value_arr = np.vectorize(_trend_score_map.get)(trend_arr)
+
     result = pd.DataFrame({
         "trade_date": stock_df["trade_date"],
         "entry_score": score_arr.astype(np.float64),
@@ -847,7 +911,10 @@ def compute_signals(
         "risk_level": risk_level,
         "score": score_arr.astype(np.float64),
         "atr": atr.values,
-        "macd_trend": trend_scores(dif, dea).astype(np.float64),
+        # 审计修复：macd_trend 恢复字符串类别（下游风险判断依赖此语义）
+        "macd_trend": trend_arr,
+        # 新增数值分字段，与 prepare.py float 消费兼容
+        "macd_trend_value": trend_value_arr,
         "golden_cross": golden_score.astype(np.float64),
         "hist_momentum": mom_score.astype(np.float64),
         "dif_slope": slope_score.astype(np.float64),
@@ -877,3 +944,77 @@ def trend_scores(dif: pd.Series, dea: pd.Series) -> np.ndarray:
         MACDTrend.SUPER_WEAK: 0,
     }
     return np.vectorize(trend_score_map.get)(t)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 参数无关特征（Phase 0 预计算缓存，跨参数试次复用）
+# ═══════════════════════════════════════════════════════════════════
+# 死循环根因（2026-08-16 诊断）：WFO 每个信号参数试次对全市场 3113 只
+# 重跑 compute_signals，其中 ~60-70% 的计算（macd_trend/_momentum/
+# _dif_slope/_volume_price/_kline_pattern/expanding 75% 分位数）与评分
+# 参数无关却被逐试次重算（expanding quantile 为 O(n²) 最重项）。
+# 现将这些列在 Phase 0 一次性计算并落盘（indicator_cache），compute_signals
+# 优先读取 _p0_* 列，缺失时内联回退，保证所有调用方语义完全一致。
+
+_P0_FEATURE_COLS = (
+    "_p0_macd_trend", "_p0_momentum", "_p0_slope",
+    "_p0_vol_price", "_p0_kline_pattern", "_p0_golden_denom",
+)
+
+
+def _p0_feature_constants() -> dict[str, int]:
+    """参数无关特征依赖的配置常量（仅 slope_window），供缓存 meta 校验。
+
+    slope_window 变化时必须使磁盘指标缓存失效（指标缓存 key 不含 config_hash），
+    否则会静默复用旧窗口的斜率分。
+    """
+    try:
+        from UtilsManager.ConfigParser import Config
+        _div = Config().app_config.divergence
+        return {"slope_window": int(getattr(_div, "slope_window", 5))}
+    except Exception:
+        return {"slope_window": 5}
+
+
+def compute_param_independent_features(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """计算评分层中与信号参数无关的逐 bar 特征列（Phase 0 一次性缓存）。
+
+    全部输出仅依赖指标列 + 配置常量（slope_window），与评分参数无关：
+      - _p0_macd_trend:    MACD 趋势分类（macd_trend）
+      - _p0_momentum:      动量分（_momentum）
+      - _p0_slope:         DIF 斜率分（_dif_slope，窗口=slope_window）
+      - _p0_vol_price:     量价配合分（_volume_price）
+      - _p0_kline_pattern: K 线形态分（_kline_pattern）
+      - _p0_golden_denom:  金叉归一化分母（expanding 75% 分位数，O(n²) 最重项，
+                           未填充/裁剪，保留 NaN 由调用方按当前配置常量填充）
+
+    与 compute_signals 一致：价格类特征必须使用后复权口径（_normal 列）。
+    返回带 _p0_* 列的新 DataFrame（不修改入参），attrs["_p0_feat_const"]
+    记录计算所用配置常量，供 compute_signals 校验 slope_window 一致性。
+    """
+    _const = _p0_feature_constants()
+    _slope_window = int(_const.get("slope_window", 5))
+
+    _fdf = stock_df
+    if "close_normal" in stock_df.columns:
+        _fdf = stock_df.copy()
+        for _c in ("open", "high", "low", "close"):
+            _norm_c = f"{_c}_normal"
+            if _norm_c in _fdf.columns:
+                _fdf[_c] = _fdf[_norm_c]
+
+    dif = _fdf["DIF"]
+    dea = _fdf["DEA"] if "DEA" in _fdf.columns else pd.Series(0.0, index=_fdf.index)
+    atr = _fdf["ATR"]
+
+    out = stock_df.copy()
+    out["_p0_macd_trend"] = macd_trend(dif, dea)
+    out["_p0_momentum"] = _momentum(dif, dea, max_score=15)
+    out["_p0_slope"] = _dif_slope(dif, window=_slope_window, max_score=10)
+    out["_p0_vol_price"] = _volume_price(_fdf, max_score=10)
+    out["_p0_kline_pattern"] = _kline_pattern(_fdf, max_score=10)
+    _gs = (dif - dea).abs() / atr.replace(0, np.nan)
+    # WFO 训练窗口信号做过拟合。改为 rolling(252) 限制 1 年窗口。
+    out["_p0_golden_denom"] = _gs.rolling(252, min_periods=20).quantile(0.75)
+    out.attrs["_p0_feat_const"] = _const
+    return out

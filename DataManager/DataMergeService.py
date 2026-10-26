@@ -109,7 +109,6 @@ class DataMergeService:
             pool = sync.get_stock_pool_from_db()
             industry = pool[["ts_code", "name", "industry"]].copy()
             industry.columns = [ColumnNames.STOCK_CODE, ColumnNames.STOCK_NAME, ColumnNames.INDUSTRY]
-            # P0-7 ①：附加申万一级行业列（独立映射表 stock_basic_info_sw_l1；
             # 宏观 tilt 按一级行业 key 映射，二级语义 行业 列保持不变供行业信号使用）。
             # 失败记录 error 日志（不静默吞异常），一级列缺失时宏观 tilt 降级为 0。
             try:
@@ -491,7 +490,7 @@ class DataMergeService:
             })
             cols = ["股票代码"]
             for pipe_col in [ColumnNames.MACD_TREND, ColumnNames.MACD_CROSS, ColumnNames.MACD_HIST_MOMENTUM, ColumnNames.DIF_SLOPE, ColumnNames.DIVERGENCE_SIGNAL, ColumnNames.VOLUME_PRICE_CONFIRM, ColumnNames.KLINE_PATTERN,
-                             ColumnNames.COMPREHENSIVE_ANALYSIS, ColumnNames.COMPREHENSIVE_SCORE, ColumnNames.COMPREHENSIVE_LEVEL, ColumnNames.RISK_LEVEL, ColumnNames.MACD_TREND_TYPE, "macd_trend",
+                             ColumnNames.COMPREHENSIVE_ANALYSIS, ColumnNames.COMPREHENSIVE_SCORE, ColumnNames.COMPREHENSIVE_LEVEL, ColumnNames.RISK_LEVEL, ColumnNames.MACD_TREND_TYPE, "macd_trend", "macd_trend_value",
                              ColumnNames.CHIP_95_PRICE, "资金流净额", "_current_dif",
                              ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE,
                              ColumnNames.STOP_LOSS, ColumnNames.T1_TARGET, ColumnNames.T2_TARGET, ColumnNames.TRAILING_STOP, ColumnNames.EXIT_RRR,
@@ -545,7 +544,7 @@ class DataMergeService:
         # MACD 管线列也补 NaN → 空串（部分股票可能因早期返回未进 MACD_FULL_BULL）
         macd_fill_cols = [ColumnNames.MACD_TREND, ColumnNames.MACD_CROSS, ColumnNames.MACD_HIST_MOMENTUM, ColumnNames.DIF_SLOPE,
                           ColumnNames.DIVERGENCE_SIGNAL, ColumnNames.VOLUME_PRICE_CONFIRM, ColumnNames.KLINE_PATTERN,
-                          ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE, ColumnNames.MACD_TREND_TYPE, "macd_trend",
+                          ColumnNames.DIVERGENCE_DAYS, ColumnNames.DIVERGENCE_PRICE, ColumnNames.MACD_TREND_TYPE, "macd_trend", "macd_trend_value",
                           ColumnNames.MACD_ZERO_AXIS_UP_DATE]
         for col in macd_fill_cols:
             if col in final_df.columns:

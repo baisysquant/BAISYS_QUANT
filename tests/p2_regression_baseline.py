@@ -20,6 +20,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from BackTrading.engine import EngineConfig, run_full_backtest
+from BackTrading.domain.models import CostModel
 
 
 def _make_synthetic_kline(n_days: int = 120, n_stocks: int = 30, seed: int = 42) -> pd.DataFrame:
@@ -153,6 +154,7 @@ def run_baseline():
                 max_position_pct=0.1,
                 buy_threshold=bt,
                 atr_stop_mult=2.0,
+                cost_model=CostModel(),
             )
             tl, ec = run_full_backtest(kline, params, ecfg)
             results[key] = {

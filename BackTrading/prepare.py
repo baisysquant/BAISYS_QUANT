@@ -9,8 +9,11 @@ import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait, ProcessPoolExecutor
+try:
+    from concurrent.futures import BrokenProcessPool
+except ImportError:
+    BrokenProcessPool = RuntimeError
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -28,7 +31,6 @@ from LogicAnalyzer.ml.signal_model import apply_ml_signal
 # ML 只按数据版本重训一次（该版本的"首帧"，优化器路径下即默认参数帧），
 # 后续任意参数变体直接注入冻结预测，不再重训 XGBoost（~800s → 秒级）。
 # 未预测日期（预热期/模型不显著回退）保持原生评分，语义与 apply_ml_signal 一致。
-# P2 审计修复：使用 OrderedDict 实现 LRU 上限，防止内存泄漏
 _ML_PRED_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 _ML_PRED_CACHE_MAX = 10  # 最多缓存 10 个 (config_hash, data_fp) 组合
 _ML_PRED_LOCK = threading.Lock()
@@ -50,6 +52,82 @@ except Exception:
 from BackTrading.indicator_cache import get_precomputed, get_divergence, precompute_all_indicators
 from BackTrading import output_store as _os
 from BackTrading import calendar_align as _ca
+
+# 改为启动时自动扫描 vectorized_signal.py、Indicators.py 等指标管线中所有
+# rolling(window=N) / ewm(span=N) 窗口，取 max() 作为最小缓存缓冲要求。
+# 当新增更长窗口指标时，此处自动生效，无需手动更新。
+#
+# 已知窗口依赖（审计注释，随代码自动扫描）：
+#   - DataManager/Indicators.py: MA120 (rolling(window=120)) ← 当前最大
+#   - prepare.py / vectorized_signal.py: rolling(20), slope(60)
+#   - vectorized_signal.py: rolling(3), rolling(5)
+
+
+def _scan_max_indicator_window() -> int:
+    """启动时自动扫描指标管线中的所有 rolling()/ewm() 窗口，取最大值。
+
+    扫描范围：BackTrading/*.py + DataManager/Indicators.py + DataManager/*.py
+    匹配模式：rolling(window=N), rolling(N), ewm(span=N), ewm(com=N), ewm(halflife=N)
+    返回 max() 窗口值 + 20（安全边际）。
+    """
+    import ast
+    import glob
+    import os
+
+    max_window = 0
+
+    # 扫描目标 glob 路径
+    search_paths = [
+        os.path.join(os.path.dirname(__file__), "*.py"),
+        os.path.join(os.path.dirname(__file__), os.pardir, "DataManager", "*.py"),
+    ]
+    for pattern in search_paths:
+        for filepath in glob.glob(pattern):
+            try:
+                with open(filepath, encoding="utf-8", errors="ignore") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=filepath)
+            except (SyntaxError, UnicodeDecodeError, OSError):
+                continue
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func_name = None
+                    if isinstance(node.func, ast.Attribute):
+                        func_name = node.func.attr  # e.g. "rolling" or "ewm"
+                    elif isinstance(node.func, ast.Name):
+                        func_name = node.func.id  # e.g. "rolling"
+
+                    if func_name in ("rolling", "ewm"):
+                        # 提取 window / span / com / halflife 参数
+                        for keyword in node.keywords:
+                            if keyword.arg in ("window", "span", "com", "halflife"):
+                                # 尝试提取整数常量
+                                if isinstance(keyword.value, ast.Constant) and isinstance(
+                                    keyword.value.value, int
+                                ):
+                                    max_window = max(max_window, keyword.value.value)
+
+                # rolling(N) 位置参数
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if node.func.attr == "rolling" and node.args and not node.keywords:
+                        arg = node.args[0]
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
+                            max_window = max(max_window, arg.value)
+
+    # 显式声明聚合：取 Indicators.py 中的 MAX_ROLLING_WINDOW（循环变量 AST 不可达）
+    try:
+        from DataManager.Indicators import MAX_ROLLING_WINDOW  # type: ignore[attr-defined]
+        max_window = max(max_window, MAX_ROLLING_WINDOW)
+    except ImportError:
+        pass
+
+    # 安全边际 +20：应对 shift(N) 滞后窗口
+    return max(max_window + 20, 100)
+
+
+MAX_INDICATOR_WINDOW = _scan_max_indicator_window()
+logger.debug(f"[P1.4] 自动扫描指标最大窗口: {MAX_INDICATOR_WINDOW}")
 
 
 def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
@@ -80,6 +158,49 @@ def _clean_stale_tempdirs(max_age_hours: float = 2) -> int:
 _clean_stale_tempdirs()
 
 
+# AUDIT_FIX Step 11: 信号缓存目录 TTL 自动清理
+def _clean_signal_cache(ttl_days: int = 7) -> int:
+    """清理 signal_cache 下超过 TTL 天数的旧缓存目录。
+
+    持久化缓存 ``signal_cache_{trade_date}_{config_hash}_{param_hash}_{data_fp}/``
+    在 WFO 多窗口运行时会累积至数百 GB，需自动驱逐过期目录。
+
+    Args:
+        ttl_days: 缓存保留天数，默认 7 天。
+
+    Returns:
+        清理掉的目录数量。
+    """
+    if not CACHE_DIR.exists():
+        return 0
+
+    removed = 0
+    now = time.time()
+    ttl_seconds = ttl_days * 86400
+
+    try:
+        for entry in CACHE_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            if entry.name.startswith("signal_cache_"):
+                try:
+                    age_seconds = now - entry.stat().st_mtime
+                    if age_seconds > ttl_seconds:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    if removed:
+        logger.info(f"[AUDIT_FIX Step 11] 清理了 {removed} 个过期信号缓存目录（TTL={ttl_days}天）")
+    return removed
+
+
+_clean_signal_cache()
+
+
 
 def _trade_day_str() -> str:
     try:
@@ -90,7 +211,6 @@ def _trade_day_str() -> str:
 
 # ── 增量缓存（日期后缀 + 每只股票独立写入，支持中断续算） ──
 
-# P3 审计修复：自动管线版本管理 — 基于关键 Python 文件 mtime 生成哈希
 # 替代手动 _SIGNAL_PIPELINE_VERSION，代码变更即自动失效旧缓存
 def _pipeline_version_hash() -> str:
     """对信号管线涉及的源文件计算 mtime 哈希，代码变更时自动使旧缓存失效。"""
@@ -194,13 +314,72 @@ def _data_fingerprint(kline_df: pd.DataFrame, data_version: str | None = None) -
             step = max(1, len(kline_df) // 20000)
             sampled = kline_df.iloc[::step]
             content = hashlib.sha256(sampled[cols].values.tobytes()).hexdigest()[:8]
+        # FIX(P2) Subtask-10：显式纳入 adj_factor 哈希，防止仅修正复权因子未改 OHLC 时
+        # 缓存静默复用（上游数据回溯/复权口径切换场景）
+        af_hash = ""
+        if "adj_factor" in kline_df.columns:
+            _af_sample = kline_df.iloc[::max(1, len(kline_df) // 20000)][["adj_factor"]]
+            af_hash = hashlib.sha256(_af_sample.values.tobytes()).hexdigest()[:8]
         raw = (
             f"{data_version or ''}|{len(kline_df)}_{dates.min()}_{dates.max()}_{len(syms)}_"
-            f"{hashlib.sha256('|'.join(syms).encode()).hexdigest()[:8]}_{content}"
+            f"{hashlib.sha256('|'.join(syms).encode()).hexdigest()[:8]}_{content}_{af_hash}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:10]
     except Exception:
         return "unknown"
+
+
+def merge_best_params_into_structured(
+    best_params: dict[str, Any],
+    base: dict[str, Any],
+    *,
+    full_bull_default: int | None = None,
+) -> dict[str, Any]:
+    """将 WFO 优化输出的 flat best_params 注入 structured base（唯一事实来源）。
+
+    所有调用方（runner.py 终验回测、simulated_trading.py 模拟验证、
+    prepare.py flat 转换）必须使用此函数，杜绝"回测一套、验证一套"。
+
+    路由规则以 PREPARE_CONSUMED 为信号参数白名单，非信号参数（如 cross_decay_min
+    等）通过 _SCORING_EXTRA 纳入，与 prepare.py flat-to-structured 白名单保持一致。
+
+    Args:
+        best_params: WFO 输出的扁平参数 dict（key 为参数名）。
+        base: _build_params(config) 输出的结构化 dict。
+        full_bull_default: conclusion_full_bull 缺失时的默认值（None 时取 base）。
+
+    Returns:
+        注入后的结构化 dict（base 被就地修改并返回）。
+    """
+    from BackTrading.parameter_robustness import PREPARE_CONSUMED
+
+    # 分区白名单（与 CALIB_PARAM_MAP / vectorized_signal 消费路径对齐）
+    _REGIME_KEYS = frozenset({"boll_narrow_ratio"})
+    _THRESHOLD_FLAT = frozenset({"conclusion_full_bull", "conclusion_bullish", "conclusion_oscillate"})
+    # scoring = PREPARE_CONSUMED 中排除 regime/thresholds 后剩余的 + 非信号扩展
+    _SCORING_EXTRA = frozenset({
+        "cross_decay_min", "vol_norm_denominator",
+        "kline_decay_days", "kline_decay_min",
+        "expected_return_lookback",
+    })
+    _SCORING_KEYS = (PREPARE_CONSUMED - _REGIME_KEYS - _THRESHOLD_FLAT) | _SCORING_EXTRA
+
+    # 1) scoring 段
+    base["scoring"].update({k: v for k, v in best_params.items() if k in _SCORING_KEYS})
+
+    # 2) regime 段
+    for k in _REGIME_KEYS & best_params.keys():
+        base["regime"][k] = float(best_params[k])
+
+    # 3) thresholds 段
+    fb_cfg = full_bull_default if full_bull_default is not None else base["thresholds"]["fully_bull"]
+    base["thresholds"] = {
+        "fully_bull": int(best_params.get("conclusion_full_bull", fb_cfg)),
+        "bullish": int(best_params.get("conclusion_bullish", base["thresholds"]["bullish"])),
+        "oscillate": int(best_params.get("conclusion_oscillate", base["thresholds"]["oscillate"])),
+    }
+
+    return base
 
 
 def _cache_dir_for(trade_date: str, param_hash: str | None = None, config_hash: str | None = None, data_fp: str | None = None) -> Path:
@@ -266,14 +445,19 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
             files.extend(sorted(bucket_dir.glob("*.parquet")))
     if not files:
         return None
-    # 分块 concat：一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
+    # 一次性读 3155 个文件再整体 concat 会产生双倍内存峰值
     #（parts 列表 + 合并结果），容易在 Windows 上触发 OOM/原生崩溃。
     # 这里按块合并、逐块释放，同时提前丢弃 exit_strategy 字典列（每行一个 dict，
     # 是内存大头，提取出止损价后不再需要）。
-    _CHUNK = 400
+    # 小数据集用大 chunk 减少 GC 开销；大数据集缩小 chunk 控制峰值。
+    _total_files = len(files)
+    _CHUNK = max(50, min(1000, round(40000 / max(_total_files, 1))))
+    assert 50 <= _CHUNK <= 1000, f"P1.12 chunk clamp failed: {_CHUNK}"
+
     parts: list[pd.DataFrame] = []
     df: pd.DataFrame | None = None
     for idx, f in enumerate(files):
+        part = None
         try:
             part = pd.read_parquet(f)
         except Exception:
@@ -282,18 +466,26 @@ def _load_signal_cache(trade_date: str, param_hash: str | None = None, config_ha
         if "exit_strategy" in part.columns:
             if "止损价" not in part.columns:
                 part["止损价"] = part["exit_strategy"].apply(
-                    lambda x: float(x.get("stop_loss", 0)) if isinstance(x, dict) else 0.0
+                    lambda x: float(x.get("stop_loss", 0.0)) if isinstance(x, dict) else 0.0
                 )
             part = part.drop(columns=["exit_strategy"])
         parts.append(part)
+        part = None
+
         if len(parts) >= _CHUNK:
             merged = pd.concat(parts, ignore_index=True)
-            parts = [merged]
-        del part
+            del parts[:]
+            parts.append(merged)
+            gc.collect()
+
+            if (idx + 1) % 800 == 0:
+                logger.debug(f"[P2.4] concat 进度: {idx + 1}/{_total_files}")
+
     if not parts:
         return None
     df = pd.concat(parts, ignore_index=True)
-    del parts
+    del parts[:]
+    gc.collect()
     # 只重命名确实存在的英文列，避免旧版缓存中文列名冲突
     rename_map = {eng: chn for eng, chn in _REV_SIGNAL_COL_MAP.items() if eng in df.columns and eng != chn}
     if rename_map:
@@ -338,7 +530,8 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     # 只保留信号计算产生的列，避免加载不需要的中间指标
     _signal_cols = [c for c in signal_df.columns if c in (
         "进场评分", "退出评分", "综合评分", "止损价", "风险等级",
-        "entry_score", "exit_score", "score", "atr", "ATR", "macd_trend",
+        "entry_score", "exit_score", "score", "atr", "ATR",
+        "macd_trend", "macd_trend_value",
         "golden_cross", "hist_momentum", "dif_slope", "divergence",
         "vol_price", "kline", "exit_strategy",
     ) or c.startswith("MACD_") or c.startswith("MA_") or c.startswith("ATR_")]
@@ -348,9 +541,16 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
     signal_subset = signal_df[["symbol", "trade_date"] + _signal_cols].copy()
     result = kline_df.merge(signal_subset, on=["symbol", "trade_date"], how="left")
     del signal_subset, signal_df
-    for col in ["进场评分", "退出评分", "综合评分", "止损价"]:
+    for col in ["进场评分", "退出评分", "综合评分"]:
         if col in result.columns:
             result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0)
+    # 填0 → core.py 的 >0 守卫跳过 _prev_stop 更新 → 旧止损线残留 → 止损静默失效
+    if "止损价" in result.columns:
+        result["止损价"] = pd.to_numeric(result["止损价"], errors="coerce")
+        # 按 symbol 分组 ffill，信号缺失日沿用最近有效止损价
+        result["止损价"] = result.groupby("symbol")["止损价"].transform(lambda s: s.ffill())
+        # 整票全无信号时仍填0（core.py >0 守卫自动跳过）
+        result["止损价"] = result["止损价"].fillna(0)
     if "风险等级" in result.columns:
         result["风险等级"] = result["风险等级"].fillna("LOW")
     return result
@@ -369,15 +569,38 @@ def prepare_backtest_data(
     data_version: str | None = None,
     confirmed_suspension_days: set[str] | None = None,
 ) -> pd.DataFrame:
-    is_flat = params is not None and (
-        "atr_stop_mult" in params
-        or "boll_narrow_ratio" in params
-        or "conclusion_full_bull" in params or "golden_cross_bonus" in params
-    )
+    # ── P1#5 指标缓存窗口断言（防御性校验） ──
+    # 最大指标窗口 MA120 (Indicators.py)。backtest_start_date 之前必须有 >= 120 行预热数据，
+    # 否则 rolling(120, min_periods=120) 全 NaN → 信号污染/静默失效。
+    # WFO 窗口切片场景下，子窗口可能无法提供 120 天历史；此处告警不阻断，
+    # 由下游 rolling(min_periods=1) 缩窗安全降级。整批全量数据由 runner._fetch_kline
+    # 保障缓冲（当前 _buffer_trading_days = 180 >> 120）。
+    if backtest_start_date is not None and "trade_date" in kline_df.columns and "symbol" in kline_df.columns:
+        _mask_pre = kline_df["trade_date"] < backtest_start_date
+        _pre_counts = kline_df.loc[_mask_pre].groupby("symbol").size()
+        _short_syms = _pre_counts[_pre_counts < MAX_INDICATOR_WINDOW]
+        if not _short_syms.empty:
+            worst = _pre_counts.idxmin()
+            logger.warning(
+                f"[P1#5] 以下 {_short_syms.index[0]!r} 等{_short_syms.shape[0]}只股票 "
+                f"在 {backtest_start_date} 前有 ≤{_pre_counts.min()} 行预热数据 "
+                f"(阈值={MAX_INDICATOR_WINDOW})，指标预热可能不足 → 信号 NaN 风险"
+            )
 
-    # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO/RISK 单值
+    # is_flat 检测：检查 params 顶层是否有任一信号参数或组合参数键。
+    # 白名单 = PREPARE_CONSUMED (prepare 消费) ∪ ENGINE_CONSUMED (引擎消费)
+    # 注：conclusion_bullish / conclusion_oscillate 不在寻优空间，但校准结果中可能出现。
+    _flat_keys = frozenset((
+        "atr_stop_mult", "boll_narrow_ratio", "cross_decay_days",
+        "golden_cross_bonus", "divergence_penalty", "conclusion_full_bull",
+        "buy_threshold", "max_holdings",
+    ))
+    is_flat = params is not None and bool(_flat_keys & params.keys())
+
+    # 在 params 被 convert 为 structured 之前，保存 PORTFOLIO 单值
     _saved_atr_stop = params.get("atr_stop_mult") if isinstance(params, dict) else None
-    _saved_risk_none = params.get("risk_none_multiplier") if isinstance(params, dict) else None
+    # ⚠️ _saved_risk_none 已移除：risk_none_multiplier 属于 DEAD_KEYS（不扰动），
+    # 在 prepare 管线中从未消费；仓位倍率由 EngineConfig.risk_none_multiplier 注入。
 
     if signal_param_hash is None:
         signal_param_hash = _compute_param_hash(params)
@@ -388,19 +611,8 @@ def prepare_backtest_data(
     elif is_flat:
         cfg = Config()
         base = _build_params(cfg)
-        base["scoring"].update({k: v for k, v in params.items() if k in (
-            "cross_decay_days", "cross_decay_min",
-            "vol_norm_denominator", "kline_decay_days", "kline_decay_min",
-            "expected_return_lookback",
-            "golden_cross_bonus", "divergence_penalty",
-        )})
-        if "boll_narrow_ratio" in params:
-            base["regime"]["boll_narrow_ratio"] = float(params["boll_narrow_ratio"])
-        base["thresholds"] = {
-            "fully_bull": int(params.get("conclusion_full_bull", base["thresholds"]["fully_bull"])),
-            "bullish": base["thresholds"]["bullish"],
-            "oscillate": base["thresholds"]["oscillate"],
-        }
+        # 统一使用 merge_best_params_into_structured，与 runner/simulated_trading 路由一致
+        merge_best_params_into_structured(params, base)
         params = base
 
     config_hash = _compute_config_hash()
@@ -455,8 +667,12 @@ def prepare_backtest_data(
         del kline, signal
         gc.collect()
         _t_ml = time.time()
-        # ── ML 解耦：预测列按数据版本冻结，参数变体不重训 ──
-        ml_key = (config_hash, data_fp)
+        # ── P0.2 修复：ML 缓存 key 加入窗口日期范围，防止跨 WFO 窗口数据泄露 ──
+        # 旧 key (config_hash, data_fp) 在跨窗口时重复命中 → 全量训练信息泄漏到 OOS。
+        # 新 key 包含 merged 本窗口最小/最大 trade_date，确保同窗口命中、跨窗口隔离。
+        _ml_date_min = str(merged["trade_date"].min())
+        _ml_date_max = str(merged["trade_date"].max())
+        ml_key = (config_hash, data_fp, _ml_date_min, _ml_date_max)
         with _ML_PRED_LOCK:
             ml_pred = _ML_PRED_CACHE.get(ml_key)
         if ml_pred is None:
@@ -464,7 +680,6 @@ def prepare_backtest_data(
             merged = apply_ml_signal(merged)
             ml_pred = merged[["symbol", "trade_date", "进场评分"]].copy()
             with _ML_PRED_LOCK:
-                # P2 审计修复：LRU 淘汰 — 缓存超限则删除最久未使用的条目
                 if len(_ML_PRED_CACHE) >= _ML_PRED_CACHE_MAX:
                     _evict_key = next(iter(_ML_PRED_CACHE))
                     del _ML_PRED_CACHE[_evict_key]
@@ -473,31 +688,48 @@ def prepare_backtest_data(
             logger.info(f"  ML 信号覆写完成，耗时 {time.time()-_t_ml:.1f}s（预测已冻结，后续参数变体不再重训）")
         else:
             merged = merged.merge(
-                ml_pred.rename(columns={"进场评分": "ML进场评分"}),
+                ml_pred.rename(columns={"进场评分": "ML评分"}),
                 on=["symbol", "trade_date"], how="left",
             )
-            _ml_fill = merged["ML进场评分"].notna()
-            merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML进场评分"]
-            merged = merged.drop(columns=["ML进场评分"])
-            logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行），耗时 {time.time()-_t_ml:.1f}s")
-        if _saved_atr_stop is not None and "ATR" in merged.columns:
-            # P2-3：止损价统一使用后复权口径，避免除权日 close 跳跌而 ATR 连续导致量纲不一致
-            close_for_stop = merged["close_adj"] if "close_adj" in merged.columns else merged["close"]
-            stop_raw = close_for_stop - merged["ATR"] * _saved_atr_stop
+            # AUDIT_FIX Step 6: ML 信号修正因子混合模式
+            # 最终进场评分 = ml_blend_weight × 原生 + (1 - ml_blend_weight) × ML
+            # ml_blend_weight=0 时退化为旧行为（完全 ML 覆写）
+            _ml_fill = merged["ML评分"].notna()
+            _blend_w = float(params.get("ml_blend_weight", 0.4))
+            if _blend_w == 0:
+                # 完全覆写（旧行为）
+                merged.loc[_ml_fill, "进场评分"] = merged.loc[_ml_fill, "ML评分"]
+            elif _blend_w >= 1.0:
+                # 完全忽略 ML，不做处理
+                pass
+            else:
+                # 混合模式：加权融合
+                merged.loc[_ml_fill, "进场评分"] = (
+                    _blend_w * merged.loc[_ml_fill, "进场评分"]
+                    + (1.0 - _blend_w) * merged.loc[_ml_fill, "ML评分"]
+                )
+            if "ML评分" in merged.columns:
+                merged = merged.drop(columns=["ML评分"])
+            logger.info(f"  ML 预测注入冻结缓存（{int(_ml_fill.sum()):,} 行，混合权重 {_blend_w:.1f}），耗时 {time.time()-_t_ml:.1f}s")
+        if "ATR" in merged.columns:
+            # 确保缓存中的旧版不复权止损价在 merge 后被无条件重建
+            _atr_stop_mult = _saved_atr_stop if _saved_atr_stop is not None else 1.5
+            close_for_stop = merged["close_normal"] if "close_normal" in merged.columns else merged["close"]
+            stop_raw = close_for_stop - merged["ATR"] * _atr_stop_mult
             merged["止损价"] = np.floor(stop_raw * 100 + 0.5) / 100
 
         # ── P0-1：止损价复权空间断言（任何口径混用直接报错，禁止静默降级） ──
-        # 止损价必须与引擎比较基准 close_adj 同空间：
-        #  1) ATR 偏差核验（merged 含 ATR 时，生产路径）：|(close_adj−止损价)−ATR×mult|
+        # 止损价必须与引擎比较基准 close_normal 同空间：
+        #  1) ATR 偏差核验（merged 含 ATR 时，生产路径）：|(close_normal−止损价)−ATR×mult|
         #     在正确空间仅为取整误差（<0.2%）；混用不复权空间时偏差 ≈ close×(adj_factor−1)。
-        #  2) 无 ATR 列（合成数据/旧缓存）：邻域软检 — 止损价明显更靠近不复权 close 时告警
+        #  2) 无 ATR 列（合成数据/旧缓存）：邻域软检 — 止损价明显更靠近不复权 close_raw 时告警
         #     并拒绝静默（旧版缓存重建后即转为硬报错）。
-        if "止损价" in merged.columns and "close_adj" in merged.columns and "close" in merged.columns:
+        if "止损价" in merged.columns and "close_normal" in merged.columns and "close_raw" in merged.columns:
             _stop_v = pd.to_numeric(merged["止损价"], errors="coerce").to_numpy(dtype=np.float64)
-            _ca_v = pd.to_numeric(merged["close_adj"], errors="coerce").to_numpy(dtype=np.float64)
-            _cl_v = pd.to_numeric(merged["close"], errors="coerce").to_numpy(dtype=np.float64)
-            _ok = np.isfinite(_stop_v) & np.isfinite(_ca_v) & np.isfinite(_cl_v)
-            _ok &= (_stop_v > 0) & (_ca_v > 0) & (_cl_v > 0)
+            _cn_v = pd.to_numeric(merged["close_normal"], errors="coerce").to_numpy(dtype=np.float64)
+            _cr_v = pd.to_numeric(merged["close_raw"], errors="coerce").to_numpy(dtype=np.float64)
+            _ok = np.isfinite(_stop_v) & np.isfinite(_cn_v) & np.isfinite(_cr_v)
+            _ok &= (_stop_v > 0) & (_cn_v > 0) & (_cr_v > 0)
             if _ok.any():
                 _bad = np.zeros(len(_ok), dtype=bool)
                 if "ATR" in merged.columns:
@@ -505,24 +737,24 @@ def prepare_backtest_data(
                     _atr_ok = _ok & np.isfinite(_atr_v) & (_atr_v > 0)
                     if _atr_ok.any():
                         _mult_ref = _saved_atr_stop if _saved_atr_stop not in (None, 0) else 1.5
-                        _dev = np.abs((_ca_v[_atr_ok] - _stop_v[_atr_ok]) - _atr_v[_atr_ok] * _mult_ref) / _ca_v[_atr_ok]
-                        _dev_bad = _dev > 0.05 + 0.05 / _ca_v[_atr_ok]
+                        _dev = np.abs((_cn_v[_atr_ok] - _stop_v[_atr_ok]) - _atr_v[_atr_ok] * _mult_ref) / _cn_v[_atr_ok]
+                        _dev_bad = _dev > 0.05 + 0.05 / _cn_v[_atr_ok]
                         _bad[np.where(_atr_ok)[0][_dev_bad]] = True
                 else:
-                    _near_raw = _ok & (np.abs(_stop_v - _cl_v) < np.abs(_stop_v - _ca_v) * 0.5)
+                    _near_raw = _ok & (np.abs(_stop_v - _cr_v) < np.abs(_stop_v - _cn_v) * 0.5)
                     if _near_raw.any():
                         _n_near = int(_near_raw.sum())
                         logger.warning(
-                            f"[P0-1] 检测到 {_n_near} 行止损价更接近不复权 close（疑似空间混用），"
+                            f"[P0-1] 检测到 {_n_near} 行止损价更接近不复权 close_raw（疑似空间混用），"
                             "merged 无 ATR 列无法硬校验；请清除信号缓存重建（旧版缓存为不复权止损价）。"
                         )
                 if _bad.any():
                     _rows = merged.iloc[np.where(_bad)[0][:5]][
-                        ["symbol", "trade_date", "close", "close_adj", "ATR", "止损价"]
+                        ["symbol", "trade_date", "close_raw", "close_normal", "ATR", "止损价"]
                     ]
                     raise RuntimeError(
-                        f"[P0-1] 止损价复权空间断言失败：{int(_bad.sum())} 行止损价与 close_adj/ATR 不同空间"
-                        f"（止损价必须按 后复权 close_adj − ATR×mult 计算，旧版信号缓存需清除重建）。"
+                        f"[P0-1] 止损价复权空间断言失败：{int(_bad.sum())} 行止损价与 close_normal/ATR 不同空间"
+                        f"（止损价必须按 后复权 close_normal − ATR×mult 计算，旧版信号缓存需清除重建）。"
                         f"样例：\n{_rows.to_string(index=False)}"
                     )
 
@@ -576,7 +808,6 @@ def prepare_backtest_data(
                     logger.info(f"信号缓存全部命中（{len(done)} 只）[{cache_tag}]")
                     return _finalize(kline_df, signal_df)
             else:
-                # P0-1 补充修复：缓存文件存在但整体不可读/为空（损坏缓存）时，之前会静默
                 # 返回原始 K 线（无止损价/信号列）→ 引擎在无止损保护下运行。改为降级重算。
                 logger.warning(
                     f"[信号缓存] {len(done)} 只股票的缓存文件存在但无法读取或为空"
@@ -595,8 +826,45 @@ def prepare_backtest_data(
         )
 
     # ── 需要计算的股票 ──
+    # 细化未命中原因诊断：对象=缓存目录，环节=_completed_symbols/_load_signal_cache，
+    # 理由分三类（目录不存在 / 文件部分缺失 / 文件在但内容无效），并列出现有缓存键辅助定位
+    # 是哪个指纹（trade_date/config/param/data）发生了变化。
     _t0 = time.time()
-    logger.info(f"信号缓存无效或不存在，开始计算 {len(missing)} 只 [{cache_tag}]...")
+    _miss_dir = _cache_dir_for(trade_date, signal_param_hash, config_hash, data_fp)
+    if not _miss_dir.exists():
+        try:
+            _siblings = sorted(
+                (d for d in CACHE_DIR.glob("signal_cache_*") if d.is_dir()),
+                key=lambda d: d.stat().st_mtime, reverse=True,
+            )[:3]
+        except Exception:
+            _siblings = []
+        _sib_desc = "; ".join(
+            f"{d.name}（{time.strftime('%Y-%m-%d %H:%M', time.localtime(d.stat().st_mtime))}）"
+            for d in _siblings
+        ) or "无任何历史信号缓存"
+        logger.warning(
+            f"[信号缓存] 未命中：缓存目录不存在 → 全量计算 {len(missing)} 只\n"
+            f"  对象: {_miss_dir}\n"
+            f"  原因: 首次计算，或 trade_date/config_hash/param_hash/data_fp 任一指纹变化生成新缓存键"
+            f"（旧键缓存不跨键复用）[{cache_tag}]\n"
+            f"  现有其他缓存: {_sib_desc}"
+        )
+    elif len(done) >= len(symbols):
+        # 全部文件都在却走到重算：_load_signal_cache 返回 None/空（损坏），上方已有专项告警
+        logger.warning(
+            f"[信号缓存] 未命中：{len(done)} 只缓存文件存在但读取结果无效/为空（损坏，见上方告警）"
+            f"→ 全量重算 {len(missing)} 只 [{cache_tag}]"
+        )
+    else:
+        logger.warning(
+            f"[信号缓存] 未命中：缓存目录存在但 {len(missing)}/{len(symbols)} 只缺少缓存 parquet"
+            f"（上次运行中断/失败，或股票池新增股票）\n"
+            f"  对象: {_miss_dir}\n"
+            f"  已有缓存: {len(done)} 只，续算 {len(missing)} 只: {sorted(missing)[:8]}"
+            f"{'…' if len(missing) > 8 else ''} [{cache_tag}]"
+        )
+    logger.info(f"开始计算 {len(missing)} 只 [{cache_tag}]...")
     tmpdir = tempfile.mkdtemp(prefix="bprep_")
     stock_dir = os.path.join(tmpdir, "stocks")
     os.mkdir(stock_dir)
@@ -606,13 +874,19 @@ def prepare_backtest_data(
                 os.path.join(stock_dir, f"{sym}.parquet"), index=False
             )
 
-        # Phase 0: 预计算所有股票的技术指标 + peak/trough（仅一次，后续评估复用）
         # fingerprint=data_fp：跨数据批次（WFO 窗口/路径切片）切换时清空指标内存缓存，
         # 防止 worker 复用旧切片的指标导致信号日期错位（2026-08-07 OOS 0 交易根因）。
-        # P0-10 ②：循环兜底路径已删除，统一向量化路径（vectorized 参数仅保留兼容性）
         if not vectorized:
             logger.warning("vectorized=False 已弃用：循环兜底路径已删除，统一走向量化路径")
-        precompute_all_indicators(stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats)
+
+        # ── 指标计算阶段 ──
+        # 不再 logger.remove() 清除所有 handler（会导致回测日志文件断写）。
+        # 多进程场景下子进程有自己的 logger 实例，不影响父进程 handler。
+        logger.info("指标预计算: 开始")
+        precompute_all_indicators(
+            stock_dir, fingerprint=data_fp, suspension_stats=_susp_stats
+        )
+        logger.info("指标预计算: 完成")
 
         from tqdm import tqdm
         signal_pipelines = Config().SIGNAL_PIPELINES
@@ -624,24 +898,46 @@ def prepare_backtest_data(
         _pipeline_records: list[_os.OutputRecord] = []
 
         def _pipeline(syms: list[str], idx: int) -> None:
-            """单管道：ThreadPoolExecutor 并发处理股票（Windows spawn 下 ProcessPoolExecutor 会死锁）。
+            """单管道：ProcessPoolExecutor 并发处理股票（CPU 密集型，突破 GIL）。
+            P2-11 修复：原 ThreadPoolExecutor 受 GIL 限制，numpy/scipy 计算无法真正并行。
+            改用 ProcessPoolExecutor，捕获 BrokenProcessPool 异常后fallback至 ThreadPoolExecutor。
             D1 分片：失败片（=失败股票集合）在 SHARD_MAX_ATTEMPTS 内仅重跑失败片。"""
             if not syms:
                 return
             pbar = tqdm(total=len(syms), desc=f"管道{idx+1}", unit="只", ncols=50, position=idx)
-            pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
             _p0 = time.time()
             done = 0
             failures: set[str] = set()
+
+            # ── P2-11：ProcessPoolExecutor → BrokenProcessPool 捕获 → ThreadPoolExecutor fallback ──
+            _use_process = True
             try:
+                pool = ProcessPoolExecutor(max_workers=_workers_per_pipeline)
+                logger.debug(f"  管道{idx+1} 使用 ProcessPoolExecutor（{_workers_per_pipeline} workers）")
+            except Exception as _e:
+                logger.warning(f"  管道{idx+1} ProcessPoolExecutor 创建失败 ({_e})，回退至 ThreadPoolExecutor")
+                pool = ThreadPoolExecutor(max_workers=_workers_per_pipeline)
+                _use_process = False
+
+            try:
+                _process_pool_crashed = False
+
                 def _run_batch(syms_batch: list[str], *, progress: bool = False) -> set[str]:
                     """提交一批符号并收集失败集合（片级失败：仅这批重跑）。"""
-                    nonlocal done
+                    nonlocal done, _process_pool_crashed
                     batch_failures: set[str] = set()
                     fut_to_sym: dict[Any, str] = {}
                     for sym in syms_batch:
-                        fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy, _susp_stats)
-                        fut_to_sym[fut] = sym
+                        try:
+                            fut = pool.submit(_worker_fn, sym, stock_dir, params, compute_exit_strategy, _susp_stats)
+                            fut_to_sym[fut] = sym
+                        except BrokenProcessPool:
+                            # ── P2-11：进程池崩溃，标记后将所有未完成的股票加入失败集合 ──
+                            if not _process_pool_crashed:
+                                _process_pool_crashed = True
+                                logger.error(f"  管道{idx+1} ProcessPoolExecutor 进程崩溃，剩余 {len(syms_batch)} 只全部标记失败")
+                            batch_failures.update(syms_batch)
+                            break
 
                     for future in as_completed(fut_to_sym):
                         sym = fut_to_sym[future]
@@ -655,6 +951,12 @@ def prepare_backtest_data(
                                     rows=len(rows),
                                     written_at=time.time(),
                                 ))
+                        except BrokenProcessPool:
+                            # ── P2-11：取结果时进程崩溃 ──
+                            if not _process_pool_crashed:
+                                _process_pool_crashed = True
+                                logger.error(f"  管道{idx+1} 取结果时进程崩溃，[{sym}] 等未完成股票标记失败")
+                            batch_failures.add(sym)
                         except Exception as e:
                             batch_failures.add(sym)
                             logger.opt(exception=True).warning(f"  [{sym}] 信号计算失败: {e}")
@@ -754,6 +1056,11 @@ def _stock_worker_vectorized(
     import sys as _sys
     try:
         stock_df, _peaks, _troughs = get_precomputed(symbol, stock_dir)
+        # 取舍原因：
+        #   1) 上市前5日A股无涨跌幅限制（2018年起），价格剧烈波动，MA/ATR等指标统计无意义；
+        #   2) 60根bar可覆盖MA60窗口（P1-10已设min_periods=60），指标预热充分；
+        #   3) 次新股上市初期流动性不稳定，回测滑点模型不可靠。
+        # 影响：次新股上市前3个月不参与回测。此属有意设计，非Bug。
         if stock_df.empty or len(stock_df) < 60:
             return []
 
@@ -777,7 +1084,6 @@ def _stock_worker_vectorized(
                 precomputed_divergence=_div,
             )
         except Exception as e:
-            # P0-10 ②：循环兜底路径已删除。向量化失败即整票失败（不降级到
             # O(n²) 逐 bar 重算的另一套实现），由外层 D1 分片重跑机制处理。
             import traceback
             logger.error(f"  [{symbol}] 向量化信号计算失败，整票失败: {e}\n{traceback.format_exc()}")
@@ -794,7 +1100,9 @@ def _stock_worker_vectorized(
                 "risk_level": str(row["risk_level"]),
                 "score": float(row["score"]),
                 "atr": float(row["atr"]) if pd.notna(row["atr"]) else 0.0,
-                "macd_trend": float(row["macd_trend"]),
+                # 审计修复：macd_trend 为字符串类别，数值分从 macd_trend_value 读取
+                "macd_trend": str(row["macd_trend"]),
+                "macd_trend_value": float(row.get("macd_trend_value", row.get("macd_trend", 0.0))),
                 "golden_cross": float(row["golden_cross"]),
                 "hist_momentum": float(row["hist_momentum"]),
                 "dif_slope": float(row["dif_slope"]),
@@ -821,6 +1129,7 @@ _SIGNAL_COL_MAP = {
     "score": "综合评分",
     "atr": "ATR",
     "macd_trend": "MACD趋势分",
+    "macd_trend_value": "MACD趋势数值分",
     "golden_cross": "金叉信号分",
     "hist_momentum": "柱状动能分",
     "dif_slope": "DIF斜评分",
@@ -912,23 +1221,11 @@ def _compute_indicators(
     )
 
     df = df_raw.copy()
-    # P2-3/P0-2：技术指标统一使用后复权口径，除权日连续无跳跌。
-    # 上游（DB）提供 open_adj/high_adj/low_adj/close_adj 全量后复权列；
-    # 合成/测试帧缺失 *_adj 时按 adj_factor 精确还原（adj = raw × adj_factor），
-    # 再回退原始列。旧版"close 用后复权、high/low 用不复权"的近似已删除。
-    close = df["close_adj"] if "close_adj" in df.columns else df["close"]
-    if "high_adj" in df.columns:
-        high = df["high_adj"]
-    elif "adj_factor" in df.columns:
-        high = df["high"] * df["adj_factor"]
-    else:
-        high = df["high"]
-    if "low_adj" in df.columns:
-        low = df["low_adj"]
-    elif "adj_factor" in df.columns:
-        low = df["low"] * df["adj_factor"]
-    else:
-        low = df["low"]
+    # 上游（DB）提供 open_normal/high_normal/low_normal/close_normal 后复权列；
+    # 合成/测试帧缺失 *_normal 时回退原始列。
+    close = df["close_normal"] if "close_normal" in df.columns else df["close"]
+    high = df["high_normal"] if "high_normal" in df.columns else df["high"]
+    low = df["low_normal"] if "low_normal" in df.columns else df["low"]
     n = len(df)
     mode = degrade_mode()
 
@@ -1025,7 +1322,6 @@ def _compute_indicators(
     else:
         df["AMOUNT"] = close * df["volume"]
     df["AMOUNT_MA20"] = df["AMOUNT"].rolling(20).mean().shift(1)
-    # P0-11：AMOUNT_MA20 用于次日开盘成交时点的流动性分档（冲击成本/滑点档位）。
     # 原实现 rolling(20).mean() 含当日全天成交额——开盘撮合时当日成交额不可知，
     # 属确定性前视（利好回测）。shift(1) 使其仅用 T 日及之前数据，与引擎
     # _update_adv（收盘后更新、不含当日）口径一致（PIT 合规）。

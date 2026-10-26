@@ -21,7 +21,6 @@ Windows 注意：进程池（spawn）会死锁，调度器只用线程（与 pre
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 import time
@@ -30,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 SHARD_DIM_SYMBOL = "symbol"
 SHARD_DIM_DATE = "date"

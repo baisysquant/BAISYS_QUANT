@@ -22,12 +22,17 @@ class ColumnNames:
     STOCK_CODE = "股票代码"
     STOCK_NAME = "股票简称"
     INDUSTRY = "行业"
-    # P0-7 ①：申万一级行业（独立映射表 stock_basic_info_sw_l1；行业保持二级
     # 语义供行业信号映射，一级列供宏观 tilt 与行业一级中性化使用）
     INDUSTRY_L1 = "行业一级"
     INDUSTRY_SIGNAL = "所属行业信号"
     LATEST_PRICE = "最新价"
     STOCK_LINK = "股票链接"
+
+    CLOSE_NORMAL = "close_normal"  # 后复权价
+    CLOSE_ADJ = "close"            # 前复权价/原始收盘价
+    VOLUME_DATA = "volume"         # 成交量
+    MA_VOLUME_5 = "MA_Volume_5"   # 5日成交量均线
+    NAME_COL = "name"             # 股票名称
 
     # akshare原始列名（数据清洗阶段使用）
     AKSHARE_CODE_RAW = "代码"  # 主力成本等接口返回的原始列名

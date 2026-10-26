@@ -232,13 +232,6 @@ class ColumnAliasesConfig(BaseModel):
     )
 
 
-class ResearchReportFilterConfig(BaseModel):
-    """研报过滤配置"""
-
-    ENABLE_RESEARCH_REPORT_FILTER: bool = Field(default=False)
-    RESEARCH_REPORT_MIN_COUNT: int = Field(default=1, ge=1)
-
-
 class FullBullScoringConfig(BaseModel):
     """MACD 完全多头评分维度权重 + 规则阈值"""
 
@@ -273,9 +266,9 @@ class MultiFactorAlphaConfig(BaseModel):
     ENABLED: bool = Field(default=True, description="是否启用多因子 Alpha 评分")
     FINANCIAL_QUALITY_CACHE_DAYS: int = Field(default=90, ge=1, le=365,
                                                description="质量因子缓存天数")
-    FINANCIAL_QUALITY_BATCH_SIZE: int = Field(default=500, ge=1, le=5000,
+    FINANCIAL_QUALITY_BATCH_SIZE: int = Field(default=100, ge=1, le=5000,
                                               description="质量因子每批采集股票数")
-    FINANCIAL_QUALITY_BATCH_SLEEP: int = Field(default=20, ge=0, le=600,
+    FINANCIAL_QUALITY_BATCH_SLEEP: int = Field(default=10, ge=0, le=600,
                                                description="质量因子批间休眠秒数")
     FINANCIAL_QUALITY_FILE_CACHE_DAYS: int = Field(default=30, ge=1, le=365,
                                                    description="质量因子离线文件缓存天数")
@@ -288,7 +281,6 @@ class AShareHubConfig(BaseModel):
     """AShareHub 筹码分布数据配置"""
 
     API_KEY: str = Field(default="")
-    ENABLE_CHIP_DISTRIBUTION: bool = Field(default=False)
     MONEYFLOW_RETRY: int = Field(default=3, ge=0, le=10,
                                    description="资金流向 API 429 重试次数")
     MONEYFLOW_PAGE_DELAY: float = Field(default=1.0, ge=0.0, le=30.0,
@@ -346,10 +338,6 @@ class ScoringParamsConfig(BaseModel):
                                          description="金叉强度波动率归一化分母：(DIF-DEA)/ATR/此值→vol_factor")
     ATR_STOP_MULT: float = Field(default=1.5, ge=0.5, le=5.0,
                                   description="止损ATR倍数：止损价=close-ATR×此值")
-    ATR_T1_MULT: float = Field(default=3.0, ge=1.0, le=10.0,
-                                description="T1目标价ATR倍数")
-    ATR_T2_MULT: float = Field(default=5.0, ge=2.0, le=20.0,
-                                description="T2目标价ATR倍数")
     TRAILING_STOP_HIGH_RATIO: float = Field(default=0.98, ge=0.9, le=1.0,
                                               description="移动止损高位触发比：close≥近N日最高价×此值")
     TRAILING_STOP_LOOKBACK: int = Field(default=10, ge=5, le=60,
@@ -367,6 +355,11 @@ class ScoringParamsConfig(BaseModel):
         description="行业估值聚合口径: aggregate_profitable(剔除亏损股, 中证口径) / "
                     "aggregate_full(整体法含负利润, 申万口径, 行业整体亏损时 PE 为负)",
     )
+    # ── 波动率自适应退出参数（VAEO 学习产出）──
+    LEARNED_T1_MULT: float = Field(default=3.0, ge=1.0, le=10.0,
+                                    description="回测学习到的 T1 止盈 ATR 倍数（替代硬编码默认值）")
+    LEARNED_T2_MULT: float = Field(default=5.0, ge=1.0, le=15.0,
+                                    description="回测学习到的 T2 止盈 ATR 倍数（替代硬编码默认值）")
 
 
 class TechnicalConstantsConfig(BaseModel):
@@ -408,6 +401,10 @@ class BacktestConfig(BaseModel):
                                      description="过户费（双边，万0.1）")
     MIN_COMMISSION_PER_TRADE: float = Field(default=5.0, ge=0, le=100,
                                             description="A股每笔最低佣金（5元）")
+    TIERED_COMMISSION_RATES: str = Field(
+        default="",
+        description="阶梯佣金费率（可选；空=统一COMMISSION_RATE）。格式: threshold1:rate1;threshold2:rate2;... 按成交额阈值升序匹配。例: 1000000:0.00025;5000000:0.0002"
+    )
     # ── 冲击成本（未提供 AMOUNT_MA20 时的统一参数） ──
     IMPACT_BASE: float = Field(default=0.002, ge=0, le=0.05,
                                description="大单冲击成本基数（阈值处）")
@@ -424,11 +421,16 @@ class BacktestConfig(BaseModel):
                                           description="各档冲击启用阈值（占ADV比例）")
     LIQUIDITY_TIER_CAP: str = Field(default="0.10,0.05,0.05,0.03",
                                     description="各档冲击成本上限")
-    EXCLUDE_ST: bool = Field(default=True,
-                             description="回测宇宙剔除 ST/*ST 风险警示股（主板 5% 涨跌幅、流动性差）")
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
+    # ── P1-5 单笔委托占成交量上限（按 ADV 成交额分档） ──
+    MAX_ORDER_PCT: float = Field(default=0.30, ge=0.01, le=1.0,
+                                 description="单笔委托占成交量上限（默认档，中流动性）")
+    MAX_ORDER_PCT_HIGH: float = Field(default=0.20, ge=0.01, le=1.0,
+                                      description="高流动性股单笔委托上限（日均成交额>1亿）")
+    MAX_ORDER_PCT_LOW: float = Field(default=0.10, ge=0.01, le=1.0,
+                                     description="低流动性股单笔委托上限（日均成交额<2000万）")
     # 0.1 成交时点模型（执行时序合规）：next_open 信号次日开盘（默认，A股T+1）/ vwap 信号次日VWAP
     # close 模式已移除（固有前视偏差：信号依赖当日收盘数据计算，以同日收盘价成交=先知交易）
     EXECUTION_MODEL: str = Field(default="next_open",
@@ -451,6 +453,9 @@ class BacktestConfig(BaseModel):
                                           description="CPCV 净化天数：训练窗口尾部剔除（前向收益标签视界）")
     BAYESIAN_CPCV_EMBARGO_DAYS: int = Field(default=3, ge=0, le=30,
                                             description="CPCV 禁运天数：训练结束与 OOS 开始之间的缓冲间隔")
+    # ── 窗口质量预检：IS Sharpe 阈值，低于此值的窗口跳过 BO 寻优 ──
+    WFO_PRECHECK_THRESHOLD: float = Field(default=-0.5, ge=-5.0, le=5.0,
+                                          description="窗口预检 IS Sharpe 阈值，低于此值跳过该窗口全部 BO 寻优")
 
     # 待寻优参数范围（逗号分隔：min,max,step）
     ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
@@ -462,10 +467,9 @@ class BacktestConfig(BaseModel):
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
     BUY_THRESHOLD_RANGE: str = "5,30,5"
     MAX_HOLDINGS_RANGE: str = "3,20,1"
-    # P0-7 ②：校准闭环 —— [BACKTEST_CALIBRATED] 覆写目标（默认取区间中位，
     # 与旧日频回退口径 int(17.5)=17 / int(11.5)=11 保持一致；校准后由
     # write_calibration_to_ini 写回、此处读取，供日频路径 EngineConfig 兜底使用）
-    BUY_THRESHOLD: int = Field(default=17, ge=1, le=100,
+    BUY_THRESHOLD: int = Field(default=12, ge=1, le=100,
                                description="买入评分阈值（校准覆写目标，WFO 未寻优时兜底）")
     MAX_HOLDINGS: int = Field(default=11, ge=0, le=100,
                               description="最大同时持仓数，0=不限制（校准覆写目标，WFO 未寻优时兜底）")
@@ -537,6 +541,13 @@ class BacktestConfig(BaseModel):
     # ── P0-6 ⑥：开盘集合竞价成交率分档（封单量/可成交量代理） ──
     AUCTION_FILL_RATIO: float = Field(default=0.12, ge=0.0, le=1.0,
                                       description="开盘价触板日集合竞价可成交量比例上限（= 当日量 × min(触板档, 该值)）")
+    # ── 经验填充模型（技术债修复）：历史日线 V_t/V_prev 分位数替代固定比例 ──
+    LIMIT_RATIO_MODE: str = Field(default="fixed",
+                                  description="涨跌停可成交量比例来源: fixed 固定比例常量 / empirical_median 历史经验中位数（中性口径） / empirical_p10 历史经验10%分位（worst-case 保守口径）")
+    LIMIT_CALIB_MIN_SAMPLES: int = Field(default=20, ge=1, le=1000000,
+                                         description="经验填充模型单元格最少样本数，不足回退 fixed 档（防稀疏样本噪声）")
+    LIMIT_STRESS_ENABLED: bool = Field(default=True,
+                                       description="涨跌停专项压力测试（一字涨停/竞价触板/炸板高发窗口 worst-case 成本报告）")
     # ── P0-6 ⑤：市场状态仓位调节（客观状态变量，替代旧评分中位数口径） ──
     REGIME_RET20_FULL: float = Field(default=0.02, ge=-1.0, le=1.0,
                                      description="指数20日收益（全市场 ret_20d 中位数代理）≥ 此值 → 全仓倍率")
@@ -609,6 +620,74 @@ class PositionBacktestConfig(BaseModel):
     POOL_FILE_PATH: str = Field(default="证券交割单.xlsx", description="证券交割单文件路径（XLSX格式）")
 
 
+class PortfolioOptimizerConfig(BaseModel):
+    """P4 组合优化器配置模型（数学规划驱动，替代 Top-K 等权）"""
+
+    METHOD: str = Field(
+        default="topk_equal",
+        description="优化方法: mean_variance / min_variance / risk_parity / topk_equal(兼容旧版)",
+    )
+    RISK_AVERSION: float = Field(
+        default=2.0, ge=0.01, le=20.0,
+        description="风险厌恶系数 (γ, 越大越保守)",
+    )
+    TURNOVER_PENALTY: float = Field(
+        default=0.001, ge=0.0, le=0.01,
+        description="换手率惩罚系数 (λ_TC)",
+    )
+    MAX_WEIGHT: float = Field(
+        default=0.10, ge=0.01, le=0.50,
+        description="单票权重上限 (w_max)",
+    )
+    COV_LOOKBACK: int = Field(
+        default=60, ge=10, le=250,
+        description="协方差估计窗口 (交易日)",
+    )
+    SHRINKAGE: bool = Field(
+        default=True,
+        description="协方差收缩 (Ledoit-Wolf)",
+    )
+    INDUSTRY_NEUTRAL: bool = Field(
+        default=False,
+        description="行业中性约束",
+    )
+    INDUSTRY_DEVIATION: float = Field(
+        default=0.05, ge=0.0, le=0.20,
+        description="行业暴露偏离上限",
+    )
+    MAX_HOLDINGS: int = Field(
+        default=0, ge=0, le=200,
+        description="最大持仓数 (0=不限制)",
+    )
+    TARGET_CASH_RATIO: float = Field(
+        default=0.0, ge=0.0, le=0.50,
+        description="目标现金比例",
+    )
+    SOLVE_TIMEOUT: float = Field(
+        default=5.0, ge=0.1, le=60.0,
+        description="求解超时 (秒)",
+    )
+    VERBOSE: bool = Field(
+        default=False,
+        description="优化器日志详细度（True=输出所有debug/info；False=仅warning以上）",
+    )
+    # ── 超参数寻优范围 ──
+    OPTIMIZER_RISK_AVERSION_RANGE: str = Field(default="0.5,5.0,0.5", description="风险厌恶系数寻优范围")
+    OPTIMIZER_TURNOVER_PENALTY_RANGE: str = Field(default="0.0005,0.003,0.0005", description="换手率惩罚寻优范围")
+    OPTIMIZER_MAX_WEIGHT_RANGE: str = Field(default="0.05,0.15,0.01", description="单票权重上限寻优范围")
+    OPTIMIZER_COV_LOOKBACK_RANGE: str = Field(default="30,120,10", description="协方差窗口寻优范围")
+
+    def parse_range(self, key: str) -> tuple[float, float, float]:
+        raw = getattr(self, key.upper(), "")
+        if not raw or not raw.strip():
+            raise ValueError(f"{key} 未配置，跳过")
+        parts = [float(x.strip()) for x in raw.split(",")]
+        if len(parts) != 3:
+            msg = f"{key} 格式应为 min,max,step，收到 {raw!r}"
+            raise ValueError(msg)
+        return (parts[0], parts[1], parts[2])
+
+
 class PositionSizingConfig(BaseModel):
     """仓位管理配置模型"""
 
@@ -634,6 +713,14 @@ class PositionSizingConfig(BaseModel):
                                  description="风险厌恶系数（越大越保守）")
     RISK_NONE_MULTIPLIER: float = Field(default=1.0, ge=0.1, le=5.0,
                                          description="NONE 风险等级仓位系数")
+
+
+class ResearchReportFilterConfig(BaseModel):
+    """研报过滤配置"""
+
+    ENABLE_RESEARCH_REPORT_FILTER: bool = Field(default=False, description="是否启用研报过滤")
+    RESEARCH_REPORT_MIN_COUNT: int = Field(default=1, ge=1, le=100,
+                                           description="买入评级最低次数")
 
 
 class ApiConfig(BaseModel):
@@ -662,7 +749,6 @@ class AppConfig(BaseSettings):
     fund_flow: FundFlowConfig
     technical_indicators: TechnicalIndicatorsConfig
     column_aliases: ColumnAliasesConfig
-    research_report_filter: ResearchReportFilterConfig
     full_bull_scoring: FullBullScoringConfig
     user_focus_stocks: UserFocusStocksConfig
     asharehub: AShareHubConfig
@@ -677,6 +763,8 @@ class AppConfig(BaseSettings):
     trading_cost: TradingCostConfig
     distribution: DistributionConfig
     multi_factor_alpha: MultiFactorAlphaConfig
+    portfolio_optimizer: PortfolioOptimizerConfig
+    research_report_filter: ResearchReportFilterConfig = ResearchReportFilterConfig()
 
 
 class Config:
@@ -756,7 +844,6 @@ class Config:
             fund_flow=FundFlowConfig(**self._section_upper("FUND_FLOW")),
             technical_indicators=TechnicalIndicatorsConfig(**self._section_upper("TECHNICAL_INDICATORS")),
             column_aliases=ColumnAliasesConfig(**col_raw),
-            research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
             full_bull_scoring=FullBullScoringConfig(**self._section_upper("FULL_BULL_SCORING")),
             user_focus_stocks=UserFocusStocksConfig(**self._section_upper("USER_FOCUS_STOCKS")),
             asharehub=AShareHubConfig(**ah_raw),
@@ -771,6 +858,8 @@ class Config:
             trading_cost=TradingCostConfig(**self._section_upper("TRADING_COST")),
             distribution=DistributionConfig(**dist_raw),
             multi_factor_alpha=MultiFactorAlphaConfig(**self._section_upper("MULTI_FACTOR_ALPHA")),
+            portfolio_optimizer=PortfolioOptimizerConfig(**self._section_upper("PORTFOLIO_OPTIMIZER")),
+            research_report_filter=ResearchReportFilterConfig(**self._section_upper("RESEARCH_REPORT_FILTER")),
             api=ApiConfig(**self._section_upper("API")),
         )
 
@@ -790,12 +879,21 @@ class Config:
                 sc.CROSS_DECAY_DAYS = int(bt_cal["CROSS_DECAY_DAYS"])
             if "ATR_STOP_MULT" in bt_cal:
                 sc.ATR_STOP_MULT = float(bt_cal["ATR_STOP_MULT"])
+            # VAEO 波动率自适应退出参数覆写
+            if "LEARNED_T1_MULT" in bt_cal:
+                sc.LEARNED_T1_MULT = float(bt_cal["LEARNED_T1_MULT"])
+            if "LEARNED_T2_MULT" in bt_cal:
+                sc.LEARNED_T2_MULT = float(bt_cal["LEARNED_T2_MULT"])
             if "LIQ_VETO_RATIO" in bt_cal:
                 fr.LIQ_VETO_RATIO = float(bt_cal["LIQ_VETO_RATIO"])
             if "KELLY_FRACTION" in bt_cal:
                 ps.KELLY_FRACTION = float(bt_cal["KELLY_FRACTION"])
             if "POSITION_A" in bt_cal:
                 ps.POSITION_A = float(bt_cal["POSITION_A"])
+            if "POSITION_B" in bt_cal:
+                ps.POSITION_B = float(bt_cal["POSITION_B"])
+            if "POSITION_C" in bt_cal:
+                ps.POSITION_C = float(bt_cal["POSITION_C"])
             if "CONCLUSION_FULL_BULL" in bt_cal:
                 self.app_config.full_bull_scoring.CONCLUSION_FULL_BULL = int(bt_cal["CONCLUSION_FULL_BULL"])
             if "GOLDEN_CROSS_BONUS" in bt_cal:
@@ -804,7 +902,6 @@ class Config:
                 sc.DIVERGENCE_PENALTY = int(bt_cal["DIVERGENCE_PENALTY"])
             if "RISK_NONE_MULTIPLIER" in bt_cal:
                 ps.RISK_NONE_MULTIPLIER = float(bt_cal["RISK_NONE_MULTIPLIER"])
-            # P0-7 ②：校准闭环补齐 —— buy_threshold/max_holdings 曾只写不读，
             # 日频路径不生效；现覆写到 backtest 配置供 EngineConfig 兜底读取。
             # 注：历史版本可能以 "17.0" 浮点落盘，此处 int(float()) 容错兼容，
             # 新写入已由 calibration.py 类型断言保证整值。
@@ -980,9 +1077,6 @@ class Config:
     def ASHAREHUB_API_KEY(self) -> str: return self.app_config.asharehub.API_KEY
 
     @property
-    def ENABLE_CHIP_DISTRIBUTION(self) -> bool: return self.app_config.asharehub.ENABLE_CHIP_DISTRIBUTION
-
-    @property
     def MONEYFLOW_RETRY(self) -> int: return self.app_config.asharehub.MONEYFLOW_RETRY
 
     @property
@@ -1135,14 +1229,15 @@ class Config:
             "kline_decay_min": s.KLINE_DECAY_MIN,
             "vol_norm_denominator": s.VOL_NORM_DENOMINATOR,
             "atr_stop_mult": s.ATR_STOP_MULT,
-            "atr_t1_mult": s.ATR_T1_MULT,
-            "atr_t2_mult": s.ATR_T2_MULT,
             "trailing_stop_high_ratio": s.TRAILING_STOP_HIGH_RATIO,
             "trailing_stop_lookback": s.TRAILING_STOP_LOOKBACK,
             "trailing_stop_high_lookback": s.TRAILING_STOP_HIGH_LOOKBACK,
             "expected_return_lookback": s.EXPECTED_RETURN_LOOKBACK,
             "golden_cross_bonus": s.GOLDEN_CROSS_BONUS,
             "divergence_penalty": s.DIVERGENCE_PENALTY,
+            # VAEO 波动率自适应退出参数
+            "learned_t1_mult": s.LEARNED_T1_MULT,
+            "learned_t2_mult": s.LEARNED_T2_MULT,
         }
 
     @property
@@ -1170,6 +1265,7 @@ class Config:
             "position_a": p.POSITION_A,
             "position_b": p.POSITION_B,
             "position_c": p.POSITION_C,
+            "risk_none_multiplier": p.RISK_NONE_MULTIPLIER,
             "max_industry_exposure": p.MAX_INDUSTRY_EXPOSURE,
             "risk_budget": p.RISK_BUDGET,
             "max_day_turnover": p.MAX_DAY_TURNOVER,
@@ -1178,6 +1274,26 @@ class Config:
             "liq_w_timeseries": f.LIQ_W_TIMESERIES,
             "liq_w_marketcap": f.LIQ_W_MARKETCAP,
             "liq_min_discount": f.LIQ_MIN_DISCOUNT,
+        }
+
+    # ── P4 组合优化器配置 ──────────────────────────────────────────────
+
+    @property
+    def PORTFOLIO_OPTIMIZER(self) -> dict:
+        o = self.app_config.portfolio_optimizer
+        return {
+            "method": o.METHOD,
+            "risk_aversion": o.RISK_AVERSION,
+            "turnover_penalty": o.TURNOVER_PENALTY,
+            "max_weight": o.MAX_WEIGHT,
+            "cov_lookback": o.COV_LOOKBACK,
+            "shrinkage": o.SHRINKAGE,
+            "industry_neutral": o.INDUSTRY_NEUTRAL,
+            "industry_deviation": o.INDUSTRY_DEVIATION,
+            "max_holdings": o.MAX_HOLDINGS,
+            "target_cash_ratio": o.TARGET_CASH_RATIO,
+            "solve_timeout": o.SOLVE_TIMEOUT,
+            "verbose": o.VERBOSE,
         }
 
     # ── 工具方法 ────────────────────────────────────────────────────────

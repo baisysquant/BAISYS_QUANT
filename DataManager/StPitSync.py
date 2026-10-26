@@ -11,7 +11,18 @@ P0-5 审计修复：stock_st_history 曾为「最近快照」（旧代码注释�
   - stock_zh_a_spot_em         当前全市场列表 → 快照日显式 is_st=False
   - stock_info_sz_change_name  深交所简称变更历史（变更日期+简称）
        → 按简称含 ST/退 重建 SZ 股历史 ST/退市整理期（PIT 核心）
-  - stock_info_sz_delist / stock_info_sh_delist  终止上市日期 → 退市日 PIT
+  - stock_info_sz_delist / stock_info_sh_delist  终止上市日期
+       → P1-4 修复：退市整理期 = 摘牌日前 N 个交易日
+       （退市新规 2020-12-31 后摘牌 15 日 / 此前 30 日），方向在摘牌日之前
+
+P1-1 修复说明（沪市 ST 历史缺失）：
+  深市历史 ST 期由简称变更历史精确回填；沪市存续股的"曾 ST 期"无免费
+  带日期数据源（SSE 官网简称变更页无公开接口；新浪/东财曾用名列表无日期），
+  仅能保证：① 每日快照（今日起逐日累积）② 退市股退市整理期（摘牌日前
+  N 交易日，精确）③ 退市时简称含 ST 的股票在整理期前的 ST 历史无法回填
+（见同步日志统计）。覆盖检查只统计"窗口内出现过 ST/退市标记的股票"，
+   非 ST 股直接视为覆盖（旧漏洞①：每日快照只写今天一行即跳过；漏洞②：快照行
+   稀释非 ST 股覆盖率 → 池级 90% 阈值永不达标 → 每次回测全量重拉网络源）。
 
 行粒度：仅对标的实际交易日（stock_daily_kline.trade_date）展开，与回测 K 线
 日键完全对齐，不写入非交易日。
@@ -39,6 +50,11 @@ _ST_TABLE = "stock_st_history"
 # 简称判定：含 "ST"（覆盖 ST/*ST/S*ST/SST 等变体）→ is_st；含 "退"（退市整理期，
 # 如 "退市金亚" / "*ST金泰退"）→ is_delisting。简称变化以变更日为生效日。
 _ST_NAME_KEY = "ST"
+
+# 2020-12-31（含）后摘牌的整理期为 15 个交易日；此前为 30 个交易日。
+DELISTING_PERIOD_DAYS_NEW = 15
+DELISTING_PERIOD_DAYS_OLD = 30
+DELISTING_REFORM_DATE = date(2020, 12, 31)
 
 
 def _name_flags(name: str | None) -> tuple[bool, bool]:
@@ -144,6 +160,27 @@ def _fetch_sh_delist() -> pd.DataFrame | None:
         return None
 
 
+def fetch_delisted_symbols() -> set[str] | None:
+    """独立生存偏差数据源：AkShare 深/沪终止上市公司列表（带市场前缀符号集）。
+
+    P3-5（审计）：生存偏差评估与 stock_st_history PIT 表解耦——PIT 同步失败时
+    退市标记缺失不应导致"生存偏差受控"误报。本函数直接消费交易所退市列表
+    （stock_info_sz_delist / stock_info_sh_delist），任一源成功即返回（可部分），
+    全部失败返回 None（调用方降级到 PIT 标记口径并注明）。
+    """
+    out: set[str] = set()
+    ok = False
+    for dl_df in (_fetch_sz_delist(), _fetch_sh_delist()):
+        if dl_df is None:
+            continue
+        code_col = "证券代码" if "证券代码" in dl_df.columns else "公司代码"
+        if code_col not in dl_df.columns:
+            continue
+        ok = True
+        out |= _norm_codes([str(v) for v in dl_df[code_col].tolist()])
+    return out if ok else None
+
+
 # ── 表结构与写入 ──
 
 
@@ -180,18 +217,39 @@ def _upsert_rows(engine: Any, rows: list[dict[str, Any]]) -> None:
 
 
 def _kline_days(engine: Any, symbol: str, start: date, end: date) -> list[date]:
-    """标的在 [start, end] 内的实际交易日（与回测 K 线日键对齐）。"""
+    """标的在 [start, end] 内的实际交易日（薄封装，内部走批量查询）。"""
+    return _kline_days_batch(engine, [(symbol, start, end)]).get((symbol, start, end), [])
+
+
+def _kline_days_batch(
+    engine: Any, specs: list[tuple[str, date, date]],
+) -> dict[tuple[str, date, date], list[date]]:
+    """批量读取 K 线交易日（P3 审计修复：替代每股每段一次查询的 N+1）。
+
+    按 (start, end) 分组，每组一次 `WHERE symbol = ANY(:syms)` 查询；
+    结果按 (symbol, start, end) 键汇总；未命中键缺省为空列表（优雅降级）。
+    """
+    out: dict[tuple[str, date, date], list[date]] = {}
+    if not specs:
+        return out
+    by_range: dict[tuple[date, date], list[str]] = {}
+    for symbol, s, e in specs:
+        by_range.setdefault((s, e), []).append(symbol)
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text(
-                "SELECT trade_date FROM stock_daily_kline "
-                "WHERE symbol = :s AND trade_date >= :a AND trade_date <= :b "
-                "ORDER BY trade_date"
-            ), {"s": symbol, "a": start, "b": end}).fetchall()
-        return [r[0] for r in rows]
+            for (s, e), syms in by_range.items():
+                rows = conn.execute(text(
+                    "SELECT symbol, trade_date FROM stock_daily_kline "
+                    "WHERE symbol = ANY(:syms) AND trade_date >= :a AND trade_date <= :b "
+                    "ORDER BY symbol, trade_date"
+                ), {"syms": syms, "a": str(s), "b": str(e)}).fetchall()
+                for sym, td in rows:
+                    out.setdefault((sym, s, e), []).append(td)
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"[ST PIT] 读取 {symbol} 交易日失败: {e}")
-        return []
+        logger.warning(f"[ST PIT] 批量读取 K 线交易日失败: {e}")
+    for spec in specs:
+        out.setdefault(spec, [])
+    return out
 
 
 def _has_row_for_date(engine: Any, d: date) -> bool:
@@ -205,18 +263,48 @@ def _has_row_for_date(engine: Any, d: date) -> bool:
 
 
 def _pool_covered(engine: Any, symbols: list[str], start: date, end: date) -> bool:
-    """池内 ≥90% 标的在查询窗口 [start, end] 内已有 PIT 行 → 视为已回填，跳过同步。"""
+    """池内 ≥90% 标的已回填 → 视为已覆盖（P2P2 修复：非 ST 股直接视为覆盖）。
+
+    旧实现按"PIT 行数 / K 线交易日数"逐股计算真实覆盖率：绝大多数从未 ST 的
+    股票 PIT 表仅有今日快照 1 行（is_st=False），vs 数百 K 线交易日 → 覆盖率
+    ≈0 → 池内 90% 阈值永不达标 → 每次回测全量重拉网络源（今日 ST 列表 + 全市场
+    快照 + SZ 简称变更 + 深/沪退市列表）。
+
+    现规则（覆盖率只统计"窗口内出现过 ST/退市标记的股票"）：
+        - 窗口内从未出现 ST/退市标记（is_st/is_delisting 均 FALSE）→ 直接视为
+          覆盖（无历史回填需求，不因快照行稀释覆盖率）
+        - 窗口内出现过 ST/退市标记 → 标记行数须 ≥ 80% K 线交易日，否则未覆盖
+          （历史缺失，需重跑回填源）
+    """
     if not symbols:
         return True
     try:
         with engine.connect() as conn:
-            n = conn.execute(text(
-                f"SELECT count(DISTINCT symbol) FROM {_ST_TABLE} "
-                f"WHERE symbol = ANY(:syms) AND trade_date >= :start AND trade_date <= :end"
-            ), {"syms": symbols, "start": start, "end": end}).scalar() or 0
-        return n >= max(1, int(len(symbols) * 0.9))
+            rows = conn.execute(text(f"""
+                SELECT k.symbol,
+                       COUNT(DISTINCT k.trade_date) AS k_days,
+                       COUNT(DISTINCT CASE WHEN s.is_st OR s.is_delisting
+                                           THEN s.trade_date END) AS st_days
+                FROM stock_daily_kline k
+                LEFT JOIN {_ST_TABLE} s
+                  ON s.symbol = k.symbol AND s.trade_date::text = k.trade_date
+                WHERE k.symbol = ANY(:syms)
+                  AND k.trade_date >= :start AND k.trade_date <= :end
+                GROUP BY k.symbol
+            """), {"syms": symbols, "start": str(start), "end": str(end)}).fetchall()
     except Exception:  # noqa: BLE001
         return False
+    if not rows:
+        return False
+    covered = 0
+    total = 0
+    for _sym, k_days, st_days in rows:
+        total += 1
+        if st_days == 0:
+            covered += 1  # 窗口内从未 ST/退市标记 → 直接视为覆盖
+        elif k_days > 0 and st_days >= int(k_days * 0.8):
+            covered += 1
+    return covered >= max(1, int(total * 0.9))
 
 
 # ── PIT 重建逻辑 ──
@@ -268,22 +356,36 @@ def _sz_st_periods(
     return periods
 
 
-def _expand_period_rows(
-    engine: Any, symbol: str, start: date, end: date,
-    periods: list[tuple[date, date | None, bool, bool]],
+def _expand_period_rows_batch(
+    engine: Any, start: date, end: date,
+    symbol_periods: dict[str, list[tuple[date, date | None, bool, bool]]],
 ) -> list[dict[str, Any]]:
-    """ST/退市整理期 → 实际交易日行（仅展开区间与 K 线重叠的部分）。"""
+    """ST/退市整理期 → 实际交易日行（P3 审计修复：全池批量展开，一次查询）。
+
+    收集所有 (symbol, eff_start, eff_end) 区间后经 _kline_days_batch 单次查询
+    K 线交易日，替代逐标的逐段 _kline_days 的 N+1 查询。
+    """
+    specs: list[tuple[str, date, date]] = []
+    for symbol, periods in symbol_periods.items():
+        for p_start, p_end, _is_st, _is_del in periods:
+            eff_start = max(p_start, start)
+            eff_end = p_end if p_end is not None else end
+            if eff_start > eff_end:
+                continue
+            specs.append((symbol, eff_start, eff_end))
+    kdays_map = _kline_days_batch(engine, specs)
     rows: list[dict[str, Any]] = []
-    for p_start, p_end, is_st, is_del in periods:
-        eff_start = max(p_start, start)
-        eff_end = p_end if p_end is not None else end
-        if eff_start > eff_end:
-            continue
-        for d in _kline_days(engine, symbol, eff_start, eff_end):
-            rows.append({
-                "symbol": symbol, "trade_date": d,
-                "is_st": bool(is_st), "is_delisting": bool(is_del),
-            })
+    for symbol, periods in symbol_periods.items():
+        for p_start, p_end, is_st, is_del in periods:
+            eff_start = max(p_start, start)
+            eff_end = p_end if p_end is not None else end
+            if eff_start > eff_end:
+                continue
+            for d in kdays_map.get((symbol, eff_start, eff_end), []):
+                rows.append({
+                    "symbol": symbol, "trade_date": d,
+                    "is_st": bool(is_st), "is_delisting": bool(is_del),
+                })
     return rows
 
 
@@ -343,19 +445,28 @@ def sync_st_pit(
     # ── 2. SZ 简称变更历史 → 历史 ST/退市整理期 PIT ──
     names_df = _fetch_sz_change_names()
     if names_df is not None:
-        for symbol, periods in _sz_st_periods(names_df, pool).items():
-            rows = _expand_period_rows(engine, symbol, start, end, periods)
-            _upsert_rows(engine, rows)
-            stats["sz_st_rows"] += len(rows)
+        symbol_periods = dict(_sz_st_periods(names_df, pool).items())
+        rows = _expand_period_rows_batch(engine, start, end, symbol_periods)
+        _upsert_rows(engine, rows)
+        stats["sz_st_rows"] += len(rows)
         logger.info(f"[ST PIT] SZ 简称变更回填完成: {stats['sz_st_rows']} 行 ST/退市整理期行")
 
-    # ── 3. 终止上市日期 → 退市日 PIT ──
+    # ── 3. 终止上市日期 → 退市整理期 PIT（P1-4 修复） ──
+    # 退市整理期 = 摘牌日（终止上市日期）前的 N 个交易日（含摘牌日当天，
+    # 摘牌日若为交易日则当天仍在交易）：
+    #   2020-12-31（退市新规）及以后摘牌 → 15 个交易日
+    #   此前摘牌 → 30 个交易日
+    # 旧实现"从终止上市日期起向后全部标记 is_delisting"方向错误：
+    # 整理期发生在摘牌日之前；摘牌后的 K 线延伸日不是退市整理期。
     delist_map: dict[str, date] = {}
+    delist_st_name_syms: set[str] = set()   # 退市时简称仍含 ST 的标的（P1-1 降级可见性）
     for dl_df in (_fetch_sz_delist(), _fetch_sh_delist()):
         if dl_df is None:
             continue
         code_col = "证券代码" if "证券代码" in dl_df.columns else "公司代码"
         date_col = "终止上市日期" if "终止上市日期" in dl_df.columns else "暂停上市日期"
+        name_col = "证券简称" if "证券简称" in dl_df.columns else (
+            "公司简称" if "公司简称" in dl_df.columns else None)
         if code_col not in dl_df.columns or date_col not in dl_df.columns:
             continue
         for _, row in dl_df.iterrows():
@@ -365,18 +476,39 @@ def sync_st_pit(
             sym = next(iter(syms))
             if sym not in pool:
                 continue
+            if name_col is not None and pd.notna(row[name_col]):
+                name = str(row[name_col]).upper()
+                if "ST" in name or "退" in name:
+                    delist_st_name_syms.add(sym)
             d = pd.to_datetime(row[date_col], errors="coerce").date() if pd.notna(row[date_col]) else None
             if d is not None and (sym not in delist_map or d < delist_map[sym]):
                 delist_map[sym] = d
+    delist_specs = [(sym, start, ddate) for sym, ddate in delist_map.items()]
+    kdays_map = _kline_days_batch(engine, delist_specs)
     for sym, ddate in delist_map.items():
+        kdays = kdays_map.get((sym, start, ddate), [])
+        if not kdays:
+            continue
+        n = DELISTING_PERIOD_DAYS_OLD if ddate < DELISTING_REFORM_DATE else DELISTING_PERIOD_DAYS_NEW
+        period_start = kdays[-min(n, len(kdays))]
         rows = [{
             "symbol": sym, "trade_date": d,
             "is_st": False, "is_delisting": True,
-        } for d in _kline_days(engine, sym, ddate, end)]
+        } for d in kdays if d >= period_start]
         _upsert_rows(engine, rows)
         stats["delist_rows"] += len(rows)
     if delist_map:
-        logger.info(f"[ST PIT] 退市日 PIT 回填完成: {len(delist_map)} 只退市股，{stats['delist_rows']} 行")
+        logger.info(
+            f"[ST PIT] 退市整理期 PIT 回填完成: {len(delist_map)} 只退市股，"
+            f"{stats['delist_rows']} 行（摘牌日前 {DELISTING_PERIOD_DAYS_NEW}/{DELISTING_PERIOD_DAYS_OLD} "
+            f"交易日，退市新规 2020-12-31 分界）"
+        )
+    if delist_st_name_syms:
+        logger.warning(
+            f"[ST PIT] P1-1 降级提示: {len(delist_st_name_syms)} 只退市股退市时简称仍含 ST/退 "
+            f"（{sorted(delist_st_name_syms)[:5]}...），其退市整理期之前的 ST 历史期"
+            f"无免费带日期数据源可回填，仅退市整理期 PIT 已写入"
+        )
 
     if stats["archive_today"] == 0 and stats["sz_st_rows"] == 0 and stats["delist_rows"] == 0:
         logger.warning(

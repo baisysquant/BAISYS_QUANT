@@ -62,7 +62,7 @@ class TestConfigInit:
         scoring = cfg.app_config.scoring_params
         assert scoring.ATR_STOP_MULT == 1.5
         assert scoring.CROSS_DECAY_DAYS == 30
-        assert scoring.ATR_T1_MULT == 3.0
+        # atr_t1_mult / atr_t2_mult 已从配置中移除（死键清理），下游采用 .get() 硬编码默认值降级
 
     @pytest.mark.unit
     def test_type_conversion_bool_on_filter(self, temp_config_ini):
