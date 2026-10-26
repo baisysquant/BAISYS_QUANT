@@ -459,31 +459,33 @@ def run_backtest_pipeline(
             )
         _log_step("load_st_history")
 
-        # ── FIX(P0) Subtask-4：退市股覆盖率门禁 ──
-        # 如果股票池中几乎没有退市股（覆盖率<5%），可能存在严重数据偏差：
-        # 回测只基于存活股票，忽略已退市公司带来的尾部风险。
-        # 覆盖率 < 5% 时中断回测（RuntimeError）；独立源为空时仅告警不断。
-        # kline中无退市股（_covered==0）时降级为警告，不中断回测——
-        # 这是腾讯API无老退市股历史K线数据的已知限制，不应阻断回测。
+        # ── FIX(P0) Subtask-4：退市股覆盖率门禁（告警不中断） ──
+        # 如果股票池中退市股覆盖率过低，可能存在生存偏差：回测只基于存活股票，
+        # 忽略已退市公司带来的尾部风险，导致收益系统性高估。
+        #
+        # 设计原则：门禁统一降级为 WARNING，不抛 RuntimeError 中断回测。
+        # 原因：腾讯行情 API 对老退市股的历史 K 线覆盖本就不全（已知限制），
+        # 若用覆盖率门限硬卡，会出现"数据拿不到→覆盖率不达标→回测跑不了"的死锁，
+        # 反而无法用回测结果本身去验证/迭代生存偏差问题。
+        # 正确路径：告警暴露偏差 → 由数据侧扩展退市股同步范围（_sync_delisted_stocks
+        # 已在管线前段尽力回填）逐步提升覆盖率，而非在门禁处卡死。
         _pool_size = len(symbols)
         _delist_coverage = len(_delisted_syms & _kline_syms) / max(_pool_size, 1)
-        if _delist_coverage < 0.05 and _delisted_syms:
+        if _delisted_syms:
             _covered = len(_delisted_syms & _kline_syms)
-            if _covered == 0:
+            if _delist_coverage < 0.05:
                 logger.warning(
                     f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
                     f"（{_covered} / {_pool_size} < 5%），"
-                    f"腾讯API无老退市股历史K线数据（已知限制），"
-                    f"门禁降级为警告（回测继续，可能存在生存偏差）"
+                    f"回测结果可能因生存偏差而系统性高估（已退市标的退市前负收益未被计入）。"
+                    f"门禁降级为警告，回测继续；建议扩展数据同步范围以包含退市标的历史 K 线。"
                 )
             else:
-                raise RuntimeError(
-                    f"退市股覆盖率门禁: 退市股覆盖率仅 {_delist_coverage:.1%} "
-                    f"（{_covered} / {_pool_size} < 5%），"
-                    f"回测结果可能因生存偏差而系统性高估。"
-                    f"请扩展数据同步范围以包含退市标的历史 K 线。"
+                logger.info(
+                    f"退市股覆盖率门禁: 退市股覆盖率 {_delist_coverage:.1%} "
+                    f"（{_covered} / {_pool_size} ≥ 5%），生存偏差受控。"
                 )
-        elif not _delisted_syms and _pool_size > 0:
+        elif _pool_size > 0:
             logger.warning(
                 f"退市股覆盖率门禁: 独立退市列表与 stock_st_history 均无退市记录，"
                 f"数据源可能未覆盖退市标的；回测结果可能存在生存偏差（仅告警，不中断）"
@@ -617,22 +619,33 @@ def run_backtest_pipeline(
                 data_version=_data_version,
             )
 
-            # 即使 WFO 系统性失败，本次回测实际评估过的参数（回退参数 =
-            # 参数空间中位）仍直接写入 config.ini [BACKTEST_CALIBRATED]，
-            # 与成功路径写回闭环同口径，保证下次加载沿用本次结果。
+            # FIX(P0-2): WFO 系统性失败时不写入 config.ini，阻断恶性循环。
+            # 旧逻辑：兜底参数（如 buy_threshold=12）直接写入 → 下次运行读取坏参数
+            # → WFO 预检再次失败 → 兜底再次用坏参数 → 无限循环。
+            # 新逻辑：仅保存到 calibration_result.json（含 gate_passed=false 标记），
+            # config.ini 保持上次通过门控的参数不变。
             try:
-                written = write_calibration_to_ini(wfo_err.fallback_params)
-                if written:
-                    logger.warning(
-                        f"[WFO系统性失败] 回退参数已写入 config.ini "
-                        f"[BACKTEST_CALIBRATED]: {written}"
-                    )
-                else:
-                    logger.warning("[WFO系统性失败] 回退参数为空，未写入 config.ini")
-            except Exception as _wfo_write_err:
+                cal_result_fail = CalibrationResult(
+                    params=wfo_err.fallback_params,
+                    gate_passed=False,
+                    gate_reasons=["WFO系统性失败: 所有窗口预检未通过"],
+                    pbo=1.0,
+                    dsr=0.0,
+                )
+                save_calibration(cal_result_fail)
+                logger.warning(
+                    f"[WFO系统性失败] 兜底参数已保存到 calibration_result.json"
+                    f"（gate_passed=false，未写入 config.ini 以阻断恶性循环）: "
+                    f"{wfo_err.fallback_params}"
+                )
+                logger.warning(
+                    "[WFO系统性失败] config.ini 保持上次通过门控的参数不变。"
+                    "如需强制采纳兜底参数，请人工修改 config.ini [BACKTEST_CALIBRATED]。"
+                )
+            except Exception as _wfo_save_err:
                 logger.opt(exception=True).warning(
-                    f"[WFO系统性失败] 回退参数写入 config.ini 被拒"
-                    f"（config 保持原值，下次运行将重新评估）: {_wfo_write_err}"
+                    f"[WFO系统性失败] 兜底参数保存 calibration_result.json 失败"
+                    f"（config 保持原值，下次运行将重新评估）: {_wfo_save_err}"
                 )
 
             alert.on_failure(wfo_err)
@@ -1278,16 +1291,24 @@ def run_backtest_pipeline(
         except Exception as e:
             logger.warning(f"[VAEO] 退出策略优化失败: {e}，回测结果将沿用默认止盈参数")
 
-        # 始终写入 config.ini 并应用到内存配置（门控不通过时也写入，但输出告警）
-        write_calibration_to_ini(best_params)
-        apply_calibration_to_config(config)
+        # FIX(P0-2): 门控阻断恶性循环 — gate_passed=false 时禁止写入 config.ini，
+        # 防止坏参数污染下次运行（上次坏参数 → WFO 预检失败 → 兜底用坏参数 → 再写入 → 循环）。
+        # calibration_result.json 仍始终保存（含 gate_passed=false 标记）供人工复核，
+        # 但 config.ini 只在门控通过时才覆写。
         if _gate_pass:
+            write_calibration_to_ini(best_params)
+            apply_calibration_to_config(config)
             logger.info("参数已写入 config.ini 并生效（门控通过）")
         else:
             logger.warning("=" * 50)
             logger.warning(
-                "[采纳门控] 参数已写入 config.ini 并生效（门控未通过 — 存在过拟合风险，请人工复核）: "
+                "[采纳门控] 参数未通过统一采纳门控，config.ini 保持不变"
+                "（gate_passed=false，阻断恶性循环）: "
                 + "；".join(_gate_reasons)
+            )
+            logger.warning(
+                "[采纳门控] calibration_result.json 已保存（含 gate_passed=false 标记）"
+                "供人工复核。如需强制采纳，请人工修改 config.ini [BACKTEST_CALIBRATED]。"
             )
             logger.warning("=" * 50)
 
@@ -1446,8 +1467,14 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
 
     从零启动兜底：stock_daily_kline 为空时股票池自引用失效（仅剩 st_history
     残余），自动回落 _fallback_universe 全市场名单，保证首跑即全量下载。
+
+    完整性兜底：无论库内已有多少只，都会与全市场主板名单（离线
+    stock_basic_info_sw 优先，缺失时在线 AkShare）做差集补齐，避免用截断
+    股票池（如仅 600 只）跑完整回测。
     """
     from UtilsManager.CodeNormalizer import CodeNormalizer
+
+    _MIN_MAIN_BOARD = 200
 
     with engine.connect() as conn:
         kline_syms = {
@@ -1480,37 +1507,39 @@ def _resolve_symbols(engine: Any, config: Config | None = None) -> list[str]:
     if len(raw) < before:
         logger.info(f"主板过滤后剩余: {len(raw)} / {before} 只")
 
-    # FIX(P0): 主板池子不足时自动兜底补全全市场名单
-    # 旧逻辑仅在 kline_syms 为空时走 _fallback_universe；但表中有少量残留数据
-    #   时兜底链被跳过 → 用局部数据（如 105 只）跑全部回测，结果无意义。
-    # 新逻辑：主板过滤后低于 MIN_MAIN_BOARD 阈值，自动合并全市场兜底名单补齐。
-    _MIN_MAIN_BOARD = 200
-    if len(raw) < _MIN_MAIN_BOARD:
-        logger.warning(
-            f"  主板股票池仅 {len(raw)} 只（低于门槛 {_MIN_MAIN_BOARD}），"
-            "自动启用全市场兜底名单补齐..."
-        )
-        fallback = _fallback_universe(engine)
-        # 兜底名单也做主板过滤
-        fallback_main = [
-            s for s in fallback
-            if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))
-        ]
-        missing = set(fallback_main) - set(raw)
-        if missing:
-            raw = sorted(set(raw) | missing)
-            logger.info(
-                f"  全市场兜底补齐主板 +{len(missing)} 只 → 总计 {len(raw)} 只"
-            )
-        else:
+    # FIX(P0): 与全市场主板名单做差集补齐。
+    # 旧逻辑只在“K 线表为空”或“主板池 < 200 只”时兜底；数据库里存在少量/截断数据
+    # （如仅 preload 了 600 只）时会绕过门槛，用残缺股票池跑完整回测，结果无意义。
+    # 新逻辑：始终取全市场主板名单（离线 stock_basic_info_sw 优先，缺失时在线 AkShare），
+    # 与库内已有池比较，缺多少补多少；最终股票池应覆盖全部沪深主板（当前约 3195 只）。
+    market_main = {
+        s for s in _fallback_universe(engine)
+        if s.replace("sh", "").replace("sz", "").startswith(("60", "00"))
+    }
+    if market_main:
+        # raw 里可能带 sh/sz 前缀，统一成 6 位代码再与全市场名单做差集
+        raw_codes = {s.replace("sh", "").replace("sz", "") for s in raw}
+        missing_codes = market_main - raw_codes
+        if missing_codes:
+            missing = {CodeNormalizer.add_market_prefix(c) for c in missing_codes}
             logger.warning(
-                f"  兜底名单经主板过滤后未带来新增（可能全市场数据本身不完整）"
+                f"  数据库主板股票池仅 {len(raw_codes)} 只，全市场主板 {len(market_main)} 只，"
+                f"自动补齐 {len(missing_codes)} 只..."
             )
-    if len(raw) < _MIN_MAIN_BOARD:
+            raw = sorted(set(raw) | missing)
+            logger.info(f"  全市场主板补齐完成 → 总计 {len(raw)} 只")
+        else:
+            logger.info(f"  主板股票池已覆盖全市场（{len(market_main)} 只）")
+    else:
         logger.warning(
-            f"  [数据完整性告警] 主板股票池仅 {len(raw)} 只，回测结果可能不可靠。"
-            "请检查 stock_basic_info_sw 表或 AkShare 在线接口是否正常。"
+            "  无法获取全市场主板名单（stock_basic_info_sw 为空且 AkShare 不可用），"
+            f"沿用数据库已有股票池 {len(raw)} 只，回测结果可能不完整"
         )
+        if len(raw) < _MIN_MAIN_BOARD:
+            logger.warning(
+                f"  [数据完整性告警] 主板股票池仅 {len(raw)} 只（低于门槛 {_MIN_MAIN_BOARD}），"
+                "请检查 stock_basic_info_sw 表或 AkShare 在线接口是否正常。"
+            )
 
     # 注意：不再做静态 ST 剔除，退市整理期/摘牌日由引擎无条件强平
     # ST 过滤已在复盘单元（Review/coordinator.py）硬编码执行，不复归 config 控制

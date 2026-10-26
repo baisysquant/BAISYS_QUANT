@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 
 class ConfigCipher:
@@ -57,7 +57,15 @@ class ConfigCipher:
     def decrypt(self, ciphertext: str) -> str:
         if not ciphertext:
             return ""
-        return self._get_fernet().decrypt(ciphertext.encode()).decode()
+        try:
+            return self._get_fernet().decrypt(ciphertext.encode()).decode()
+        except InvalidToken as exc:
+            raise ValueError(
+                f"配置解密失败：当前密钥文件 {self.key_file} 与密文不匹配。"
+                "常见原因是密钥文件被重新生成或未随 config.ini 一起迁移。"
+                "请恢复加密时使用的密钥文件（或配置 [DATABASE] encryption_key_path），"
+                "也可以将该配置项改成明文后重新加密。"
+            ) from exc
 
     @staticmethod
     def is_encrypted(value: str) -> bool:

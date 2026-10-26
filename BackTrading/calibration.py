@@ -472,13 +472,15 @@ def write_calibration_to_ini(params: dict) -> dict | None:
                 written.add(key)
         out.append(ln)
 
-    # 追加未写出的键（插到 section 内容末尾）
+    # 追加未写出的键（插到 [BACKTEST_CALIBRATED] section 内容末尾，而非文件最后一个 section）
     missing = {k for k in params if k not in written}
     if missing:
+        # 从 sec_idx+1 往后找下一个 section header，在其前插入；
+        # 若无后续 section 则追加到文件末尾
         insert_at = len(out)
-        for i in range(len(out) - 1, -1, -1):
+        for i in range(sec_idx + 1, len(out)):
             if out[i].strip().startswith("["):
-                insert_at = i + 1
+                insert_at = i
                 break
         extra = "".join(f"{k} = {_format_val(k, params[k])}\n" for k in sorted(missing))
         out.insert(insert_at, extra)

@@ -186,5 +186,12 @@
     "time": "2026-10-16T14:45:23.578912",
     "snapshot_id": "e1c33a64e4cf306d",
     "error_code": "PIPELINE_FAILED"
+  },
+  {
+    "type": "failure",
+    "error": "退市股覆盖率门禁: 退市股覆盖率仅 0.0% （1 / 3195 < 5%），回测结果可能因生存偏差而系统性高估。请扩展数据同步范围以包含退市标的历史 K 线。",
+    "time": "2026-10-24T01:02:13.645648",
+    "snapshot_id": "7f3c84103c7b66fc",
+    "error_code": "PIPELINE_FAILED"
   }
 ]

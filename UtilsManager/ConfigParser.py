@@ -421,6 +421,8 @@ class BacktestConfig(BaseModel):
                                           description="各档冲击启用阈值（占ADV比例）")
     LIQUIDITY_TIER_CAP: str = Field(default="0.10,0.05,0.05,0.03",
                                     description="各档冲击成本上限")
+    LIQUIDITY_TIER_SLIPPAGE_FLOOR: str = Field(default="0.0018,0.0012,0.0008,0.0005",
+                                               description="各档滑点下限（小票高、大票低），单边滑点不低于此值")
     MAX_POSITION_PCT: float = Field(default=0.1, ge=0.01, le=1.0)
     PORTFOLIO_METHOD: str = Field(default="score_weighted")
     POINT_IN_TIME: bool = Field(default=True)
@@ -458,18 +460,20 @@ class BacktestConfig(BaseModel):
                                           description="窗口预检 IS Sharpe 阈值，低于此值跳过该窗口全部 BO 寻优")
 
     # 待寻优参数范围（逗号分隔：min,max,step）
-    ATR_STOP_MULT_RANGE: str = "1.0,3.0,0.5"
+    # FIX(P2-1): 寻优范围从 1.0~3.0 收紧（旧值 1.0~3.0 已合理，config.ini 从 3~8 改回 1~4）
+    ATR_STOP_MULT_RANGE: str = "1.0,4.0,0.5"
     BOLL_NARROW_RATIO_RANGE: str = "0.6,1.2,0.1"
     CROSS_DECAY_DAYS_RANGE: str = "15,60,5"
     CONCLUSION_FULL_BULL_RANGE: str = "60,95,5"
     GOLDEN_CROSS_BONUS_RANGE: str = "5,20,5"
     DIVERGENCE_PENALTY_RANGE: str = "10,40,5"
     RISK_NONE_MULTIPLIER_RANGE: str = "0.5,2.0,0.25"
-    BUY_THRESHOLD_RANGE: str = "5,30,5"
+    # FIX(P1-2): 寻优范围从 5~30 扩大到 30~60，避免寻优出低阈值导致大量低质量信号
+    BUY_THRESHOLD_RANGE: str = "30,60,5"
     MAX_HOLDINGS_RANGE: str = "3,20,1"
-    # 与旧日频回退口径 int(17.5)=17 / int(11.5)=11 保持一致；校准后由
-    # write_calibration_to_ini 写回、此处读取，供日频路径 EngineConfig 兜底使用）
-    BUY_THRESHOLD: int = Field(default=12, ge=1, le=100,
+    # FIX(P1-2): 兜底值从 12 提高到 30（新寻优范围中位数 45 的保守值），
+    # 防止 WFO 失败时 buy_threshold=12 导致满屏低分垃圾信号入场
+    BUY_THRESHOLD: int = Field(default=30, ge=1, le=100,
                                description="买入评分阈值（校准覆写目标，WFO 未寻优时兜底）")
     MAX_HOLDINGS: int = Field(default=11, ge=0, le=100,
                               description="最大同时持仓数，0=不限制（校准覆写目标，WFO 未寻优时兜底）")
@@ -819,7 +823,10 @@ class Config:
             ConfigCipher.default_key_path = key_path
         db_raw = self._raw_section("DATABASE")
         for enc_key in ("password", "host", "port", "db_name"):
-            db_raw[enc_key] = ConfigCipher.maybe_decrypt(db_raw.get(enc_key, ""))
+            try:
+                db_raw[enc_key] = ConfigCipher.maybe_decrypt(db_raw.get(enc_key, ""))
+            except ValueError as exc:
+                raise ValueError(f"[DATABASE] {enc_key} 解密失败：{exc}") from exc
 
         # COLUMN_ALIASES（lowercase 字段名）
         col_raw = self._raw_section("COLUMN_ALIASES")
@@ -827,12 +834,18 @@ class Config:
         # ASHAREHUB（API_KEY 需解密）
         ah_raw = self._section_upper("ASHAREHUB")
         if ah_raw:
-            ah_raw["API_KEY"] = ConfigCipher.maybe_decrypt(ah_raw.get("API_KEY", ""))
+            try:
+                ah_raw["API_KEY"] = ConfigCipher.maybe_decrypt(ah_raw.get("API_KEY", ""))
+            except ValueError as exc:
+                raise ValueError(f"[ASHAREHUB] API_KEY 解密失败：{exc}") from exc
 
         # DISTRIBUTION（API_TOKEN 需解密）
         dist_raw = self._section_upper("DISTRIBUTION")
         if dist_raw:
-            dist_raw["API_TOKEN"] = ConfigCipher.maybe_decrypt(dist_raw.get("API_TOKEN", ""))
+            try:
+                dist_raw["API_TOKEN"] = ConfigCipher.maybe_decrypt(dist_raw.get("API_TOKEN", ""))
+            except ValueError as exc:
+                raise ValueError(f"[DISTRIBUTION] API_TOKEN 解密失败：{exc}") from exc
 
         # 装配 AppConfig（Pydantic field_validator 自动处理逗号/bool/int/float 转换）
         self.app_config = AppConfig(

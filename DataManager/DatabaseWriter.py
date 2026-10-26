@@ -44,6 +44,40 @@ class QuantDBManager:
             pool_recycle=3600,
         )
 
+        # 自动修复已知的表结构问题（幂等执行）
+        self._auto_migrate()
+
+    def _auto_migrate(self) -> None:
+        """自动修复已知的表结构缺陷（幂等，失败不阻断主流程）。
+
+        ods_ak_ranking_stocks.id 历史建表为 int4 NOT NULL（无默认值），
+        _write_batch 用 COPY 显式列名不写 id 列 → NotNullViolation。
+        补 sequence + default 使其具备 serial 语义，与建表 SQL migration 一致。
+        """
+        _MIGRATIONS = {
+            "ods_ak_ranking_stocks": [
+                "CREATE SEQUENCE IF NOT EXISTS public.ods_ak_ranking_stocks_id_seq",
+                "ALTER TABLE public.ods_ak_ranking_stocks "
+                "ALTER COLUMN id SET DEFAULT nextval('public.ods_ak_ranking_stocks_id_seq')",
+                "ALTER SEQUENCE public.ods_ak_ranking_stocks_id_seq "
+                "OWNED BY public.ods_ak_ranking_stocks.id",
+            ],
+        }
+        for table, stmts in _MIGRATIONS.items():
+            try:
+                with self.engine.begin() as conn:
+                    for sql in stmts:
+                        conn.execute(text(sql))
+                    # 推进 sequence 到当前 MAX(id)+1，避免与历史行冲突
+                    conn.execute(text(
+                        f"SELECT setval('public.{table}_id_seq', "
+                        f"COALESCE((SELECT MAX(id) FROM public.{table}), 0) + 1, false)"
+                    ))
+                logger.info(f"  - [migration] {table}.id serial 语义修复完成")
+            except Exception as e:
+                # 表可能不存在或已是 serial，migration 失败不阻断写入主流程
+                logger.debug(f"  - [migration] {table} 跳过: {e}")
+
     def safe_insert_data(
         self,
         df: pd.DataFrame,

@@ -645,6 +645,117 @@ def _exit_score(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FIX(P1-1): 先行指标 — 提前识别趋势启动信号
+# ═══════════════════════════════════════════════════════════════════
+
+def _volatility_squeeze(df: pd.DataFrame, max_score: int = 8) -> np.ndarray:
+    """波动率压缩分（先行指标）— BOLL 带宽收窄预示即将变盘。
+
+    当 BOLL 带宽低于 60 日中位数的 0.6 倍时，市场处于低波动压缩状态，
+    历史统计显示压缩后 1-2 周内大概率出现方向性突破。
+    满分 = 压缩最紧 + DIF 在零轴附近（蓄势待发）。
+    """
+    n = len(df)
+    if n < 60:
+        return np.zeros(n, dtype=np.float64)
+
+    bw_col = "BOLL_BANDWIDTH" if "BOLL_BANDWIDTH" in df.columns else None
+    if bw_col is None:
+        return np.zeros(n, dtype=np.float64)
+
+    bw = df[bw_col].values.astype(np.float64)
+    bw_median = pd.Series(bw).rolling(60, min_periods=20).median().values
+    ratio = np.where(bw_median > 1e-9, bw / np.maximum(bw_median, 1e-9), 1.0)
+
+    # ratio < 0.6 → 强压缩；< 0.8 → 轻度压缩
+    squeeze_score = np.zeros(n, dtype=np.float64)
+    strong = ratio < 0.6
+    mild = (ratio >= 0.6) & (ratio < 0.8)
+    squeeze_score[strong] = max_score * 0.8
+    squeeze_score[mild] = max_score * 0.4
+
+    # DIF 在零轴附近（|DIF| < ATR × 0.5）→ 蓄势待发，加分
+    dif = df["DIF"].values.astype(np.float64)
+    atr = df["ATR"].values.astype(np.float64)
+    near_zero = np.abs(dif) < atr * 0.5
+    squeeze_score[near_zero] = np.minimum(squeeze_score[near_zero] + max_score * 0.2, max_score)
+
+    squeeze_score[:60] = 0
+    return squeeze_score
+
+
+def _price_position(df: pd.DataFrame, max_score: int = 8) -> np.ndarray:
+    """价格位置分（先行指标）— 均线多头排列 + 价格在 MA20 上方的趋势确认。
+
+    当 close > MA20 > MA60 时，短中期趋势对齐，趋势延续概率高。
+    与 MACD 滞后信号互补：均线排列在 MACD 金叉前 1-3 天确认方向。
+    """
+    n = len(df)
+    if n < 60:
+        return np.zeros(n, dtype=np.float64)
+
+    close = (df["close_normal"] if "close_normal" in df.columns else df["close"]).values.astype(np.float64)
+    ma20 = df["MA_20"].values.astype(np.float64)
+    ma60 = df["MA_60"].values.astype(np.float64)
+
+    score = np.zeros(n, dtype=np.float64)
+    valid = np.isfinite(close) & np.isfinite(ma20) & np.isfinite(ma60) & (ma60 > 0)
+
+    # 三级趋势确认
+    above_ma20 = valid & (close > ma20)
+    ma20_above_ma60 = valid & (ma20 > ma60)
+    above_both = above_ma20 & ma20_above_ma60
+    above_only = above_ma20 & ~ma20_above_ma60
+
+    # close > MA20 > MA60 → 满分；close > MA20 only → 半分
+    score[above_both] = max_score
+    score[above_only] = max_score * 0.5
+
+    # 价格距 MA20 偏离度 > 5% → 超买，减分（均值回归风险）
+    dev = np.where(ma20 > 0, (close - ma20) / ma20, 0.0)
+    overbought = above_both & (dev > 0.05)
+    score[overbought] = max_score * 0.6
+
+    score[:60] = 0
+    return score
+
+
+def _momentum_acceleration(dif: pd.Series, dea: pd.Series, max_score: int = 8) -> np.ndarray:
+    """动能加速分（先行指标）— MACD 柱状图二阶导数，趋势加速早期信号。
+
+    当柱状图的变化率本身在加速（hist_diff 的 diff > 0），
+    表明多头力量在增强，领先于 MACD 金叉信号 2-5 天。
+    """
+    n = len(dif)
+    if n < 10:
+        return np.zeros(n, dtype=np.float64)
+
+    hist = (dif - dea).values.astype(np.float64)
+    hist_change = np.diff(hist, prepend=hist[0])
+    hist_accel = np.diff(hist_change, prepend=hist_change[0])
+
+    score = np.zeros(n, dtype=np.float64)
+    # 动能为正且加速 → 趋势增强
+    bull_accel = (hist > 0) & (hist_accel > 0) & (hist_change > 0)
+    score[bull_accel] = max_score
+
+    # 动能为负但减速 → 空头力量衰减，底部临近
+    bear_decel = (hist < 0) & (hist_accel > 0) & (hist_change > 0)
+    score[bear_decel] = max_score * 0.5
+
+    # 归一化：按 5 日滚动标准差缩放，避免极端值
+    accel_std = pd.Series(hist_accel).rolling(5, min_periods=3).std().replace(0, 1e-9).values
+    norm_accel = np.abs(hist_accel) / accel_std
+    norm_accel = np.clip(norm_accel, 0, 3) / 3  # 0~1
+
+    # 最终分数 = 基础分 × 加速度归一化系数
+    score = score * (0.4 + 0.6 * norm_accel)
+    score = np.clip(score, 0, max_score)
+    score[:10] = 0
+    return score
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 11. 综合评分
 # ═══════════════════════════════════════════════════════════════════
 
@@ -669,6 +780,13 @@ def _composite_score(
     w_vol: int,
     w_kp: int,
     divergence_penalty: int = 20,
+    # FIX(P1-1): 先行指标
+    squeeze_score: np.ndarray | None = None,
+    price_pos_score: np.ndarray | None = None,
+    mom_accel_score: np.ndarray | None = None,
+    w_squeeze: int = 0,
+    w_price_pos: int = 0,
+    w_mom_accel: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """逐 bar 综合评分和 level/conclusion。"""
     n = len(macd_trend_arr)
@@ -694,7 +812,20 @@ def _composite_score(
     vol_bonus = np.where(has_top_div, 0, vol_score)
     vol_bonus = np.clip(vol_bonus, -w_vol, w_vol)
 
-    total_base = trend_scores + golden_score + mom_score + slope_score + div_score + kp_score - div_penalty
+    # FIX(P1-1): 先行指标纳入基础分
+    leading_bonus = np.zeros(n, dtype=np.float64)
+    if squeeze_score is not None:
+        leading_bonus += squeeze_score
+    if price_pos_score is not None:
+        leading_bonus += price_pos_score
+    if mom_accel_score is not None:
+        leading_bonus += mom_accel_score
+
+    total_base = (
+        trend_scores + golden_score + mom_score + slope_score
+        + div_score + kp_score - div_penalty
+        + leading_bonus
+    )
     total_max_base = sum(weights.values())
     total_base = np.clip(total_base, 0, total_max_base)
     total = np.clip(total_base + vol_bonus, 0, total_max_base + w_vol)
@@ -758,6 +889,8 @@ def compute_signals(
     weights = {
         "MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,
         "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10,
+        # FIX(P1-1): 先行指标权重（共 18 分，归一化后从 7 个滞后因子中分摊）
+        "波动率压缩": 6, "价格位置": 6, "动能加速": 6,
     }
     # 归一化权重至总和 100，保证阈值 80/60/40 是统一的百分比语义
     _ws = sum(weights.values())
@@ -870,6 +1003,11 @@ def compute_signals(
     # ── 9. 风险等级 ──
     risk_level = _risk_level(regime, trend_arr, div_type, div_strength, has_top_div)
 
+    # ── FIX(P1-1): 先行指标计算 ──
+    squeeze_score = _volatility_squeeze(stock_df, max_score=6)
+    price_pos_score = _price_position(stock_df, max_score=6)
+    mom_accel_score = _momentum_acceleration(dif, dea, max_score=6)
+
     # ── 10. 退出评分 ──
     exit_score_arr = _exit_score(risk_level, close, atr, atr_stop_mult)
 
@@ -879,6 +1017,9 @@ def compute_signals(
     w_div = weights["背离信号"]
     w_vol = weights["量价配合"]
     w_kp = weights["K线形态"]
+    w_squeeze = weights["波动率压缩"]
+    w_price_pos = weights["价格位置"]
+    w_mom_accel = weights["动能加速"]
     score_arr, level_arr, conclusion_arr = _composite_score(
         trend_arr, golden_score, mom_score, slope_score,
         div_type, div_strength, div_decay,
@@ -886,6 +1027,12 @@ def compute_signals(
         weights, thresholds,
         w_cross, w_mom, w_slope, w_div, w_vol, w_kp,
         divergence_penalty=int(score_p.get("divergence_penalty", 20)),
+        squeeze_score=squeeze_score,
+        price_pos_score=price_pos_score,
+        mom_accel_score=mom_accel_score,
+        w_squeeze=w_squeeze,
+        w_price_pos=w_price_pos,
+        w_mom_accel=w_mom_accel,
     )
 
     # ── 止损价 ──
@@ -921,6 +1068,10 @@ def compute_signals(
         "divergence": (div_strength * 100).astype(np.float64),
         "vol_price": vol_score.astype(np.float64),
         "kline": kp_score.astype(np.float64),
+        # FIX(P1-1): 先行指标列
+        "vol_squeeze": squeeze_score.astype(np.float64),
+        "price_position": price_pos_score.astype(np.float64),
+        "mom_acceleration": mom_accel_score.astype(np.float64),
         "stop_loss": stop_loss,
         "level": level_arr,
         "conclusion": conclusion_arr,

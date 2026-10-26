@@ -676,6 +676,8 @@ def _run_single_backtest(
     _max_order_pct_low = engine_cfg.max_order_pct_low
     _adv_threshold_high = engine_cfg.adv_amount_threshold_high  # 高流动性阈值（元）
     _adv_threshold_low = engine_cfg.adv_amount_threshold_low    # 低流动性阈值（元）
+    # FIX(P2-2): 入场流动性否决阈值 — 20日均成交额低于此值禁止买入
+    _entry_liq_min = engine_cfg.entry_liq_min_amount
     _top_k = engine_cfg.top_k
 
     cash = float(init_cash)
@@ -828,6 +830,7 @@ def _run_single_backtest(
         s_limit_tag: np.ndarray | None = None,
         s_sig_close: np.ndarray | None = None,
         s_force: bool = False,
+        s_reason: str | None = None,
     ):
         total_sold = 0.0
         for j in range(len(s_syms)):
@@ -948,6 +951,8 @@ def _run_single_backtest(
                     "exec_open": float(s_close[j]),
                     **_extra,
                     **({"force_exit": True} if s_force else {}),
+                    # 埋点：卖出原因（atr_stop/take_profit/score_reversal/score_decay/risk_high/force_exit/partial）
+                    **({"sell_reason": s_reason} if s_reason else {}),
                 }
             )
         return total_sold
@@ -1223,6 +1228,7 @@ def _run_single_backtest(
                     s_fill_ratio=np.array([_auction_ratio_sell]),
                     s_limit_tag=["down"] if _limit_tag_ld is not None else None,
                     s_sig_close=None,
+                    s_reason=p.get("reason"),
                 )
                 if p.get("force"):
                     pass  # 强平单一字跌停已按部分成交处理
@@ -1264,6 +1270,7 @@ def _run_single_backtest(
                 s_limit_tag=[_limit_tag_ld[jj]] if _auction_ratio_sell is not None else None,
                 s_sig_close=np.array([float(p["sig_close"])]),
                 s_force=bool(p.get("force", False)),
+                s_reason=p.get("reason"),
             )
         _pending_sells[:] = remaining_sells
         # ── 买入挂单（按信号日优先级顺序；一字涨停不可买） ──
@@ -1552,6 +1559,8 @@ def _run_single_backtest(
                     # 1.7 执行滞后自检字段：next_open/vwap 下为信号日复权收盘价锚点
                     "close_adj": float(p["sig_close"]),
                     "exec_open": float(px),
+                    # 埋点：买入评分（用于信号质量汇总报告——评分 vs 后续收益 IC）
+                    "buy_score": float(p.get("buy_score", 0.0)),
                     **_extra_buy,
                 }
             )
@@ -2032,6 +2041,7 @@ def _run_single_backtest(
                         s_amount=amount_ma20[si_resume] if amount_ma20 is not None else None,
                         s_amp_mult=_resume_amp,
                         s_sig_close=close_adj[si_resume],
+                        s_reason="resume",
                     )
                     close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                     total_value = cash + _calc_market_value()
@@ -2056,11 +2066,12 @@ def _run_single_backtest(
             _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
             exit_high = np.isin(risk_str, ["HIGH", "D"])
             _entry_scores = np.array([_entry_buy_score.get(s, 0.0) for s in syms_str])
-            # 新逻辑：固定阈值 70（信号质量反转）+ 独立跟踪止盈（max_close_since_entry 回撤）
-            exit_gt = (sell_score >= 70) & (sell_score > _entry_scores + 5)
+            # ②修复：退出评分阈值从70降至60（原70门槛过高致 exit_gt 几乎不触发→卖出仅靠持有期限到期）
+            exit_gt = (sell_score >= 60) & (sell_score > _entry_scores + 5)
             # 同时要求持仓评分下降超过 15 分才触发（防震荡市误杀）
+            # ②修复：buy_score 阈值从 0.6 放宽到 0.7（原0.6致 exit_score_low 过严→卖出条件失效）
             exit_score_low = (
-                (buy_score > 0) & (buy_score < _buy_threshold * 0.6) &
+                (buy_score > 0) & (buy_score < _buy_threshold * 0.7) &
                 (_entry_scores - buy_score > 15)
             )
             # 条件：持仓浮盈超过 take_profit_pct 且从最高点回撤超过 trail_profit_ratio
@@ -2134,6 +2145,7 @@ def _run_single_backtest(
                             s_amp_mult=_vol_mult[_liq],
                             s_sig_close=close_adj[_liq],
                             s_force=True,
+                            s_reason="delist_force",
                         )
                 close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                 total_value = cash + _calc_market_value()
@@ -2170,6 +2182,7 @@ def _run_single_backtest(
                             s_amount=amount_ma20[_liq_nobar] if amount_ma20 is not None else None,
                             s_amp_mult=_vol_mult[_liq_nobar],
                             s_force=True,
+                            s_reason="delist_force",
                         )
                     close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                     total_value = cash + _calc_market_value()
@@ -2208,8 +2221,26 @@ def _run_single_backtest(
                     _pending_sells.append({
                         "sym": syms_str[_k], "si": idx[_k], "partial": False,
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
-                        "force": True,
+                        "force": True, "reason": "force_exit",
                     })
+            # ── 埋点：逐标的标记卖出原因（用于信号质量汇总报告） ──
+            _sell_reasons: dict[str, str] = {}
+            if held.any():
+                for _i in range(len(syms_str)):
+                    if not held[_i] or not _t1_ok[_i] or not adj_ok[_i] or not has_volume[_i]:
+                        continue
+                    if force_exit[_i]:
+                        _sell_reasons[syms_str[_i]] = "force_exit"
+                    elif stop_hit[_i]:
+                        _sell_reasons[syms_str[_i]] = "atr_stop"
+                    elif exit_take_profit[_i]:
+                        _sell_reasons[syms_str[_i]] = "take_profit"
+                    elif exit_gt[_i]:
+                        _sell_reasons[syms_str[_i]] = "score_reversal"
+                    elif exit_score_low[_i]:
+                        _sell_reasons[syms_str[_i]] = "score_decay"
+                    elif exit_high[_i]:
+                        _sell_reasons[syms_str[_i]] = "risk_high"
             sel_all = (
                 held
                 & (exit_high | exit_gt | exit_score_low | stop_hit | exit_take_profit)
@@ -2238,11 +2269,13 @@ def _run_single_backtest(
                     _pending_sells.append({
                         "sym": syms_str[_k], "si": idx[_k], "partial": False,
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
+                        "reason": _sell_reasons.get(syms_str[_k], "atr_stop"),
                     })
                 for _k in si_partial:
                     _pending_sells.append({
                         "sym": syms_str[_k], "si": idx[_k], "partial": True,
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
+                        "reason": _sell_reasons.get(syms_str[_k], "partial"),
                     })
                 close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                 total_value = cash + _calc_market_value()
@@ -2268,6 +2301,17 @@ def _run_single_backtest(
             & adj_ok
             & _st_ok
         )
+        # FIX(P2-2): 流动性否决 — 20日均成交额 < entry_liq_min_amount 的标的禁止买入
+        # 避免买入微盘/低流动性股票导致冲击成本吃掉全部利润（回测显示冲击成本 45 万 = 45% 本金）
+        if amount_ma20 is not None and _entry_liq_min > 0:
+            _liq_ok = amount_ma20 >= _entry_liq_min
+            _liq_blocked = buy_ok & ~_liq_ok
+            if np.any(_liq_blocked):
+                _n_blocked = int(_liq_blocked.sum())
+                logger.debug(
+                    f"[流动性过滤] {dt}: {_n_blocked} 只标的因 20日均成交额 < {_entry_liq_min/1e4:.0f}万 被剔除"
+                )
+            buy_ok = buy_ok & _liq_ok
         bi = np.where(buy_ok)[0]
         if _sim_limits:
             # 涨停无量 → 未成交（撮合约束日志，可追溯）
@@ -2611,6 +2655,7 @@ def _run_single_backtest(
                 s_amount=_tail_amounts,
                 s_amp_mult=_tail_amps,
                 s_force=True,
+                s_reason="delist_force",
             )
             total_value = cash + _calc_market_value()
 
@@ -2668,8 +2713,145 @@ def _run_single_backtest(
                 _lines.append(
                     f"   {_labels[_k]}: {_v:.2f} 元 ({_v / _total_cost * 100:.2f}%)"
                 )
+            # ── P0 诊断：毛收益对照（区分"成本吃光正alpha" vs "策略本身也亏"） ──
+            # 净收益=已扣成本的真实return；总成本/本金=成本侵蚀幅度；
+            # 无成本近似毛收益=净收益+成本占比（一阶近似，成本对股数影响为二阶效应，诊断够用）。
+            _net_ret = (total_value / init_cash) - 1
+            _cost_ratio = _total_cost / init_cash
+            _gross_ret_approx = _net_ret + _cost_ratio
+            if _gross_ret_approx > 0 and _net_ret < 0:
+                _diag = "成本吃光正alpha（调成本有望翻身）"
+            elif _gross_ret_approx <= 0:
+                _diag = "策略本身也亏（调成本不够，需改策略）"
+            else:
+                _diag = "成本临界（毛收益为正但被成本压缩）"
+            _lines.append(
+                f"[毛收益对照] 净收益={_net_ret:.4%} | 总成本/本金={_cost_ratio:.4%} | "
+                f"无成本近似毛收益={_gross_ret_approx:.4%} → {_diag}"
+            )
             logger.info("\n".join(_lines))
     except Exception as _cost_e:
         logger.debug(f"[成本拆解] 报告跳过: {_cost_e}")
+
+    # ── 信号质量汇总报告（埋点输出）：评分-收益IC、卖出原因分布、分档胜率 ──
+    try:
+        _buys = [t for t in trade_log if t["action"] == "buy"]
+        _sells = [t for t in trade_log if t["action"] in ("sell", "sell_partial")]
+        _sig_lines = [f"[信号质量] 买入={len(_buys)}笔 卖出={len(_sells)}笔"]
+
+        # 1. 卖出原因分布
+        _reason_counts: dict[str, int] = {}
+        for _t in _sells:
+            _r = _t.get("sell_reason", "unknown")
+            _reason_counts[_r] = _reason_counts.get(_r, 0) + 1
+        if _reason_counts:
+            _reason_labels = {
+                "atr_stop": "ATR止损", "take_profit": "止盈", "score_reversal": "评分反转",
+                "score_decay": "评分衰减", "risk_high": "高位风险", "force_exit": "强平",
+                "resume": "复牌兑现", "delist_force": "摘牌强平", "partial": "减仓",
+                "unknown": "未标记",
+            }
+            _reason_str = "  ".join(
+                f"{_reason_labels.get(k, k)}={v}" for k, v in
+                sorted(_reason_counts.items(), key=lambda x: -x[1])
+            )
+            _sig_lines.append(f"  卖出原因: {_reason_str}")
+
+        # 2. 评分-收益配对 & IC（Spearman rank correlation）
+        _entry_map: dict[str, dict] = {}  # sym -> {score, entry_price, entry_dt}
+        for _t in _buys:
+            _entry_map[_t["symbol"]] = {
+                "score": float(_t.get("buy_score", 0.0)),
+                "entry_price": float(_t["price"]),
+                "entry_dt": str(_t["time"]),
+            }
+        _pairs = []  # (score, pnl_pct, hold_days, reason)
+        for _t in _sells:
+            _e = _entry_map.get(_t["symbol"])
+            if _e is None:
+                continue
+            _exit_price = float(_t["price"])
+            _pnl_pct = (_exit_price - _e["entry_price"]) / _e["entry_price"]
+            # 估算持有天数（字符串日期差近似）
+            _hold_days = 0
+            try:
+                from pandas import Timestamp
+                _hold_days = int((Timestamp(str(_t["time"])) - Timestamp(_e["entry_dt"])).days)
+            except Exception:
+                pass
+            _pairs.append((_e["score"], _pnl_pct, _hold_days, _t.get("sell_reason", "unknown")))
+
+        if len(_pairs) >= 10:
+            _scores = [p[0] for p in _pairs]
+            _pnls = [p[1] for p in _pairs]
+            _holds = [p[2] for p in _pairs]
+            _wins = sum(1 for p in _pairs if p[1] > 0)
+            _win_rate = _wins / len(_pairs)
+            _avg_pnl = sum(_pnls) / len(_pnls)
+            _avg_hold = sum(_holds) / len(_holds)
+
+            # Spearman rank IC
+            _ic = 0.0
+            try:
+                from scipy.stats import spearmanr
+                _ic_res = spearmanr(_scores, _pnls)
+                _ic = float(_ic_res[0]) if _ic_res[0] == _ic_res[0] else 0.0  # NaN check
+            except Exception:
+                # 手动 rank correlation
+                def _rank(arr):
+                    _sorted_idx = sorted(range(len(arr)), key=lambda i: arr[i])
+                    _ranks = [0] * len(arr)
+                    for i, idx in enumerate(_sorted_idx):
+                        _ranks[idx] = i + 1
+                    return _ranks
+                _sr = _rank(_scores)
+                _pr = _rank(_pnls)
+                _n = len(_pairs)
+                _d2 = sum((a - b) ** 2 for a, b in zip(_sr, _pr))
+                _ic = 1 - 6 * _d2 / (_n * (_n * _n - 1))
+
+            _sig_lines.append(
+                f"  IC(Spearman)={_ic:+.4f}  胜率={_win_rate:.2%}  "
+                f"平均收益={_avg_pnl:+.2%}  平均持有={_avg_hold:.0f}天"
+            )
+
+            # 3. 评分分档收益（5档）
+            _sorted_pairs = sorted(_pairs, key=lambda x: x[0])
+            _bucket_size = max(1, len(_sorted_pairs) // 5)
+            _buckets = []
+            for _bi in range(5):
+                _chunk = _sorted_pairs[_bi * _bucket_size: (_bi + 1) * _bucket_size]
+                if not _chunk:
+                    continue
+                _b_scores = [c[0] for c in _chunk]
+                _b_pnls = [c[1] for c in _chunk]
+                _b_wins = sum(1 for c in _chunk if c[1] > 0)
+                _buckets.append(
+                    f"Q{_bi+1}[{min(_b_scores):.1f}-{max(_b_scores):.1f}]"
+                    f" n={len(_chunk)} 胜率={_b_wins/len(_chunk):.0%} 收益={sum(_b_pnls)/len(_chunk):+.2%}"
+                )
+            if _buckets:
+                _sig_lines.append("  评分分档:")
+                _sig_lines.append("    " + " | ".join(_buckets))
+
+            # 4. 诊断结论
+            if _ic < 0.05 and _ic > -0.05:
+                _sig_lines.append(
+                    f"  ⚠ 诊断: IC≈{_ic:.3f}接近0 → 信号无预测能力（评分高低与后续收益无关），需改信号生成逻辑"
+                )
+            elif _ic < -0.05:
+                _sig_lines.append(
+                    f"  ⚠ 诊断: IC={_ic:.3f}为负 → 信号反向（高分反亏），评分方向需反转或逻辑有误"
+                )
+            else:
+                _sig_lines.append(
+                    f"  ✓ 诊断: IC={_ic:.3f}为正 → 信号有预测力（问题在执行/成本层而非信号层）"
+                )
+        else:
+            _sig_lines.append("  (配对样本不足10笔，跳过IC计算)")
+
+        logger.info("\n".join(_sig_lines))
+    except Exception as _sig_e:
+        logger.debug(f"[信号质量] 报告跳过: {_sig_e}")
 
     return (total_value / init_cash) - 1

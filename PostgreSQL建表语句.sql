@@ -73,8 +73,25 @@ CREATE INDEX idx_ind_date ON ods_ak_industry_analysis USING btree (archive_date)
 
 
 -- ods_ak_ranking_stocks definition
-CREATE TABLE ods_ak_ranking_stocks ( id int4 NOT NULL, archive_date date NOT NULL, strategy_type varchar(50) NOT NULL, stock_code varchar(20) NOT NULL, stock_name varchar(50) NULL, feature_value numeric(10, 2) NULL, description text NULL, created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL, CONSTRAINT ods_ak_strategy_stocks_combined_pkey PRIMARY KEY (archive_date, strategy_type, stock_code));
+-- 注意：id 为 serial4 自增列（代理键），业务主键仍是联合主键
+-- (archive_date, strategy_type, stock_code)，COPY 写入时不带 id 列即可自动填充。
+CREATE TABLE ods_ak_ranking_stocks ( id serial4 NOT NULL, archive_date date NOT NULL, strategy_type varchar(50) NOT NULL, stock_code varchar(20) NOT NULL, stock_name varchar(50) NULL, feature_value numeric(10, 2) NULL, description text NULL, created_at timestamp DEFAULT CURRENT_TIMESTAMP NULL, CONSTRAINT ods_ak_strategy_stocks_combined_pkey PRIMARY KEY (archive_date, strategy_type, stock_code));
 CREATE INDEX idx_stock_code_lookup ON ods_ak_ranking_stocks USING btree (stock_code);
+
+-- ── migration: 修复 ods_ak_ranking_stocks.id 自增默认值 ──────────
+-- 历史建表误写成 `id int4 NOT NULL`（无默认值），DatabaseWriter._write_batch
+-- 用 COPY (显式列名) 不写 id 列，触发 NotNullViolation:
+--   null value in column "id" of relation "ods_ak_ranking_stocks" violates not-null constraint
+-- 改为 serial 语义，与 ods_ak_industry_analysis / stock_basic_info_sw 等表一致。
+-- 幂等，可重复执行；对已存在表补 sequence + default，对新表无副作用。
+CREATE SEQUENCE IF NOT EXISTS public.ods_ak_ranking_stocks_id_seq;
+ALTER TABLE public.ods_ak_ranking_stocks
+    ALTER COLUMN id SET DEFAULT nextval('public.ods_ak_ranking_stocks_id_seq');
+ALTER SEQUENCE public.ods_ak_ranking_stocks_id_seq OWNED BY public.ods_ak_ranking_stocks.id;
+-- 推进 sequence 起点到当前最大 id 之后，避免与历史行冲突；空表时从 1 开始
+SELECT setval('public.ods_ak_ranking_stocks_id_seq',
+              COALESCE((SELECT MAX(id) FROM public.ods_ak_ranking_stocks), 0) + 1,
+              false);
 
 
 -- public.stock_basic_info_sw definition

@@ -26,6 +26,10 @@ BATCH_INTERVAL = 10       # 批次间休息 10 秒
 STAGGER_DELAY = 15        # 两管道错峰 15 秒
 FETCH_WORKERS = 2         # 每管道并发取数线程数
 _STOCK_FETCH_LOCK = threading.Semaphore(4)  # 两管道共 4 worker，各需 1 permit；原 Semaphore(2) 导致 B 管道饿死
+# py_mini_racer(V8) 不是线程安全的：akshare 新浪接口会在每次调用时新建 MiniRacer 并 eval JS，
+# 多线程并发初始化会触发 V8 FATAL（IsConfigurablePoolInitialized）直接杀死进程。
+# 用 RLock 串行化所有新浪接口调用（可重入，便于 _build_sina_df 内部嵌套获取）。
+_SINA_JS_LOCK = threading.RLock()
 
 
 class IncrementalSyncEngine:
@@ -396,12 +400,13 @@ class IncrementalSyncEngine:
             sym = self._ensure_market_prefix(symbol)
             logger.info(f"  备用接口请求 {sym}: {start} ~ {end} (hfq)")
 
-            df = ak.stock_zh_a_daily(
-                symbol=sym,
-                start_date=start,
-                end_date=end,
-                adjust="hfq",
-            )
+            with _SINA_JS_LOCK:
+                df = ak.stock_zh_a_daily(
+                    symbol=sym,
+                    start_date=start,
+                    end_date=end,
+                    adjust="hfq",
+                )
 
             if df is None or df.empty:
                 logger.warning(f"  备用接口 {sym} 返回空数据")
@@ -487,21 +492,23 @@ class IncrementalSyncEngine:
 
             # 尝试获取后复权因子（用于精确还原原始价）
             factor_map: dict[str, float] | None = None
+            raw_df: pd.DataFrame | None = None
             try:
-                factor_df = ak.stock_zh_a_daily(
-                    symbol=sym,
-                    start_date=start,
-                    end_date=end,
-                    adjust="hfq",
-                )
+                with _SINA_JS_LOCK:
+                    factor_df = ak.stock_zh_a_daily(
+                        symbol=sym,
+                        start_date=start,
+                        end_date=end,
+                        adjust="hfq",
+                    )
 
-                # 再拉一次不复权数据来反算因子
-                raw_df = ak.stock_zh_a_daily(
-                    symbol=sym,
-                    start_date=start,
-                    end_date=end,
-                    adjust="",
-                )
+                    # 再拉一次不复权数据来反算因子
+                    raw_df = ak.stock_zh_a_daily(
+                        symbol=sym,
+                        start_date=start,
+                        end_date=end,
+                        adjust="",
+                    )
 
                 # 兼容 akshare 不同版本的列名
                 date_col = self._resolve_column(factor_df, ["date", "日期"]) if factor_df is not None and not factor_df.empty else None
@@ -535,6 +542,9 @@ class IncrementalSyncEngine:
                 return self._build_sina_df_with_factor(symbol, start, end, raw_df, factor_map)
 
             # 降级：无因子数据时，假设所有复权价 = 原始价 × 1.0（即无除权）
+            if raw_df is None or raw_df.empty:
+                logger.warning(f"  备用接口 {symbol} 无可用行情数据，标记为失败待下次重试")
+                return None
             logger.warning(f"  备用接口 {symbol} 无复权因子，降级为原始价≈复权价写入")
             return self._build_sina_df_simple(symbol, start, end, raw_df)
 
@@ -1117,6 +1127,33 @@ class IncrementalSyncEngine:
         """
         codes = df["股票代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True)
         return df[codes.str.match(r"^(60|00)", na=False)].copy()
+
+    def get_stock_pool_from_kline(self) -> pd.DataFrame:
+        """从 stock_daily_kline 表提取股票池（当 stock_basic_info_sw 为空时的兜底）。
+
+        与 get_stock_pool_from_db() 返回相同 schema 的 DataFrame，
+        复盘管线在 stock_basic_info_sw 表为空时可调用此方法降级。
+        """
+        query = text("""
+            SELECT DISTINCT symbol AS ts_code, symbol AS 股票代码
+            FROM stock_daily_kline
+            ORDER BY symbol
+        """)
+        with self._engine.connect() as conn:
+            df = pd.read_sql(query, conn)
+        def _strip(s: str) -> str:
+            s = str(s)
+            for pfx in ("sh", "sz", "bj"):
+                if s.startswith(pfx):
+                    s = s[len(pfx):]
+                    break
+            return s.zfill(6)
+        df["ts_code"] = df["ts_code"].apply(_strip)
+        df["股票代码"] = df["股票代码"].apply(_strip)
+        # K 线表无股票名称/行业，填充占位值
+        df["name"] = "N/A"
+        df["industry"] = "N/A"
+        return df[["ts_code", "name", "industry", "股票代码"]]
 
     def _filter_by_research_report(self, pure_codes: set[str]) -> set[str]:
         if not self._enable_research_report_filter:

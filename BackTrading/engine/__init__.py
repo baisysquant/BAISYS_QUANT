@@ -55,6 +55,7 @@ class ExecutionConfig:
     max_order_pct_low: float
     adv_amount_threshold_high: float
     adv_amount_threshold_low: float
+    entry_liq_min_amount: float  # FIX(P2-2): 入场流动性否决阈值
     order_expiry_days: int
     strict_listing_days: bool
 
@@ -139,8 +140,8 @@ class EngineConfig:
     portfolio_method: str = "score_weighted"
     point_in_time: bool = True
     atr_stop_mult: float = 2.5
-    take_profit_pct: float = 15.0
-    trail_profit_ratio: float = 10.0  # 移动止盈回撤阈值：从最高点回撤 10% 触发止盈；AUDIT_FIX P0-1 修复双重除法（50.0→10.0，代码中仅除 100 一次）
+    take_profit_pct: float = 8.0  # ②修复：从15%降至8%，降低止盈门槛让移动止盈更易触发（原15%浮盈门槛过高致卖出条件几乎不触发）
+    trail_profit_ratio: float = 5.0  # ②修复：从10%降至5%，从最高点回撤5%即触发止盈（原10%回撤门槛偏高，持仓利润回吐过多才卖出）
     # kelly_fraction / position_a / risk_none_multiplier — DEAD KEY，引擎未消费；保留向后兼容但标记废弃
     kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
     position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
@@ -212,6 +213,8 @@ class EngineConfig:
     max_order_pct_low: float = 0.10   # 低流动性股上限 (ADV成交额<adv_amount_threshold_low)
     adv_amount_threshold_high: float = 1e8  # 高流动性阈值（元）
     adv_amount_threshold_low: float = 2e7   # 低流动性阈值（元）
+    # FIX(P2-2): 入场流动性否决阈值（元）— 20日均成交额低于此值的股票禁止买入
+    entry_liq_min_amount: float = 5e7  # 5000 万元，过滤微盘/低流动性标的避免冲击成本吃掉利润
     top_k: int = 20  # 每日最大候选买入数（集中资金，避免每只分到极小额度 < 1 手）
     # 从 core.py 硬编码提升为配置项，便于研究（如"连续重挂 N 日"实验）；默认 1 保持原语义。
     order_expiry_days: int = 1
@@ -267,8 +270,9 @@ class EngineConfig:
     # ── FIX(P1) Subtask-9：强制持有期限上限 ──
     # 无止损保护（stop_col=NaN）时股票可能被永久持有，导致资金效率低。
     # 持仓超过 max_hold_days 交易日后重新评估：若当前 buy_score 低于 buy_threshold → 卖出。
-    # 默认 60 个交易日（约一季度）；设为 0 表示关闭此限制。
-    max_hold_days: int = 60
+    # 默认 30 个交易日（约一个半月）；设为 0 表示关闭此限制。
+    # ②修复：从60降至30，加速仓位周转（原60天致持仓长期占用 max_holdings 槽位→买卖失衡2.5:1~4:1）
+    max_hold_days: int = 30
 
     @property
     def cost(self) -> CostConfig:
@@ -306,6 +310,7 @@ class EngineConfig:
             max_order_pct_low=self.max_order_pct_low,
             adv_amount_threshold_high=self.adv_amount_threshold_high,
             adv_amount_threshold_low=self.adv_amount_threshold_low,
+            entry_liq_min_amount=self.entry_liq_min_amount,
             order_expiry_days=self.order_expiry_days,
             strict_listing_days=self.strict_listing_days,
         )

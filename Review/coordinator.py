@@ -268,22 +268,41 @@ class StockAnalysisCoordinator:
             # ── 降级保护：当 sync 返回空集（如回测锁拦截），从数据库已有数据加载股票池 ──
             if not filtered_pure_codes:
                 self.logger.warning(
-                    "同步未返回股票池，尝试从数据库已有 stock_daily_kline 加载股票池"
+                    "同步未返回股票池，尝试从数据库已有数据加载股票池"
                 )
                 try:
+                    # 第一级：stock_basic_info_sw 表
                     pool_df = self.incremental_sync_engine.get_stock_pool_from_db()
                     if not pool_df.empty and "股票代码" in pool_df.columns:
-                        # 复用同步引擎的过滤链（ST + 主板 + 研报）
                         pool_df = self.incremental_sync_engine.filter_st_stocks(pool_df)
                         pool_df = self.incremental_sync_engine.filter_main_board(pool_df)
                         codes = set(pool_df["股票代码"].unique())
                         if codes:
                             filtered_pure_codes = codes
                             self.logger.info(
-                                f"[降级] 从已有数据加载股票池: {len(codes)} 只"
+                                f"[降级-一级] 从 stock_basic_info_sw 加载股票池: {len(codes)} 只"
                             )
                 except Exception as e:
-                    self.logger.warning(f"降级加载股票池失败: {e}")
+                    self.logger.warning(f"降级-一级(stock_basic_info_sw)失败: {e}")
+
+                # 第二级：stock_daily_kline 表兜底（当 stock_basic_info_sw 为空时）
+                if not filtered_pure_codes:
+                    try:
+                        self.logger.info(
+                            "[降级-二级] stock_basic_info_sw 为空，从 stock_daily_kline 提取股票池"
+                        )
+                        pool_df = self.incremental_sync_engine.get_stock_pool_from_kline()
+                        if not pool_df.empty and "股票代码" in pool_df.columns:
+                            pool_df = self.incremental_sync_engine.filter_main_board(pool_df)
+                            # K 线表无 name 列，跳过 ST 过滤（coordinator 后续 PIT 级 ST 过滤会兜住）
+                            codes = set(pool_df["股票代码"].unique())
+                            if codes:
+                                filtered_pure_codes = codes
+                                self.logger.info(
+                                    f"[降级-二级] 从 stock_daily_kline 加载股票池: {len(codes)} 只"
+                                )
+                    except Exception as e:
+                        self.logger.warning(f"降级-二级(stock_daily_kline)失败: {e}")
 
             if not filtered_pure_codes:
                 self.logger.critical("同步历史数据后无有效股票代码，流程终止")

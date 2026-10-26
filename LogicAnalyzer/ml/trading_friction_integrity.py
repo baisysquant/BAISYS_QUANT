@@ -54,11 +54,15 @@ def _resolve_cost_obj(cm_or_cfg: Any) -> Any:
 
 
 def _slippage_rates(obj: Any) -> tuple[float, float]:
-    """统一取 (市价滑点, 限价滑点)：EngineConfig 只暴露 slippage（限价=0.5×），CostModel 有独立字段。"""
+    """统一取 (市价滑点, 限价滑点)：EngineConfig 只暴露 slippage（限价=0.5×），CostModel 有独立字段。
+
+    摩擦合规修复：回退路径 limit = slip*0.5 可能低于强制下限 0.05%，
+    取 max(slip*0.5, _MIN_SLIPPAGE_FLOOR) 确保合规。
+    """
     cfg = _read_cfg(obj)
     slip = cfg.get("slippage", getattr(obj, "slippage", None))
     market = cfg.get("market_slippage", slip or _MIN_SLIPPAGE_FLOOR)
-    limit = cfg.get("limit_slippage", (slip or market) * 0.5)
+    limit = cfg.get("limit_slippage", max((slip or market) * 0.5, _MIN_SLIPPAGE_FLOOR))
     return market, limit
 
 

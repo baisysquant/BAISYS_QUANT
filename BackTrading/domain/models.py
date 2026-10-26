@@ -766,7 +766,7 @@ class CostModel:
             commission_rate=float(bt.COMMISSION_RATE),
             stamp_tax_rate=float(bt.STAMP_TAX_RATE),
             market_slippage=float(bt.SLIPPAGE),
-            limit_slippage=float(bt.SLIPPAGE) * 0.5,
+            limit_slippage=max(float(bt.SLIPPAGE) * 0.5, 0.0005),  # 摩擦合规修复：限价滑点下限 0.05%，防止 market*0.5 低于强制下限
             min_commission_per_trade=float(bt.MIN_COMMISSION_PER_TRADE),
             transfer_fee_rate=float(bt.TRANSFER_FEE_RATE),
             handling_fee_rate=float(getattr(bt, "HANDLING_FEE_RATE", DEFAULT_HANDLING_FEE_RATE)),
@@ -796,6 +796,9 @@ class CostModel:
                 ),
                 liquidity_tier_cap=_parse_csv(
                     getattr(bt, "LIQUIDITY_TIER_CAP", "0.10,0.05,0.05,0.03")
+                ),
+                liquidity_tier_slippage_floor=_parse_csv(
+                    getattr(bt, "LIQUIDITY_TIER_SLIPPAGE_FLOOR", "0.0018,0.0012,0.0008,0.0005")
                 ),
             )
         except ValueError as e:

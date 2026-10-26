@@ -38,11 +38,26 @@ def main() -> None:
 
     # ── 初始化文件日志（必须先于所有业务代码） ──
 
-    # 改为 {PROJECT_ROOT}/logs/，增加 LOG_DIR 环境变量覆盖，确保目录不存在时自动创建。
+    # 改为从 config.ini [LOGGING] log_dir 读取，环境变量 LOG_DIR 覆盖，确保目录不存在时自动创建。
     import os as _os
     from pathlib import Path as _Path
+    import configparser as _cp
     PROJECT_ROOT = str(_Path(__file__).resolve().parent)
-    _log_dir = _os.environ.get("LOG_DIR", _os.path.join(PROJECT_ROOT, "logs"))
+
+    # 优先级：环境变量 LOG_DIR > config.ini [LOGGING] log_dir > {PROJECT_ROOT}/logs
+    _log_dir = _os.environ.get("LOG_DIR")
+    if not _log_dir:
+        try:
+            _ini = _cp.ConfigParser()
+            _ini.read(_os.path.join(PROJECT_ROOT, "config.ini"), encoding="utf-8")
+            _cfg_log_dir = _ini.get("LOGGING", "log_dir", fallback="Logs").strip()
+            _home_dir = _ini.get("SYSTEM", "HOME_DIRECTORY", fallback=PROJECT_ROOT).strip()
+            if _os.path.isabs(_cfg_log_dir):
+                _log_dir = _cfg_log_dir
+            else:
+                _log_dir = _os.path.join(_home_dir, _cfg_log_dir)
+        except Exception:
+            _log_dir = _os.path.join(PROJECT_ROOT, "logs")
     _os.makedirs(_log_dir, exist_ok=True)
     logger.add(
         _os.path.join(_log_dir, "Corenews_Main.log"),

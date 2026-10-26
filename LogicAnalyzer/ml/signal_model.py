@@ -99,6 +99,8 @@ _PREPROCESS_PARAMS: list[PreprocessParam] = []
 _FEATURE_CN = [
     "MACD趋势分", "金叉信号分", "柱状动能分",
     "DIF斜评分", "背离信号分", "量价配合分", "K线形态分",
+    # FIX(P1-1): 先行指标列
+    "波动率压缩分", "价格位置分", "动能加速分",
 ]
 
 # 全面板自检（特征窗口/标签/预处理隔离）只依赖原始行情行数与日期范围，
@@ -109,6 +111,8 @@ _PANEL_SELFCHECK_KEY: tuple | None = None
 _FEATURE_ALL = [
     # 保留验证过的 CN 特征（4 个 IC 相对较高的）
     "MACD趋势分", "金叉信号分", "DIF斜评分", "量价配合分",
+    # FIX(P1-1): 先行指标 — 与价格位置、波动率压缩相关的截面特征
+    "price_pos_ma20", "price_pos_ma60",
     # 收益率族（5 个不同周期）
     "ret_1d", "ret_5d", "ret_10d", "ret_20d", "ret_60d",
     # 波动率族（7 个）

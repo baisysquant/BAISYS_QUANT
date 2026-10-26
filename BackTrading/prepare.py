@@ -534,6 +534,14 @@ def _merge_signal(kline_df: pd.DataFrame, signal_df: pd.DataFrame) -> pd.DataFra
         "macd_trend", "macd_trend_value",
         "golden_cross", "hist_momentum", "dif_slope", "divergence",
         "vol_price", "kline", "exit_strategy",
+        # FIX(P0-1): 中文特征列名 — signal_cache 经 _REV_SIGNAL_COL_MAP 重命名后
+        # 列名已从英文转为中文，此处必须同时匹配中文列名，否则 ML 模型
+        # 在 _FEATURE_CN 中找不到 7 个特征列 → apply_ml_signal 跳过 → 退化为纯 MACD
+        "MACD趋势分", "MACD趋势数值分", "金叉信号分", "柱状动能分",
+        "DIF斜评分", "背离信号分", "量价配合分", "K线形态分",
+        # FIX(P1-1): 先行指标列
+        "波动率压缩分", "价格位置分", "动能加速分",
+        "level", "conclusion",
     ) or c.startswith("MACD_") or c.startswith("MA_") or c.startswith("ATR_")]
     if not _signal_cols:
         # fallback: 合并全部信号列
@@ -1109,6 +1117,12 @@ def _stock_worker_vectorized(
                 "divergence": float(row["divergence"]),
                 "vol_price": float(row["vol_price"]),
                 "kline": float(row["kline"]),
+                # FIX(P1-1): 先行指标列 — 必须提取写入缓存，否则 parquet 缺列
+                # → _load_signal_cache 重命名跳过 → merged 缺中文列
+                # → apply_ml_signal 跳过 ML 信号模型（退化为纯 MACD）
+                "vol_squeeze": float(row.get("vol_squeeze", 0.0)),
+                "price_position": float(row.get("price_position", 0.0)),
+                "mom_acceleration": float(row.get("mom_acceleration", 0.0)),
                 "exit_strategy": {"stop_loss": float(row["stop_loss"])} if compute_exit_strategy else {"stop_loss": 0.0},
             })
         return rows
@@ -1136,6 +1150,10 @@ _SIGNAL_COL_MAP = {
     "divergence": "背离信号分",
     "vol_price": "量价配合分",
     "kline": "K线形态分",
+    # FIX(P1-1): 先行指标列
+    "vol_squeeze": "波动率压缩分",
+    "price_position": "价格位置分",
+    "mom_acceleration": "动能加速分",
     "stop_loss": "止损价",
 }
 

@@ -250,7 +250,7 @@ def bayesian_walk_forward_multi(
             commission_rate=kwargs.get("commission", 0.0003),
             stamp_tax_rate=kwargs.get("stamp_tax", 0.0005),
             market_slippage=_slip,
-            limit_slippage=_slip * 0.5,
+            limit_slippage=max(_slip * 0.5, 0.0005),  # 摩擦合规修复：限价滑点下限 0.05%
             min_commission_per_trade=kwargs.get("min_commission", 5.0),
         )
     base_cfg = EngineConfig(
