@@ -692,6 +692,11 @@ def run_backtest_pipeline(
             atr_stop_mult=best_params.get("atr_stop_mult", _sc.ATR_STOP_MULT),
             buy_threshold=int(best_params.get("buy_threshold", bt.BUY_THRESHOLD)),
             max_holdings=int(best_params.get("max_holdings", bt.MAX_HOLDINGS)),
+            # FIX(B1): 超短线结构修复 — 最小持仓天数 + 止盈参数从配置注入（搜寻路径 WFO 亦使用）
+            min_hold_days=int(getattr(bt, "MIN_HOLD_DAYS", 5)),
+            take_profit_pct=float(getattr(bt, "TAKE_PROFIT_PCT", 12.0)),
+            trail_profit_ratio=float(getattr(bt, "TRAIL_PROFIT_RATIO", 8.0)),
+            max_hold_days=int(getattr(bt, "MAX_HOLD_DAYS", 45)),
             cost_model=CostModel.from_backtest_config(
                 bt, trading_cost=config.app_config.trading_cost
             ),

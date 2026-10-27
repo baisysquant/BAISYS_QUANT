@@ -136,12 +136,15 @@ class EngineConfig:
     # 过户费日期分段表（2022-04-29 前后费率不同，双边收取）；
     # fallback 构造 CostModel 时未显式传入则用 CostModel 默认值。
     transfer_fee_segments: tuple[tuple[str, float], ...] = DEFAULT_TRANSFER_FEE_SEGMENTS
-    max_position_pct: float = 0.1
+    max_position_pct: float = 0.12
     portfolio_method: str = "score_weighted"
     point_in_time: bool = True
     atr_stop_mult: float = 2.5
-    take_profit_pct: float = 8.0  # ②修复：从15%降至8%，降低止盈门槛让移动止盈更易触发（原15%浮盈门槛过高致卖出条件几乎不触发）
-    trail_profit_ratio: float = 5.0  # ②修复：从10%降至5%，从最高点回撤5%即触发止盈（原10%回撤门槛偏高，持仓利润回吐过多才卖出）
+    # FIX(B1): 止盈参数回调至中性水平 — 原②修复把 take_profit 15→8、trail 10→5 导致
+    # 浮盈8%回撤5%即触发止盈，配合 partial 半仓减仓造成超短线空转；现提高至 12%/8%，
+    # 保留移动止盈的利润保护功能，但给趋势足够呼吸空间（与 min_hold_days 协同）。
+    take_profit_pct: float = 12.0
+    trail_profit_ratio: float = 8.0
     # kelly_fraction / position_a / risk_none_multiplier — DEAD KEY，引擎未消费；保留向后兼容但标记废弃
     kelly_fraction: float = 0.25  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
     position_a: float = 0.3  # [DEAD KEY] 审计确认仓位恒等权，未被引擎消费；建议移除
@@ -270,9 +273,17 @@ class EngineConfig:
     # ── FIX(P1) Subtask-9：强制持有期限上限 ──
     # 无止损保护（stop_col=NaN）时股票可能被永久持有，导致资金效率低。
     # 持仓超过 max_hold_days 交易日后重新评估：若当前 buy_score 低于 buy_threshold → 卖出。
-    # 默认 30 个交易日（约一个半月）；设为 0 表示关闭此限制。
+    # 默认 45 个交易日（约两个多月）；设为 0 表示关闭此限制。
     # ②修复：从60降至30，加速仓位周转（原60天致持仓长期占用 max_holdings 槽位→买卖失衡2.5:1~4:1）
-    max_hold_days: int = 30
+    # FIX(B1)：回调至 45 — 配合 min_hold_days/止盈阈值联动后，无需靠压缩持有上限加速周转；
+    # 过短的持有上限会造成"评分尚可但被迫到期离场"的额外换手。
+    max_hold_days: int = 45
+
+    # ── FIX(B1) Subtask-10：最小持仓天数 ──
+    # 评分反转/评分衰减/止盈回撤类卖出必须持仓满 min_hold_days 个交易日后才允许触发，
+    # 防止"买进次日即因技术性信号卖出"的超短线空转（ATR止损/摘牌强平/复牌兑现不受限）。
+    # 默认 5 个交易日（约一周持仓观察期）；0 = 关闭保护。
+    min_hold_days: int = 5
 
     @property
     def cost(self) -> CostConfig:

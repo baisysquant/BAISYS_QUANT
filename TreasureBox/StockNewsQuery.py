@@ -17,6 +17,56 @@ def get_period_selection() -> int:
         else:
             print(f"输入 '{choice}' 无效。请重新输入 1 或 2。")
 
+def get_output_selection() -> str:
+    while True:
+        print("\n请选择新闻结果的输出方式：")
+        print("  输入 1: 保存到 Excel 文件")
+        print("  输入 2: 直接在对话中查看")
+        choice = input("请输入您的选择 (1 或 2): ").strip()
+
+        if choice in ("1", "2"):
+            return choice
+        else:
+            print(f"输入 '{choice}' 无效。请重新输入 1 或 2。")
+
+def _format_cell(value: object) -> str:
+    """将单元格内容转换为可打印的字符串，缺失值按空字符串处理。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+def print_news_to_console(news_df: pd.DataFrame, stock_code: str) -> None:
+    """将新闻结果直接打印到当前会话。"""
+    print(f"\n以下是股票 {stock_code} 的 {len(news_df)} 条新闻：\n")
+
+    for idx, row in news_df.reset_index(drop=True).iterrows():
+        title = _format_cell(row.get("新闻标题")) or "(无标题)"
+        publish_time = _format_cell(row.get("发布时间"))
+        keyword = _format_cell(row.get("关键词"))
+        content = _format_cell(row.get("新闻内容"))
+
+        meta_parts = []
+        if publish_time:
+            meta_parts.append(f"发布时间: {publish_time}")
+        if keyword:
+            meta_parts.append(f"关键词: {keyword}")
+
+        print("=" * 80)
+        print(f"[{idx + 1}] {title}")
+        if meta_parts:
+            print("    " + "    ".join(meta_parts))
+        print("-" * 80)
+        print(content if content else "(无内容)")
+        print()
+
+    print("=" * 80)
+    print(f"共 {len(news_df)} 条新闻，已全部显示。")
+
 def query_stock_news() -> None:
     print("--- 东方财富个股新闻查询工具 ---")
 
@@ -73,18 +123,25 @@ def query_stock_news() -> None:
             except (ValueError, TypeError):
                 pass
 
+        print(f"成功获取 {stock_code} 的 {len(display_df)} 条新闻。")
+
+        output_choice = get_output_selection()
+
+        if output_choice == "2":
+            print_news_to_console(display_df, stock_code)
+            return
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"个股新闻_{stock_code}_{timestamp}.xlsx"
 
         try:
             display_df.to_excel(filename, index=False, sheet_name=stock_code)
-            print(f"成功获取 {stock_code} 的 {len(display_df)} 条新闻。")
             print(f"结果已保存到 Excel 文件: {filename}")
             print("您可以在 Excel 中打开此文件，查看完整的新闻内容。")
         except Exception as e:
             print(f"[错误] 保存 Excel 文件失败: {e}")
-            print("\n[警告] 文件保存失败，以下是完整数据控制台输出（可能格式错乱）:")
-            print(display_df.to_string(index=False))
+            print("\n[警告] 文件保存失败，以下是完整数据控制台输出：")
+            print_news_to_console(display_df, stock_code)
 
     except Exception as e:
         print(f"[错误] 查询过程中发生异常，请检查股票代码是否正确或网络连接: {e}")

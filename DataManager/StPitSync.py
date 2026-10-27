@@ -90,12 +90,50 @@ def _norm_codes(codes: list[Any]) -> set[str]:
 # ── AkShare 取数封装（独立函数便于测试打桩与降级） ──
 
 
+def _ak_call(fn, *args, _name: str = "ak", **kwargs):
+    """调用 akshare 接口，内置 FIX(E1) SSL 降级重试。
+
+    首次按系统 CA/显式 SSL_CERT_FILE 验证请求；若因代理自签名证书 SSL 验证失败
+    （SSLError/CertificateError/URLError 且含 ssl/证书 关键字）且显式开启了
+    BAISYS_AKSHARE_SSL_INSECURE=1，则 verify=False 重试一次并告警。
+    安全基线：默认不开降级，仍只信任系统信任库（与 AShareHubClient 策略一致）。
+    """
+    from UtilsManager.AkshareConfig import ensure_akshare_timeout, akshare_ssl_insecure
+    ensure_akshare_timeout()
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        _msg = str(e).lower()
+        _is_ssl_issue = ("ssl" in _msg or "certificate" in _msg or "tls" in _msg
+                         or "握手" in str(e) or "证书" in str(e))
+        if _is_ssl_issue and akshare_ssl_insecure():
+            _orig = None
+            try:
+                import requests
+                _orig = requests.Session.request
+                def _insec(self, method, url, **kw):  # type: ignore[no-untyped-def]
+                    kw["verify"] = False
+                    return _orig(self, method, url, **kw)
+                requests.Session.request = _insec
+                logger.warning(
+                    f"[ST PIT] {_name} 首次 SSL 验证失败: {e} → BAISYS_AKSHARE_SSL_INSECURE=1 "
+                    f"已启用，verify=False 重试"
+                )
+                return fn(*args, **kwargs)
+            except Exception as e2:  # noqa: BLE001
+                logger.warning(f"[ST PIT] {_name} SSL 降级重试仍失败: {e2}")
+            finally:
+                if _orig is not None:
+                    requests.Session.request = _orig
+        raise
+
+
 def _fetch_st_list() -> pd.DataFrame | None:
     """当前 ST/*ST 列表（每日快照源）。失败返回 None。"""
     try:
         import akshare as ak
 
-        df = ak.stock_zh_a_st_em()
+        df = _ak_call(ak.stock_zh_a_st_em, _name="stock_zh_a_st_em")
         if df is None or df.empty:
             return None
         return df
@@ -109,7 +147,7 @@ def _fetch_spot_list() -> pd.DataFrame | None:
     try:
         import akshare as ak
 
-        df = ak.stock_zh_a_spot_em()
+        df = _ak_call(ak.stock_zh_a_spot_em, _name="stock_zh_a_spot_em")
         if df is None or df.empty:
             return None
         return df
@@ -123,7 +161,7 @@ def _fetch_sz_change_names() -> pd.DataFrame | None:
     try:
         import akshare as ak
 
-        df = ak.stock_info_sz_change_name("简称变更")
+        df = _ak_call(ak.stock_info_sz_change_name, "简称变更", _name="stock_info_sz_change_name")
         if df is None or df.empty:
             return None
         return df
@@ -137,7 +175,7 @@ def _fetch_sz_delist() -> pd.DataFrame | None:
     try:
         import akshare as ak
 
-        df = ak.stock_info_sz_delist("终止上市公司")
+        df = _ak_call(ak.stock_info_sz_delist, "终止上市公司", _name="stock_info_sz_delist")
         if df is None or df.empty:
             return None
         return df
@@ -151,7 +189,7 @@ def _fetch_sh_delist() -> pd.DataFrame | None:
     try:
         import akshare as ak
 
-        df = ak.stock_info_sh_delist("全部")
+        df = _ak_call(ak.stock_info_sh_delist, "全部", _name="stock_info_sh_delist")
         if df is None or df.empty:
             return None
         return df

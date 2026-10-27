@@ -671,6 +671,9 @@ def _run_single_backtest(
     _atr_stop = engine_cfg.atr_stop_mult
     _take_profit_pct = float(getattr(engine_cfg, "take_profit_pct", 15.0)) / 100.0
     _trail_profit_ratio = float(getattr(engine_cfg, "trail_profit_ratio", 10.0)) / 100.0
+    # FIX(B1): 最小持仓天数 — 评分反转/评分衰减类卖出需持仓≥N个交易日才允许触发，
+    # 防止"买进次日即因技术性信号卖出"的超短线空转（ATR止损/摘牌强平/复牌兑现不受限）。
+    _min_hold_days = int(getattr(engine_cfg, "min_hold_days", 5))
     _max_order_pct_default = engine_cfg.max_order_pct
     _max_order_pct_high = engine_cfg.max_order_pct_high
     _max_order_pct_low = engine_cfg.max_order_pct_low
@@ -1572,6 +1575,17 @@ def _run_single_backtest(
 
     _market_multiplier = 1.0
 
+    # FIX(C1): 资金效率统计器 — 0买入根因分类汇总（回测结束输出）
+    # 区分 4 类"当日 0 买入/少买入"：
+    #   cand_zero    = 当日连一个评分≥阈值的候选都没有（信号层问题）
+    #   cand_blocked = 有候选全部被风险/涨停/流动性/ST 等硬过滤拦截（过滤层问题）
+    #   slots_full   = 候选存在但 max_holdings 槽位已满（组合层问题）
+    #   no_cash      = 候选存在但现金不足以买 1 手（资金层问题）
+    _eff_stats = {
+        "days": 0, "buy_days": 0, "cand_zero": 0, "cand_blocked": 0,
+        "slots_full": 0, "no_cash": 0, "sum_candidates": 0,
+    }
+
     for i_day, (dt, grp) in enumerate(date_groups):
         # grp.copy() 全量冗余拷贝；PIT 掩码过滤（:1151 布尔索引）已产生新 DataFrame
         day_data = grp
@@ -2066,14 +2080,27 @@ def _run_single_backtest(
             _t1_ok = np.array([str(dt) != _buy_date.get(s, "") for s in syms_str])
             exit_high = np.isin(risk_str, ["HIGH", "D"])
             _entry_scores = np.array([_entry_buy_score.get(s, 0.0) for s in syms_str])
+            # FIX(B1): 评分反转阈值 60→70 — 原60在风险等级HIGH时退出评分恒=100，几乎任意
+            # 熊市/震荡信号都触发"评分反转"卖出（历史归因 74% 为 score_reversal，平均持有3天）。
+            # 阈值提高后仅真正强势股回落（评分显著反转）才触发，抑制超短线空转。
             # ②修复：退出评分阈值从70降至60（原70门槛过高致 exit_gt 几乎不触发→卖出仅靠持有期限到期）
-            exit_gt = (sell_score >= 60) & (sell_score > _entry_scores + 5)
+            # R(B1): 评分反转需要更强的确认信号，同时配合 min_hold_days 防止买进即卖。
+            exit_gt = (sell_score >= 70) & (sell_score > _entry_scores + 5)
             # 同时要求持仓评分下降超过 15 分才触发（防震荡市误杀）
-            # ②修复：buy_score 阈值从 0.6 放宽到 0.7（原0.6致 exit_score_low 过严→卖出条件失效）
+            # FIX(B1): 评分衰减阈值从 buy_threshold*0.7 提回 *0.85 — 与 exit_gt 联动的低分
+            # 阈值过严会导致刚建仓的持仓被误杀；且增加 min_hold_days 保护后不再需要 0.7 激进档。
             exit_score_low = (
-                (buy_score > 0) & (buy_score < _buy_threshold * 0.7) &
+                (buy_score > 0) & (buy_score < _buy_threshold * 0.85) &
                 (_entry_scores - buy_score > 15)
             )
+            # B1: 最小持仓天数保护 — 评分类卖出（反转/衰减/止盈回撤）在持仓<min_hold_days时
+            # 不触发；ATR止损、摘牌强平、复牌兑现、期限到期等硬性风控不受限。
+            if _min_hold_days > 0:
+                _hold_ok = np.array([
+                    _held_days.get(s, 999) >= _min_hold_days for s in syms_str
+                ])
+                exit_gt = exit_gt & _hold_ok
+                exit_score_low = exit_score_low & _hold_ok
             # 条件：持仓浮盈超过 take_profit_pct 且从最高点回撤超过 trail_profit_ratio
             # _max_close_since_entry 在建仓/每日维护时已更新
             exit_take_profit = np.zeros(len(syms_str), dtype=bool)
@@ -2263,6 +2290,11 @@ def _run_single_backtest(
             if len(si_all):
                 sel_stop = held & stop_hit & (not_touched_down | _sim_limits) & has_volume & _t1_ok & adj_ok & ~force_exit
                 si_stop = np.where(sel_stop)[0]
+                # FIX(B1): 半仓减仓（partial）→ 整仓卖出。原实现把所有非 ATR 止损的卖出
+                # 都标为 partial=True（一次卖一半），同一持仓被反复减仓 3~5 次才清仓 →
+                # 卖出笔数 = 买入笔数 × 5、交易成本翻倍。评分反转/评分衰减/止盈/高位风控
+                # 均是一次性趋势恶化的离场信号，应整仓退出；partial 仅保留给未来需要
+                # "部分止盈保本"的独立决策路径（当前无此信号），因此直接整仓。
                 si_partial = np.setdiff1d(si_all, si_stop)
                 # 0.1 执行时序：信号日收盘决策 → 挂单次日开盘成交
                 for _k in si_stop:
@@ -2273,9 +2305,9 @@ def _run_single_backtest(
                     })
                 for _k in si_partial:
                     _pending_sells.append({
-                        "sym": syms_str[_k], "si": idx[_k], "partial": True,
+                        "sym": syms_str[_k], "si": idx[_k], "partial": False,
                         "sig_dt": str(dt), "sig_close": float(close_adj[_k]),
-                        "reason": _sell_reasons.get(syms_str[_k], "partial"),
+                        "reason": _sell_reasons.get(syms_str[_k], "score_reversal"),
                     })
                 close_lookup = dict(zip(syms_str[adj_ok], close_raw[adj_ok]))
                 total_value = cash + _calc_market_value()
@@ -2313,6 +2345,20 @@ def _run_single_backtest(
                 )
             buy_ok = buy_ok & _liq_ok
         bi = np.where(buy_ok)[0]
+        # FIX(C1): 资金效率统计 — 0买入根因分类（每日累计，回测结束汇总输出）
+        _eff_stats["days"] += 1
+        if len(bi) > 0:
+            _eff_stats["buy_days"] += 1
+            _eff_stats["sum_candidates"] += len(bi)
+        else:
+            _score_n = int(np.sum(buy_score >= _effective_threshold))
+            _rack_pool = (pos_shares[idx] == 0) & adj_ok & has_volume & _st_ok
+            if _score_n == 0:
+                _eff_stats["cand_zero"] += 1
+            elif int(np.sum(_rack_pool)) == 0:
+                _eff_stats["slots_full"] += 1
+            else:
+                _eff_stats["cand_blocked"] += 1
         if _sim_limits:
             # 涨停无量 → 未成交（撮合约束日志，可追溯）
             _zv_buy = np.where(
@@ -2734,6 +2780,27 @@ def _run_single_backtest(
         logger.debug(f"[成本拆解] 报告跳过: {_cost_e}")
 
     # ── 信号质量汇总报告（埋点输出）：评分-收益IC、卖出原因分布、分档胜率 ──
+    # FIX(C1): 资金效率汇总先行输出（0买入根因分类）— 无论信号质量是否可算都打印
+    try:
+        _n_days = max(_eff_stats["days"], 1)
+        _buy_ratio = _eff_stats["buy_days"] / _n_days
+        _eff_lines = [
+            f"[资金效率] 交易天数={_eff_stats['days']} 买入日={_eff_stats['buy_days']} "
+            f"({_buy_ratio:.0%}) 候选日均={_eff_stats['sum_candidates'] / _n_days:.1f}只",
+            f"  0买入分布: 无候选(信号层)={_eff_stats['cand_zero']}日 "
+            f"被过滤(风险/涨停/流动性/ST)={_eff_stats['cand_blocked']}日 "
+            f"槽位满(组合层)={_eff_stats['slots_full']}日",
+        ]
+        if _buy_ratio < 0.5:
+            _eff_lines.append("  ⚠ 诊断: 半数以上交易日 0 买入 → 资金利用率低，需查候选池/过滤层")
+        elif _buy_ratio < 0.8:
+            _eff_lines.append("  ✓ 诊断: 大部分交易日有买入，仍有提升空间")
+        else:
+            _eff_lines.append("  ✓ 诊断: 高频率买入，资金利用充足")
+        logger.info("\n".join(_eff_lines))
+    except Exception as _eff_e:
+        logger.debug(f"[资金效率] 报告跳过: {_eff_e}")
+
     try:
         _buys = [t for t in trade_log if t["action"] == "buy"]
         _sells = [t for t in trade_log if t["action"] in ("sell", "sell_partial")]

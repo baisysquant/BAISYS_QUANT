@@ -164,6 +164,7 @@ def optimize_window(
     data_version: str | None = None,
     listing_days: dict | None = None,
     db_engine: Any = None,
+    seed_params: list[dict[str, float]] | None = None,  # FIX(D): 预检/上次校准参数注入初始点
 ) -> tuple[dict[str, float], GPState | None, list[dict[str, float]], float]:
     """单窗口贝叶斯优化（4 阶段）。
 
@@ -180,6 +181,10 @@ def optimize_window(
         previous_gp_state: 前一窗口的 GPState（warm-start）。
         progress_cb: 可选回调 progress_cb(phase, i, n, sharpe)。
         compute_exit_strategy: 传给 FidelityController。
+        seed_params: FIX(D) 可选的预检/上次校准参数列表。在 Phase 1 Sobol 之前
+            先评估这些点并纳入 GP 训练集，防止 BO 在空间内找到的参数远差于
+            预检点（历史根因：预检 buy_threshold=12 / atr_stop_mult=5.5 超出
+            搜索空间 30-60 / 1-4，BO 永远搜不到预检区域）。
 
     Returns:
         (best_params, gp_state_for_next_window, top_k_params_for_oos, best_sharpe, best_is_equity)
@@ -232,6 +237,11 @@ def optimize_window(
     def _params_key(p: dict[str, float]) -> tuple[tuple[str, float], ...]:
         return tuple(sorted((k, round(float(v), 8)) for k, v in p.items()))
 
+    def _sp_source_label(p: dict[str, float]) -> str:
+        """种子的简短标签：如 atr_stop_mult=3.0,buy_threshold=12（截取3键防刷屏）。"""
+        _kvs = [f"{k}={v:g}" for k, v in sorted(p.items()) if k in spaces][:3]
+        return ",".join(_kvs) if _kvs else "无搜索键"
+
     def _eval_once(params: dict[str, float], fidelity: int) -> dict[str, Any]:
         # 但 backtest 引擎仍需要这些字段）。固定参数优先级低于搜索参数。
         merged = {**_fixed_params, **params}
@@ -269,6 +279,40 @@ def optimize_window(
     default_signal = {k: (sp.low + sp.high) / 2.0 for k, sp in signal_sp.items()}
     if default_signal:
         controller.warm_cache(default_signal)
+
+    # FIX(D): 预检/上次校准参数作为种子点优先评估（纳入 GP 初始化集）。
+    # 历史上预检用 buy_threshold=12/atr_stop_mult=5.5 能得 IS Sharpe 1.08，
+    # 但搜索空间只含 30-60/1-4，BO 120 轮全部落空（best=-0.19）。
+    # 种子点评估在 Sobol 之前执行，保证：
+    #   1) 预检参数必然进入评估集合（无论如何都有 1 次高质量评估）；
+    #   2) GP 初始训练集包含真实好点，EI 采集不会远离预检区域。
+    _seed_evaluated = 0
+    if seed_params:
+        for _sp in seed_params:
+            _sp_merged = {**_fixed_params, **_sp}
+            # 仅当种子点含搜索空间任一维（含固定参数时无需重复）才有意义
+            _sp_in_space = any(k in spaces for k in _sp)
+            if not _sp_in_space:
+                continue
+            try:
+                # 种子点可能含空间外键（如 golden_cross_bonus）→ 归一化只取空间键
+                _x_norm = _to_normalized(_sp_merged, spaces)
+            except Exception:
+                continue
+            _result = _eval_once(_sp_merged, fidelity=1)
+            _sharpe = _result.get("sharpe", float("-inf"))
+            if not np.isfinite(_sharpe):
+                continue
+            _track(_sharpe, _sp_merged, _x_norm, _result.get("equity"))
+            if progress_cb:
+                progress_cb(0, _seed_evaluated, len(seed_params), _sharpe)
+            logger.info(
+                f"[Phase 0/4] 种子点[{_seed_evaluated}] {_sp_source_label(_sp)} "
+                f"IS Sharpe={_sharpe:.4f}（预检参数入初始点，FIX-D）"
+            )
+            _seed_evaluated += 1
+    if _seed_evaluated:
+        logger.info(f"[Phase 0/4] 共评估 {_seed_evaluated} 个种子点并入 GP 训练集")
 
     if n_portfolio > 0:
         logger.info(f"[Phase 1/4] Sobol init: {n_init} 组 (组合空间 Level2, 信号=默认)")

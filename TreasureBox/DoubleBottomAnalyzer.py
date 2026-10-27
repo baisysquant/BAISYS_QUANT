@@ -41,7 +41,7 @@ class Config:
         from UtilsManager.ConfigCipher import ConfigCipher
 
         config = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
-        config.read(self.config_file, encoding="utf-8")
+        config.read(self.config_file, encoding="utf-8-sig")
 
         db = config["DATABASE"]
 

@@ -503,6 +503,13 @@ def bayesian_walk_forward_multi(
                     _precheck_source = "上次成功校准参数(合并空间中位数)"
                 else:
                     _precheck_source = "参数空间中位数"
+                # FIX(D): 预检参数必须进入 BO 搜索空间，否则"预检 1.08 vs BO best -0.19"
+                # 会反复出现（BO 只在 _RANGE 空间内采样，历史校准值如 buy_threshold=12
+                # 超出当前 30-60 区间时永远搜不到预检好点）。扩展空间到覆盖校准值，
+                # 让 BO 在预检点邻域继续搜索；golden_cross_bonus 等固定参数由
+                # _eval_once 的固定参数机制处理，此处仅扩展搜索空间键。
+                from BackTrading.bayesian.space import extend_spaces_to_cover as _ext_spaces
+                _ext_spaces(spaces, _precheck_params, margin=1.0)
                 _pre_ctrl = _FC(train_data, base_cfg, compute_exit_strategy=True,
                                 vectorized=True, eval_start_date=train_eval_start,
                                 st_history=st_history, exclude_st=exclude_st,
@@ -531,6 +538,11 @@ def bayesian_walk_forward_multi(
 
             # ── 贝叶斯优化 IS ──
             try:
+                # FIX(D): 预检参数注入 BO 初始点（seed_params）— 与上方空间扩展配套，
+                # 保证预检点必然被评估且不远离其邻域搜索。
+                _seed_param_list = []
+                if _precheck_sharpe is not None and np.isfinite(_precheck_sharpe):
+                    _seed_param_list = [_precheck_params]
                 best_params, gp_state, top_k_params, is_sharpe, is_equity = optimize_window(
                     kline_df=train_data,
                     engine_cfg=base_cfg,
@@ -547,6 +559,7 @@ def bayesian_walk_forward_multi(
                     data_version=data_version,
                     listing_days=listing_days,
                     db_engine=db_engine,
+                    seed_params=_seed_param_list,
                 )
             except Exception as opt_err:
                 _sid = save_failure_snapshot(

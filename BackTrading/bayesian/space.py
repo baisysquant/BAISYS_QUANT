@@ -33,6 +33,50 @@ class ParamSpace:
     def contains(self, value: float) -> bool:
         return self.low <= value <= self.high
 
+    def extend_to_cover(self, value: float, margin: float = 1.0) -> bool:
+        """扩展边界以覆盖指定值（含 margin 余量）。返回是否发生扩展。
+
+        FIX(D): 校准历史参数（如 buy_threshold=12、atr_stop_mult=5.5）可能超出
+        当前 _RANGE 搜索空间（如 30-60 / 1-4）。BO 只在空间内采样，预检参数
+        若不在空间内，预检 Sharpe 高但 BO 永远搜不到该区域 → "预检 1.08 vs
+        BO best -0.19"的根源。此方法把边界放宽至覆盖历史好点，让 BO 有机会
+        在预检点邻域继续搜索；同时保证 discrete step 语义不破坏（新边界仍对齐
+        步长，供 _from_normalized 取整）。
+        """
+        step = self.step if (self.step is not None and self.step > 0) else 1.0
+        new_low = min(self.low, value - margin)
+        new_high = max(self.high, value + margin)
+        # 步长对齐：low 向下对齐、high 向上对齐，保证空间覆盖值
+        new_low = float(np.floor(new_low / step) * step)
+        new_high = float(np.ceil(new_high / step) * step)
+        changed = (new_low < self.low) or (new_high > self.high)
+        if changed:
+            logger.info(
+                f"[空间扩展] {self.name}: [{self.low},{self.high}]{f' x{self.step}' if self.step else ''}"
+                f" → [{new_low},{new_high}]（覆盖校准历史值 {value}）"
+            )
+            self.low = new_low
+            self.high = new_high
+        return changed
+
+
+def extend_spaces_to_cover(
+    spaces: dict[str, ParamSpace],
+    params: dict[str, float],
+    margin: float = 1.0,
+) -> bool:
+    """对 spaces 中存在的参数，将其边界扩展以覆盖 params 中的值。返回是否发生扩展。
+
+    FIX(D): 在 BO 之前调用 — 把预检/上次校准参数纳入搜索空间，避免"预检好点
+    在空间外、BO 永远搜不到"的口径断裂。仅扩展已有参数的空间；params 中不在
+    空间里的键（如 golden_cross_bonus/divergence_penalty 固定参数）直接忽略。
+    """
+    changed = False
+    for name, sp in spaces.items():
+        if name in params:
+            changed = sp.extend_to_cover(float(params[name]), margin=margin) or changed
+    return changed
+
 
 # config.ini _RANGE 字段名 → 参数名映射
 # 注：kelly_fraction / position_a / position_b / position_c / risk_none_multiplier

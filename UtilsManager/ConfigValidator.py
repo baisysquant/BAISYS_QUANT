@@ -535,7 +535,7 @@ def validate(config_path: str = "config.ini") -> ValidationReport:
         return report
 
     parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
-    parser.read(config_path, encoding="utf-8")
+    parser.read(config_path, encoding="utf-8-sig")
     known_section_names = {sr.name for sr in SECTION_RULES}
 
     for sec_name in parser.sections():

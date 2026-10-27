@@ -837,7 +837,7 @@ python MainShareAnalysis.py --backtest-only  # 仅回测
 | `DoubleBottomAnalyzer.py` | 全市场 MACD+KDJ 双谷（双重底）形态扫描，输出"双谷探底机会点"Excel |
 | `KDJ_Signal.py` | 从 `app_stock_strategy_report` 筛选 KDJ 信号并验证信号日后股价表现 |
 | `MacdZeroAxisPattern.py` | 全市场 MACD"零轴完整反弹形态"扫描 |
-| `个股新闻查询.py` | 东方财富个股新闻批量查询导出 |
+| `StockNewsQuery.py` | 东方财富个股新闻批量查询导出 |
 
 <br />
 

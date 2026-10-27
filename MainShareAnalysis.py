@@ -49,7 +49,7 @@ def main() -> None:
     if not _log_dir:
         try:
             _ini = _cp.ConfigParser()
-            _ini.read(_os.path.join(PROJECT_ROOT, "config.ini"), encoding="utf-8")
+            _ini.read(_os.path.join(PROJECT_ROOT, "config.ini"), encoding="utf-8-sig")
             _cfg_log_dir = _ini.get("LOGGING", "log_dir", fallback="Logs").strip()
             _home_dir = _ini.get("SYSTEM", "HOME_DIRECTORY", fallback=PROJECT_ROOT).strip()
             if _os.path.isabs(_cfg_log_dir):

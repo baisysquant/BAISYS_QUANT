@@ -477,6 +477,14 @@ class BacktestConfig(BaseModel):
                                description="买入评分阈值（校准覆写目标，WFO 未寻优时兜底）")
     MAX_HOLDINGS: int = Field(default=11, ge=0, le=100,
                               description="最大同时持仓数，0=不限制（校准覆写目标，WFO 未寻优时兜底）")
+    MIN_HOLD_DAYS: int = Field(default=5, ge=0, le=120,
+                               description="最小持仓天数：评分反转/评分衰减/止盈回撤类卖出须持仓满该天数（ATR止损/摘牌强平/复牌兑现不受限）；0=关闭")
+    TAKE_PROFIT_PCT: float = Field(default=12.0, ge=0, le=100,
+                                   description="浮盈触发移动止盈的门槛（百分比）")
+    TRAIL_PROFIT_RATIO: float = Field(default=8.0, ge=0, le=50,
+                                      description="从最高点回撤触发止盈的比例（百分比）")
+    MAX_HOLD_DAYS: int = Field(default=45, ge=0, le=500,
+                               description="持仓期限上限（交易日，超期后评分低于阈值则卖出）；0=关闭")
 
     @field_validator("OPTIMIZE_FREQUENCY")
     @classmethod
@@ -813,7 +821,8 @@ class Config:
         import configparser
 
         self._cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
-        self._cp.read(self.config_file, encoding="utf-8")
+        # utf-8-sig: 自动剥离 UTF-8 BOM，兼容带/不带 BOM 的 config.ini
+        self._cp.read(self.config_file, encoding="utf-8-sig")
 
         from UtilsManager.ConfigCipher import ConfigCipher
 

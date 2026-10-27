@@ -46,6 +46,40 @@ def _norm_pool(symbols: list[str]) -> set[str]:
     return out
 
 
+def _fetch_insecure(fn, *args, _name: str = "ak", **kwargs):
+    """FIX(E1): akshare 首次按系统 CA 请求失败(SSL/证书)时，若显式开启
+    BAISYS_AKSHARE_SSL_INSECURE=1 则 verify=False 重试一次（与 StPitSync 同策略，
+    安全基线默认仍只信任系统信任库）。
+    """
+    from UtilsManager.AkshareConfig import ensure_akshare_timeout, akshare_ssl_insecure
+    ensure_akshare_timeout()
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        _msg = f"{str(e).lower()} {e}".lower()
+        _is_ssl = ("ssl" in _msg or "certificate" in _msg or "tls" in _msg
+                   or "证书" in str(e) or "握手" in str(e))
+        if _is_ssl and akshare_ssl_insecure():
+            _orig = None
+            try:
+                import requests
+                _orig = requests.Session.request
+                def _insec(self, method, url, **kw):  # type: ignore[no-untyped-def]
+                    kw["verify"] = False
+                    return _orig(self, method, url, **kw)
+                requests.Session.request = _insec
+                logger.warning(
+                    f"[上市日] {_name} 首次 SSL 验证失败: {e} → 降级 verify=False 重试"
+                )
+                return fn(*args, **kwargs)
+            except Exception as e2:  # noqa: BLE001
+                logger.warning(f"[上市日] {_name} SSL 降级重试仍失败: {e2}")
+            finally:
+                if _orig is not None:
+                    requests.Session.request = _orig
+        raise
+
+
 def _fetch_a_code_name() -> pd.DataFrame | None:
     """沪深 A 股基本信息（含上市日期）。失败返回 None。
 
@@ -64,7 +98,7 @@ def _fetch_a_code_name() -> pd.DataFrame | None:
 
     # ── 尝试 1: stock_info_a_code_name ──
     try:
-        df = ak.stock_info_a_code_name()
+        df = _fetch_insecure(ak.stock_info_a_code_name, _name="stock_info_a_code_name")
         if df is not None and not df.empty:
             code_col = next((c for c in ("代码", "code") if c in df.columns), None)
             date_col = next((c for c in ("上市日期", "list_date", "ipo_date") if c in df.columns), None)
@@ -79,7 +113,7 @@ def _fetch_a_code_name() -> pd.DataFrame | None:
 
     # ── 尝试 2: stock_a_code_name_spot_em（东方财富 A 股代码行情快照，含上市日期） ──
     try:
-        df = ak.stock_a_code_name_spot_em()
+        df = _fetch_insecure(ak.stock_a_code_name_spot_em, _name="stock_a_code_name_spot_em")
         if df is not None and not df.empty:
             code_col = next((c for c in ("代码", "code", "证券代码", "symbol") if c in df.columns), None)
             date_col = next((c for c in ("上市日期", "list_date", "ipo_date", "上市时间") if c in df.columns), None)
@@ -94,7 +128,7 @@ def _fetch_a_code_name() -> pd.DataFrame | None:
 
     # ── 尝试 3: stock_info_global_em ──
     try:
-        df = ak.stock_info_global_em()
+        df = _fetch_insecure(ak.stock_info_global_em, _name="stock_info_global_em")
         if df is not None and not df.empty:
             code_col = next((c for c in ("代码", "code", "证券代码") if c in df.columns), None)
             date_col = next((c for c in ("上市日期", "list_date", "ipo_date") if c in df.columns), None)

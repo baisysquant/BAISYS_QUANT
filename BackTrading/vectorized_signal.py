@@ -614,11 +614,20 @@ def _risk_level(
     div_strength: np.ndarray,
     has_top_div: np.ndarray,
 ) -> np.ndarray:
-    """逐 bar 风险等级 (HIGH/LOW/MEDIUM/NONE)。"""
+    """逐 bar 风险等级 (HIGH/MEDIUM/LOW)。
+
+    FIX(A2/C)：原实现把 WEAK_TREND（MA 全空头排列，震荡市常见）直接判 HIGH，
+    导致：
+      1) 买入端一票否决 → 半数交易日候选池为空（0 买入，资金效率低）；
+      2) 退出评分 es[HIGH]=100 → 持仓稍有回调即"评分反转"卖出（超短线空转、
+         卖出=买入×5）。
+    WEAK_TREND 仅是趋势偏弱，降级为 MEDIUM（可买入，评分把关）；HIGH 仅保留
+    真正的深度弱势（MACD SUPER_WEAK）与强顶背离。MEDIUM 不再触发退出评分 100。
+    """
     n = len(macd_trend_arr)
     rl = np.full(n, "LOW", dtype=object)
     rl[macd_trend_arr == MACDTrend.SUPER_WEAK] = "HIGH"
-    rl[regime == "WEAK_TREND"] = "HIGH"
+    rl[regime == "WEAK_TREND"] = "MEDIUM"
     rl[has_top_div & (div_strength > 0.3)] = "HIGH"
     return rl
 
