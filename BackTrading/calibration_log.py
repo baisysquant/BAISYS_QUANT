@@ -149,6 +149,10 @@ def should_rerun(
     data_version/config_hash 与上次成功记录不一致时，即使在同一周期内
     也强制重跑——上次结果对应的数据/配置已过期，缓存复用会静默失真。
 
+    最近一次记录 status=failed 时无条件重跑：失败结果不可视为有效执行，
+    不能用于"本月已执行过"之类的跳过判定；仅 status=success 的记录
+    才参与频率/时间周期判断。
+
     Returns:
         (should_run, reason)
     """
@@ -173,14 +177,12 @@ def should_rerun(
         if _last_ch and _last_ch != config_hash:
             return True, f"配置哈希变化（{_last_ch} → {config_hash}），需重新回测"
 
-    # ── 上次失败保护：data/config 未变且上次失败，不再重复浪费算力 ──
+    # ── 上次失败 → 必须重跑：失败结果不等于有效执行，不能用于跳过后续调度 ──
+    # 只有最近一次回测为 success 时，才允许用频率/时间周期判定是否跳过
+    # （例如：本月最后一次测试成功才能跳过）。
     _last_status = last_run.get("status", "success")
     if _last_status == "failed":
-        logger.warning(
-            f"上次回测失败（于 {last_date}），数据/配置未发生变化，跳过重复执行。"
-            f"如需强制重跑请调用 run_backtest_pipeline(force=True)"
-        )
-        return False, f"上次回测于 {last_date} 失败（data/config 未变），跳过重复执行"
+        return True, f"上次回测于 {last_date} 失败，需要重新执行"
 
     if frequency == "initial":
         return False, f"频率=initial，上次执行于 {last_date}，不再自动重跑"

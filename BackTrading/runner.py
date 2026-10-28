@@ -598,12 +598,11 @@ def run_backtest_pipeline(
                 "  1. 特征工程是否存在隐性数据泄露\n"
                 "  2. 信号逻辑是否适应当前市场 regime\n"
                 "  3. 回看区间是否过短/过长导致过拟合\n"
-                "本次回测已标记为失败；回退参数（参数空间中位）仍会写入 config.ini，"
-                "下次调度将跳过（需手动 force=True 或数据/配置变化后重跑）"
+                "本次回测已标记为失败；下次调度将自动重试（失败不会跳过重复执行）"
             )
             logger.critical("=" * 60)
 
-            # 记录失败状态，避免下次调度重复执行
+            # 记录失败状态（审计用）；失败不阻断下次调度自动重试
             record_run(
                 engine=engine,
                 frequency=bt.OPTIMIZE_FREQUENCY,
