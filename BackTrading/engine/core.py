@@ -681,6 +681,10 @@ def _run_single_backtest(
     _adv_threshold_low = engine_cfg.adv_amount_threshold_low    # 低流动性阈值（元）
     # FIX(P2-2): 入场流动性否决阈值 — 20日均成交额低于此值禁止买入
     _entry_liq_min = engine_cfg.entry_liq_min_amount
+    # FIX(A2-2026-10-28): 追高闸门 配置读取（% → 小数）
+    _entry_max_chg_1d = float(getattr(engine_cfg, "entry_max_chg_1d_pct", 0.0)) / 100.0
+    _entry_max_chg_5d = float(getattr(engine_cfg, "entry_max_chg_5d_pct", 0.0)) / 100.0
+    _entry_max_bias_ma20 = float(getattr(engine_cfg, "entry_max_bias_ma20_pct", 0.0)) / 100.0
     _top_k = engine_cfg.top_k
 
     cash = float(init_cash)
@@ -2344,6 +2348,45 @@ def _run_single_backtest(
                     f"[流动性过滤] {dt}: {_n_blocked} 只标的因 20日均成交额 < {_entry_liq_min/1e4:.0f}万 被剔除"
                 )
             buy_ok = buy_ok & _liq_ok
+        # FIX(A2-2026-10-28): 追高闸门 — 执行层兜底（A1b 实证：综合评分在≥45区间
+        # IC=-0.094 方向反，Q5 最高分档胜率 38% 止盈 0 笔；即使评分重构后，短期涨幅
+        # 过大的标的仍可能残留高分，此处按配置硬性拦截）。
+        # 数据源：_close_hist 后复权收盘历史（1721 行 append 当日 close 先于本判定，
+        # 无前视）；MA20 乖离用后复权 close vs 数据侧 MA_20（同口径）。
+        if _entry_max_chg_1d > 0 or _entry_max_chg_5d > 0 or _entry_max_bias_ma20 > 0:
+            _chg_1d = np.zeros(len(syms_str))
+            _chg_5d = np.zeros(len(syms_str))
+            for _k, _s in enumerate(syms_str):
+                _ch = _close_hist.get(_s)
+                if _ch is None:
+                    continue
+                if _entry_max_chg_1d > 0 and len(_ch) >= 2 and _ch[-2] > 0:
+                    _chg_1d[_k] = _ch[-1] / _ch[-2] - 1.0
+                if _entry_max_chg_5d > 0 and len(_ch) >= 6 and _ch[-6] > 0:
+                    _chg_5d[_k] = _ch[-1] / _ch[-6] - 1.0
+            _chase_ok = np.ones(len(syms_str), dtype=bool)
+            if _entry_max_chg_1d > 0:
+                _chase_ok &= _chg_1d <= _entry_max_chg_1d
+            if _entry_max_chg_5d > 0:
+                _chase_ok &= _chg_5d <= _entry_max_chg_5d
+            if _entry_max_bias_ma20 > 0:
+                _ma20_series = day_data.get("MA_20")
+                if _ma20_series is not None:
+                    _ma20_arr = _ma20_series.values.astype(np.float64, copy=False)
+                    _bias = np.where(
+                        np.isfinite(_ma20_arr) & (_ma20_arr > 0),
+                        close_adj / np.maximum(_ma20_arr, 1e-9) - 1.0,
+                        0.0,
+                    )
+                    _chase_ok &= _bias <= _entry_max_bias_ma20
+                else:
+                    logger.debug("[追高闸门] MA_20 列缺失，乖离过滤跳过（涨幅闸门仍生效）")
+            _n_chased = int((buy_ok & ~_chase_ok).sum())
+            if _n_chased:
+                logger.debug(
+                    f"[追高闸门] {dt}: {_n_chased} 只标的因短期涨幅/乖离过大被剔除"
+                )
+            buy_ok = buy_ok & _chase_ok
         bi = np.where(buy_ok)[0]
         # FIX(C1): 资金效率统计 — 0买入根因分类（每日累计，回测结束汇总输出）
         _eff_stats["days"] += 1

@@ -896,10 +896,19 @@ def compute_signals(
     score_p = params.get("scoring", {})
     th_p = params.get("thresholds", {})
     weights = {
-        "MACD趋势": 20, "金叉信号": 15, "柱状动能": 15,
-        "DIF斜率": 10, "背离信号": 10, "量价配合": 10, "K线形态": 10,
-        # FIX(P1-1): 先行指标权重（共 18 分，归一化后从 7 个滞后因子中分摊）
-        "波动率压缩": 6, "价格位置": 6, "动能加速": 6,
+        # FIX(A2-2026-10-28): 评分权重重构 — 依据 A1b 高分区间(评分≥45)单因子 IC
+        #   A1b 实证（候选买入区间内，未来10日收益 Spearman IC）：
+        #     波动率压缩分  IC=+0.093 ✅ 唯一强正（BOLL收窄=变盘前兆）
+        #     MACD趋势数值分 IC=-0.080 ❌  金叉信号分 IC=-0.070 ❌
+        #     价格位置分     IC=-0.056 ❌  量价配合分 IC=-0.037 ❌
+        #     动能加速分     IC=-0.024 ❌  柱状动能分 IC=-0.024 ❌
+        #   → 结论：82/100 权重是"趋势已走强"追涨因子，高分=短期已大涨=追高接盘，
+        #     导致 Q1~Q5 分档在 Q5 反转（最高分档胜率仅 38%）、止盈 0 笔。
+        #   重构：追涨因子全面降权，波动率压缩升为第一权重。
+        "MACD趋势": 10, "金叉信号": 8, "柱状动能": 10,
+        "DIF斜率": 8, "背离信号": 5, "量价配合": 4, "K线形态": 7,
+        # FIX(P1-1): 先行指标（波动率压缩上调为第一权重，其余压缩）
+        "波动率压缩": 18, "价格位置": 4, "动能加速": 3,
     }
     # 归一化权重至总和 100，保证阈值 80/60/40 是统一的百分比语义
     _ws = sum(weights.values())
@@ -974,10 +983,12 @@ def compute_signals(
     regime = _regime_series(stock_df, boll_bw_col=boll_bw, params=params.get("regime"))
 
     # ── 4. 动量分（Phase 0 缓存优先，缺失时内联回退） ──
+    # FIX(A2-2026-10-28): 因子满分由权重驱动（原缓存按满分 15 生成，线性换算）
     if "_p0_momentum" in stock_df.columns:
-        mom_score = stock_df["_p0_momentum"].values
+        _p0_mom = stock_df["_p0_momentum"].values
+        mom_score = _p0_mom * (weights["柱状动能"] / 15.0)
     else:
-        mom_score = _momentum(dif, dea, max_score=15)
+        mom_score = _momentum(dif, dea, max_score=weights["柱状动能"])
 
     # ── 5. 斜率分（Phase 0 缓存优先；slope_window 与缓存常量不一致时重算） ──
     _p0_feat_const = stock_df.attrs.get("_p0_feat_const") or {}
@@ -985,21 +996,24 @@ def compute_signals(
         "_p0_slope" in stock_df.columns
         and int(_p0_feat_const.get("slope_window", -1)) == slope_window
     ):
-        slope_score = stock_df["_p0_slope"].values
+        _p0_sl = stock_df["_p0_slope"].values
+        slope_score = _p0_sl * (weights["DIF斜率"] / 10.0)
     else:
-        slope_score = _dif_slope(dif, window=slope_window, max_score=10)
+        slope_score = _dif_slope(dif, window=slope_window, max_score=weights["DIF斜率"])
 
     # ── 6. 量价分（Phase 0 缓存优先，缺失时内联回退） ──
     if "_p0_vol_price" in stock_df.columns:
-        vol_score = stock_df["_p0_vol_price"].values
+        _p0_vp = stock_df["_p0_vol_price"].values
+        vol_score = _p0_vp * (weights["量价配合"] / 10.0)
     else:
-        vol_score = _volume_price(stock_df, max_score=10)
+        vol_score = _volume_price(stock_df, max_score=weights["量价配合"])
 
     # ── 7. K 线形态分（Phase 0 缓存优先，缺失时内联回退） ──
     if "_p0_kline_pattern" in stock_df.columns:
-        kp_score = stock_df["_p0_kline_pattern"].values
+        _p0_kp = stock_df["_p0_kline_pattern"].values
+        kp_score = _p0_kp * (weights["K线形态"] / 10.0)
     else:
-        kp_score = _kline_pattern(stock_df, max_score=10)
+        kp_score = _kline_pattern(stock_df, max_score=weights["K线形态"])
 
     # ── 8. 金叉评分 ──
     w_cross = weights["金叉信号"]
@@ -1013,9 +1027,11 @@ def compute_signals(
     risk_level = _risk_level(regime, trend_arr, div_type, div_strength, has_top_div)
 
     # ── FIX(P1-1): 先行指标计算 ──
-    squeeze_score = _volatility_squeeze(stock_df, max_score=6)
-    price_pos_score = _price_position(stock_df, max_score=6)
-    mom_accel_score = _momentum_acceleration(dif, dea, max_score=6)
+    # FIX(A2-2026-10-28): 因子满分由权重驱动（原硬编码 6，导致权重字典与
+    # 实际分值脱节——波动率压缩权重上调后真实贡献仍被卡在 6 分）
+    squeeze_score = _volatility_squeeze(stock_df, max_score=weights["波动率压缩"])
+    price_pos_score = _price_position(stock_df, max_score=weights["价格位置"])
+    mom_accel_score = _momentum_acceleration(dif, dea, max_score=weights["动能加速"])
 
     # ── 10. 退出评分 ──
     exit_score_arr = _exit_score(risk_level, close, atr, atr_stop_mult)

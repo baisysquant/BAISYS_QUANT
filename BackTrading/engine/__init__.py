@@ -56,6 +56,10 @@ class ExecutionConfig:
     adv_amount_threshold_high: float
     adv_amount_threshold_low: float
     entry_liq_min_amount: float  # FIX(P2-2): 入场流动性否决阈值
+    # FIX(A2-2026-10-28): 追高闸门（执行层兜底，0=关闭）
+    entry_max_chg_1d_pct: float
+    entry_max_chg_5d_pct: float
+    entry_max_bias_ma20_pct: float
     order_expiry_days: int
     strict_listing_days: bool
 
@@ -218,6 +222,16 @@ class EngineConfig:
     adv_amount_threshold_low: float = 2e7   # 低流动性阈值（元）
     # FIX(P2-2): 入场流动性否决阈值（元）— 20日均成交额低于此值的股票禁止买入
     entry_liq_min_amount: float = 5e7  # 5000 万元，过滤微盘/低流动性标的避免冲击成本吃掉利润
+    # FIX(A2-2026-10-28): 追高闸门 — 入场策略实证修复（A1b 高分区间单因子 IC
+    # 显示：综合评分在评分≥45 区间 IC=-0.094 方向反，Q5 最高分档胜率仅 38%、
+    # 止盈 0 笔，根因是 82/100 权重为"趋势已走强"追涨因子 → 高分=短期已大涨=追高）。
+    # 执行层兜底：即使评分模型仍给高分，短期涨幅过大的标的也禁止买入。
+    #   entry_max_chg_1d_pct:  当日涨幅上限（%），0=关闭；默认 15 → 20cm 涨停板禁买
+    #   entry_max_chg_5d_pct:  近5日累计涨幅上限（%），0=关闭；默认 40 → 约4个10cm涨停
+    #   entry_max_bias_ma20_pct: 收盘价对 MA20 乖离上限（%），0=关闭；默认 35 → 极端乖离禁买
+    entry_max_chg_1d_pct: float = 15.0
+    entry_max_chg_5d_pct: float = 40.0
+    entry_max_bias_ma20_pct: float = 35.0
     top_k: int = 20  # 每日最大候选买入数（集中资金，避免每只分到极小额度 < 1 手）
     # 从 core.py 硬编码提升为配置项，便于研究（如"连续重挂 N 日"实验）；默认 1 保持原语义。
     order_expiry_days: int = 1
@@ -322,6 +336,10 @@ class EngineConfig:
             adv_amount_threshold_high=self.adv_amount_threshold_high,
             adv_amount_threshold_low=self.adv_amount_threshold_low,
             entry_liq_min_amount=self.entry_liq_min_amount,
+            # FIX(A2-2026-10-28): 追高闸门视图同步
+            entry_max_chg_1d_pct=self.entry_max_chg_1d_pct,
+            entry_max_chg_5d_pct=self.entry_max_chg_5d_pct,
+            entry_max_bias_ma20_pct=self.entry_max_bias_ma20_pct,
             order_expiry_days=self.order_expiry_days,
             strict_listing_days=self.strict_listing_days,
         )

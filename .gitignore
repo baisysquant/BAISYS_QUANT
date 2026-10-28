@@ -72,6 +72,10 @@ logs/
 cache/
 *.cache
 
+# 运行时产物（每次回测自动更新，仅本地有效，不入版本库）
+backtest_drift.json
+calibration_result.json
+
 # Excel files (optional - uncomment if you want to ignore)
 # *.xlsx
 # *.xls
